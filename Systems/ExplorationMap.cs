@@ -617,6 +617,103 @@ namespace AutoExile.Systems
         }
 
         // ═══════════════════════════════════════════════════
+        // Snapshot / Restore (for cross-zone caching)
+        // ═══════════════════════════════════════════════════
+
+        /// <summary>
+        /// Capture a lightweight snapshot of exploration state that can be restored later.
+        /// Used by BotCore to cache map progress when entering sub-zones (e.g., Wishes portal).
+        /// </summary>
+        public ExplorationSnapshot CreateSnapshot()
+        {
+            var snapshot = new ExplorationSnapshot
+            {
+                ActiveBlobIndex = ActiveBlobIndex,
+                TotalWalkableCells = TotalWalkableCells,
+                LastAction = LastAction,
+            };
+
+            foreach (var blob in Blobs)
+            {
+                snapshot.BlobSnapshots.Add(new BlobSnapshot
+                {
+                    Index = blob.Index,
+                    WalkableCells = new HashSet<Vector2i>(blob.WalkableCells),
+                    SeenCells = new HashSet<Vector2i>(blob.SeenCells),
+                    Regions = blob.Regions.Select(r => new RegionSnapshot
+                    {
+                        Index = r.Index,
+                        Center = r.Center,
+                        CellCount = r.CellCount,
+                        SeenCount = r.SeenCount,
+                        Cells = new List<Vector2i>(r.Cells),
+                    }).ToList(),
+                    CellToRegion = new Dictionary<Vector2i, int>(blob.CellToRegion),
+                    Coverage = blob.Coverage,
+                });
+            }
+
+            foreach (var t in KnownTransitions)
+            {
+                snapshot.Transitions.Add(new TransitionPortal
+                {
+                    GridPos = t.GridPos,
+                    Name = t.Name,
+                    SourceBlobIndex = t.SourceBlobIndex,
+                    DestBlobIndex = t.DestBlobIndex,
+                });
+            }
+
+            snapshot.FailedRegionsCopy = new HashSet<int>(FailedRegions);
+            return snapshot;
+        }
+
+        /// <summary>
+        /// Restore exploration state from a previously captured snapshot.
+        /// Replaces all current state.
+        /// </summary>
+        public void RestoreSnapshot(ExplorationSnapshot snapshot)
+        {
+            Clear();
+
+            ActiveBlobIndex = snapshot.ActiveBlobIndex;
+            TotalWalkableCells = snapshot.TotalWalkableCells;
+            LastAction = snapshot.LastAction + " (restored)";
+
+            foreach (var bs in snapshot.BlobSnapshots)
+            {
+                var blob = new Blob
+                {
+                    Index = bs.Index,
+                    WalkableCells = bs.WalkableCells,
+                    SeenCells = bs.SeenCells,
+                    CellToRegion = bs.CellToRegion,
+                    Coverage = bs.Coverage,
+                };
+
+                foreach (var rs in bs.Regions)
+                {
+                    blob.Regions.Add(new Region
+                    {
+                        Index = rs.Index,
+                        Center = rs.Center,
+                        CellCount = rs.CellCount,
+                        SeenCount = rs.SeenCount,
+                        Cells = rs.Cells,
+                    });
+                }
+
+                Blobs.Add(blob);
+            }
+
+            foreach (var t in snapshot.Transitions)
+                KnownTransitions.Add(t);
+
+            foreach (var r in snapshot.FailedRegionsCopy)
+                FailedRegions.Add(r);
+        }
+
+        // ═══════════════════════════════════════════════════
         // Helpers
         // ═══════════════════════════════════════════════════
 
@@ -692,6 +789,36 @@ namespace AutoExile.Systems
             public int SourceBlobIndex = -1;
             public int DestBlobIndex = -1;  // -1 until we enter it
         }
+    }
+
+    /// <summary>Snapshot of full ExplorationMap state for cross-zone caching.</summary>
+    public class ExplorationSnapshot
+    {
+        public int ActiveBlobIndex;
+        public int TotalWalkableCells;
+        public string LastAction = "";
+        public List<BlobSnapshot> BlobSnapshots = new();
+        public List<ExplorationMap.TransitionPortal> Transitions = new();
+        public HashSet<int> FailedRegionsCopy = new();
+    }
+
+    public class BlobSnapshot
+    {
+        public int Index;
+        public HashSet<Vector2i> WalkableCells = new();
+        public HashSet<Vector2i> SeenCells = new();
+        public List<RegionSnapshot> Regions = new();
+        public Dictionary<Vector2i, int> CellToRegion = new();
+        public float Coverage;
+    }
+
+    public class RegionSnapshot
+    {
+        public int Index;
+        public Vector2 Center;
+        public int CellCount;
+        public int SeenCount;
+        public List<Vector2i> Cells = new();
     }
 
     /// <summary>

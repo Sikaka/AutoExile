@@ -309,9 +309,9 @@ namespace AutoExile.Systems
             BotInput.Click(absPos);
             _lastActionTime = DateTime.Now;
 
-            _phase = MapDevicePhase.WaitForPortals;
-            _phaseStartTime = DateTime.Now;
-            Status = "Clicked activate — waiting for portals";
+            // Stay in Activate phase — next tick will detect atlas closing (lines above)
+            // and transition to WaitForPortals only after verification
+            Status = "Clicked activate — waiting for atlas to close";
             return MapDeviceResult.InProgress;
         }
 

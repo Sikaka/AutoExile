@@ -383,6 +383,93 @@ namespace AutoExile
         public class MechanicsSettings
         {
             public UltimatumMechanicSettings Ultimatum { get; set; } = new UltimatumMechanicSettings();
+            public HarvestMechanicSettings Harvest { get; set; } = new HarvestMechanicSettings();
+            public WishesMechanicSettings Wishes { get; set; } = new WishesMechanicSettings();
+            public InteractableSettings Interactables { get; set; } = new InteractableSettings();
+        }
+
+        [Submenu(CollapsedByDefault = false)]
+        public class InteractableSettings
+        {
+            [Menu("Click Shrines", "Activate shrines encountered while mapping.")]
+            public ToggleNode Shrines { get; set; } = new ToggleNode(true);
+
+            [Menu("Click Strongboxes", "Open strongboxes (spawns monsters, drops loot after kill).")]
+            public ToggleNode Strongboxes { get; set; } = new ToggleNode(true);
+
+            [Menu("Click Djinn Caches", "Open Faridun league caches (Djinn's Cache).")]
+            public ToggleNode DjinnCaches { get; set; } = new ToggleNode(true);
+
+            [Menu("Click Heist Caches", "Open Smuggler's Caches (Heist league).")]
+            public ToggleNode HeistCaches { get; set; } = new ToggleNode(true);
+
+            [Menu("Click Crafting Recipes", "Unlock crafting recipe tablets.")]
+            public ToggleNode CraftingRecipes { get; set; } = new ToggleNode(true);
+        }
+
+        [Submenu(CollapsedByDefault = false)]
+        public class HarvestMechanicSettings
+        {
+            public HarvestMechanicSettings()
+            {
+                Mode.SetListValues(Enum.GetNames<MechanicMode>().ToList());
+                Mode.Value = MechanicMode.Optional.ToString();
+
+                PreferredColour.SetListValues(new List<string> { "Any", "Wild", "Vivid", "Primal" });
+                PreferredColour.Value = "Any";
+            }
+
+            [Menu("Mode", "Skip=ignore, Optional=do if found, Required=must complete for map done.")]
+            public ListNode Mode { get; set; } = new ListNode();
+
+            [Menu("Preferred Colour", "Prefer this harvest type when scoring. Any = pure score only.")]
+            public ListNode PreferredColour { get; set; } = new ListNode();
+
+            [Menu("Colour Preference Bonus", "Score multiplier applied to preferred colour irrigator (1.0 = no bonus).")]
+            public RangeNode<float> ColourPreferenceBonus { get; set; } = new RangeNode<float>(1.5f, 1.0f, 3.0f);
+
+            [Menu("Normal Monster Weight", "Score weight per normal rarity monster.")]
+            public RangeNode<int> NormalWeight { get; set; } = new RangeNode<int>(1, 0, 20);
+
+            [Menu("Magic Monster Weight", "Score weight per magic rarity monster.")]
+            public RangeNode<int> MagicWeight { get; set; } = new RangeNode<int>(3, 0, 20);
+
+            [Menu("Rare Monster Weight", "Score weight per rare rarity monster.")]
+            public RangeNode<int> RareWeight { get; set; } = new RangeNode<int>(10, 0, 50);
+
+            [Menu("Wild Type Multiplier", "Score multiplier for Wild harvest type (green).")]
+            public RangeNode<float> WildMultiplier { get; set; } = new RangeNode<float>(1.0f, 0.0f, 5.0f);
+
+            [Menu("Vivid Type Multiplier", "Score multiplier for Vivid harvest type (yellow).")]
+            public RangeNode<float> VividMultiplier { get; set; } = new RangeNode<float>(1.0f, 0.0f, 5.0f);
+
+            [Menu("Primal Type Multiplier", "Score multiplier for Primal harvest type (blue).")]
+            public RangeNode<float> PrimalMultiplier { get; set; } = new RangeNode<float>(1.0f, 0.0f, 5.0f);
+
+            [Menu("Loot Sweep Seconds", "How long to loot after each plot fight ends.")]
+            public RangeNode<float> LootSweepSeconds { get; set; } = new RangeNode<float>(3f, 1f, 10f);
+        }
+
+        [Submenu(CollapsedByDefault = false)]
+        public class WishesMechanicSettings
+        {
+            public WishesMechanicSettings()
+            {
+                Mode.SetListValues(Enum.GetNames<MechanicMode>().ToList());
+                Mode.Value = MechanicMode.Optional.ToString();
+
+                PreferredWish.SetListValues(new List<string> { "Any", "Foes", "Horizons", "Meddling" });
+                PreferredWish.Value = "Any";
+            }
+
+            [Menu("Mode", "Skip=ignore, Optional=do if found, Required=must complete for map done.")]
+            public ListNode Mode { get; set; } = new ListNode();
+
+            [Menu("Preferred Wish", "Which wish to select. Any = pick the first available.")]
+            public ListNode PreferredWish { get; set; } = new ListNode();
+
+            [Menu("Loot Sweep Seconds", "How long to loot in the wish zone before returning.")]
+            public RangeNode<float> LootSweepSeconds { get; set; } = new RangeNode<float>(5f, 1f, 15f);
         }
 
         [Submenu(CollapsedByDefault = false)]

@@ -68,6 +68,10 @@ namespace AutoExile.Mechanics
         private int _preStartSelectedIndex = -1;
         private bool _preStartEntityClicked;  // True after clicking the altar entity to open UI
         private DateTime _lastPreStartClickTime = DateTime.MinValue;
+        private bool _preStartBeginClicked;   // True after clicking BEGIN, waiting for encounter_started=1
+        private DateTime _preStartBeginClickTime = DateTime.MinValue;
+        private bool _takeRewardClicked;
+        private DateTime _takeRewardClickTime = DateTime.MinValue;
 
         public enum UltimatumPhase
         {
@@ -77,6 +81,7 @@ namespace AutoExile.Mechanics
             PreStart,       // Ground label visible: read type, select mod, click BEGIN
             Fighting,       // Wave active, combat handles it
             ChoosingMod,    // UltimatumPanel visible between waves: select mod or take reward
+            TakeReward,     // Clicking "take reward" button, verifying panel closes
             WaitingForLoot,
             Complete,
             Abandoned,
@@ -94,13 +99,20 @@ namespace AutoExile.Mechanics
 
         /// <summary>
         /// Effective orbit radius — halved if "limited area" modifier is active.
+        /// Checks both mod IDs and display names since the exact game ID is unknown.
         /// </summary>
         private float GetEffectiveOrbitRadius(float baseRadius)
         {
             foreach (var id in _acceptedModIds)
             {
-                if (id.Contains("LimitedArea", StringComparison.OrdinalIgnoreCase) ||
-                    id.Contains("ReducedArea", StringComparison.OrdinalIgnoreCase))
+                // Known ID: "Radius1" = Limited Arena (confirmed via live game data)
+                if (id.StartsWith("Radius", StringComparison.OrdinalIgnoreCase))
+                    return baseRadius * 0.5f;
+            }
+            // Fallback: check display names
+            foreach (var name in _acceptedMods)
+            {
+                if (name.Contains("Limited Arena", StringComparison.OrdinalIgnoreCase))
                     return baseRadius * 0.5f;
             }
             return baseRadius;
@@ -161,7 +173,7 @@ namespace AutoExile.Mechanics
             if (gc?.Player == null || !gc.InGame) return MechanicResult.InProgress;
 
             // Check for player death
-            if (!gc.Player.IsAlive && _phase is UltimatumPhase.Fighting or UltimatumPhase.ChoosingMod)
+            if (!gc.Player.IsAlive && _phase is UltimatumPhase.Fighting or UltimatumPhase.ChoosingMod or UltimatumPhase.TakeReward)
             {
                 _phase = UltimatumPhase.Failed;
                 Status = "Died during encounter";
@@ -199,6 +211,9 @@ namespace AutoExile.Mechanics
 
                 case UltimatumPhase.ChoosingMod:
                     return TickChoosingMod(ctx, gc);
+
+                case UltimatumPhase.TakeReward:
+                    return TickTakeReward(ctx, gc);
 
                 case UltimatumPhase.WaitingForLoot:
                     return TickWaitingForLoot(ctx, gc);
@@ -419,40 +434,87 @@ namespace AutoExile.Mechanics
                 return MechanicResult.InProgress;
             }
 
-            // Step 2: Click BEGIN button at root[4][0][0]
-            var beginBtn = root.GetChildAtIndex(4)?.GetChildAtIndex(0)?.GetChildAtIndex(0);
-            if (beginBtn == null || !beginBtn.IsVisible)
+            // Step 2: Click BEGIN button and verify encounter actually started
+            if (!_preStartBeginClicked)
             {
-                Status = "BEGIN button not found";
-                if ((DateTime.Now - _phaseStartTime).TotalSeconds > 20)
+                var beginBtn = root.GetChildAtIndex(4)?.GetChildAtIndex(0)?.GetChildAtIndex(0);
+                if (beginBtn == null || !beginBtn.IsVisible)
                 {
-                    _phase = UltimatumPhase.Failed;
-                    Status = "Timeout: BEGIN button not found";
-                    return MechanicResult.Failed;
+                    Status = "BEGIN button not found";
+                    if ((DateTime.Now - _phaseStartTime).TotalSeconds > 20)
+                    {
+                        _phase = UltimatumPhase.Failed;
+                        Status = "Timeout: BEGIN button not found";
+                        return MechanicResult.Failed;
+                    }
+                    return MechanicResult.InProgress;
                 }
+
+                ClickElement(gc, beginBtn);
+                _preStartBeginClicked = true;
+                _preStartBeginClickTime = DateTime.Now;
+                ctx.Log("[Ultimatum] Clicked BEGIN, waiting for encounter_started confirmation");
+                Status = "Clicked BEGIN, verifying...";
                 return MechanicResult.InProgress;
             }
 
-            ClickElement(gc, beginBtn);
-
-            // Record the accepted mod
-            if (_preStartSelectedIndex >= 0 && _preStartSelectedIndex < modifiers.Count)
+            // Step 3: Verify encounter actually started (encounter_started == 1 or ground label gone)
+            bool encounterStarted = false;
+            if (_altarEntity?.TryGetComponent<StateMachine>(out var preSm) == true)
             {
-                var mod = modifiers[_preStartSelectedIndex];
-                int danger = settings.GetModDanger(mod.Id);
-                _cumulativeDanger += danger;
-                _acceptedMods.Add(mod.Name);
-                _acceptedModIds.Add(mod.Id);
+                var started = preSm.States.FirstOrDefault(s => s.Name == "encounter_started");
+                if (started?.Value == 1)
+                    encounterStarted = true;
             }
 
-            // Save combat profile and override for encounter
-            SaveAndOverrideCombatProfile(ctx, settings);
+            // Ground label disappearing is also a reliable signal
+            if (!encounterStarted && FindAltarGroundLabel(gc) == null &&
+                (DateTime.Now - _preStartBeginClickTime).TotalMilliseconds > 500)
+            {
+                encounterStarted = true;
+            }
 
-            _phase = UltimatumPhase.Fighting;
-            _phaseStartTime = DateTime.Now;
-            _currentRound = 1;
-            Status = $"BEGIN clicked — fighting round 1, type={_encounterType}";
-            ctx.Log($"[Ultimatum] Started encounter: type={_encounterType}, danger={_cumulativeDanger}");
+            if (encounterStarted)
+            {
+                // Record the accepted mod
+                if (_preStartSelectedIndex >= 0 && _preStartSelectedIndex < modifiers.Count)
+                {
+                    var mod = modifiers[_preStartSelectedIndex];
+                    int danger = settings.GetModDanger(mod.Id);
+                    _cumulativeDanger += danger;
+                    _acceptedMods.Add(mod.Name);
+                    _acceptedModIds.Add(mod.Id);
+                }
+
+                SaveAndOverrideCombatProfile(ctx, settings);
+
+                _phase = UltimatumPhase.Fighting;
+                _phaseStartTime = DateTime.Now;
+                _currentRound = 1;
+                _encounterConfirmedStarted = true;
+                Status = $"BEGIN confirmed — fighting round 1, type={_encounterType}";
+                ctx.Log($"[Ultimatum] Encounter confirmed started: type={_encounterType}, danger={_cumulativeDanger}");
+                return MechanicResult.InProgress;
+            }
+
+            // Retry BEGIN click if not confirmed after 3s
+            if ((DateTime.Now - _preStartBeginClickTime).TotalSeconds > 3)
+            {
+                _preStartBeginClicked = false;
+                ctx.Log("[Ultimatum] BEGIN click not confirmed after 3s, retrying");
+                Status = "BEGIN click missed, retrying...";
+                return MechanicResult.InProgress;
+            }
+
+            // Overall timeout
+            if ((DateTime.Now - _phaseStartTime).TotalSeconds > 25)
+            {
+                _phase = UltimatumPhase.Failed;
+                Status = "Timeout: encounter never started after BEGIN clicks";
+                return MechanicResult.Failed;
+            }
+
+            Status = "Waiting for encounter to start...";
             return MechanicResult.InProgress;
         }
 
@@ -602,17 +664,26 @@ namespace AutoExile.Mechanics
                 return MechanicResult.InProgress;
             }
 
-            // Click confirm button ("accept trial")
+            // Click confirm button ("accept trial") — record mod only once per round
             var confirmBtn = panel.ConfirmButton;
             if (confirmBtn != null && confirmBtn.IsVisible)
             {
                 ClickElement(gc, confirmBtn);
 
-                _cumulativeDanger += modDanger;
-                _acceptedMods.Add(bestMod.Name);
-                _acceptedModIds.Add(bestMod.Id);
-                Status = $"Accepted: {bestMod.Name} (total danger={_cumulativeDanger})";
+                // Guard: only record the mod if we haven't already for this round
+                if (_acceptedMods.Count < _currentRound)
+                {
+                    _cumulativeDanger += modDanger;
+                    _acceptedMods.Add(bestMod.Name);
+                    _acceptedModIds.Add(bestMod.Id);
+                    ctx.Log($"[Ultimatum] Accepted mod: {bestMod.Name} (danger={modDanger}, total={_cumulativeDanger})");
 
+                    // Update combat engage radius in case this mod affects area
+                    var newRadius = GetEffectiveOrbitRadius(settings.OrbitRadius.Value);
+                    ctx.Combat.Profile.EngageRadius = newRadius;
+                }
+
+                Status = $"Accepted: {bestMod.Name} (total danger={_cumulativeDanger})";
                 _phase = UltimatumPhase.Fighting;
                 _phaseStartTime = DateTime.Now;
                 _currentRound++;
@@ -623,28 +694,69 @@ namespace AutoExile.Mechanics
 
         // ── Take reward ──
 
+        private string _takeRewardReason = "";
+
         private MechanicResult TakeReward(BotContext ctx, GameController gc, Element panel, string reason)
         {
             ctx.Log($"[Ultimatum] Taking reward: {reason}");
+            _takeRewardReason = reason;
+
+            _phase = UltimatumPhase.TakeReward;
+            _phaseStartTime = DateTime.Now;
+            _takeRewardClicked = false;
             Status = $"Taking reward: {reason}";
+            RestoreCombatProfile(ctx);
+
+            return MechanicResult.InProgress;
+        }
+
+        // ── Take reward: click button with retry until panel closes ──
+
+        private MechanicResult TickTakeReward(BotContext ctx, GameController gc)
+        {
+            var panel = gc.IngameState.IngameUi.UltimatumPanel;
+
+            // Panel closed = reward taken successfully
+            if (panel == null || !panel.IsVisible)
+            {
+                _rewardTakenTime = DateTime.Now;
+                _phase = UltimatumPhase.WaitingForLoot;
+                _phaseStartTime = DateTime.Now;
+                Status = $"Reward taken — waiting for drops";
+                ctx.Log("[Ultimatum] Panel closed, reward confirmed taken");
+                return MechanicResult.InProgress;
+            }
+
+            // Overall timeout
+            if ((DateTime.Now - _phaseStartTime).TotalSeconds > 15)
+            {
+                _phase = UltimatumPhase.Failed;
+                Status = "Timeout: take reward button never worked";
+                return MechanicResult.Failed;
+            }
 
             if (!BotInput.CanAct) return MechanicResult.InProgress;
 
-            // "take reward" button: panel[1][4][0][0]
-            var takeBtn = panel.GetChildAtIndex(1)?.GetChildAtIndex(4)?.GetChildAtIndex(0)?.GetChildAtIndex(0);
-            if (takeBtn != null && takeBtn.IsVisible)
+            // Retry click every 2s if panel still visible
+            if (!_takeRewardClicked || (DateTime.Now - _takeRewardClickTime).TotalSeconds > 2)
             {
-                ClickElement(gc, takeBtn);
-
-                _phase = UltimatumPhase.WaitingForLoot;
-                _phaseStartTime = DateTime.Now;
-                _rewardTakenTime = DateTime.Now;
-                Status = $"Reward taken: {reason}. Waiting for items to drop...";
-                RestoreCombatProfile(ctx);
+                var takeBtn = panel.GetChildAtIndex(1)?.GetChildAtIndex(4)?.GetChildAtIndex(0)?.GetChildAtIndex(0);
+                if (takeBtn != null && takeBtn.IsVisible)
+                {
+                    ClickElement(gc, takeBtn);
+                    _takeRewardClicked = true;
+                    _takeRewardClickTime = DateTime.Now;
+                    Status = $"Clicking take reward... ({_takeRewardReason})";
+                    ctx.Log("[Ultimatum] Clicked take reward button");
+                }
+                else
+                {
+                    Status = "Take reward button not found, waiting...";
+                }
             }
             else
             {
-                Status = $"Take reward button not found — {reason}";
+                Status = $"Waiting for panel to close...";
             }
 
             return MechanicResult.InProgress;
@@ -992,6 +1104,11 @@ namespace AutoExile.Mechanics
             _preStartSelectedIndex = -1;
             _preStartEntityClicked = false;
             _lastPreStartClickTime = DateTime.MinValue;
+            _preStartBeginClicked = false;
+            _preStartBeginClickTime = DateTime.MinValue;
+            _takeRewardClicked = false;
+            _takeRewardClickTime = DateTime.MinValue;
+            _takeRewardReason = "";
             _accumulatedRewardValue = 0;
             _lastPricedRound = 0;
             Status = "";

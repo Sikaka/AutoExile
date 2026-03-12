@@ -41,6 +41,7 @@ namespace AutoExile.Mechanics
             ["AltarDaemon1"] = 3,                         // Blood Altar I
             ["RevenantDaemon1"] = 3,                      // Stalking Ruin I
             ["PlayerDebuffLimitedFlasks"] = 3,            // Limited Flasks
+            ["Radius1"] = 3,                              // Limited Arena (halves encounter area)
 
             // ── Hard (5) — high threat, build-dependent ──
             ["AltarDaemon2"] = 5,                         // Blood Altar II

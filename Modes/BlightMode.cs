@@ -5,6 +5,7 @@ using ExileCore.PoEMemory.Elements;
 using ExileCore.PoEMemory.MemoryObjects;
 using ExileCore.Shared.Enums;
 using AutoExile.Systems;
+using AutoExile.Modes.Shared;
 using System.Numerics;
 
 namespace AutoExile.Modes
@@ -27,6 +28,10 @@ namespace AutoExile.Modes
         // Tower management
         private TowerAction? _towerAction;
         private DateTime _lastTowerActionEndAt = DateTime.MinValue;
+
+        // Shared components
+        private readonly LootPickupTracker _lootTracker = new();
+        private readonly HideoutFlow _hideoutFlow = new();
 
         // Settings reference
         private BotSettings.BlightSettings _settings = new();
@@ -68,13 +73,7 @@ namespace AutoExile.Modes
             _lastMapAreaName = "";
 
             // Enable combat — blight needs skills for sweep + self-defense
-            var pos = Enum.TryParse<CombatPositioning>(ctx.Settings.Build.DefaultPositioning.Value, out var p)
-                ? p : CombatPositioning.Aggressive;
-            ctx.Combat.SetProfile(new CombatProfile
-            {
-                Enabled = true,
-                Positioning = pos,
-            });
+            ModeHelpers.EnableDefaultCombat(ctx);
 
             // Determine starting phase based on where we are
             var gc = ctx.Game;
@@ -131,16 +130,19 @@ namespace AutoExile.Modes
             {
                 // --- Hideout phases ---
                 case BlightPhase.InHideout:
-                    TickInHideout(ctx);
-                    break;
                 case BlightPhase.StashItems:
-                    TickStashItems(ctx);
-                    break;
                 case BlightPhase.OpenMap:
-                    TickOpenMap(ctx);
-                    break;
                 case BlightPhase.EnterPortal:
-                    TickEnterPortal(ctx);
+                    var hideoutSignal = _hideoutFlow.Tick(ctx);
+                    StatusText = _hideoutFlow.Status;
+                    if (hideoutSignal == HideoutSignal.PortalTimeout)
+                    {
+                        _blight.Reset();
+                        _phase = BlightPhase.InHideout;
+                        _phaseStartTime = DateTime.Now;
+                        _hideoutFlow.Start(MapDeviceSystem.IsAnyBlightMap);
+                        StatusText = "No portal found — starting new map";
+                    }
                     break;
 
                 // --- Map phases ---
@@ -189,6 +191,10 @@ namespace AutoExile.Modes
         {
             var gc = ctx.Game;
 
+            // Cancel all in-flight systems on any area change (bug fix)
+            ModeHelpers.CancelAllSystems(ctx);
+            _hideoutFlow.Cancel();
+
             if (gc.Area.CurrentArea.IsHideout || gc.Area.CurrentArea.IsTown)
             {
                 // Arrived in hideout — decide next step
@@ -198,6 +204,7 @@ namespace AutoExile.Modes
                     _phase = BlightPhase.InHideout;
                     _phaseStartTime = DateTime.Now;
                     _mapCompleted = false;
+                    _hideoutFlow.Start(MapDeviceSystem.IsAnyBlightMap);
                     StatusText = "Back in hideout — starting new map";
                 }
                 else if (_blight.DeathCount > 0 && _blight.DeathCount < MaxDeaths)
@@ -205,6 +212,7 @@ namespace AutoExile.Modes
                     // Died and revived — try to re-enter map via portal
                     _phase = BlightPhase.EnterPortal;
                     _phaseStartTime = DateTime.Now;
+                    _hideoutFlow.StartPortalReentry();
                     StatusText = $"Revived (death {_blight.DeathCount}) — re-entering map";
                 }
                 else if (_blight.DeathCount >= MaxDeaths)
@@ -213,18 +221,19 @@ namespace AutoExile.Modes
                     _blight.Reset();
                     _phase = BlightPhase.InHideout;
                     _phaseStartTime = DateTime.Now;
+                    _hideoutFlow.Start(MapDeviceSystem.IsAnyBlightMap);
                     StatusText = "Too many deaths — starting new map";
                 }
                 else
                 {
                     _phase = BlightPhase.InHideout;
                     _phaseStartTime = DateTime.Now;
+                    _hideoutFlow.Start(MapDeviceSystem.IsAnyBlightMap);
                 }
             }
             else
             {
-                // Entered a map — clean up hideout systems and start looking for pump
-                ctx.MapDevice.Cancel(gc, ctx.Navigation);
+                // Entered a map — start looking for pump
                 var deathCount = _blight.DeathCount; // preserve across reset
                 _blight.Reset();
                 _blight.DeathCount = deathCount;
@@ -235,149 +244,6 @@ namespace AutoExile.Modes
                 _nudgedForPump = false;
                 StatusText = "Entered map — finding pump";
             }
-        }
-
-        // =================================================================
-        // Hideout phases
-        // =================================================================
-
-        // Settle time after zone transition before checking inventory/starting actions
-        private const float HideoutSettleSeconds = 3f;
-
-        private void TickInHideout(BotContext ctx)
-        {
-            // Wait for game state to settle after zone transition
-            var elapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
-            if (elapsed < HideoutSettleSeconds)
-            {
-                StatusText = $"Hideout — waiting for game state ({elapsed:F1}s)";
-                return;
-            }
-
-            // Check if we have items in inventory to stash
-            if (HasInventoryItems(ctx.Game))
-            {
-                _phase = BlightPhase.StashItems;
-                _phaseStartTime = DateTime.Now;
-                ctx.Stash.Start();
-                StatusText = "Stashing inventory items";
-                return;
-            }
-
-            // No items to stash — open a new map
-            _phase = BlightPhase.OpenMap;
-            _phaseStartTime = DateTime.Now;
-            StartMapDevice(ctx);
-            StatusText = "Opening blighted map";
-        }
-
-        private void TickStashItems(BotContext ctx)
-        {
-            var result = ctx.Stash.Tick(ctx.Game, ctx.Navigation);
-
-            switch (result)
-            {
-                case StashResult.Succeeded:
-                    StatusText = $"Stashed {ctx.Stash.ItemsStored} items — opening map";
-                    _phase = BlightPhase.OpenMap;
-                    _phaseStartTime = DateTime.Now;
-                    StartMapDevice(ctx);
-                    break;
-                case StashResult.Failed:
-                    StatusText = $"Stash failed: {ctx.Stash.Status} — opening map anyway";
-                    _phase = BlightPhase.OpenMap;
-                    _phaseStartTime = DateTime.Now;
-                    StartMapDevice(ctx);
-                    break;
-                default:
-                    StatusText = $"Stashing: {ctx.Stash.Status}";
-                    break;
-            }
-        }
-
-        private void StartMapDevice(BotContext ctx)
-        {
-            // Force-reset if stuck from a previous run (e.g. entered map while MapDevice was mid-flow)
-            if (ctx.MapDevice.IsBusy)
-                ctx.MapDevice.Cancel(ctx.Game, ctx.Navigation);
-
-            if (!ctx.MapDevice.Start(MapDeviceSystem.IsAnyBlightMap))
-                StatusText = $"MapDevice.Start failed (phase={ctx.MapDevice.Phase})";
-        }
-
-        private void TickOpenMap(BotContext ctx)
-        {
-            var result = ctx.MapDevice.Tick(ctx.Game, ctx.Navigation);
-
-            switch (result)
-            {
-                case MapDeviceResult.Succeeded:
-                    // MapDeviceSystem handles entering the portal
-                    StatusText = "Map opened — entering";
-                    break;
-                case MapDeviceResult.Failed:
-                    StatusText = $"Map device failed: {ctx.MapDevice.Status}";
-                    // Retry after a delay
-                    if ((DateTime.Now - _phaseStartTime).TotalSeconds > 10)
-                    {
-                        _phaseStartTime = DateTime.Now;
-                        StartMapDevice(ctx);
-                    }
-                    break;
-                default:
-                    StatusText = $"Map device: {ctx.MapDevice.Status}";
-                    break;
-            }
-        }
-
-        private void TickEnterPortal(BotContext ctx)
-        {
-            // Re-enter map after death — find and click portal in hideout
-            var gc = ctx.Game;
-
-            if (!gc.Area.CurrentArea.IsHideout)
-            {
-                // We're no longer in hideout — area change handler will reset state
-                return;
-            }
-
-            if ((DateTime.Now - _phaseStartTime).TotalSeconds > 15)
-            {
-                // Timeout — no portal found, start new map
-                _phase = BlightPhase.InHideout;
-                _phaseStartTime = DateTime.Now;
-                _blight.Reset();
-                StatusText = "No portal found — starting new map";
-                return;
-            }
-
-            if (!CanAct()) return;
-
-            Entity? portal = FindPortal(gc);
-            if (portal == null)
-            {
-                StatusText = "Looking for portal to re-enter...";
-                return;
-            }
-
-            // Navigate to portal if far (grid distance)
-            var playerGridPos = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
-            var portalGridPos = new Vector2(portal.GridPosNum.X, portal.GridPosNum.Y);
-            var dist = Vector2.Distance(playerGridPos, portalGridPos);
-
-            if (dist > 8f)
-            {
-                if (!ctx.Navigation.IsNavigating)
-                    ctx.Navigation.NavigateTo(gc, portalGridPos * Systems.Pathfinding.GridToWorld);
-                StatusText = $"Walking to portal (dist: {dist:F0})";
-                return;
-            }
-
-            // Click portal
-            var screenPos = gc.IngameState.Camera.WorldToScreen(portal.BoundsCenterPosNum);
-            var windowRect = gc.Window.GetWindowRectangle();
-            DoClick(new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y));
-            StatusText = "Clicking portal to re-enter map";
         }
 
         // =================================================================
@@ -499,7 +365,7 @@ namespace AutoExile.Modes
                 return;
             }
 
-            if (!CanAct()) return;
+            if (!ModeHelpers.CanAct(_lastActionTime, MajorActionCooldownMs)) return;
 
             var gc = ctx.Game;
             Entity? pump = FindPumpEntity(gc);
@@ -528,8 +394,7 @@ namespace AutoExile.Modes
                 }
             }
 
-            ClickEntity(gc, pump);
-            _lastActionTime = DateTime.Now;
+            ModeHelpers.ClickEntity(gc, pump, ref _lastActionTime);
             StatusText = "Clicking pump to start encounter";
 
             if ((DateTime.Now - _phaseStartTime).TotalSeconds > 30)
@@ -555,7 +420,7 @@ namespace AutoExile.Modes
                 return;
             }
 
-            if (!CanAct()) return;
+            if (!ModeHelpers.CanAct(_lastActionTime, MajorActionCooldownMs)) return;
 
             var gc = ctx.Game;
             try
@@ -1014,44 +879,23 @@ namespace AutoExile.Modes
         // Chest + Loot phase
         // =================================================================
 
-        private int _lootPickupCount;
         private DateTime _lastEmptyScanAt = DateTime.MinValue;
         private const float LootTimeoutSeconds = 120f;
         private const float EmptyGraceSeconds = 5f;
-
-        // Pending loot tracking — only record on confirmed pickup
-        private long _pendingLootEntityId;
-        private string _pendingLootName = "";
-        private double _pendingLootValue;
 
         private void EnterOpenChestsPhase()
         {
             _phase = BlightPhase.OpenChests;
             _phaseStartTime = DateTime.Now;
             _currentChestTarget = null;
-            _lootPickupCount = 0;
+            _lootTracker.Reset();
             _lastEmptyScanAt = DateTime.MinValue;
-            _pendingLootEntityId = 0;
         }
 
         private void TickOpenChests(BotContext ctx, InteractionResult interactionResult)
         {
             // Handle completed loot pickup — record only on confirmed success
-            if (_pendingLootEntityId != 0)
-            {
-                if (interactionResult == InteractionResult.Succeeded)
-                {
-                    ctx.LootTracker.RecordItem(_pendingLootName, _pendingLootValue);
-                    _lootPickupCount++;
-                }
-                else if (interactionResult == InteractionResult.Failed)
-                {
-                    ctx.Loot.MarkFailed(_pendingLootEntityId);
-                }
-
-                if (interactionResult == InteractionResult.Succeeded || interactionResult == InteractionResult.Failed)
-                    _pendingLootEntityId = 0;
-            }
+            _lootTracker.HandleResult(interactionResult, ctx);
 
             if (interactionResult == InteractionResult.Succeeded || interactionResult == InteractionResult.Failed)
                 _currentChestTarget = null;
@@ -1059,7 +903,7 @@ namespace AutoExile.Modes
             if ((DateTime.Now - _phaseStartTime).TotalSeconds > LootTimeoutSeconds)
             {
                 EnterExitMapPhase(ctx);
-                StatusText = $"Chest+loot timeout — exiting map ({_lootPickupCount} items)";
+                StatusText = $"Chest+loot timeout — exiting map ({_lootTracker.PickupCount} items)";
                 return;
             }
 
@@ -1077,10 +921,8 @@ namespace AutoExile.Modes
                 var withinRadius = best.Distance <= ctx.Loot.LootRadius;
                 ctx.Interaction.PickupGroundItem(best.Entity, ctx.Navigation,
                     requireProximity: !withinRadius, interactRange: 8f);
-                _pendingLootEntityId = best.Entity.Id;
-                _pendingLootName = best.ItemName;
-                _pendingLootValue = best.ChaosValue;
-                StatusText = $"Picking up loot ({ctx.Loot.Candidates.Count} visible, {_lootPickupCount} picked, {_blight.ChestPositions.Count} chests left)";
+                _lootTracker.SetPending(best.Entity.Id, best.ItemName, best.ChaosValue);
+                StatusText = $"Picking up loot ({ctx.Loot.Candidates.Count} visible, {_lootTracker.PickupCount} picked, {_blight.ChestPositions.Count} chests left)";
                 return;
             }
 
@@ -1156,11 +998,11 @@ namespace AutoExile.Modes
             {
                 ctx.Navigation.Stop(gc);
                 EnterExitMapPhase(ctx);
-                StatusText = $"Looting complete — exiting map ({_lootPickupCount} items)";
+                StatusText = $"Looting complete — exiting map ({_lootTracker.PickupCount} items)";
                 return;
             }
 
-            StatusText = $"Searching for remaining loot... ({_lootPickupCount} picked)";
+            StatusText = $"Searching for remaining loot... ({_lootTracker.PickupCount} picked)";
         }
 
         // =================================================================
@@ -1192,10 +1034,10 @@ namespace AutoExile.Modes
                 return;
             }
 
-            if (!CanAct()) return;
+            if (!ModeHelpers.CanAct(_lastActionTime, MajorActionCooldownMs)) return;
 
             // Try to find live portal entity first
-            Entity? portal = FindPortal(gc);
+            Entity? portal = ModeHelpers.FindNearestPortal(gc);
             var playerPos = gc.Player.GridPosNum;
 
             if (portal != null)
@@ -1213,7 +1055,7 @@ namespace AutoExile.Modes
 
                 // Click portal
                 ctx.Navigation.Stop(gc);
-                ClickEntity(gc, portal);
+                ModeHelpers.ClickEntity(gc, portal, ref _lastActionTime);
                 StatusText = "Clicking portal to exit";
                 return;
             }
@@ -1296,7 +1138,7 @@ namespace AutoExile.Modes
 
             if (_phase == BlightPhase.OpenChests)
             {
-                g.DrawText($"Loot: {ctx.Loot.LootableCount} visible, {_lootPickupCount} picked, {_blight.ChestPositions.Count} chests", new Vector2(hudX, hudY), SharpDX.Color.Gold);
+                g.DrawText($"Loot: {ctx.Loot.LootableCount} visible, {_lootTracker.PickupCount} picked, {_blight.ChestPositions.Count} chests", new Vector2(hudX, hudY), SharpDX.Color.Gold);
                 hudY += lineH;
             }
 
@@ -1427,32 +1269,6 @@ namespace AutoExile.Modes
             return null;
         }
 
-        private Entity? FindPortal(GameController gc)
-        {
-            Entity? best = null;
-            float bestDist = float.MaxValue;
-            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
-            {
-                if (entity.Type != EntityType.TownPortal || !entity.IsTargetable) continue;
-                if (entity.DistancePlayer < bestDist)
-                {
-                    bestDist = entity.DistancePlayer;
-                    best = entity;
-                }
-            }
-            return best;
-        }
-
-        private bool HasInventoryItems(GameController gc) => StashSystem.HasInventoryItems(gc);
-
-        private void ClickEntity(GameController gc, Entity entity)
-        {
-            var screenPos = gc.IngameState.Camera.WorldToScreen(entity.BoundsCenterPosNum);
-            var windowRect = gc.Window.GetWindowRectangle();
-            var absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
-            DoClick(absPos);
-        }
-
         private bool DoClick(Vector2 absPos)
         {
             if (!BotInput.CanAct) return false;
@@ -1468,10 +1284,6 @@ namespace AutoExile.Modes
             return DoClick(absPos);
         }
 
-        private bool CanAct()
-        {
-            return BotInput.CanAct && (DateTime.Now - _lastActionTime).TotalMilliseconds >= MajorActionCooldownMs;
-        }
     }
 
     public enum BlightPhase

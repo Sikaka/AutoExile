@@ -41,6 +41,12 @@ namespace AutoExile
 
         // Area change tracking for tile map reload
         private string _lastAreaName = "";
+        private long _lastAreaHash;
+
+        // Cross-zone state cache (e.g., Wishes portal round-trip)
+        // Keyed by area name — when returning to same-named area, restore cached state
+        private readonly Dictionary<string, AreaStateCache> _areaStateCache = new();
+        private const int MaxCachedAreas = 3;
 
         // --- Buff scanner ---
         private bool _buffScanActive;
@@ -87,6 +93,8 @@ namespace AutoExile
 
             // Register in-map mechanics
             _mechanics.Register(new UltimatumMechanic());
+            _mechanics.Register(new HarvestMechanic());
+            _mechanics.Register(new WishesMechanic());
 
             // Populate mode dropdown and restore saved selection
             Settings.ActiveMode.SetListValues(_modes.Keys.ToList());
@@ -137,14 +145,51 @@ namespace AutoExile
                 return base.Tick();
 
             // Reload tile map + exploration on area change
+            // Use area hash (unique per instance) to detect changes — area name alone
+            // can be the same for sub-zones (e.g., wish zone shares name with parent map)
             var currentArea = GameController.Area?.CurrentArea?.Name ?? "";
-            if (currentArea != _lastAreaName && !string.IsNullOrEmpty(currentArea))
+            var currentHash = GameController.IngameState?.Data?.CurrentAreaHash ?? 0;
+            if (currentHash != _lastAreaHash && currentHash != 0)
             {
+                var previousAreaName = _lastAreaName;
+
+                // Cache current area state before switching (for round-trip zone support)
+                // Use area name as cache key so returning to same-named area restores state
+                if (!string.IsNullOrEmpty(previousAreaName) && _exploration.IsInitialized)
+                {
+                    // Only cache if we don't already have an entry for this name
+                    // (prevents overwriting original map cache with wish zone state)
+                    if (!_areaStateCache.ContainsKey(previousAreaName))
+                    {
+                        // Force-complete active mechanic before caching — if the mechanic
+                        // sent us through a portal (e.g., Wishes), it should be done
+                        // so it doesn't re-detect when we return
+                        _mechanics.ForceCompleteActive();
+
+                        _areaStateCache[previousAreaName] = new AreaStateCache
+                        {
+                            Exploration = _exploration.CreateSnapshot(),
+                            Mechanics = _mechanics.CreateSnapshot(),
+                            AreaHash = _lastAreaHash,
+                            CachedAt = DateTime.Now,
+                        };
+
+                        // Evict oldest if cache is full
+                        while (_areaStateCache.Count > MaxCachedAreas)
+                        {
+                            var oldest = _areaStateCache.OrderBy(kv => kv.Value.CachedAt).First().Key;
+                            _areaStateCache.Remove(oldest);
+                        }
+
+                        _ctx.Log($"[Cache] Saved area state for '{previousAreaName}' hash={_lastAreaHash} ({_areaStateCache.Count} cached)");
+                    }
+                }
+
                 _lastAreaName = currentArea;
+                _lastAreaHash = currentHash;
                 _tileMap.Clear();
                 _tileMap.Load(GameController);
                 _loot.ClearFailed();
-                _mechanics.Reset();
 
                 // Stop MappingMode if we landed in hideout/town (e.g. death respawn)
                 if (_mode == _mappingMode && _mappingMode != null)
@@ -157,16 +202,32 @@ namespace AutoExile
                     }
                 }
 
-                // Initialize exploration from full walkability grid
-                var terrainData = GameController.IngameState?.Data?.RawPathfindingData;
-                var targetingData = GameController.IngameState?.Data?.RawTerrainTargetingData;
-                if (terrainData != null && GameController.Player != null)
+                // Check if we have cached state for this area name AND matching hash
+                // (returning from sub-zone back to the original map instance)
+                if (_areaStateCache.TryGetValue(currentArea, out var cached) && cached.AreaHash == currentHash)
                 {
-                    var playerGrid = new Vector2(
-                        GameController.Player.GridPosNum.X,
-                        GameController.Player.GridPosNum.Y);
-                    _exploration.Initialize(terrainData, targetingData, playerGrid,
-                        Settings.Build.BlinkRange.Value);
+                    _exploration.RestoreSnapshot(cached.Exploration);
+                    _mechanics.RestoreSnapshot(cached.Mechanics);
+                    _areaStateCache.Remove(currentArea);
+                    _ctx.Log($"[Cache] Restored area state for '{currentArea}' hash={currentHash}");
+                }
+                else
+                {
+                    // Fresh area or different instance — reset mechanics and initialize exploration
+                    // Do NOT remove cache entry — sub-zones (wish zones) share the same area name
+                    // and we need the original map's cache intact for when the player returns
+                    _mechanics.Reset();
+
+                    var terrainData = GameController.IngameState?.Data?.RawPathfindingData;
+                    var targetingData = GameController.IngameState?.Data?.RawTerrainTargetingData;
+                    if (terrainData != null && GameController.Player != null)
+                    {
+                        var playerGrid = new Vector2(
+                            GameController.Player.GridPosNum.X,
+                            GameController.Player.GridPosNum.Y);
+                        _exploration.Initialize(terrainData, targetingData, playerGrid,
+                            Settings.Build.BlinkRange.Value);
+                    }
                 }
             }
 
@@ -1135,5 +1196,14 @@ namespace AutoExile
                 }
             }
         }
+    }
+
+    /// <summary>Cached exploration + mechanics state for a map area, used for round-trip zone support.</summary>
+    internal class AreaStateCache
+    {
+        public ExplorationSnapshot Exploration = null!;
+        public MechanicsSnapshot Mechanics = null!;
+        public long AreaHash;
+        public DateTime CachedAt;
     }
 }

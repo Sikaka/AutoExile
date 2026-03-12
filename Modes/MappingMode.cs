@@ -1,7 +1,9 @@
 using ExileCore;
 using ExileCore.PoEMemory.Components;
+using ExileCore.PoEMemory.MemoryObjects;
 using ExileCore.Shared.Enums;
 using AutoExile.Mechanics;
+using AutoExile.Modes.Shared;
 using AutoExile.Systems;
 using System.Numerics;
 using Pathfinding = AutoExile.Systems.Pathfinding;
@@ -31,9 +33,7 @@ namespace AutoExile.Modes
         // ── Loot state ──
         private DateTime _lastLootScan = DateTime.MinValue;
         private const float LootScanIntervalMs = 500;
-        private long _pendingLootEntityId;
-        private string _pendingLootName = "";
-        private double _pendingLootValue;
+        private readonly LootPickupTracker _lootTracker = new();
 
         // ── Clickable interactables (shrines, heist caches) ──
         private long _pendingInteractableId;
@@ -45,6 +45,10 @@ namespace AutoExile.Modes
         // ── Mechanic state ──
         private IMapMechanic? _pendingMechanic;    // Detected, navigating to it
         private bool _mechanicActive;               // Mechanic owns the tick loop
+
+        // ── Exit portal (wish zones, sub-zones with return portals) ──
+        private Entity? _exitPortal;
+        private DateTime _lastExitClickTime = DateTime.MinValue;
 
         // ── Stats ──
         private DateTime _startTime;
@@ -65,6 +69,7 @@ namespace AutoExile.Modes
             Fighting,
             Looting,
             Paused,
+            Exiting,    // navigating to and clicking exit portal (wish zones)
             Complete,
         }
 
@@ -92,13 +97,7 @@ namespace AutoExile.Modes
             }
 
             // Enable combat with configured positioning
-            var positioning = Enum.TryParse<CombatPositioning>(ctx.Settings.Build.DefaultPositioning.Value, out var pos)
-                ? pos : CombatPositioning.Aggressive;
-            ctx.Combat.SetProfile(new CombatProfile
-            {
-                Enabled = true,
-                Positioning = positioning,
-            });
+            ModeHelpers.EnableDefaultCombat(ctx);
 
             _phase = MappingPhase.Exploring;
             Status = "Started";
@@ -115,6 +114,7 @@ namespace AutoExile.Modes
             _pendingInteractableId = 0;
             _interactableClickAttempts = 0;
             _failedInteractables.Clear();
+            _exitPortal = null;
             Status = "Stopped";
             Decision = "";
         }
@@ -215,17 +215,12 @@ namespace AutoExile.Modes
                 var result = ctx.Interaction.Tick(gc);
 
                 // Handle loot pickup results
-                if (result == InteractionResult.Succeeded && _pendingLootName.Length > 0)
+                var hadPending = _lootTracker.HasPending;
+                _lootTracker.HandleResult(result, ctx);
+                if (hadPending && result == InteractionResult.Succeeded)
                 {
-                    ctx.LootTracker.RecordItem(_pendingLootName, _pendingLootValue);
-                    _pendingLootName = "";
                     ctx.Loot.Scan(gc);
                     _lastLootScan = DateTime.Now;
-                }
-                else if (result == InteractionResult.Failed && _pendingLootEntityId != 0 && _pendingLootName.Length > 0)
-                {
-                    ctx.Loot.MarkFailed(_pendingLootEntityId);
-                    _pendingLootName = "";
                 }
 
                 // Handle interactable (shrine/cache) results
@@ -251,10 +246,10 @@ namespace AutoExile.Modes
 
                 if (ctx.Interaction.IsBusy)
                 {
-                    if (_pendingLootName.Length > 0)
+                    if (_lootTracker.HasPending)
                     {
                         _phase = MappingPhase.Looting;
-                        Status = $"Looting: {_pendingLootName}";
+                        Status = $"Looting: {_lootTracker.PendingItemName}";
                     }
                     else if (_pendingInteractableId != 0)
                     {
@@ -270,9 +265,7 @@ namespace AutoExile.Modes
                 var (wasInRadius, candidate) = ctx.Loot.PickupNext(ctx.Interaction, ctx.Navigation);
                 if (candidate != null && ctx.Interaction.IsBusy)
                 {
-                    _pendingLootEntityId = candidate.Entity.Id;
-                    _pendingLootName = candidate.ItemName;
-                    _pendingLootValue = candidate.ChaosValue;
+                    _lootTracker.SetPending(candidate.Entity.Id, candidate.ItemName, candidate.ChaosValue);
                     _phase = MappingPhase.Looting;
                     Status = $"Looting: {candidate.ItemName}";
                     return;
@@ -282,7 +275,7 @@ namespace AutoExile.Modes
             // ── Clickable interactables (shrines, heist caches — click as we pass by) ──
             if (!ctx.Interaction.IsBusy)
             {
-                var target = FindNearbyInteractable(gc, playerGrid);
+                var target = FindNearbyInteractable(gc, playerGrid, ctx.Settings.Mechanics.Interactables);
                 if (target != null)
                 {
                     if (ctx.Interaction.InteractWithEntity(target, ctx.Navigation))
@@ -301,6 +294,13 @@ namespace AutoExile.Modes
             {
                 _phase = MappingPhase.Fighting;
                 Status = $"Fighting: {ctx.Combat.NearbyMonsterCount} monsters ({ctx.Combat.LastSkillAction})";
+                return;
+            }
+
+            // ── Exit portal handling (wish zones / sub-zones) ──
+            if (_phase == MappingPhase.Exiting)
+            {
+                TickExitPortal(ctx, gc);
                 return;
             }
 
@@ -347,10 +347,24 @@ namespace AutoExile.Modes
                     }
                     else
                     {
-                        _phase = MappingPhase.Complete;
-                        var elapsed = (DateTime.Now - _startTime).TotalSeconds;
-                        Status = $"COMPLETE — {coverage:P1} coverage in {elapsed:F0}s";
-                        Decision = $"{ctx.Exploration.FailedRegions.Count} unreachable regions";
+                        // Exploration done — check for exit portal (wish zones / sub-zones)
+                        var exitPortal = FindExitPortal(gc);
+                        if (exitPortal != null)
+                        {
+                            _exitPortal = exitPortal;
+                            _phase = MappingPhase.Exiting;
+                            var elapsed = (DateTime.Now - _startTime).TotalSeconds;
+                            Status = $"Explored {coverage:P1} in {elapsed:F0}s — using exit portal";
+                            Decision = "Heading to exit portal";
+                            ctx.Log($"[Mapping] Exploration complete, found exit portal — returning to parent map");
+                        }
+                        else
+                        {
+                            _phase = MappingPhase.Complete;
+                            var elapsed = (DateTime.Now - _startTime).TotalSeconds;
+                            Status = $"COMPLETE — {coverage:P1} coverage in {elapsed:F0}s";
+                            Decision = $"{ctx.Exploration.FailedRegions.Count} unreachable regions";
+                        }
                     }
                 }
                 else
@@ -387,9 +401,21 @@ namespace AutoExile.Modes
                 {
                     var coverage = ctx.Exploration.ActiveBlobCoverage;
                     var elapsed = (DateTime.Now - _startTime).TotalSeconds;
-                    _phase = MappingPhase.Complete;
-                    Status = $"COMPLETE — {coverage:P1} coverage in {elapsed:F0}s";
-                    Decision = $"No more targets ({ctx.Exploration.FailedRegions.Count} unreachable)";
+                    var exitPortal = FindExitPortal(gc);
+                    if (exitPortal != null)
+                    {
+                        _exitPortal = exitPortal;
+                        _phase = MappingPhase.Exiting;
+                        Status = $"Explored {coverage:P1} in {elapsed:F0}s — using exit portal";
+                        Decision = "Heading to exit portal";
+                        ctx.Log($"[Mapping] No more targets, found exit portal — returning");
+                    }
+                    else
+                    {
+                        _phase = MappingPhase.Complete;
+                        Status = $"COMPLETE — {coverage:P1} coverage in {elapsed:F0}s";
+                        Decision = $"No more targets ({ctx.Exploration.FailedRegions.Count} unreachable)";
+                    }
                     return;
                 }
 
@@ -412,35 +438,51 @@ namespace AutoExile.Modes
         }
 
         /// <summary>
-        /// Find the nearest clickable interactable (shrine or heist cache) within detection radius.
+        /// Find the nearest clickable interactable within detection radius, filtered by settings.
         /// </summary>
-        private ExileCore.PoEMemory.MemoryObjects.Entity? FindNearbyInteractable(GameController gc, Vector2 playerGrid)
+        private ExileCore.PoEMemory.MemoryObjects.Entity? FindNearbyInteractable(
+            GameController gc, Vector2 playerGrid, BotSettings.InteractableSettings settings)
         {
             ExileCore.PoEMemory.MemoryObjects.Entity? best = null;
             float bestDist = float.MaxValue;
 
             // Shrines
-            foreach (var entity in gc.EntityListWrapper.ValidEntitiesByType[EntityType.Shrine])
+            if (settings.Shrines)
             {
-                if (!entity.IsTargetable) continue;
-                if (_failedInteractables.Contains(entity.Id)) continue;
-                if (!entity.TryGetComponent<Shrine>(out var shrine) || !shrine.IsAvailable) continue;
-
-                var dist = Vector2.Distance(playerGrid, new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y));
-                if (dist < bestDist && dist <= InteractableDetectRadius)
+                foreach (var entity in gc.EntityListWrapper.ValidEntitiesByType[EntityType.Shrine])
                 {
-                    bestDist = dist;
-                    best = entity;
+                    if (!entity.IsTargetable) continue;
+                    if (_failedInteractables.Contains(entity.Id)) continue;
+                    if (!entity.TryGetComponent<Shrine>(out var shrine) || !shrine.IsAvailable) continue;
+
+                    var dist = Vector2.Distance(playerGrid, new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y));
+                    if (dist < bestDist && dist <= InteractableDetectRadius)
+                    {
+                        bestDist = dist;
+                        best = entity;
+                    }
                 }
             }
 
-            // Heist caches (Smuggler's Cache — chest type, path contains LeagueHeist)
+            // Chests: strongboxes, heist caches, djinn caches
             foreach (var entity in gc.EntityListWrapper.ValidEntitiesByType[EntityType.Chest])
             {
                 if (!entity.IsTargetable) continue;
                 if (_failedInteractables.Contains(entity.Id)) continue;
-                if (!entity.Path.Contains("LeagueHeist/HeistSmuggler")) continue;
-                if (entity.TryGetComponent<Chest>(out var chest) && chest.IsOpened) continue;
+                if (!entity.TryGetComponent<Chest>(out var chest) || chest.IsOpened) continue;
+
+                // Strongboxes
+                if (chest.IsStrongbox && !settings.Strongboxes) continue;
+                // Heist caches
+                if (entity.Path.Contains("LeagueHeist/HeistSmuggler") && !settings.HeistCaches) continue;
+                // Djinn caches (Faridun league)
+                if (entity.Path.Contains("Chests/Faridun/") && !settings.DjinnCaches) continue;
+
+                // Must be one of the known types
+                if (!chest.IsStrongbox
+                    && !entity.Path.Contains("LeagueHeist/HeistSmuggler")
+                    && !entity.Path.Contains("Chests/Faridun/"))
+                    continue;
 
                 var dist = Vector2.Distance(playerGrid, new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y));
                 if (dist < bestDist && dist <= InteractableDetectRadius)
@@ -451,17 +493,20 @@ namespace AutoExile.Modes
             }
 
             // Crafting recipes (click to unlock)
-            foreach (var entity in gc.EntityListWrapper.ValidEntitiesByType[EntityType.IngameIcon])
+            if (settings.CraftingRecipes)
             {
-                if (!entity.IsTargetable) continue;
-                if (_failedInteractables.Contains(entity.Id)) continue;
-                if (!entity.Path.Contains("CraftingUnlocks/RecipeUnlock")) continue;
-
-                var dist = Vector2.Distance(playerGrid, new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y));
-                if (dist < bestDist && dist <= InteractableDetectRadius)
+                foreach (var entity in gc.EntityListWrapper.ValidEntitiesByType[EntityType.IngameIcon])
                 {
-                    bestDist = dist;
-                    best = entity;
+                    if (!entity.IsTargetable) continue;
+                    if (_failedInteractables.Contains(entity.Id)) continue;
+                    if (!entity.Path.Contains("CraftingUnlocks/RecipeUnlock")) continue;
+
+                    var dist = Vector2.Distance(playerGrid, new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y));
+                    if (dist < bestDist && dist <= InteractableDetectRadius)
+                    {
+                        bestDist = dist;
+                        best = entity;
+                    }
                 }
             }
 
@@ -490,6 +535,68 @@ namespace AutoExile.Modes
                 if (entity.Id == entityId) return entity;
             }
             return null;
+        }
+
+        /// <summary>
+        /// Find a return/exit portal in the current zone (e.g., SekhemaPortal in wish zones).
+        /// </summary>
+        private static Entity? FindExitPortal(GameController gc)
+        {
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (entity.Path == null) continue;
+                if (!entity.IsTargetable) continue;
+                if (entity.Path.Contains("SekhemaPortal"))
+                    return entity;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Navigate to and click the exit portal to return to the parent map.
+        /// </summary>
+        private void TickExitPortal(BotContext ctx, GameController gc)
+        {
+            // Refresh entity reference
+            if (_exitPortal != null)
+            {
+                var refreshed = FindEntityById(gc, _exitPortal.Id);
+                if (refreshed != null) _exitPortal = refreshed;
+            }
+
+            if (_exitPortal == null || !_exitPortal.IsTargetable)
+            {
+                // Portal gone — area change should have fired
+                Status = "Exit portal gone — waiting for area change";
+                return;
+            }
+
+            var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
+            var portalGrid = new Vector2(_exitPortal.GridPosNum.X, _exitPortal.GridPosNum.Y);
+            var dist = Vector2.Distance(playerGrid, portalGrid);
+
+            if (dist > 15)
+            {
+                // Navigate to portal
+                var worldTarget = portalGrid * Pathfinding.GridToWorld;
+                ctx.Navigation.NavigateTo(gc, worldTarget);
+                Status = $"Exiting — walking to portal ({dist:F0}g)";
+                return;
+            }
+
+            // Close enough — click it
+            if (!BotInput.CanAct) return;
+            if ((DateTime.Now - _lastExitClickTime).TotalMilliseconds < 500) return;
+
+            var screenPos = gc.IngameState.Camera.WorldToScreen(_exitPortal.BoundsCenterPosNum);
+            var windowRect = gc.Window.GetWindowRectangleTimeCache;
+            var absPos = new Vector2(screenPos.X + windowRect.X, screenPos.Y + windowRect.Y);
+
+            if (BotInput.Click(absPos))
+            {
+                _lastExitClickTime = DateTime.Now;
+                Status = "Exiting — clicked portal";
+            }
         }
 
         public void Render(BotContext ctx)
@@ -522,6 +629,7 @@ namespace AutoExile.Modes
                 MappingPhase.Looting => SharpDX.Color.LimeGreen,
                 MappingPhase.Exploring => SharpDX.Color.Yellow,
                 MappingPhase.Complete => SharpDX.Color.LimeGreen,
+                MappingPhase.Exiting => SharpDX.Color.Magenta,
                 MappingPhase.Paused => SharpDX.Color.Yellow,
                 _ => SharpDX.Color.White,
             };

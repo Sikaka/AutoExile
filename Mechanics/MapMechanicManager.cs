@@ -1,3 +1,4 @@
+using System.Linq;
 using System.Numerics;
 
 namespace AutoExile.Mechanics
@@ -126,6 +127,19 @@ namespace AutoExile.Mechanics
         }
 
         /// <summary>
+        /// Force the active mechanic to completed state. Called before caching area state
+        /// so that the mechanic (e.g., Wishes after portal entry) is marked done when restored.
+        /// </summary>
+        public void ForceCompleteActive()
+        {
+            if (_active == null) return;
+            if (!_completed.Contains(_active))
+                _completed.Add(_active);
+            _detected.Remove(_active);
+            _active = null;
+        }
+
+        /// <summary>
         /// Reset all mechanics. Called on area change.
         /// </summary>
         public void Reset()
@@ -138,12 +152,45 @@ namespace AutoExile.Mechanics
                 m.Reset();
         }
 
+        /// <summary>
+        /// Capture which mechanics are completed/detected so state survives cross-zone trips.
+        /// </summary>
+        public MechanicsSnapshot CreateSnapshot()
+        {
+            return new MechanicsSnapshot
+            {
+                CompletedNames = _completed.Select(m => m.Name).ToHashSet(),
+                DetectedNames = _detected.Select(m => m.Name).ToHashSet(),
+            };
+        }
+
+        /// <summary>
+        /// Restore mechanic completion state from a snapshot. Marks matching mechanics
+        /// as complete so they won't be re-detected.
+        /// </summary>
+        public void RestoreSnapshot(MechanicsSnapshot snapshot)
+        {
+            _active = null;
+            _detected.Clear();
+            _completed.Clear();
+            _lastDetectTime = DateTime.MinValue;
+
+            foreach (var m in _mechanics)
+            {
+                m.Reset();
+                if (snapshot.CompletedNames.Contains(m.Name))
+                    _completed.Add(m);
+            }
+        }
+
         private MechanicMode GetMechanicMode(IMapMechanic mechanic, BotSettings.MechanicsSettings settings)
         {
             // Map mechanic name to its settings mode
             return mechanic.Name switch
             {
                 "Ultimatum" => ParseMode(settings.Ultimatum.Mode.Value),
+                "Harvest" => ParseMode(settings.Harvest.Mode.Value),
+                "Wishes" => ParseMode(settings.Wishes.Mode.Value),
                 _ => MechanicMode.Skip,
             };
         }
@@ -152,5 +199,12 @@ namespace AutoExile.Mechanics
         {
             return Enum.TryParse<MechanicMode>(value, out var mode) ? mode : MechanicMode.Skip;
         }
+    }
+
+    /// <summary>Snapshot of mechanic completion state for cross-zone caching.</summary>
+    public class MechanicsSnapshot
+    {
+        public HashSet<string> CompletedNames = new();
+        public HashSet<string> DetectedNames = new();
     }
 }
