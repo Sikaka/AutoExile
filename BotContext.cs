@@ -1,0 +1,41 @@
+using ExileCore;
+using AutoExile.Mechanics;
+using AutoExile.Systems;
+
+namespace AutoExile
+{
+    /// <summary>
+    /// Passed to modes and systems each tick. Provides access to everything
+    /// without coupling to the plugin class directly.
+    /// </summary>
+    public class BotContext
+    {
+        public required GameController Game { get; init; }
+        public required NavigationSystem Navigation { get; init; }
+        public required InteractionSystem Interaction { get; init; }
+        public required TileMap TileMap { get; init; }
+        public required CombatSystem Combat { get; init; }
+        public required LootSystem Loot { get; init; }
+        public required MapDeviceSystem MapDevice { get; init; }
+        public required StashSystem Stash { get; init; }
+        public required ExplorationMap Exploration { get; init; }
+        public required LootTracker LootTracker { get; init; }
+        public required MapMechanicManager Mechanics { get; init; }
+        public required BotSettings Settings { get; init; }
+
+        /// <summary>
+        /// Graphics API for rendering overlays. Set during Render() calls.
+        /// </summary>
+        public ExileCore.Graphics? Graphics { get; set; }
+
+        /// <summary>
+        /// Elapsed seconds since last tick.
+        /// </summary>
+        public float DeltaTime { get; set; }
+
+        /// <summary>
+        /// Log a message to ExileCore's debug log.
+        /// </summary>
+        public Action<string> Log { get; set; } = _ => { };
+    }
+}

@@ -1,0 +1,715 @@
+using System.Numerics;
+
+namespace AutoExile.Systems
+{
+    /// <summary>
+    /// Tracks map exploration coverage using the full walkability grid.
+    /// Segments walkable space into blobs (connected regions) via flood fill from player position.
+    /// Disconnected areas (Harvest, Wildwood, upper floors) are separate blobs.
+    /// Coverage is tracked per-blob — cells within render range of the player are marked "seen".
+    /// </summary>
+    public class ExplorationMap
+    {
+        private static int RenderRange => (int)Pathfinding.NetworkBubbleRadius;
+
+        // Region chunk size — blob is divided into NxN grid chunks for navigation targeting
+        private const int RegionChunkSize = 80;
+
+        // Minimum walkable cells for a region to be worth exploring
+        private const int MinRegionSize = 50;
+
+        // Small pocket threshold — dead-end areas smaller than this are deprioritized
+        private const int SmallPocketThreshold = 200;
+
+        // Minimum pathfinding grid value to count as "real" walkable space.
+        // Values 1-2 are edge fringe hugging walls/coastlines — not worth exploring.
+        private const int MinWalkableValue = 3;
+
+        // ── Public state ──
+
+        public List<Blob> Blobs { get; } = new();
+        public int ActiveBlobIndex { get; private set; } = -1;
+        public Blob? ActiveBlob => ActiveBlobIndex >= 0 && ActiveBlobIndex < Blobs.Count ? Blobs[ActiveBlobIndex] : null;
+        public float ActiveBlobCoverage => ActiveBlob?.Coverage ?? 0f;
+        public int TotalBlobCount => Blobs.Count;
+        public bool IsInitialized => Blobs.Count > 0;
+
+        // Known transition portals (grid positions where we've seen AreaTransition entities)
+        public List<TransitionPortal> KnownTransitions { get; } = new();
+
+        // Regions that pathfinding couldn't reach — skip on future targeting
+        public HashSet<int> FailedRegions { get; } = new();
+
+        // Debug info
+        public string LastAction { get; private set; } = "";
+        public int TotalWalkableCells { get; private set; }
+
+        /// <summary>
+        /// Mark a region as unreachable so GetNextExplorationTarget skips it.
+        /// Call when pathfinding fails to the region's target.
+        /// </summary>
+        public void MarkRegionFailed(Vector2 targetGridPos)
+        {
+            var blob = ActiveBlob;
+            if (blob == null) return;
+
+            // Find which region this target was in
+            var cell = new Vector2i((int)targetGridPos.X, (int)targetGridPos.Y);
+            if (blob.CellToRegion.TryGetValue(cell, out var regionIdx))
+            {
+                FailedRegions.Add(regionIdx);
+                LastAction = $"Marked region {regionIdx} as unreachable";
+            }
+            else
+            {
+                // Target may be a centroid not exactly on a cell — find nearest region
+                float bestDist = float.MaxValue;
+                int bestIdx = -1;
+                for (int i = 0; i < blob.Regions.Count; i++)
+                {
+                    var d = Vector2.Distance(targetGridPos, blob.Regions[i].Center);
+                    if (d < bestDist) { bestDist = d; bestIdx = i; }
+                }
+                if (bestIdx >= 0)
+                {
+                    FailedRegions.Add(bestIdx);
+                    LastAction = $"Marked region {bestIdx} as unreachable (nearest)";
+                }
+            }
+        }
+
+        // ═══════════════════════════════════════════════════
+        // Initialization
+        // ═══════════════════════════════════════════════════
+
+        /// <summary>
+        /// Initialize from the pathfinding grid. Flood fills from player position to discover
+        /// the primary blob (all walkable cells reachable by walking + blink gaps).
+        /// </summary>
+        public void Initialize(int[][] pfGrid, int[][]? tgtGrid, Vector2 playerGridPos, int blinkRange)
+        {
+            Clear();
+
+            if (pfGrid == null || pfGrid.Length == 0) return;
+
+            var rows = pfGrid.Length;
+            var cols = pfGrid[0].Length;
+            var px = (int)playerGridPos.X;
+            var py = (int)playerGridPos.Y;
+
+            px = Math.Clamp(px, 0, cols - 1);
+            py = Math.Clamp(py, 0, rows - 1);
+
+            // If player is on unwalkable cell, find nearest walkable
+            if (pfGrid[py][px] == 0)
+            {
+                var nearest = FindNearestWalkable(pfGrid, px, py, rows, cols);
+                if (nearest == null)
+                {
+                    LastAction = "No walkable cells found near player";
+                    return;
+                }
+                (px, py) = nearest.Value;
+            }
+
+            // Flood fill from player position
+            var blobCells = FloodFill(pfGrid, tgtGrid, px, py, rows, cols, blinkRange);
+
+            if (blobCells.Count == 0)
+            {
+                LastAction = "Flood fill returned 0 cells";
+                return;
+            }
+
+            var blob = CreateBlob(blobCells, 0);
+            Blobs.Add(blob);
+            ActiveBlobIndex = 0;
+            TotalWalkableCells = blobCells.Count;
+
+            // Mark cells near player as already seen
+            Update(playerGridPos);
+
+            LastAction = $"Initialized: {blobCells.Count} cells, {blob.Regions.Count} regions";
+        }
+
+        /// <summary>
+        /// Enter a new blob (after using a transition portal). Flood fills from new position.
+        /// </summary>
+        public int EnterNewBlob(int[][] pfGrid, int[][]? tgtGrid, Vector2 playerGridPos, int blinkRange)
+        {
+            if (pfGrid == null || pfGrid.Length == 0) return -1;
+
+            var rows = pfGrid.Length;
+            var cols = pfGrid[0].Length;
+            var px = (int)playerGridPos.X;
+            var py = (int)playerGridPos.Y;
+            px = Math.Clamp(px, 0, cols - 1);
+            py = Math.Clamp(py, 0, rows - 1);
+
+            if (pfGrid[py][px] == 0)
+            {
+                var nearest = FindNearestWalkable(pfGrid, px, py, rows, cols);
+                if (nearest == null) return -1;
+                (px, py) = nearest.Value;
+            }
+
+            // Check if player is already inside an existing blob
+            var playerCell = new Vector2i(px, py);
+            for (int i = 0; i < Blobs.Count; i++)
+            {
+                if (Blobs[i].WalkableCells.Contains(playerCell))
+                {
+                    ActiveBlobIndex = i;
+                    Update(playerGridPos);
+                    LastAction = $"Re-entered blob {i}";
+                    return i;
+                }
+            }
+
+            // New disconnected area — create new blob
+            var blobCells = FloodFill(pfGrid, tgtGrid, px, py, rows, cols, blinkRange);
+            if (blobCells.Count == 0) return -1;
+
+            var blob = CreateBlob(blobCells, Blobs.Count);
+            Blobs.Add(blob);
+            ActiveBlobIndex = Blobs.Count - 1;
+            TotalWalkableCells += blobCells.Count;
+
+            Update(playerGridPos);
+            LastAction = $"New blob {ActiveBlobIndex}: {blobCells.Count} cells, {blob.Regions.Count} regions";
+            return ActiveBlobIndex;
+        }
+
+        /// <summary>
+        /// Clear all exploration data.
+        /// </summary>
+        public void Clear()
+        {
+            Blobs.Clear();
+            ActiveBlobIndex = -1;
+            KnownTransitions.Clear();
+            FailedRegions.Clear();
+            TotalWalkableCells = 0;
+            LastAction = "";
+        }
+
+        /// <summary>
+        /// Clear all seen state while preserving blob/region structure.
+        /// Use in modes like Simulacrum where the same area must be re-swept
+        /// each wave to find newly spawned monsters. Also clears failed regions
+        /// since pathability may have changed.
+        /// </summary>
+        public void ResetSeen()
+        {
+            foreach (var blob in Blobs)
+            {
+                blob.SeenCells.Clear();
+                blob.Coverage = 0f;
+                foreach (var region in blob.Regions)
+                    region.SeenCount = 0;
+            }
+            FailedRegions.Clear();
+        }
+
+        // ═══════════════════════════════════════════════════
+        // Per-tick update
+        // ═══════════════════════════════════════════════════
+
+        /// <summary>
+        /// Mark cells within render range of the player as seen. Call each tick.
+        /// Uses squared distance check for performance — no sqrt needed.
+        /// </summary>
+        public void Update(Vector2 playerGridPos)
+        {
+            var blob = ActiveBlob;
+            if (blob == null) return;
+
+            var px = (int)playerGridPos.X;
+            var py = (int)playerGridPos.Y;
+            var rangeSq = RenderRange * RenderRange;
+
+            // Only check cells in the vicinity — scan a bounding box around player
+            var minX = px - RenderRange;
+            var maxX = px + RenderRange;
+            var minY = py - RenderRange;
+            var maxY = py + RenderRange;
+
+            for (int y = minY; y <= maxY; y++)
+            {
+                for (int x = minX; x <= maxX; x++)
+                {
+                    var cell = new Vector2i(x, y);
+                    if (!blob.WalkableCells.Contains(cell)) continue;
+                    if (blob.SeenCells.Contains(cell)) continue;
+
+                    var dx = x - px;
+                    var dy = y - py;
+                    if (dx * dx + dy * dy <= rangeSq)
+                    {
+                        blob.SeenCells.Add(cell);
+
+                        // Update region seen counts
+                        var regionIdx = blob.CellToRegion.GetValueOrDefault(cell, -1);
+                        if (regionIdx >= 0 && regionIdx < blob.Regions.Count)
+                            blob.Regions[regionIdx].SeenCount++;
+                    }
+                }
+            }
+
+            blob.Coverage = blob.WalkableCells.Count > 0
+                ? (float)blob.SeenCells.Count / blob.WalkableCells.Count
+                : 0f;
+        }
+
+        // ═══════════════════════════════════════════════════
+        // Navigation targeting
+        // ═══════════════════════════════════════════════════
+
+        /// <summary>
+        /// Get the best unexplored region center to navigate to. Returns null if fully explored.
+        /// Prefers large unseen regions, weighted by proximity to player.
+        /// </summary>
+        public Vector2? GetNextExplorationTarget(Vector2 playerGridPos)
+        {
+            var blob = ActiveBlob;
+            if (blob == null) return null;
+
+            Region? bestRegion = null;
+            float bestScore = float.MinValue;
+
+            foreach (var region in blob.Regions)
+            {
+                // Skip fully explored regions (>80% seen)
+                if (region.ExploredRatio > 0.8f) continue;
+
+                // Skip tiny dead-end pockets
+                if (region.CellCount < MinRegionSize) continue;
+
+                // Skip regions we failed to path to
+                if (FailedRegions.Contains(region.Index)) continue;
+
+                var unseenCount = region.CellCount - region.SeenCount;
+                var dist = Vector2.Distance(playerGridPos, region.Center);
+
+                // Score: unseen cells per unit distance — naturally balances nearby small branches
+                // vs distant large regions. A 200-cell branch at dist 30 beats a 5000-cell
+                // region at dist 400 (200/60=3.3 vs 5000/430=11.6... but with sqrt scaling
+                // for diminishing returns on huge regions: 14.1/60=0.24 vs 70.7/430=0.16).
+                float sizeScore = MathF.Sqrt(unseenCount);
+                if (region.CellCount < SmallPocketThreshold)
+                    sizeScore *= 0.5f; // mild deprioritize for tiny areas
+
+                float score = sizeScore / (dist + 30f);
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestRegion = region;
+                }
+            }
+
+            if (bestRegion == null) return null;
+
+            // Return the centroid of unseen cells in this region for more accurate targeting
+            return GetUnseenCentroid(blob, bestRegion);
+        }
+
+        /// <summary>
+        /// Find the centroid of unseen cells within a region, then snap to the nearest
+        /// actual unseen cell. Raw centroids can land on wall cells (average of cells
+        /// on both sides of a corridor), causing navigation to tight/stuck spots.
+        /// </summary>
+        private Vector2? GetUnseenCentroid(Blob blob, Region region)
+        {
+            float sumX = 0, sumY = 0;
+            int count = 0;
+
+            foreach (var cell in region.Cells)
+            {
+                if (!blob.SeenCells.Contains(cell))
+                {
+                    sumX += cell.X;
+                    sumY += cell.Y;
+                    count++;
+                }
+            }
+
+            if (count == 0) return null;
+
+            // Snap centroid to nearest actual unseen cell to avoid wall positions
+            var centroid = new Vector2(sumX / count, sumY / count);
+            float bestDist = float.MaxValue;
+            Vector2i bestCell = default;
+
+            foreach (var cell in region.Cells)
+            {
+                if (blob.SeenCells.Contains(cell)) continue;
+                var dx = cell.X - centroid.X;
+                var dy = cell.Y - centroid.Y;
+                var dist = dx * dx + dy * dy;
+                if (dist < bestDist)
+                {
+                    bestDist = dist;
+                    bestCell = cell;
+                }
+            }
+
+            return new Vector2(bestCell.X, bestCell.Y);
+        }
+
+        // ═══════════════════════════════════════════════════
+        // Transition portal tracking
+        // ═══════════════════════════════════════════════════
+
+        /// <summary>
+        /// Record a discovered transition portal position. Called when we see an AreaTransition entity.
+        /// </summary>
+        public void RecordTransition(Vector2 gridPos, string name = "")
+        {
+            // Don't duplicate
+            foreach (var t in KnownTransitions)
+            {
+                if (Vector2.Distance(t.GridPos, gridPos) < 5f)
+                    return;
+            }
+
+            KnownTransitions.Add(new TransitionPortal
+            {
+                GridPos = gridPos,
+                Name = name,
+                SourceBlobIndex = ActiveBlobIndex,
+                DestBlobIndex = -1, // unknown until entered
+            });
+        }
+
+        // ═══════════════════════════════════════════════════
+        // Flood fill
+        // ═══════════════════════════════════════════════════
+
+        /// <summary>
+        /// BFS flood fill from a starting cell. Includes blink-aware gap crossing
+        /// so ledge-separated areas that are reachable via movement skills stay in the same blob.
+        /// </summary>
+        private static HashSet<Vector2i> FloodFill(int[][] pfGrid, int[][]? tgtGrid, int startX, int startY, int rows, int cols, int blinkRange)
+        {
+            var visited = new HashSet<Vector2i>();
+            var queue = new Queue<Vector2i>();
+
+            var start = new Vector2i(startX, startY);
+            queue.Enqueue(start);
+            visited.Add(start);
+
+            // 8-directional neighbors
+            ReadOnlySpan<(int dx, int dy)> dirs = stackalloc (int, int)[]
+            {
+                (1, 0), (-1, 0), (0, 1), (0, -1),
+                (1, 1), (1, -1), (-1, 1), (-1, -1)
+            };
+
+            while (queue.Count > 0)
+            {
+                var cell = queue.Dequeue();
+                var hasPf0Neighbor = false;
+
+                foreach (var (dx, dy) in dirs)
+                {
+                    var nx = cell.X + dx;
+                    var ny = cell.Y + dy;
+
+                    if (nx < 0 || nx >= cols || ny < 0 || ny >= rows) continue;
+
+                    var val = pfGrid[ny][nx];
+                    if (val < MinWalkableValue)
+                    {
+                        // Values 0 = impassable, 1-2 = edge fringe (treat as boundary)
+                        if (val == 0) hasPf0Neighbor = true;
+                        continue;
+                    }
+
+                    var neighbor = new Vector2i(nx, ny);
+                    if (visited.Add(neighbor))
+                        queue.Enqueue(neighbor);
+                }
+
+                // Blink gap crossing: if at a boundary cell, scan for walkable landing spots
+                if (hasPf0Neighbor && tgtGrid != null && blinkRange > 0)
+                {
+                    foreach (var landing in ScanBlinkLandings(pfGrid, tgtGrid, cell.X, cell.Y, blinkRange, rows, cols))
+                    {
+                        if (pfGrid[landing.y][landing.x] < MinWalkableValue) continue;
+                        var landingCell = new Vector2i(landing.x, landing.y);
+                        if (visited.Add(landingCell))
+                            queue.Enqueue(landingCell);
+                    }
+                }
+            }
+
+            return visited;
+        }
+
+        /// <summary>
+        /// Scan for blink landing spots from a boundary cell. Mirrors the logic in Pathfinding.
+        /// Scans in 8 directions through cells where targeting > 0, looking for walkable cells
+        /// on the other side within blink range.
+        /// </summary>
+        private static List<(int x, int y)> ScanBlinkLandings(int[][] pfGrid, int[][] tgtGrid, int cx, int cy, int blinkRange, int rows, int cols)
+        {
+            var landings = new List<(int x, int y)>();
+
+            // Scan in 8 cardinal/diagonal directions
+            ReadOnlySpan<(int dx, int dy)> dirs = stackalloc (int, int)[]
+            {
+                (1, 0), (-1, 0), (0, 1), (0, -1),
+                (1, 1), (1, -1), (-1, 1), (-1, -1)
+            };
+
+            foreach (var (dx, dy) in dirs)
+            {
+                bool inGap = false;
+
+                for (int step = 1; step <= blinkRange; step++)
+                {
+                    var nx = cx + dx * step;
+                    var ny = cy + dy * step;
+
+                    if (nx < 0 || nx >= cols || ny < 0 || ny >= rows) break;
+
+                    var pfVal = pfGrid[ny][nx];
+                    var tgtVal = tgtGrid[ny][nx];
+
+                    if (pfVal == 0)
+                    {
+                        // In the gap — targeting must be > 0 to continue (jumpable, not wall)
+                        if (tgtVal > 0)
+                        {
+                            inGap = true;
+                            continue;
+                        }
+                        else
+                        {
+                            break; // hit a wall, stop scanning this direction
+                        }
+                    }
+                    else if (inGap)
+                    {
+                        // Found walkable ground on the other side of a gap
+                        landings.Add((nx, ny));
+                        break; // one landing per direction
+                    }
+                    else
+                    {
+                        // Still on walkable ground, haven't entered gap yet
+                        break;
+                    }
+                }
+            }
+
+            return landings;
+        }
+
+        // ═══════════════════════════════════════════════════
+        // Blob and region creation
+        // ═══════════════════════════════════════════════════
+
+        private static Blob CreateBlob(HashSet<Vector2i> cells, int index)
+        {
+            var blob = new Blob
+            {
+                Index = index,
+                WalkableCells = cells,
+            };
+
+            // Find bounding box
+            int minX = int.MaxValue, minY = int.MaxValue;
+            int maxX = int.MinValue, maxY = int.MinValue;
+            foreach (var c in cells)
+            {
+                if (c.X < minX) minX = c.X;
+                if (c.Y < minY) minY = c.Y;
+                if (c.X > maxX) maxX = c.X;
+                if (c.Y > maxY) maxY = c.Y;
+            }
+
+            // Segment into regions using grid chunks
+            int chunksX = (maxX - minX) / RegionChunkSize + 1;
+            int chunksY = (maxY - minY) / RegionChunkSize + 1;
+
+            // Create region grid
+            var regionGrid = new List<Vector2i>[chunksX * chunksY];
+            for (int i = 0; i < regionGrid.Length; i++)
+                regionGrid[i] = new List<Vector2i>();
+
+            foreach (var cell in cells)
+            {
+                int rx = (cell.X - minX) / RegionChunkSize;
+                int ry = (cell.Y - minY) / RegionChunkSize;
+                int ri = ry * chunksX + rx;
+
+                if (ri >= 0 && ri < regionGrid.Length)
+                    regionGrid[ri].Add(cell);
+            }
+
+            // Create regions from non-empty chunks
+            for (int i = 0; i < regionGrid.Length; i++)
+            {
+                var chunk = regionGrid[i];
+                if (chunk.Count < MinRegionSize) continue;
+
+                // Calculate centroid
+                float sumX = 0, sumY = 0;
+                foreach (var c in chunk)
+                {
+                    sumX += c.X;
+                    sumY += c.Y;
+                }
+
+                var region = new Region
+                {
+                    Index = blob.Regions.Count,
+                    Center = new Vector2(sumX / chunk.Count, sumY / chunk.Count),
+                    CellCount = chunk.Count,
+                    SeenCount = 0,
+                    Cells = chunk,
+                };
+
+                // Map cells to region index
+                foreach (var c in chunk)
+                    blob.CellToRegion[c] = region.Index;
+
+                blob.Regions.Add(region);
+            }
+
+            // Also add small chunks' cells to the nearest region's mapping
+            // (so their seen status still gets tracked)
+            for (int i = 0; i < regionGrid.Length; i++)
+            {
+                var chunk = regionGrid[i];
+                if (chunk.Count >= MinRegionSize || chunk.Count == 0) continue;
+
+                // Find nearest region
+                float sumX = 0, sumY = 0;
+                foreach (var c in chunk) { sumX += c.X; sumY += c.Y; }
+                var chunkCenter = new Vector2(sumX / chunk.Count, sumY / chunk.Count);
+
+                int nearestRegion = -1;
+                float nearestDist = float.MaxValue;
+                for (int r = 0; r < blob.Regions.Count; r++)
+                {
+                    var d = Vector2.Distance(chunkCenter, blob.Regions[r].Center);
+                    if (d < nearestDist)
+                    {
+                        nearestDist = d;
+                        nearestRegion = r;
+                    }
+                }
+
+                if (nearestRegion >= 0)
+                {
+                    var target = blob.Regions[nearestRegion];
+                    target.CellCount += chunk.Count;
+                    target.Cells.AddRange(chunk);
+                    foreach (var c in chunk)
+                        blob.CellToRegion[c] = nearestRegion;
+                }
+            }
+
+            return blob;
+        }
+
+        // ═══════════════════════════════════════════════════
+        // Helpers
+        // ═══════════════════════════════════════════════════
+
+        private static (int x, int y)? FindNearestWalkable(int[][] grid, int x, int y, int rows, int cols)
+        {
+            for (int radius = 1; radius < 20; radius++)
+            {
+                for (int dx = -radius; dx <= radius; dx++)
+                {
+                    for (int dy = -radius; dy <= radius; dy++)
+                    {
+                        if (Math.Abs(dx) != radius && Math.Abs(dy) != radius) continue;
+                        var nx = x + dx;
+                        var ny = y + dy;
+                        if (nx >= 0 && nx < cols && ny >= 0 && ny < rows && grid[ny][nx] >= MinWalkableValue)
+                            return (nx, ny);
+                    }
+                }
+            }
+            return null;
+        }
+
+        // ═══════════════════════════════════════════════════
+        // Data types
+        // ═══════════════════════════════════════════════════
+
+        public class Blob
+        {
+            public int Index;
+            public HashSet<Vector2i> WalkableCells = new();
+            public HashSet<Vector2i> SeenCells = new();
+            public List<Region> Regions = new();
+            public Dictionary<Vector2i, int> CellToRegion = new();
+            public float Coverage;
+        }
+
+        /// <summary>
+        /// Get the weighted centroid of the active blob (center of all walkable space).
+        /// Uses region centers weighted by cell count for efficiency.
+        /// Returns null if not initialized.
+        /// </summary>
+        public Vector2? GetMapCenter()
+        {
+            var blob = ActiveBlob;
+            if (blob == null || blob.Regions.Count == 0) return null;
+
+            var weightedSum = Vector2.Zero;
+            int totalCells = 0;
+            foreach (var region in blob.Regions)
+            {
+                weightedSum += region.Center * region.CellCount;
+                totalCells += region.CellCount;
+            }
+
+            return totalCells > 0 ? weightedSum / totalCells : null;
+        }
+
+        public class Region
+        {
+            public int Index;
+            public Vector2 Center;          // centroid in grid coords
+            public int CellCount;           // total walkable cells
+            public int SeenCount;           // cells revealed by player proximity
+            public List<Vector2i> Cells = new();
+
+            public float ExploredRatio => CellCount > 0 ? (float)SeenCount / CellCount : 0f;
+        }
+
+        public class TransitionPortal
+        {
+            public Vector2 GridPos;
+            public string Name = "";
+            public int SourceBlobIndex = -1;
+            public int DestBlobIndex = -1;  // -1 until we enter it
+        }
+    }
+
+    /// <summary>
+    /// Integer Vector2 for grid cell coordinates. Used as dictionary/hashset keys.
+    /// </summary>
+    public readonly struct Vector2i : IEquatable<Vector2i>
+    {
+        public readonly int X;
+        public readonly int Y;
+
+        public Vector2i(int x, int y) { X = x; Y = y; }
+
+        public bool Equals(Vector2i other) => X == other.X && Y == other.Y;
+        public override bool Equals(object? obj) => obj is Vector2i other && Equals(other);
+        public override int GetHashCode() => HashCode.Combine(X, Y);
+        public override string ToString() => $"({X},{Y})";
+
+        public static bool operator ==(Vector2i a, Vector2i b) => a.X == b.X && a.Y == b.Y;
+        public static bool operator !=(Vector2i a, Vector2i b) => !(a == b);
+    }
+}
