@@ -177,8 +177,7 @@ namespace AutoExile.Systems
 
             var withinRadius = best.Distance <= LootRadius;
             interaction.PickupGroundItem(best.Entity, nav,
-                requireProximity: !withinRadius,
-                interactRange: 8f);
+                requireProximity: !withinRadius);
 
             return (withinRadius, best);
         }

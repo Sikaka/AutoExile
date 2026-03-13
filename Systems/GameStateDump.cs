@@ -23,6 +23,8 @@ namespace AutoExile.Systems
     {
         public long Id { get; set; }
         public string Metadata { get; set; } = "";
+        public string Path { get; set; } = "";
+        public string EntityType { get; set; } = "";
         public Vector2 GridPos { get; set; }
         public float DistanceToPlayer { get; set; }
         public EntityCategory Category { get; set; }
@@ -32,12 +34,15 @@ namespace AutoExile.Systems
         public string? Rarity { get; set; }
         /// <summary>Short display name extracted from metadata path.</summary>
         public string ShortName { get; set; } = "";
+        /// <summary>Character name for Player entities, empty otherwise.</summary>
+        public string RenderName { get; set; } = "";
     }
 
     public enum EntityCategory
     {
         Monster,
         NPC,
+        Player,
         Chest,
         AreaTransition,
         Portal,
@@ -465,6 +470,10 @@ namespace AutoExile.Systems
                     int entSize;
                     switch (ent.Category)
                     {
+                        case EntityCategory.Player:
+                            entColor = Color.FromArgb(255, 255, 255, 255); // white = other player
+                            entSize = 5;
+                            break;
                         case EntityCategory.Monster:
                             entColor = ent.IsAlive
                                 ? Color.FromArgb(255, 255, 50, 50)    // red = alive monster
@@ -613,6 +622,9 @@ namespace AutoExile.Systems
                 {
                     ["id"] = e.Id,
                     ["shortName"] = e.ShortName,
+                    ["metadata"] = e.Metadata,
+                    ["path"] = e.Path,
+                    ["entityType"] = e.EntityType,
                     ["category"] = e.Category.ToString(),
                     ["gridPos"] = new[] { Math.Round(e.GridPos.X, 1), Math.Round(e.GridPos.Y, 1) },
                     ["distToPlayer"] = Math.Round(e.DistanceToPlayer, 1),
@@ -620,6 +632,7 @@ namespace AutoExile.Systems
                     ["isTargetable"] = e.IsTargetable,
                     ["isHostile"] = e.IsHostile,
                     ["rarity"] = e.Rarity ?? "",
+                    ["renderName"] = e.RenderName,
                 }).ToList();
 
                 if (snapshot.Combat != null)

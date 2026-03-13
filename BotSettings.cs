@@ -69,6 +69,9 @@ namespace AutoExile
             [Menu("Blink Range", "Max grid distance for gap-jumping with movement skills. Gaps wider than this won't be attempted.")]
             public RangeNode<int> BlinkRange { get; set; } = new RangeNode<int>(25, 5, 50);
 
+            [Menu("Dash Min Distance", "Min straight-line grid distance ahead before using dash for speed. Too low and dash animation lock is slower than walking. 0 = disable dash-for-speed.")]
+            public RangeNode<int> DashMinDistance { get; set; } = new RangeNode<int>(60, 0, 200);
+
             // ── Skill Slots ──
             // Configure each skill on your bar: what key it's bound to, what role it plays,
             // and its priority (higher = checked first during combat).
@@ -241,6 +244,15 @@ namespace AutoExile
 
             [Menu("Follow Through Transitions", "Follow leader through area transitions.")]
             public ToggleNode FollowThroughTransitions { get; set; } = new ToggleNode(false);
+
+            [Menu("Enable Combat", "Fight monsters while following. Uses build skill/flask settings.")]
+            public ToggleNode EnableCombat { get; set; } = new ToggleNode(true);
+
+            [Menu("Enable Standard Loot", "Pick up all filtered loot while following. When off, only quest items are grabbed.")]
+            public ToggleNode EnableLoot { get; set; } = new ToggleNode(false);
+
+            [Menu("Loot While Near Leader Only", "Only loot when within follow distance of leader (don't wander off to loot).")]
+            public ToggleNode LootNearLeaderOnly { get; set; } = new ToggleNode(true);
         }
 
         [Submenu(CollapsedByDefault = true)]

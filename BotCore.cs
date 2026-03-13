@@ -245,11 +245,16 @@ namespace AutoExile
 
             // Sync settings → systems
             _navigation.BlinkRange = Settings.Build.BlinkRange.Value;
+            _navigation.DashMinDistance = Settings.Build.DashMinDistance.Value;
             BotInput.ActionCooldownMs = Settings.ActionCooldownMs.Value;
 
             // Sync primary movement key from skill config → NavigationSystem + CombatSystem
             var primaryMove = Settings.Build.GetPrimaryMovement();
             _navigation.MoveKey = primaryMove?.Key.Value ?? Keys.T;
+
+            // Ensure skill bar is always up to date — NavigationSystem needs MovementSkills
+            // for dash-for-speed even when combat is disabled by the active mode
+            _combat.RefreshSkillBar(GameController, Settings.Build);
 
             // Sync movement skills (dash/blink) from CombatSystem → NavigationSystem
             _navigation.MovementSkills = _combat.MovementSkills;
@@ -290,6 +295,7 @@ namespace AutoExile
             _loot.MinUniqueChaosValue = Settings.Loot.MinUniqueChaosValue.Value;
             _loot.MinChaosPerSlot = Settings.Loot.MinChaosPerSlot.Value;
             _loot.LootRadius = Settings.Loot.LootRadius.Value;
+            _interaction.InteractRadius = Settings.Loot.LootRadius.Value;
             _loot.IgnoreQuestItems = Settings.Loot.IgnoreQuestItems.Value;
 
             // Sync stash settings — use active mode's cooldown
@@ -297,10 +303,6 @@ namespace AutoExile
                 ? Settings.Simulacrum.StashItemCooldownMs.Value
                 : Settings.Blight.StashItemCooldownMs.Value;
             _stash.ApplyIncubators = Settings.AutoApplyIncubators.Value;
-
-            // Navigation always ticks when running (it executes movement)
-            if (Settings.Running)
-                _navigation.Tick(GameController);
 
             // Only run full mode logic when running
             if (!Settings.Running)
@@ -317,10 +319,18 @@ namespace AutoExile
                 _followerMode.FollowDistance = Settings.Follower.FollowDistance.Value;
                 _followerMode.StopDistance = Settings.Follower.StopDistance.Value;
                 _followerMode.FollowThroughTransitions = Settings.Follower.FollowThroughTransitions.Value;
+                _followerMode.EnableCombat = Settings.Follower.EnableCombat.Value;
+                _followerMode.EnableLoot = Settings.Follower.EnableLoot.Value;
+                _followerMode.LootNearLeaderOnly = Settings.Follower.LootNearLeaderOnly.Value;
             }
 
-            // Let the active mode decide what to do
+            // Let the active mode decide what to do (may set up navigation paths)
             _mode.Tick(_ctx);
+
+            // Navigation ticks AFTER mode — mode sets up/updates paths, then nav executes movement.
+            // This prevents stale walk commands: the walk command always targets the current path,
+            // not a path that's about to be replaced.
+            _navigation.Tick(GameController);
 
             // Auto level gems (global, runs across all modes)
             TickGemLevelUp();
@@ -749,6 +759,8 @@ namespace AutoExile
                 {
                     Id = entity.Id,
                     Metadata = entity.Metadata ?? "",
+                    Path = entity.Path ?? "",
+                    EntityType = entity.Type.ToString(),
                     GridPos = gridPos,
                     DistanceToPlayer = dist,
                     Category = category,
@@ -758,6 +770,8 @@ namespace AutoExile
                     Rarity = entity.Type == ExileCore.Shared.Enums.EntityType.Monster
                         ? entity.Rarity.ToString() : null,
                     ShortName = ExtractShortName(entity.Metadata ?? entity.Path ?? ""),
+                    RenderName = entity.Type == ExileCore.Shared.Enums.EntityType.Player
+                        ? (entity.GetComponent<ExileCore.PoEMemory.Components.Player>()?.PlayerName ?? entity.RenderName ?? "") : "",
                 };
                 snapshot.Entities.Add(ent);
             }
@@ -805,6 +819,23 @@ namespace AutoExile
             {
                 snapshot.Mode.Phase = blight.Phase.ToString();
                 snapshot.Mode.Status = blight.StatusText;
+            }
+            else if (_mode is FollowerMode follower)
+            {
+                snapshot.Mode.Phase = follower.State.ToString();
+                snapshot.Mode.Status = follower.StatusText;
+                snapshot.Mode.Decision = follower.Decision;
+                snapshot.Mode.Extra["leaderName"] = follower.LeaderName;
+                snapshot.Mode.Extra["followDistance"] = follower.FollowDistance;
+                snapshot.Mode.Extra["stopDistance"] = follower.StopDistance;
+                snapshot.Mode.Extra["lastLeaderPos"] = follower.LastLeaderGridPos.HasValue
+                    ? new[] { follower.LastLeaderGridPos.Value.X, follower.LastLeaderGridPos.Value.Y }
+                    : (object)Array.Empty<float>();
+                snapshot.Mode.Extra["transitionTarget"] = follower.TransitionTargetGridPos.HasValue
+                    ? new[] { follower.TransitionTargetGridPos.Value.X, follower.TransitionTargetGridPos.Value.Y }
+                    : (object)Array.Empty<float>();
+                snapshot.Mode.Extra["combatEnabled"] = follower.EnableCombat;
+                snapshot.Mode.Extra["lootEnabled"] = follower.EnableLoot;
             }
 
             // Interaction state
@@ -854,6 +885,8 @@ namespace AutoExile
             var type = entity.Type;
             var path = entity.Path ?? "";
 
+            if (type == ExileCore.Shared.Enums.EntityType.Player)
+                return EntityCategory.Player;
             if (type == ExileCore.Shared.Enums.EntityType.Monster)
                 return EntityCategory.Monster;
             if (type == ExileCore.Shared.Enums.EntityType.Chest)

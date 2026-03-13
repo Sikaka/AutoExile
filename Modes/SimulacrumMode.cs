@@ -881,7 +881,7 @@ namespace AutoExile.Modes
                 _lastEmptyScanAt = DateTime.MinValue;
                 var withinRadius = best.Distance <= ctx.Loot.LootRadius;
                 ctx.Interaction.PickupGroundItem(best.Entity, ctx.Navigation,
-                    requireProximity: !withinRadius, interactRange: 8f);
+                    requireProximity: !withinRadius);
                 _lootTracker.SetPending(best.Entity.Id, best.ItemName, best.ChaosValue);
                 StatusText = $"Sweep: picking up {best.ItemName} ({_lootTracker.PickupCount} picked)";
                 return;

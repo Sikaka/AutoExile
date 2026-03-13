@@ -26,7 +26,11 @@ namespace AutoExile.Systems
         private float _currentTimeout;
         private int _clickAttempts;
         private const int MaxClickAttempts = 3;
-        private const float DefaultInteractRange = 8f; // grid units — must be this close to click
+        /// <summary>
+        /// Minimum distance to click entities/items (grid units). Synced from LootRadius setting.
+        /// Navigation gets as close as possible; if within this range, clicks directly.
+        /// </summary>
+        public float InteractRadius { get; set; } = 35f;
         private const float TimeoutDirect = 5f; // seconds — short timeout for range clicks
         private const float TimeoutClickBuffer = 5f; // seconds added on top of travel estimate
         private const float MinTimeoutNavigate = 10f; // minimum navigate timeout
@@ -40,10 +44,10 @@ namespace AutoExile.Systems
         /// <summary>
         /// Request to interact with a world entity (chest, shrine, transition, NPC, etc.).
         /// If requireProximity is true, will navigate to the entity first.
-        /// interactRange controls how close we need to be before clicking (grid units).
+        /// Uses InteractRadius to determine when close enough to click.
         /// </summary>
         public bool InteractWithEntity(Entity entity, NavigationSystem? nav = null,
-            bool requireProximity = true, float interactRange = DefaultInteractRange)
+            bool requireProximity = true)
         {
             if (_currentTarget != null)
                 return false;
@@ -54,7 +58,7 @@ namespace AutoExile.Systems
                 TargetType = InteractionTargetType.WorldEntity,
                 InitialState = CaptureEntityState(entity),
                 RequireProximity = requireProximity,
-                InteractRange = interactRange,
+                InteractRange = InteractRadius,
                 Nav = nav,
                 Phase = requireProximity ? InteractionPhase.Navigating : InteractionPhase.Clicking,
                 EntityGridPos = new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y),
@@ -71,7 +75,7 @@ namespace AutoExile.Systems
         /// If requireProximity is true, will navigate to the item first.
         /// </summary>
         public bool PickupGroundItem(Entity itemEntity, NavigationSystem? nav = null,
-            bool requireProximity = true, float interactRange = DefaultInteractRange)
+            bool requireProximity = true)
         {
             if (_currentTarget != null)
                 return false;
@@ -81,7 +85,7 @@ namespace AutoExile.Systems
                 EntityId = itemEntity.Id,
                 TargetType = InteractionTargetType.GroundItem,
                 RequireProximity = requireProximity,
-                InteractRange = interactRange,
+                InteractRange = InteractRadius,
                 Nav = nav,
                 Phase = requireProximity ? InteractionPhase.Navigating : InteractionPhase.Clicking,
                 EntityGridPos = new Vector2(itemEntity.GridPosNum.X, itemEntity.GridPosNum.Y),

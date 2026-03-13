@@ -29,6 +29,10 @@ namespace AutoExile.Systems
         private DateTime _dashStartTime = DateTime.MinValue;
         private const int DashAnimationMs = 300; // assume dash animation takes ~300ms
 
+        // Dash-for-speed: use non-gap-crossing movement skills on long straight path segments
+        public int DashMinDistance { get; set; } = 60;       // min straight grid distance ahead (0 = disabled)
+        private const float DashPathDeviationMax = 0.85f;    // dot product threshold — path must be this aligned
+
         public bool IsNavigating { get; private set; }
         public bool IsPaused { get; private set; }
         public List<NavWaypoint> CurrentNavPath { get; private set; } = new();
@@ -209,7 +213,10 @@ namespace AutoExile.Systems
             {
                 var screenPos = gc.IngameState.Camera.WorldToScreen(
                     new Vector3(waypoint.Position.X, waypoint.Position.Y, playerZ));
-                ExecuteWalk(screenPos, windowRect);
+
+                // Try dash-for-speed on long straight segments
+                if (!TryDashForSpeed(gc, playerWorld, playerZ, windowRect))
+                    ExecuteWalk(screenPos, windowRect);
             }
         }
 
@@ -279,6 +286,112 @@ namespace AutoExile.Systems
             }
         }
 
+        /// <summary>
+        /// Use a non-gap-crossing movement skill (e.g. Dash, Shield Charge) to speed up travel
+        /// when the path ahead is long and straight. Returns true if a dash was fired.
+        /// Checks: game cooldown (CanBeUsed), manual cooldown (MinCastIntervalMs), and
+        /// minimum straight-line distance ahead (DashMinDistance setting).
+        /// </summary>
+        private bool TryDashForSpeed(GameController gc, Vector2 playerWorld, float playerZ,
+            SharpDX.RectangleF windowRect)
+        {
+            if (DashMinDistance <= 0)
+                return false;
+
+            // Find a speed dash skill — non-gap-crossing, game-ready, and manual cooldown elapsed
+            MovementSkillInfo? dashSkill = null;
+            foreach (var ms in MovementSkills)
+            {
+                if (ms.CanCrossTerrain || !ms.IsReady)
+                    continue;
+                if (ms.MinCastIntervalMs > 0 &&
+                    (DateTime.Now - ms.LastUsedAt).TotalMilliseconds < ms.MinCastIntervalMs)
+                    continue;
+                dashSkill = ms;
+                break;
+            }
+            if (dashSkill == null)
+                return false;
+
+            // Measure straight-line distance from the CURRENT waypoint forward along the path.
+            // This is the distance the dash would actually cover — not from the player
+            // (which may be mid-segment and close to the current waypoint).
+            var idx = CurrentWaypointIndex;
+            if (idx >= CurrentNavPath.Count)
+                return false;
+
+            var startWp = CurrentNavPath[idx].Position;
+
+            // Direction from current waypoint to next (the travel direction at dash point)
+            Vector2 travelDir;
+            if (idx + 1 < CurrentNavPath.Count)
+            {
+                travelDir = CurrentNavPath[idx + 1].Position - startWp;
+                if (travelDir.Length() < 1f)
+                    return false;
+                travelDir = Vector2.Normalize(travelDir);
+            }
+            else
+            {
+                // Only one waypoint left — use player-to-waypoint direction
+                travelDir = startWp - playerWorld;
+                if (travelDir.Length() < 1f)
+                    return false;
+                travelDir = Vector2.Normalize(travelDir);
+            }
+
+            // Walk forward from current waypoint, accumulating distance while path stays straight
+            var straightDist = 0f;
+            var prev = startWp;
+            for (var i = idx + 1; i < CurrentNavPath.Count; i++)
+            {
+                var wp = CurrentNavPath[i];
+
+                // Stop at blink waypoints — don't dash into a gap
+                if (wp.Action == WaypointAction.Blink)
+                    break;
+
+                var segDir = wp.Position - prev;
+                var segLen = segDir.Length();
+                if (segLen < 1f)
+                {
+                    prev = wp.Position;
+                    continue;
+                }
+
+                // Check alignment with travel direction
+                var dot = Vector2.Dot(Vector2.Normalize(segDir), travelDir);
+                if (dot < DashPathDeviationMax)
+                    break;
+
+                straightDist += segLen;
+                prev = wp.Position;
+            }
+
+            // Not enough straight distance ahead — don't waste the dash
+            var minStraightWorld = DashMinDistance * Pathfinding.GridToWorld;
+            if (straightDist < minStraightWorld)
+                return false;
+
+            // Aim along the travel direction
+            var aimTarget = playerWorld + travelDir * minStraightWorld;
+            var aimScreen = gc.IngameState.Camera.WorldToScreen(
+                new Vector3(aimTarget.X, aimTarget.Y, playerZ));
+
+            if (aimScreen.X <= 0 || aimScreen.X >= windowRect.Width ||
+                aimScreen.Y <= 0 || aimScreen.Y >= windowRect.Height)
+                return false;
+
+            var absPos = new Vector2(windowRect.X + aimScreen.X, windowRect.Y + aimScreen.Y);
+            if (!BotInput.CursorPressKey(absPos, dashSkill.Key))
+                return false;
+
+            dashSkill.LastUsedAt = DateTime.Now;
+            _dashActive = true;
+            _dashStartTime = DateTime.Now;
+            return true;
+        }
+
         public bool NavigateTo(GameController gc, Vector2 worldTarget, int maxNodes = 80000)
         {
             var playerPos = gc.Player.PosNum;
@@ -312,6 +425,26 @@ namespace AutoExile.Systems
 
             CurrentNavPath = Pathfinding.SmoothNavPath(pfGrid, rawPath);
             CurrentWaypointIndex = 0;
+
+            // Forward-trim: skip walk waypoints the player has already passed.
+            // Prevents stutter-stepping backward when repathing to a moving target.
+            // Uses dot product to check if player is on the "far side" of each waypoint
+            // (i.e., closer to the next waypoint than back toward this one).
+            for (int i = 0; i < CurrentNavPath.Count - 1; i++)
+            {
+                // Don't skip past blink approach points
+                if (CurrentNavPath[i + 1].Action == WaypointAction.Blink)
+                    break;
+
+                var toNext = CurrentNavPath[i + 1].Position - CurrentNavPath[i].Position;
+                var toPlayer = start - CurrentNavPath[i].Position;
+
+                if (Vector2.Dot(toNext, toPlayer) > 0)
+                    CurrentWaypointIndex = i + 1;
+                else
+                    break;
+            }
+
             if (!Destination.HasValue || Vector2.Distance(Destination.Value, worldTarget) > 100f)
                 _totalStuckRecoveries = 0;
             Destination = worldTarget;

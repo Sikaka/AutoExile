@@ -284,7 +284,12 @@ namespace AutoExile.Systems
         // Skill bar reading
         // ═══════════════════════════════════════════════════
 
-        private void RefreshSkillBar(GameController gc, BotSettings.BuildSettings settings)
+        /// <summary>
+        /// Refresh skill bar data — updates MovementSkills readiness every tick,
+        /// full rebuild every 500ms. Public so BotCore can call it even when combat is disabled
+        /// (NavigationSystem needs MovementSkills for dash-for-speed).
+        /// </summary>
+        public void RefreshSkillBar(GameController gc, BotSettings.BuildSettings settings)
         {
             // Update movement skill readiness every tick (cheap check)
             foreach (var ms in MovementSkills)
@@ -397,15 +402,23 @@ namespace AutoExile.Systems
             _skillBar.Sort((a, b) => b.Priority.CompareTo(a.Priority));
 
             // Build movement skill info list for NavigationSystem
+            // Snapshot LastUsedAt before clearing — preserve across rebuilds
+            var prevUsedTimes = new Dictionary<Keys, DateTime>();
+            foreach (var ms in MovementSkills)
+                prevUsedTimes[ms.Key] = ms.LastUsedAt;
+
             MovementSkills.Clear();
             foreach (var entry in _movementSkillEntries)
             {
+                prevUsedTimes.TryGetValue(entry.Key, out var lastUsed);
                 MovementSkills.Add(new MovementSkillInfo
                 {
                     Key = entry.Key,
                     CanCrossTerrain = entry.CanCrossTerrain,
                     IsReady = entry.Skill?.CanBeUsed ?? true,
                     ActorSkill = entry.Skill,
+                    MinCastIntervalMs = entry.MinCastIntervalMs,
+                    LastUsedAt = lastUsed,
                 });
             }
             // Sort: gap-crossers first, then by priority
@@ -847,6 +860,8 @@ namespace AutoExile.Systems
         public bool CanCrossTerrain { get; set; }
         public bool IsReady { get; set; }
         public ActorSkill? ActorSkill { get; set; }
+        public int MinCastIntervalMs { get; set; }
+        public DateTime LastUsedAt { get; set; } = DateTime.MinValue;
     }
 
     // ═══════════════════════════════════════════════════

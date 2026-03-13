@@ -920,7 +920,7 @@ namespace AutoExile.Modes
                 _lastEmptyScanAt = DateTime.MinValue;
                 var withinRadius = best.Distance <= ctx.Loot.LootRadius;
                 ctx.Interaction.PickupGroundItem(best.Entity, ctx.Navigation,
-                    requireProximity: !withinRadius, interactRange: 8f);
+                    requireProximity: !withinRadius);
                 _lootTracker.SetPending(best.Entity.Id, best.ItemName, best.ChaosValue);
                 StatusText = $"Picking up loot ({ctx.Loot.Candidates.Count} visible, {_lootTracker.PickupCount} picked, {_blight.ChestPositions.Count} chests left)";
                 return;
