@@ -95,6 +95,7 @@ namespace AutoExile.Systems
         // Chest ID→position mapping (needed for removal by event)
         private readonly Dictionary<long, Vector2> _chestEntityPositions = new();
 
+
         /// <summary>
         /// Reset all state for a new area/encounter.
         /// </summary>
@@ -314,6 +315,53 @@ namespace AutoExile.Systems
             foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
                 OnEntityAdded(entity);
             UpdateFoundationDebugText();
+        }
+
+        /// <summary>
+        /// Actively scan entity list for the pump and read its StateMachine.
+        /// Call each tick during FindPump when PumpPosition is not set — handles re-entry
+        /// after death where EntityAdded events may not re-fire for cached entities.
+        /// </summary>
+        public void ScanForPump(GameController gc)
+        {
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (entity.Type != EntityType.IngameIcon || entity.Path == null || !entity.Path.EndsWith("/BlightPump"))
+                    continue;
+
+                var pos = entity.GridPosNum;
+                if (PumpPosition.HasValue && Vector2.Distance(pos, PumpPosition.Value) > PumpRejectDistance)
+                    continue;
+
+                PumpPosition = pos;
+                PumpEntityId = entity.Id;
+                IsPumpInRange = true;
+
+                // Read StateMachine immediately — don't wait for next Tick()
+                if (entity.TryGetComponent<StateMachine>(out var states))
+                {
+                    var activated = GetStateValue(states, "activated");
+                    if (activated > 0)
+                        IsEncounterActive = true;
+
+                    var encounterDone = GetStateValue(states, "encounter_done");
+                    var success = GetStateValue(states, "success");
+                    var fail = GetStateValue(states, "fail");
+                    if (encounterDone > 0 || success > 0 || fail > 0)
+                    {
+                        IsEncounterDone = true;
+                        IsTimerDone = true;
+                        EncounterSucceeded = success > 0;
+                        TimerDoneAt ??= DateTime.Now;
+                    }
+                }
+
+                // Fallback: non-targetable pump means the encounter has been activated.
+                // The "activated" StateMachine state may not stay >0 for the entire encounter.
+                if (!IsEncounterActive && !entity.IsTargetable)
+                    IsEncounterActive = true;
+                break;
+            }
         }
 
         // =================================================================

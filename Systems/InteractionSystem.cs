@@ -162,13 +162,22 @@ namespace AutoExile.Systems
                 return InteractionResult.InProgress;
             }
 
-            // Entity gone while navigating
+            // Entity gone while navigating — could mean picked up, or just out of entity range
+            // (ground item labels are visible beyond the ~180 grid network bubble).
+            // Only count as Succeeded if we already clicked (entity vanished after click).
+            // Otherwise fail so the item gets blacklisted and we don't loop forever.
             if (entity == null && target.TargetType == InteractionTargetType.GroundItem)
             {
                 target.Nav?.Stop(gc);
-                Status = "Item gone while navigating";
+                if (_clickAttempts > 0)
+                {
+                    Status = "Item gone after click — collected";
+                    _currentTarget = null;
+                    return InteractionResult.Succeeded;
+                }
+                Status = "Item not in entity list — skipping";
                 _currentTarget = null;
-                return InteractionResult.Succeeded;
+                return InteractionResult.Failed;
             }
 
             // Start or update navigation — convert grid to world for NavigateTo
@@ -218,14 +227,34 @@ namespace AutoExile.Systems
             var (found, labelDesc) = FindGroundItemLabel(gc, target.EntityId);
             if (!found)
             {
-                Status = "Item collected (or gone)";
-                _currentTarget = null;
-                return InteractionResult.Succeeded;
+                // Label not in VisibleGroundItemLabels — check if the entity still exists.
+                // With many ground items, labels flicker in/out as the game hides overlapping labels.
+                // Only count as Succeeded if the entity is truly gone from the world.
+                var entity = FindEntity(gc, target.EntityId);
+                if (entity == null)
+                {
+                    Status = "Item collected (or gone)";
+                    _currentTarget = null;
+                    return InteractionResult.Succeeded;
+                }
+
+                // Entity still exists but label not visible — transient flicker.
+                // If we haven't clicked yet, wait for label to reappear.
+                // If we already clicked, count as success (click likely worked, label removed).
+                if (_clickAttempts > 0)
+                {
+                    Status = "Item label gone after click — assumed collected";
+                    _currentTarget = null;
+                    return InteractionResult.Succeeded;
+                }
+
+                Status = "Label not visible — waiting";
+                return InteractionResult.InProgress;
             }
 
             if (labelDesc.Label == null || !labelDesc.Label.IsVisible)
             {
-                // Label not visible — might need to get closer
+                // Label found but not visible — might need to get closer
                 if (target.RequireProximity && target.Nav != null)
                 {
                     target.Phase = InteractionPhase.Navigating;

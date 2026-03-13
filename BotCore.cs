@@ -773,6 +773,24 @@ namespace AutoExile
                     RenderName = entity.Type == ExileCore.Shared.Enums.EntityType.Player
                         ? (entity.GetComponent<ExileCore.PoEMemory.Components.Player>()?.PlayerName ?? entity.RenderName ?? "") : "",
                 };
+
+                // Capture StateMachine states for entities that have them (pump, monolith, etc.)
+                if (entity.TryGetComponent<ExileCore.PoEMemory.Components.StateMachine>(out var sm) && sm.States != null)
+                {
+                    var states = new Dictionary<string, long>();
+                    try
+                    {
+                        foreach (var s in sm.States)
+                        {
+                            if (!string.IsNullOrEmpty(s.Name))
+                                states[s.Name] = s.Value;
+                        }
+                    }
+                    catch { }
+                    if (states.Count > 0)
+                        ent.States = states;
+                }
+
                 snapshot.Entities.Add(ent);
             }
 
@@ -819,6 +837,19 @@ namespace AutoExile
             {
                 snapshot.Mode.Phase = blight.Phase.ToString();
                 snapshot.Mode.Status = blight.StatusText;
+                var bs = blight.State;
+                snapshot.Mode.Extra["pumpEntityId"] = bs.PumpEntityId;
+                snapshot.Mode.Extra["pumpPos"] = bs.PumpPosition.HasValue
+                    ? new[] { bs.PumpPosition.Value.X, bs.PumpPosition.Value.Y }
+                    : (object)Array.Empty<float>();
+                snapshot.Mode.Extra["isEncounterActive"] = bs.IsEncounterActive;
+                snapshot.Mode.Extra["isEncounterDone"] = bs.IsEncounterDone;
+                snapshot.Mode.Extra["isTimerDone"] = bs.IsTimerDone;
+                snapshot.Mode.Extra["encounterSucceeded"] = bs.EncounterSucceeded;
+                snapshot.Mode.Extra["pumpUnderAttack"] = bs.PumpUnderAttack;
+                snapshot.Mode.Extra["aliveMonsterCount"] = bs.AliveMonsterCount;
+                snapshot.Mode.Extra["chestCount"] = bs.ChestPositions.Count;
+                snapshot.Mode.Extra["deathCount"] = bs.DeathCount;
             }
             else if (_mode is FollowerMode follower)
             {

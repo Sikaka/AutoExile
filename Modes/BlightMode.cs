@@ -120,6 +120,15 @@ namespace AutoExile.Modes
             if (gc.Area?.CurrentArea != null && !gc.Area.CurrentArea.IsHideout && !gc.Area.CurrentArea.IsTown)
             {
                 _blight.Tick(gc);
+
+                // Suppress combat repositioning during phases where BlightMode drives navigation.
+                // Combat still scans threats and fires skills — just won't move the player.
+                // Only allow combat positioning in WaitForCompletion when actively fighting (no tower action).
+                bool allowCombatMovement = _phase == BlightPhase.WaitForCompletion
+                    && _towerAction == null
+                    && ctx.Combat.NearbyChaseCount > 0;
+                ctx.Combat.SuppressPositioning = !allowCombatMovement;
+
                 ctx.Combat.Tick(gc, ctx.Settings.Build);
             }
 
@@ -254,21 +263,31 @@ namespace AutoExile.Modes
 
         private void TickFindPump(BotContext ctx)
         {
+            var gc = ctx.Game;
+
+            // Actively scan for pump each tick — EntityAdded events may not re-fire
+            // on re-entry to the same map instance (e.g. after death via portal).
+            if (!_blight.PumpPosition.HasValue)
+                _blight.ScanForPump(gc);
+
+            // Check encounter-active FIRST — on re-entry after death, the encounter
+            // is already running. If pump is found + encounter active, skip straight
+            // to the right phase (don't go through NavigateToPump → StartEncounter).
+            if (_blight.IsEncounterActive)
+            {
+                _phase = _blight.IsTimerDone ? BlightPhase.WaitForCompletion : BlightPhase.TowerManagement;
+                _phaseStartTime = DateTime.Now;
+                _nudgedForPump = false;
+                StatusText = "Encounter already active — resuming";
+                return;
+            }
+
             if (_blight.PumpPosition.HasValue)
             {
                 _phase = BlightPhase.NavigateToPump;
                 _phaseStartTime = DateTime.Now;
                 _nudgedForPump = false;
                 StatusText = "Pump found — navigating";
-                return;
-            }
-
-            if (_blight.IsEncounterActive)
-            {
-                _phase = BlightPhase.TowerManagement;
-                _phaseStartTime = DateTime.Now;
-                _nudgedForPump = false;
-                StatusText = "Encounter already active — managing towers";
                 return;
             }
 
@@ -279,7 +298,6 @@ namespace AutoExile.Modes
             if (!_nudgedForPump && elapsed > 2)
             {
                 _nudgedForPump = true;
-                var gc = ctx.Game;
                 var playerGrid = gc.Player.GridPosNum;
                 var nudgeTarget = new Vector2(playerGrid.X + 5, playerGrid.Y) * Systems.Pathfinding.GridToWorld;
                 ctx.Navigation.NavigateTo(gc, nudgeTarget);
@@ -287,12 +305,10 @@ namespace AutoExile.Modes
                 return;
             }
 
-            StatusText = "Searching for blight pump...";
-
-            if (elapsed > 30)
+            // After 5s, check for blight entities as evidence of an active encounter
+            // (pump entity may not be in the entity list but towers/monsters are)
+            if (elapsed > 5)
             {
-                // Pump not found — but if we see blight entities (towers, monsters),
-                // the encounter is in progress (re-entry after death). Skip to sweep.
                 bool hasBlightEntities = _blight.CachedTowers.Count > 0 ||
                     _blight.CachedMonsters.Values.Any(m => m.AssumedAlive);
 
@@ -306,7 +322,12 @@ namespace AutoExile.Modes
                     StatusText = "Pump not found but blight entities present — sweeping";
                     return;
                 }
+            }
 
+            StatusText = "Searching for blight pump...";
+
+            if (elapsed > 30)
+            {
                 StatusText = "No pump found — timeout";
                 _phase = BlightPhase.Done;
             }

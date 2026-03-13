@@ -36,6 +36,8 @@ namespace AutoExile.Systems
         public string ShortName { get; set; } = "";
         /// <summary>Character name for Player entities, empty otherwise.</summary>
         public string RenderName { get; set; } = "";
+        /// <summary>StateMachine states (name→value), if the entity has a StateMachine component.</summary>
+        public Dictionary<string, long>? States { get; set; }
     }
 
     public enum EntityCategory
