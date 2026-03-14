@@ -432,8 +432,14 @@ namespace AutoExile.Systems
                     if (entity.TryGetComponent<StateMachine>(out var states))
                     {
                         var activated = GetStateValue(states, "activated");
-                        IsEncounterActive = activated > 0;
+                        if (activated > 0)
+                            IsEncounterActive = true;
                     }
+                    // Fallback: non-targetable pump means encounter is active.
+                    // The "activated" state is a trigger that may not stay >0 for the
+                    // entire encounter — once set, IsEncounterActive should never flip back.
+                    if (!IsEncounterActive && !entity.IsTargetable)
+                        IsEncounterActive = true;
                     continue;
                 }
             }
