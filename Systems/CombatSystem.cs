@@ -258,6 +258,9 @@ namespace AutoExile.Systems
 
                 if (!entity.IsAlive || !entity.IsTargetable) continue;
 
+                // Skip monsters trapped inside essence monoliths (cannot be damaged until released)
+                if (IsInsideMonolith(entity)) continue;
+
                 cachedCount++;
 
                 // Track nearest monster (for awareness-tier navigation)
@@ -891,6 +894,19 @@ namespace AutoExile.Systems
             if (path.Contains("CannotDie", StringComparison.OrdinalIgnoreCase))
                 return true;
 
+            return false;
+        }
+
+        private static bool IsInsideMonolith(Entity entity)
+        {
+            try
+            {
+                var stats = entity.GetComponent<Stats>();
+                if (stats?.StatDictionary != null &&
+                    stats.StatDictionary.TryGetValue(GameStat.MonsterInsideMonolith, out var val) && val > 0)
+                    return true;
+            }
+            catch { }
             return false;
         }
 

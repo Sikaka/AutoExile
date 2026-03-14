@@ -22,12 +22,23 @@ namespace AutoExile.Mechanics
         public IReadOnlyList<IMapMechanic> DetectedMechanics => _detected;
         private readonly List<IMapMechanic> _detected = new();
 
-        /// <summary>Mechanics that have been completed this map.</summary>
+        /// <summary>
+        /// Non-repeatable mechanics that have been completed this map.
+        /// Repeatable mechanics are reset after completion and won't appear here.
+        /// Use CompletionCounts for full history.
+        /// </summary>
         public IReadOnlyList<IMapMechanic> CompletedMechanics => _completed;
         private readonly List<IMapMechanic> _completed = new();
 
         /// <summary>All registered mechanics.</summary>
         public IReadOnlyList<IMapMechanic> AllMechanics => _mechanics;
+
+        /// <summary>
+        /// How many times each mechanic has completed this map (by name).
+        /// Includes both repeatable and non-repeatable mechanics.
+        /// </summary>
+        public IReadOnlyDictionary<string, int> CompletionCounts => _completionCounts;
+        private readonly Dictionary<string, int> _completionCounts = new();
 
         public void Register(IMapMechanic mechanic)
         {
@@ -37,11 +48,11 @@ namespace AutoExile.Mechanics
         /// <summary>
         /// Check if all Required mechanics have been completed (or failed/abandoned).
         /// Used by MappingMode to decide if map is "done".
+        /// For repeatable mechanics, "Required" means at least one completion.
         /// </summary>
         public bool AllRequiredComplete(BotSettings.MechanicsSettings settings)
         {
-            // For now we only have Ultimatum. When more are added, check each.
-            // A Required mechanic is satisfied if: completed, failed, abandoned, or not found.
+            // A Required mechanic is satisfied if: completed at least once, or not found.
             // "Not found" is handled by MappingMode's coverage threshold — if 90%+ explored
             // and mechanic not detected, it's not in this map.
             foreach (var m in _mechanics)
@@ -49,7 +60,11 @@ namespace AutoExile.Mechanics
                 var mode = GetMechanicMode(m, settings);
                 if (mode != MechanicMode.Required) continue;
 
-                // If detected but not in a terminal state, it's not done
+                // Has it completed at least once?
+                if (_completionCounts.TryGetValue(m.Name, out var count) && count > 0)
+                    continue;
+
+                // If detected or active but not yet completed, it's not done
                 if (_detected.Contains(m) && !m.IsComplete)
                     return false;
                 if (_active == m && !m.IsComplete)
@@ -73,6 +88,7 @@ namespace AutoExile.Mechanics
             foreach (var mechanic in _mechanics)
             {
                 if (mechanic.IsComplete) continue;
+                // Non-repeatable mechanics stay in _completed once done
                 if (_completed.Contains(mechanic)) continue;
 
                 var mode = GetMechanicMode(mechanic, ctx.Settings.Mechanics);
@@ -80,8 +96,11 @@ namespace AutoExile.Mechanics
 
                 if (mechanic.Detect(ctx) && !_detected.Contains(mechanic))
                 {
+                    var countStr = "";
+                    if (mechanic.IsRepeatable && _completionCounts.TryGetValue(mechanic.Name, out var c) && c > 0)
+                        countStr = $" (#{c + 1})";
                     _detected.Add(mechanic);
-                    ctx.Log($"[Mechanics] Detected: {mechanic.Name} at {mechanic.AnchorGridPos}");
+                    ctx.Log($"[Mechanics] Detected: {mechanic.Name}{countStr} at {mechanic.AnchorGridPos}");
                 }
             }
 
@@ -104,7 +123,8 @@ namespace AutoExile.Mechanics
 
         /// <summary>
         /// Tick the active mechanic. Returns the result.
-        /// On terminal results, moves mechanic to completed list and clears active.
+        /// On terminal results, records completion and clears active.
+        /// Repeatable mechanics are Reset() so they can detect the next encounter.
         /// </summary>
         public MechanicResult TickActive(BotContext ctx)
         {
@@ -116,10 +136,23 @@ namespace AutoExile.Mechanics
                 result == MechanicResult.Abandoned ||
                 result == MechanicResult.Failed)
             {
-                ctx.Log($"[Mechanics] {_active.Name} finished: {result}");
-                if (!_completed.Contains(_active))
-                    _completed.Add(_active);
+                var name = _active.Name;
+                _completionCounts[name] = _completionCounts.GetValueOrDefault(name) + 1;
+                ctx.Log($"[Mechanics] {name} finished: {result} (total: {_completionCounts[name]})");
+
                 _detected.Remove(_active);
+
+                if (_active.IsRepeatable)
+                {
+                    // Reset so it can detect the next encounter
+                    _active.Reset();
+                }
+                else
+                {
+                    if (!_completed.Contains(_active))
+                        _completed.Add(_active);
+                }
+
                 _active = null;
             }
 
@@ -133,9 +166,22 @@ namespace AutoExile.Mechanics
         public void ForceCompleteActive()
         {
             if (_active == null) return;
-            if (!_completed.Contains(_active))
-                _completed.Add(_active);
+
+            var name = _active.Name;
+            _completionCounts[name] = _completionCounts.GetValueOrDefault(name) + 1;
+
             _detected.Remove(_active);
+
+            if (_active.IsRepeatable)
+            {
+                _active.Reset();
+            }
+            else
+            {
+                if (!_completed.Contains(_active))
+                    _completed.Add(_active);
+            }
+
             _active = null;
         }
 
@@ -147,6 +193,7 @@ namespace AutoExile.Mechanics
             _active = null;
             _detected.Clear();
             _completed.Clear();
+            _completionCounts.Clear();
             _lastDetectTime = DateTime.MinValue;
             foreach (var m in _mechanics)
                 m.Reset();
@@ -161,6 +208,7 @@ namespace AutoExile.Mechanics
             {
                 CompletedNames = _completed.Select(m => m.Name).ToHashSet(),
                 DetectedNames = _detected.Select(m => m.Name).ToHashSet(),
+                CompletionCounts = new Dictionary<string, int>(_completionCounts),
             };
         }
 
@@ -173,14 +221,28 @@ namespace AutoExile.Mechanics
             _active = null;
             _detected.Clear();
             _completed.Clear();
+            _completionCounts.Clear();
             _lastDetectTime = DateTime.MinValue;
 
             foreach (var m in _mechanics)
             {
                 m.Reset();
-                if (snapshot.CompletedNames.Contains(m.Name))
+                // Non-repeatable: put back in completed list so they won't re-detect
+                if (!m.IsRepeatable && snapshot.CompletedNames.Contains(m.Name))
                     _completed.Add(m);
             }
+
+            // Restore counts for all mechanics (repeatable and non-repeatable)
+            foreach (var kvp in snapshot.CompletionCounts)
+                _completionCounts[kvp.Key] = kvp.Value;
+        }
+
+        /// <summary>
+        /// Get the total completion count for a mechanic by name.
+        /// </summary>
+        public int GetCompletionCount(string name)
+        {
+            return _completionCounts.GetValueOrDefault(name);
         }
 
         private MechanicMode GetMechanicMode(IMapMechanic mechanic, BotSettings.MechanicsSettings settings)
@@ -191,6 +253,7 @@ namespace AutoExile.Mechanics
                 "Ultimatum" => ParseMode(settings.Ultimatum.Mode.Value),
                 "Harvest" => ParseMode(settings.Harvest.Mode.Value),
                 "Wishes" => ParseMode(settings.Wishes.Mode.Value),
+                "Essence" => ParseMode(settings.Essence.Mode.Value),
                 _ => MechanicMode.Skip,
             };
         }
@@ -206,5 +269,6 @@ namespace AutoExile.Mechanics
     {
         public HashSet<string> CompletedNames = new();
         public HashSet<string> DetectedNames = new();
+        public Dictionary<string, int> CompletionCounts = new();
     }
 }

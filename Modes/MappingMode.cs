@@ -768,7 +768,19 @@ namespace AutoExile.Modes
 
                 foreach (var m in ctx.Mechanics.CompletedMechanics)
                 {
-                    g.DrawText($"  Done: {m.Name}", new Vector2(hudX, hudY), SharpDX.Color.LimeGreen);
+                    var count = ctx.Mechanics.GetCompletionCount(m.Name);
+                    var countStr = count > 1 ? $" (x{count})" : "";
+                    g.DrawText($"  Done: {m.Name}{countStr}", new Vector2(hudX, hudY), SharpDX.Color.LimeGreen);
+                    hudY += lineH - 2;
+                }
+
+                // Show repeatable mechanics that aren't in _completed but have completions
+                foreach (var kvp in ctx.Mechanics.CompletionCounts)
+                {
+                    if (ctx.Mechanics.CompletedMechanics.Any(m => m.Name == kvp.Key)) continue;
+                    if (ctx.Mechanics.ActiveMechanic?.Name == kvp.Key) continue;
+                    var countStr = kvp.Value > 1 ? $" (x{kvp.Value})" : "";
+                    g.DrawText($"  Done: {kvp.Key}{countStr}", new Vector2(hudX, hudY), SharpDX.Color.LimeGreen);
                     hudY += lineH - 2;
                 }
             }

@@ -67,7 +67,7 @@ namespace AutoExile
             // ── Movement ──
 
             [Menu("Blink Range", "Max grid distance for gap-jumping with movement skills. Gaps wider than this won't be attempted.")]
-            public RangeNode<int> BlinkRange { get; set; } = new RangeNode<int>(25, 5, 50);
+            public RangeNode<int> BlinkRange { get; set; } = new RangeNode<int>(40, 5, 50);
 
             [Menu("Dash Min Distance", "Min straight-line grid distance ahead before using dash for speed. Too low and dash animation lock is slower than walking. 0 = disable dash-for-speed.")]
             public RangeNode<int> DashMinDistance { get; set; } = new RangeNode<int>(60, 0, 200);
@@ -229,16 +229,16 @@ namespace AutoExile
             public TextNode LeaderName { get; set; } = new TextNode("");
 
             [Menu("Follow Distance", "Start following when leader is farther than this (grid units).")]
-            public RangeNode<float> FollowDistance { get; set; } = new RangeNode<float>(28f, 5f, 100f);
+            public RangeNode<int> FollowDistance { get; set; } = new RangeNode<int>(28, 5, 100);
 
             [Menu("Stop Distance", "Stop moving when within this distance of leader (grid units).")]
-            public RangeNode<float> StopDistance { get; set; } = new RangeNode<float>(14f, 3f, 50f);
+            public RangeNode<int> StopDistance { get; set; } = new RangeNode<int>(14, 3, 50);
 
             [Menu("Follow Through Transitions", "Follow leader through area transitions.")]
-            public ToggleNode FollowThroughTransitions { get; set; } = new ToggleNode(false);
+            public ToggleNode FollowThroughTransitions { get; set; } = new ToggleNode(true);
 
             [Menu("Enable Combat", "Fight monsters while following. Uses build skill/flask settings.")]
-            public ToggleNode EnableCombat { get; set; } = new ToggleNode(true);
+            public ToggleNode EnableCombat { get; set; } = new ToggleNode(false);
 
             [Menu("Enable Standard Loot", "Pick up all filtered loot while following. When off, only quest items are grabbed.")]
             public ToggleNode EnableLoot { get; set; } = new ToggleNode(false);
@@ -386,6 +386,7 @@ namespace AutoExile
             public UltimatumMechanicSettings Ultimatum { get; set; } = new UltimatumMechanicSettings();
             public HarvestMechanicSettings Harvest { get; set; } = new HarvestMechanicSettings();
             public WishesMechanicSettings Wishes { get; set; } = new WishesMechanicSettings();
+            public EssenceMechanicSettings Essence { get; set; } = new EssenceMechanicSettings();
             public InteractableSettings Interactables { get; set; } = new InteractableSettings();
         }
 
@@ -471,6 +472,33 @@ namespace AutoExile
 
             [Menu("Loot Sweep Seconds", "How long to loot in the wish zone before returning.")]
             public RangeNode<float> LootSweepSeconds { get; set; } = new RangeNode<float>(5f, 1f, 15f);
+        }
+
+        [Submenu(CollapsedByDefault = false)]
+        public class EssenceMechanicSettings
+        {
+            public EssenceMechanicSettings()
+            {
+                Mode.SetListValues(Enum.GetNames<MechanicMode>().ToList());
+                Mode.Value = MechanicMode.Optional.ToString();
+                MinEssenceTier.SetListValues(new List<string> {
+                    "Any", "Whispering", "Muttering", "Weeping", "Wailing",
+                    "Screaming", "Shrieking", "Deafening"
+                });
+                MinEssenceTier.Value = "Any";
+            }
+
+            [Menu("Mode", "Skip=ignore, Optional=do if found, Required=must complete for map done.")]
+            public ListNode Mode { get; set; } = new ListNode();
+
+            [Menu("Min Essence Tier", "Skip encounters below this tier. 'Any' = always do.")]
+            public ListNode MinEssenceTier { get; set; } = new ListNode();
+
+            [Menu("Corrupt Essences", "Use Vaal Orb on encounters with corruption-target essences (Misery/Envy/Dread/Scorn → Insanity/Horror/Delirium/Hysteria).")]
+            public ToggleNode CorruptEssences { get; set; } = new ToggleNode(true);
+
+            [Menu("Loot Sweep Seconds", "How long to loot after killing the essence monster.")]
+            public RangeNode<float> LootSweepSeconds { get; set; } = new RangeNode<float>(3f, 1f, 10f);
         }
 
         [Submenu(CollapsedByDefault = false)]

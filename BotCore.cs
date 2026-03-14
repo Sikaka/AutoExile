@@ -101,6 +101,7 @@ namespace AutoExile
             _mechanics.Register(new UltimatumMechanic());
             _mechanics.Register(new HarvestMechanic());
             _mechanics.Register(new WishesMechanic());
+            _mechanics.Register(new EssenceMechanic());
 
             // Populate mode dropdown and restore saved selection
             Settings.ActiveMode.SetListValues(_modes.Keys.ToList());
@@ -388,9 +389,15 @@ namespace AutoExile
             var b = Settings.Build;
             var l = Settings.Loot;
 
+            CheckRange("Blink Range", b.BlinkRange.Value);
+            CheckRange("Dash Min Distance", b.DashMinDistance.Value);
             CheckRange("Fight Range", b.FightRange.Value);
             CheckRange("Combat Range", b.CombatRange.Value);
             CheckRange("Loot Radius", l.LootRadius.Value);
+
+            var f = Settings.Follower;
+            CheckRange("Follow Distance", f.FollowDistance.Value);
+            CheckRange("Stop Distance", f.StopDistance.Value);
 
             // Per-skill MaxTargetRange
             int i = 1;

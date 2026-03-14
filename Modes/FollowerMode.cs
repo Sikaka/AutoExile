@@ -857,7 +857,8 @@ namespace AutoExile.Modes
                 if (!entity.IsTargetable)
                     continue;
 
-                var isPortal = entity.Type == EntityType.TownPortal || entity.Type == EntityType.Portal;
+                var isPortal = entity.Type == EntityType.TownPortal || entity.Type == EntityType.Portal
+                    || IsLeagueMechanicPortal(entity);
                 var isTransition = entity.Type == EntityType.AreaTransition;
 
                 if (isPortal && !includePortals) continue;
@@ -874,6 +875,20 @@ namespace AutoExile.Modes
             }
 
             return best;
+        }
+
+        /// <summary>
+        /// Detect league mechanic portals that use non-standard EntityTypes (e.g., Effect, MiscellaneousObjects)
+        /// instead of Portal/TownPortal/AreaTransition.
+        /// </summary>
+        private static bool IsLeagueMechanicPortal(Entity entity)
+        {
+            var path = entity.Path;
+            if (string.IsNullOrEmpty(path)) return false;
+
+            return path.Contains("SekhemaPortal")            // Faridun wishes return portal (type: Effect)
+                || path.Contains("Faridun/DjinnPortal")      // Faridun wishes entry portal
+                || path.Contains("HarvestPortalToggleable"); // Harvest portals (entrance + return)
         }
 
         private static Vector2 GetPlayerGrid(GameController gc)

@@ -62,6 +62,13 @@ namespace AutoExile.Mechanics
         bool IsComplete { get; }
 
         /// <summary>
+        /// True if this mechanic can appear multiple times per map (e.g., Essences).
+        /// After completion, the mechanic is Reset() so it can detect the next encounter.
+        /// Required mode is satisfied once at least one encounter is completed.
+        /// </summary>
+        bool IsRepeatable => false;
+
+        /// <summary>
         /// Run one tick of the mechanic's logic. MappingMode delegates entirely when active.
         /// Handles navigation to anchor, starting encounter, wave management, reward collection.
         /// </summary>
