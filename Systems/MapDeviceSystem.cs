@@ -423,14 +423,25 @@ namespace AutoExile.Systems
 
         private Entity? FindMapDevice(GameController gc)
         {
+            Entity? fallback = null;
+
             foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
             {
-                if (entity.Type == EntityType.IngameIcon &&
-                    entity.Path != null &&
-                    entity.Path.Contains("MappingDevice"))
+                if (!entity.IsTargetable)
+                    continue;
+
+                // Primary: RenderName exactly "Map Device" — works for standard and variant devices
+                // (variant decorative piece is "Map Device 1", so exact match avoids it)
+                if (entity.RenderName == "Map Device")
                     return entity;
+
+                // Fallback: standard map device by path (legacy detection)
+                if (fallback == null && entity.Type == EntityType.IngameIcon &&
+                    entity.Path != null && entity.Path.Contains("MappingDevice"))
+                    fallback = entity;
             }
-            return null;
+
+            return fallback;
         }
 
         private Entity? FindNearestPortal(GameController gc)

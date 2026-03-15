@@ -43,8 +43,10 @@ namespace AutoExile.Modes
         private bool _hasLastLeaderPos;
         private string _lastAreaName = "";
 
-        // Repath anti-oscillation — reject new paths that reverse current travel direction
-        private DateTime _lastRepathTime = DateTime.MinValue;
+        // LOS→pathfind hysteresis — once we switch to pathfinding, stay on the path
+        // briefly before re-checking LOS to avoid flicker near terrain corners
+        private DateTime _lastPathStartTime = DateTime.MinValue;
+        private const float PathHysteresisMs = 500f;
 
         // Transition following
         private Vector2? _transitionGridPos; // grid pos of transition we're heading to (entity ref may go stale)
@@ -142,15 +144,20 @@ namespace AutoExile.Modes
             }
 
             var playerGridPos = GetPlayerGrid(gc);
+            var isHideout = gc.Area?.CurrentArea?.IsHideout == true;
 
-            // Combat — tick every frame when enabled
-            if (EnableCombat)
+            // In hideout: skip combat/loot/skills — only decision is teleport or portal
+            if (!isHideout)
             {
-                // Suppress repositioning when we're navigating (following leader or heading to transition)
-                // Suppress targeted skills during loot pickup to avoid cursor interference
-                ctx.Combat.SuppressPositioning = ctx.Navigation.IsNavigating || ctx.Interaction.IsBusy;
-                ctx.Combat.SuppressTargetedSkills = ctx.Interaction.IsBusy;
-                ctx.Combat.Tick(ctx);
+                // Combat — tick every frame when enabled
+                if (EnableCombat)
+                {
+                    // Suppress repositioning when we're navigating (following leader or heading to transition)
+                    // Suppress targeted skills during loot pickup to avoid cursor interference
+                    ctx.Combat.SuppressPositioning = ctx.Navigation.IsNavigating || ctx.Interaction.IsBusy;
+                    ctx.Combat.SuppressTargetedSkills = ctx.Interaction.IsBusy;
+                    ctx.Combat.Tick(ctx);
+                }
             }
 
             // Tick interaction system (for transition clicks and loot pickups)
@@ -213,8 +220,9 @@ namespace AutoExile.Modes
                 HandleLeaderMissing(ctx, gc, playerGridPos);
             }
 
-            // Loot and quest interactions — skip when busy with transitions/teleport.
-            if (_state != FollowerState.NavigatingToTransition && _state != FollowerState.ClickingTransition
+            // Loot and quest interactions — skip in hideout and when busy with transitions/teleport.
+            if (!isHideout
+                && _state != FollowerState.NavigatingToTransition && _state != FollowerState.ClickingTransition
                 && _state != FollowerState.TeleportingViaParty)
             {
                 TickLoot(ctx, gc, leader, playerGridPos);
@@ -267,6 +275,18 @@ namespace AutoExile.Modes
             _lastLeaderPos = leaderGridPos;
             _hasLastLeaderPos = true;
 
+            // In hideout: don't follow the leader around — just idle and track position.
+            // The only meaningful actions (portal/teleport) happen in HandleLeaderMissing.
+            if (gc.Area?.CurrentArea?.IsHideout == true)
+            {
+                if (ctx.Navigation.IsNavigating)
+                    ctx.Navigation.Stop(gc);
+                _state = FollowerState.NearLeader;
+                _status = $"Hideout — waiting near {LeaderName}";
+                _decision = "hideout_idle";
+                return;
+            }
+
             // If we're chasing a transition but leader is visible and close, cancel that
             if (_state == FollowerState.NavigatingToTransition || _state == FollowerState.ClickingTransition)
             {
@@ -296,51 +316,42 @@ namespace AutoExile.Modes
             if (dist > FollowDistance)
             {
                 var leaderWorldPos = leaderGridPos * Pathfinding.GridToWorld;
-                var destDrift = Vector2.Distance(ctx.Navigation.Destination ?? Vector2.Zero, leaderWorldPos);
+                var playerWorldPos = playerGridPos * Pathfinding.GridToWorld;
 
-                if (!ctx.Navigation.IsNavigating)
+                // Check walkable LOS to leader
+                var hasLOS = ctx.Navigation.HasWalkableLOS(gc, playerWorldPos, leaderWorldPos);
+
+                // Hysteresis: if we recently started a path, don't switch back to LOS movement
+                // too quickly — prevents flicker near terrain corners
+                var pathAge = (DateTime.Now - _lastPathStartTime).TotalMilliseconds;
+                var preferPath = ctx.Navigation.IsNavigating && pathAge < PathHysteresisMs;
+
+                if (hasLOS && !preferPath)
                 {
-                    // Not navigating — start immediately
-                    ctx.Navigation.NavigateTo(gc, leaderWorldPos);
-                    _lastRepathTime = DateTime.Now;
+                    // LOS clear — direct movement, no pathfinding
+                    ctx.Navigation.MoveToward(gc, leaderWorldPos);
+                    _state = FollowerState.Following;
+                    _status = $"Following {LeaderName} (LOS, dist: {dist:F0})";
+                    _decision = "following_los";
                 }
-                else if (destDrift > FollowDistance * Pathfinding.GridToWorld)
+                else if (ctx.Navigation.IsNavigating)
                 {
-                    // Leader moved enough to warrant a repath — but check for oscillation.
-                    // Capture our current travel direction before repathing.
-                    var currentDir = GetCurrentTravelDirection(ctx);
-
+                    // No LOS (or hysteresis active) but already have a path — graft destination
+                    ctx.Navigation.UpdateDestination(gc, leaderWorldPos,
+                        driftThreshold: FollowDistance * Pathfinding.GridToWorld);
+                    _state = FollowerState.Following;
+                    _status = $"Following {LeaderName} (path, dist: {dist:F0})";
+                    _decision = "following_path_update";
+                }
+                else
+                {
+                    // No LOS, no active path — start fresh pathfinding
                     if (ctx.Navigation.NavigateTo(gc, leaderWorldPos))
-                    {
-                        // If we had a travel direction, check the new path doesn't reverse it.
-                        // Reject if the new path's initial direction opposes current travel —
-                        // that means A* picked the other side of an obstacle.
-                        if (currentDir.HasValue)
-                        {
-                            var newDir = GetCurrentTravelDirection(ctx);
-                            if (newDir.HasValue)
-                            {
-                                var dot = Vector2.Dot(currentDir.Value, newDir.Value);
-                                if (dot < -0.3f)
-                                {
-                                    // New path reverses direction — reject it, restore old direction.
-                                    // NavigateTo already replaced the path, so re-navigate along
-                                    // the old bearing by targeting a point ahead in the original direction.
-                                    var playerWorldPos = playerGridPos * Pathfinding.GridToWorld;
-                                    var continueTarget = playerWorldPos + currentDir.Value * FollowDistance * Pathfinding.GridToWorld;
-                                    ctx.Navigation.NavigateTo(gc, continueTarget);
-                                    _decision = "following (anti-oscillation)";
-                                }
-                            }
-                        }
-                        _lastRepathTime = DateTime.Now;
-                    }
+                        _lastPathStartTime = DateTime.Now;
+                    _state = FollowerState.Following;
+                    _status = $"Following {LeaderName} (new path, dist: {dist:F0})";
+                    _decision = "following_new_path";
                 }
-
-                _state = FollowerState.Following;
-                _status = $"Following {LeaderName} (dist: {dist:F0})";
-                if (_decision != "following (anti-oscillation)")
-                    _decision = "following";
             }
             else if (dist < StopDistance)
             {
@@ -353,7 +364,15 @@ namespace AutoExile.Modes
             }
             else
             {
-                // In the follow/stop gap — keep current navigation but don't start new
+                // In the follow/stop gap — keep current navigation but don't start new.
+                // If no active path, keep direct-moving toward leader when LOS is clear.
+                if (!ctx.Navigation.IsNavigating)
+                {
+                    var leaderWorldPos = leaderGridPos * Pathfinding.GridToWorld;
+                    var playerWorldPos = playerGridPos * Pathfinding.GridToWorld;
+                    if (ctx.Navigation.HasWalkableLOS(gc, playerWorldPos, leaderWorldPos))
+                        ctx.Navigation.MoveToward(gc, leaderWorldPos);
+                }
                 _state = FollowerState.Following;
                 _status = $"Following {LeaderName} (dist: {dist:F0})";
                 _decision = "in_range";
@@ -408,6 +427,22 @@ namespace AutoExile.Modes
                             _decision = "searching_town_no_teleport";
                         }
                     }
+                    // In hideout: leader left through a map device portal.
+                    // Use smart portal selection — match by zone name or pick 2nd nearest
+                    // (nearest is the one leader used, about to vanish).
+                    else if (areaInfo is { IsHideout: true })
+                    {
+                        if (TryFollowLeaderThroughHideoutPortal(ctx, gc))
+                        {
+                            // sets state/status/decision
+                        }
+                        else
+                        {
+                            _state = FollowerState.SearchingForLeader;
+                            _status = $"Searching for {LeaderName} (hideout, no portals)...";
+                            _decision = "searching_hideout_no_portal";
+                        }
+                    }
                     // In maps: try portals/transitions to follow leader through exits.
                     else if (_hasLastLeaderPos && TryFollowLeaderExit(ctx, gc, _lastLeaderPos))
                     {
@@ -427,29 +462,6 @@ namespace AutoExile.Modes
                     _decision = "searching";
                     break;
             }
-        }
-
-        /// <summary>
-        /// Get the normalized direction the player is currently traveling along the nav path.
-        /// Returns null if not navigating or path is too short.
-        /// </summary>
-        private static Vector2? GetCurrentTravelDirection(BotContext ctx)
-        {
-            var nav = ctx.Navigation;
-            if (!nav.IsNavigating || nav.CurrentNavPath.Count < 2)
-                return null;
-
-            var idx = nav.CurrentWaypointIndex;
-            if (idx >= nav.CurrentNavPath.Count)
-                return null;
-
-            // Direction from previous waypoint (or path start) toward current target waypoint
-            var from = idx > 0 ? nav.CurrentNavPath[idx - 1].Position : nav.CurrentNavPath[0].Position;
-            var to = nav.CurrentNavPath[idx].Position;
-            var dir = to - from;
-            var len = dir.Length();
-            if (len < 1f) return null;
-            return dir / len;
         }
 
         // ─── Loot ─────────────────────────────────────────────────────
@@ -831,6 +843,109 @@ namespace AutoExile.Modes
             {
                 return false;
             }
+        }
+
+        /// <summary>
+        /// In hideout, find the right map device portal to follow the leader.
+        /// Strategy: get leader's zone from party UI, then try to match portal RenderName.
+        /// Fallback: pick 2nd nearest portal (nearest is the one leader just used, about to vanish).
+        /// </summary>
+        private bool TryFollowLeaderThroughHideoutPortal(BotContext ctx, GameController gc)
+        {
+            var portals = FindAllPortals(gc);
+            if (portals.Count == 0)
+                return false;
+
+            // Try to get leader's current zone from party UI
+            var leaderZone = GetLeaderZoneFromPartyUI(gc);
+
+            // Strategy 1: match portal RenderName to leader's zone
+            if (!string.IsNullOrEmpty(leaderZone))
+            {
+                foreach (var portal in portals)
+                {
+                    var renderName = portal.RenderName;
+                    if (!string.IsNullOrEmpty(renderName) &&
+                        leaderZone.Contains(renderName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        ctx.Log($"Hideout: matched portal '{renderName}' to leader zone '{leaderZone}'");
+                        return StartNavigationToEntity(ctx, gc, portal);
+                    }
+                }
+            }
+
+            // Strategy 2: pick 2nd nearest portal, skipping the one closest to leader's last position
+            // (that's the one the leader used and it's about to vanish)
+            if (portals.Count == 1)
+            {
+                // Only one portal — use it (no choice)
+                ctx.Log("Hideout: only 1 portal available, using it");
+                return StartNavigationToEntity(ctx, gc, portals[0]);
+            }
+
+            // Sort by distance to leader's last known position (nearest = leader's portal)
+            var playerGridPos = GetPlayerGrid(gc);
+            var referencePos = _hasLastLeaderPos ? _lastLeaderPos : playerGridPos;
+
+            portals.Sort((a, b) =>
+            {
+                var da = Vector2.Distance(referencePos, new Vector2(a.GridPosNum.X, a.GridPosNum.Y));
+                var db = Vector2.Distance(referencePos, new Vector2(b.GridPosNum.X, b.GridPosNum.Y));
+                return da.CompareTo(db);
+            });
+
+            // Pick the 2nd nearest (index 1) — skip the leader's portal
+            var target = portals[1];
+            var targetPos = new Vector2(target.GridPosNum.X, target.GridPosNum.Y);
+            ctx.Log($"Hideout: using 2nd nearest portal (skip leader's) at ({targetPos.X:F0},{targetPos.Y:F0}), " +
+                    $"leader zone: '{leaderZone ?? "unknown"}'");
+            return StartNavigationToEntity(ctx, gc, target);
+        }
+
+        /// <summary>
+        /// Get the leader's current zone name from the party UI.
+        /// Returns null if party UI isn't visible or leader not found.
+        /// </summary>
+        private string? GetLeaderZoneFromPartyUI(GameController gc)
+        {
+            try
+            {
+                var partyElement = gc.IngameState?.IngameUi?.PartyElement;
+                if (partyElement?.IsVisible != true)
+                    return null;
+
+                var playerElements = partyElement.PlayerElements;
+                if (playerElements == null)
+                    return null;
+
+                foreach (var pe in playerElements)
+                {
+                    if (pe?.PlayerName == LeaderName)
+                        return pe.ZoneName;
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        /// <summary>
+        /// Find all targetable portals in the current area.
+        /// </summary>
+        private List<Entity> FindAllPortals(GameController gc)
+        {
+            var result = new List<Entity>();
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (!entity.IsTargetable)
+                    continue;
+
+                if (entity.Type == EntityType.TownPortal || entity.Type == EntityType.Portal
+                    || IsLeagueMechanicPortal(entity))
+                {
+                    result.Add(entity);
+                }
+            }
+            return result;
         }
 
         private Entity? FindLeader(GameController gc)

@@ -942,10 +942,13 @@ namespace AutoExile.Mechanics
                 Positioning = ctx.Combat.Profile.Positioning,
             };
 
+            var effectiveRadius = GetEffectiveOrbitRadius(settings.OrbitRadius.Value);
             ctx.Combat.SetProfile(new CombatProfile
             {
                 Enabled = true,
                 Positioning = CombatPositioning.Ranged,
+                LeashAnchor = AnchorGridPos,
+                LeashRadius = effectiveRadius,
             });
         }
 

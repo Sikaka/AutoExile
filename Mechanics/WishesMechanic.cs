@@ -54,8 +54,8 @@ namespace AutoExile.Mechanics
         private const float ClickCooldownMs = 500;
         private const float PhaseTimeoutSeconds = 30;
 
-        // Wishes UI indices (IngameUi child)
-        private const int WishesPanelIndex = 177;
+        // Wishes panel — discovered dynamically, cached until reset
+        private int _wishesPanelIndex = -1;
 
         public bool Detect(BotContext ctx)
         {
@@ -140,6 +140,7 @@ namespace AutoExile.Mechanics
             Status = "";
             _wishClickAttempts = 0;
             _confirmClickAttempts = 0;
+            _wishesPanelIndex = -1;
         }
 
         // ═══════════════════════════════════════════════════
@@ -267,6 +268,18 @@ namespace AutoExile.Mechanics
                 return MechanicResult.InProgress;
             }
 
+            // Ensure we're close enough — walk closer if needed (interact range ~8 grid)
+            var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
+            _npcGridPos = new Vector2(_npc.GridPosNum.X, _npc.GridPosNum.Y);
+            var dist = Vector2.Distance(playerGrid, _npcGridPos);
+            if (dist > 10)
+            {
+                var worldTarget = _npcGridPos * Pathfinding.GridToWorld;
+                ctx.Navigation.NavigateTo(gc, worldTarget);
+                Status = $"[NPC] Walking closer to Varashta ({dist:F0}g)";
+                return MechanicResult.InProgress;
+            }
+
             if (!CanClick()) return MechanicResult.InProgress;
 
             var screenPos = gc.IngameState.Camera.WorldToScreen(_npc.BoundsCenterPosNum);
@@ -276,7 +289,7 @@ namespace AutoExile.Mechanics
             if (BotInput.Click(absPos))
             {
                 _lastClickTime = DateTime.Now;
-                Status = "[NPC] Clicked Varashta, waiting for Wishes panel";
+                Status = $"[NPC] Clicked Varashta (dist={dist:F0}), waiting for Wishes panel";
             }
 
             return MechanicResult.InProgress;
@@ -585,15 +598,50 @@ namespace AutoExile.Mechanics
         private ExileCore.PoEMemory.Element? GetWishesPanel(GameController gc)
         {
             var ui = gc.IngameState.IngameUi;
-            if (ui.ChildCount <= WishesPanelIndex) return null;
-            var panel = ui.GetChildAtIndex(WishesPanelIndex);
-            if (panel == null || !panel.IsVisible) return null;
 
-            if (panel.ChildCount < 5) return null;
-            var inner = panel.GetChildAtIndex(4);
-            if (inner == null || inner.ChildCount < 7) return null;
+            // Try cached index first
+            if (_wishesPanelIndex >= 0 && _wishesPanelIndex < (int)ui.ChildCount)
+            {
+                var cached = ui.GetChildAtIndex(_wishesPanelIndex);
+                if (cached != null && cached.IsVisible && IsWishesStructure(cached))
+                    return cached;
+            }
 
-            return panel;
+            // Scan all IngameUi children for the wishes panel structure
+            var childCount = (int)ui.ChildCount;
+            for (int i = 0; i < childCount; i++)
+            {
+                var child = ui.GetChildAtIndex(i);
+                if (child == null || !child.IsVisible) continue;
+                if (!IsWishesStructure(child)) continue;
+
+                _wishesPanelIndex = i;
+                return child;
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Check if an element matches the wishes panel structure:
+        /// panel has 5+ children, child[4] (wishes container) has 7+ children
+        /// with wish options at indices 3-5 and confirm button at 6.
+        /// </summary>
+        private static bool IsWishesStructure(ExileCore.PoEMemory.Element panel)
+        {
+            if (panel.ChildCount < 5) return false;
+            var container = panel.GetChildAtIndex(4);
+            if (container == null || container.ChildCount < 7) return false;
+
+            // Verify wish options exist at expected indices (3, 4, 5)
+            // Each wish option should have 3+ children (icon, border, title, etc.)
+            for (int i = 3; i <= 5; i++)
+            {
+                var option = container.GetChildAtIndex(i);
+                if (option == null || option.ChildCount < 3) return false;
+            }
+
+            return true;
         }
 
         private static string GetWishName(ExileCore.PoEMemory.Element option)

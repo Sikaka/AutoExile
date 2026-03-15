@@ -287,10 +287,10 @@ namespace AutoExile.Systems
         }
 
         /// <summary>
-        /// Use a non-gap-crossing movement skill (e.g. Dash, Shield Charge) to speed up travel
-        /// when the path ahead is long and straight. Returns true if a dash was fired.
-        /// Checks: game cooldown (CanBeUsed), manual cooldown (MinCastIntervalMs), and
-        /// minimum straight-line distance ahead (DashMinDistance setting).
+        /// Use a movement skill to speed up travel when the path ahead is long and straight.
+        /// Prefers non-gap-crossing skills (Dash, Shield Charge). Falls back to gap-crossing
+        /// skills (Blink, Leap Slam) when no upcoming blink waypoint needs them reserved.
+        /// Returns true if a skill was fired.
         /// </summary>
         private bool TryDashForSpeed(GameController gc, Vector2 playerWorld, float playerZ,
             SharpDX.RectangleF windowRect)
@@ -298,24 +298,8 @@ namespace AutoExile.Systems
             if (DashMinDistance <= 0)
                 return false;
 
-            // Find a speed dash skill — non-gap-crossing, game-ready, and manual cooldown elapsed
-            MovementSkillInfo? dashSkill = null;
-            foreach (var ms in MovementSkills)
-            {
-                if (ms.CanCrossTerrain || !ms.IsReady)
-                    continue;
-                if (ms.MinCastIntervalMs > 0 &&
-                    (DateTime.Now - ms.LastUsedAt).TotalMilliseconds < ms.MinCastIntervalMs)
-                    continue;
-                dashSkill = ms;
-                break;
-            }
-            if (dashSkill == null)
-                return false;
-
             // Measure straight-line distance from the CURRENT waypoint forward along the path.
-            // This is the distance the dash would actually cover — not from the player
-            // (which may be mid-segment and close to the current waypoint).
+            // Also detect if any blink waypoints lie ahead (gap crossings that need a blink skill).
             var idx = CurrentWaypointIndex;
             if (idx >= CurrentNavPath.Count)
                 return false;
@@ -340,37 +324,79 @@ namespace AutoExile.Systems
                 travelDir = Vector2.Normalize(travelDir);
             }
 
-            // Walk forward from current waypoint, accumulating distance while path stays straight
+            // Walk forward from current waypoint, accumulating distance while path stays straight.
+            // Also scan the full remaining path for any blink waypoints.
             var straightDist = 0f;
+            var straightMeasured = false; // true once we've hit a deviation or blink
+            var hasUpcomingBlink = false;
             var prev = startWp;
             for (var i = idx + 1; i < CurrentNavPath.Count; i++)
             {
                 var wp = CurrentNavPath[i];
 
-                // Stop at blink waypoints — don't dash into a gap
                 if (wp.Action == WaypointAction.Blink)
-                    break;
-
-                var segDir = wp.Position - prev;
-                var segLen = segDir.Length();
-                if (segLen < 1f)
                 {
-                    prev = wp.Position;
-                    continue;
+                    hasUpcomingBlink = true;
+                    straightMeasured = true; // stop accumulating straight distance at blink
                 }
 
-                // Check alignment with travel direction
-                var dot = Vector2.Dot(Vector2.Normalize(segDir), travelDir);
-                if (dot < DashPathDeviationMax)
-                    break;
+                if (!straightMeasured)
+                {
+                    var segDir = wp.Position - prev;
+                    var segLen = segDir.Length();
+                    if (segLen < 1f)
+                    {
+                        prev = wp.Position;
+                        continue;
+                    }
 
-                straightDist += segLen;
+                    var dot = Vector2.Dot(Vector2.Normalize(segDir), travelDir);
+                    if (dot < DashPathDeviationMax)
+                    {
+                        straightMeasured = true;
+                    }
+                    else
+                    {
+                        straightDist += segLen;
+                    }
+                }
+                // Once we've found a blink we can stop scanning entirely
+                else if (hasUpcomingBlink)
+                {
+                    break;
+                }
+
                 prev = wp.Position;
             }
 
-            // Not enough straight distance ahead — don't waste the dash
+            // Not enough straight distance ahead — don't waste the skill
             var minStraightWorld = DashMinDistance * Pathfinding.GridToWorld;
             if (straightDist < minStraightWorld)
+                return false;
+
+            // Find a movement skill to use.
+            // Prefer non-gap-crossing skills. Use gap-crossing skills only when
+            // no blink waypoints ahead need them reserved for gap traversal.
+            MovementSkillInfo? dashSkill = null;
+            foreach (var ms in MovementSkills)
+            {
+                if (!ms.IsReady)
+                    continue;
+                if (ms.MinCastIntervalMs > 0 &&
+                    (DateTime.Now - ms.LastUsedAt).TotalMilliseconds < ms.MinCastIntervalMs)
+                    continue;
+                if (ms.CanCrossTerrain && hasUpcomingBlink)
+                    continue; // reserve gap-crosser for upcoming blink waypoint
+
+                // Prefer non-gap-crossing; take gap-crossing only if we haven't found one yet
+                if (dashSkill == null || (dashSkill.CanCrossTerrain && !ms.CanCrossTerrain))
+                    dashSkill = ms;
+
+                // Found a non-gap-crossing skill — that's ideal, stop looking
+                if (!ms.CanCrossTerrain)
+                    break;
+            }
+            if (dashSkill == null)
                 return false;
 
             // Aim along the travel direction
@@ -574,6 +600,18 @@ namespace AutoExile.Systems
         /// Returns true if skills/projectiles can pass between A and B (targeting > 0 along line).
         /// Returns false if terrain data unavailable.
         /// </summary>
+        /// <summary>
+        /// Check walkable LOS between two world positions using the pathfinding grid.
+        /// Returns true if a straight walk is safe (no walls, no fringe cells).
+        /// Returns true on degraded data (graceful fallback — assume open).
+        /// </summary>
+        public bool HasWalkableLOS(GameController gc, Vector2 worldA, Vector2 worldB)
+        {
+            var pfGrid = gc.IngameState.Data.RawFramePathfindingData;
+            if (pfGrid == null) return true;
+            return Pathfinding.HasLineOfSight(pfGrid, worldA, worldB);
+        }
+
         public bool HasTargetingLOS(GameController gc, Vector2 gridA, Vector2 gridB)
         {
             var tgtGrid = gc.IngameState.Data.RawTerrainTargetingData;
@@ -691,6 +729,157 @@ namespace AutoExile.Systems
             _stuckRecoveryCount = 0;
             _totalStuckRecoveries = 0;
             LastRecoveryAction = "";
+        }
+
+        /// <summary>
+        /// Direct movement toward a world position — no pathfinding, no waypoints.
+        /// Use when LOS is clear and the caller is managing movement each tick.
+        /// Clears any active navigation. Returns false if BotInput gate is blocked.
+        /// Tries movement skills for speed on long distances before falling back to walk.
+        /// </summary>
+        public bool MoveToward(GameController gc, Vector2 worldTarget)
+        {
+            // Clear any active path — caller is driving movement directly
+            if (IsNavigating)
+            {
+                IsNavigating = false;
+                IsPaused = false;
+                CurrentNavPath.Clear();
+                CurrentWaypointIndex = 0;
+                Destination = null;
+                BlinkCount = 0;
+                _blinkPending = false;
+                _dashActive = false;
+            }
+
+            // Don't send input while mid-dash animation
+            if (_dashActive)
+            {
+                if ((DateTime.Now - _dashStartTime).TotalMilliseconds > DashAnimationMs)
+                    _dashActive = false;
+                else
+                    return false;
+            }
+
+            if (!BotInput.CanAct)
+                return false;
+
+            var playerPos = gc.Player.PosNum;
+            var playerWorld = new Vector2(playerPos.X, playerPos.Y);
+            var playerZ = playerPos.Z;
+            var windowRect = gc.Window.GetWindowRectangle();
+
+            // Try movement skills for speed if distance is long enough
+            if (TryDirectDash(gc, playerWorld, worldTarget, playerZ, windowRect))
+                return true;
+
+            var screenPos = gc.IngameState.Camera.WorldToScreen(
+                new Vector3(worldTarget.X, worldTarget.Y, playerZ));
+
+            ExecuteWalk(screenPos, windowRect);
+            return true;
+        }
+
+        /// <summary>
+        /// Try to use a movement skill for direct LOS movement (no path waypoints).
+        /// Similar to TryDashForSpeed but for pathless movement — uses raw distance to target.
+        /// No blink reservation needed since there are no blink waypoints in direct movement.
+        /// </summary>
+        private bool TryDirectDash(GameController gc, Vector2 playerWorld, Vector2 worldTarget,
+            float playerZ, SharpDX.RectangleF windowRect)
+        {
+            if (DashMinDistance <= 0)
+                return false;
+
+            var dist = Vector2.Distance(playerWorld, worldTarget);
+            var minStraightWorld = DashMinDistance * Pathfinding.GridToWorld;
+            if (dist < minStraightWorld)
+                return false;
+
+            // Find any ready movement skill — no blink reservation since there's no path with gaps
+            MovementSkillInfo? dashSkill = null;
+            foreach (var ms in MovementSkills)
+            {
+                if (!ms.IsReady)
+                    continue;
+                if (ms.MinCastIntervalMs > 0 &&
+                    (DateTime.Now - ms.LastUsedAt).TotalMilliseconds < ms.MinCastIntervalMs)
+                    continue;
+
+                // Prefer non-gap-crossing; take gap-crossing only if nothing better
+                if (dashSkill == null || (dashSkill.CanCrossTerrain && !ms.CanCrossTerrain))
+                    dashSkill = ms;
+
+                if (!ms.CanCrossTerrain)
+                    break;
+            }
+            if (dashSkill == null)
+                return false;
+
+            // Aim toward the target
+            var travelDir = Vector2.Normalize(worldTarget - playerWorld);
+            var aimTarget = playerWorld + travelDir * minStraightWorld;
+            var aimScreen = gc.IngameState.Camera.WorldToScreen(
+                new Vector3(aimTarget.X, aimTarget.Y, playerZ));
+
+            if (aimScreen.X <= 0 || aimScreen.X >= windowRect.Width ||
+                aimScreen.Y <= 0 || aimScreen.Y >= windowRect.Height)
+                return false;
+
+            var absPos = new Vector2(windowRect.X + aimScreen.X, windowRect.Y + aimScreen.Y);
+            if (!BotInput.CursorPressKey(absPos, dashSkill.Key))
+                return false;
+
+            dashSkill.LastUsedAt = DateTime.Now;
+            _dashActive = true;
+            _dashStartTime = DateTime.Now;
+            return true;
+        }
+
+        /// <summary>
+        /// Update the destination of an active navigation for a moving target.
+        /// If LOS is clear to the new target, grafts a direct waypoint onto the current path.
+        /// If LOS is blocked, computes a new path with forward-trim to avoid backtracking.
+        /// Returns false if not currently navigating or destination hasn't drifted enough.
+        /// </summary>
+        public bool UpdateDestination(GameController gc, Vector2 worldTarget, float driftThreshold = 0f)
+        {
+            if (!IsNavigating || CurrentNavPath.Count == 0)
+                return false;
+
+            if (driftThreshold <= 0f)
+                driftThreshold = 14f * Pathfinding.GridToWorld;
+
+            var currentDest = Destination ?? Vector2.Zero;
+            if (Vector2.Distance(currentDest, worldTarget) < driftThreshold)
+                return false;
+
+            var playerPos = gc.Player.PosNum;
+            var playerWorld = new Vector2(playerPos.X, playerPos.Y);
+            var pfGrid = gc.IngameState.Data.RawFramePathfindingData;
+
+            if (pfGrid == null || pfGrid.Length == 0)
+                return false;
+
+            if (Pathfinding.HasLineOfSight(pfGrid, playerWorld, worldTarget))
+            {
+                // LOS clear — truncate path at current waypoint, append direct waypoint
+                var truncated = new List<NavWaypoint>();
+
+                if (CurrentWaypointIndex < CurrentNavPath.Count)
+                    truncated.Add(CurrentNavPath[CurrentWaypointIndex]);
+
+                truncated.Add(new NavWaypoint(worldTarget, WaypointAction.Walk));
+
+                CurrentNavPath = truncated;
+                CurrentWaypointIndex = 0;
+                Destination = worldTarget;
+                BlinkCount = 0;
+                return true;
+            }
+
+            // No LOS — full repath (NavigateTo already does forward-trim)
+            return NavigateTo(gc, worldTarget);
         }
     }
 }

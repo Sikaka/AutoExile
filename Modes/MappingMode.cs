@@ -406,7 +406,11 @@ namespace AutoExile.Modes
                 {
                     var coverage = ctx.Exploration.ActiveBlobCoverage;
                     var elapsed = (DateTime.Now - _startTime).TotalSeconds;
-                    var exitPortal = FindExitPortal(gc);
+
+                    // Only consider exit portals after meaningful exploration (>10% coverage).
+                    // Prevents immediately exiting wish zones / sub-zones before exploring them
+                    // (exploration can return null briefly on fresh zone init).
+                    var exitPortal = coverage > 0.10f ? FindExitPortal(gc) : null;
                     if (exitPortal != null)
                     {
                         _exitPortal = exitPortal;
@@ -415,12 +419,13 @@ namespace AutoExile.Modes
                         Decision = "Heading to exit portal";
                         ctx.Log($"[Mapping] No more targets, found exit portal — returning");
                     }
-                    else
+                    else if (coverage > 0.10f)
                     {
                         _phase = MappingPhase.Complete;
                         Status = $"COMPLETE — {coverage:P1} coverage in {elapsed:F0}s";
                         Decision = $"No more targets ({ctx.Exploration.FailedRegions.Count} unreachable)";
                     }
+                    // else: fresh zone, no targets yet — wait for exploration to populate
                     return;
                 }
 

@@ -831,7 +831,8 @@ namespace AutoExile
                         ? entity.Rarity.ToString() : null,
                     ShortName = ExtractShortName(entity.Metadata ?? entity.Path ?? ""),
                     RenderName = entity.Type == ExileCore.Shared.Enums.EntityType.Player
-                        ? (entity.GetComponent<ExileCore.PoEMemory.Components.Player>()?.PlayerName ?? entity.RenderName ?? "") : "",
+                        ? (entity.GetComponent<ExileCore.PoEMemory.Components.Player>()?.PlayerName ?? entity.RenderName ?? "")
+                        : (entity.RenderName ?? ""),
                 };
 
                 // Capture StateMachine states for entities that have them (pump, monolith, etc.)
@@ -1048,13 +1049,19 @@ namespace AutoExile
                     }
                 }
 
-                // Click the level-up "+" button for the first gem
+                // Click the level-up "+" button for the first levelable gem.
                 // Layout: [0]=dismiss(X) [1]=level(+) [2]=bar(hidden) [3]=text
-                // The "+" button is the second visible small square child
-                var gemEl = gems[0];
-                if (gemEl?.IsVisible == true)
+                // The "+" button is the second visible small square child.
+                // Skip gems where the button is greyed out (insufficient stats) —
+                // detected via the button's highlight state (IsHighlighted).
+                foreach (var gemEl in gems)
                 {
-                    SharpDX.RectangleF rect = gemEl.GetClientRect();
+                    if (gemEl?.IsVisible != true) continue;
+
+                    // Check if this gem can actually be leveled by examining child button state.
+                    // When stats are insufficient, the level-up row still appears but the
+                    // "+" button's highlight is disabled — use this as a proxy for "enabled".
+                    dynamic? levelButton = null;
                     int smallSquareCount = 0;
                     for (int i = 0; i < gemEl.ChildCount; i++)
                     {
@@ -1066,15 +1073,28 @@ namespace AutoExile
                             smallSquareCount++;
                             if (smallSquareCount == 2) // Second square = "+" button
                             {
-                                rect = cr;
+                                levelButton = child;
                                 break;
                             }
                         }
                     }
 
+                    if (levelButton == null) continue;
+
+                    // Try to check IsEnabled if the property exists on this Element type.
+                    // ExileCore Element may expose it — if not, fall through and click anyway.
+                    try
+                    {
+                        bool enabled = levelButton.IsEnabled;
+                        if (!enabled) continue;
+                    }
+                    catch { /* Property doesn't exist on this type — skip check */ }
+
+                    SharpDX.RectangleF rect = levelButton.GetClientRect();
                     var absPos = new Vector2(windowRect.X + rect.Center.X, windowRect.Y + rect.Center.Y);
                     BotInput.Click(absPos);
                     _lastGemLevelAt = DateTime.Now;
+                    return;
                 }
             }
             catch { }

@@ -172,9 +172,11 @@ namespace AutoExile.Systems
                     foreach (var landing in ScanBlinkLandings(pfGrid, tgtGrid, cx, cy, blinkRange, rows, cols))
                     {
                         var dist = MathF.Sqrt((landing.x - cx) * (landing.x - cx) + (landing.y - cy) * (landing.y - cy));
-                        // Penalize wider gaps — perpendicular crossings have fewer gap cells
-                        // than diagonal ones for the same wall, making them preferred
-                        var gapPenalty = landing.gapWidth * 2f;
+                        // Penalize wider gaps heavily — perpendicular crossings have fewer gap cells
+                        // than diagonal ones for the same wall, strongly preferring straight-across jumps.
+                        // A diagonal scan across a 2-wide wall traverses ~3 cells vs 2 for cardinal,
+                        // so penalty must outweigh the walking detour to reach a perpendicular approach.
+                        var gapPenalty = landing.gapWidth * 5f;
                         var blinkCost = dist + blinkCostPenalty + gapPenalty;
                         var tentativeG = currentG + blinkCost;
                         var key = (landing.x, landing.y);
@@ -238,8 +240,26 @@ namespace AutoExile.Systems
 
                     if (pfGrid[y][x] > 0)
                     {
-                        // Found walkable terrain on the other side
-                        landings.Add((x, y, steps));
+                        // Found walkable terrain — push deeper to avoid landing at the edge.
+                        // Continue along the same direction for a few more cells while still walkable.
+                        const int landingBuffer = 3;
+                        var lx = x;
+                        var ly = y;
+                        for (var b = 0; b < landingBuffer; b++)
+                        {
+                            var nx = lx + dx;
+                            var ny = ly + dy;
+                            if (nx < 0 || nx >= cols || ny < 0 || ny >= rows)
+                                break;
+                            if (pfGrid[ny][nx] < 3) // stop at walls and fringe cells
+                                break;
+                            var bufferDist = MathF.Sqrt((nx - bx) * (nx - bx) + (ny - by) * (ny - by));
+                            if (bufferDist > maxRange)
+                                break;
+                            lx = nx;
+                            ly = ny;
+                        }
+                        landings.Add((lx, ly, steps));
                         break;
                     }
 
@@ -255,6 +275,8 @@ namespace AutoExile.Systems
         /// <summary>
         /// Smooth a path with blink awareness. Only smooths between walk waypoints
         /// within the same walking segment — never smooths across blink boundaries.
+        /// After smoothing, pulls back the last walk waypoint before each blink so
+        /// the player approaches from a few cells back, giving clean blink line-up.
         /// </summary>
         public static List<NavWaypoint> SmoothNavPath(int[][] grid, List<NavWaypoint> path)
         {
@@ -285,6 +307,18 @@ namespace AutoExile.Systems
                         result.AddRange(path.GetRange(segStart, segEnd - segStart));
                     }
 
+                    // Pull back the last walk waypoint before a blink so the player
+                    // approaches from a few cells into safe terrain, not right at the edge.
+                    // This gives the blink a clean perpendicular line-up.
+                    if (path[i].Action == WaypointAction.Blink && result.Count >= 1)
+                    {
+                        var blinkPos = path[i].Position;
+                        var approachPos = result[result.Count - 1].Position;
+                        var pullbackPos = PullBackFromEdge(grid, approachPos, blinkPos, rows, cols);
+                        if (pullbackPos.HasValue)
+                            result[result.Count - 1] = new NavWaypoint(pullbackPos.Value, WaypointAction.Walk);
+                    }
+
                     // Add the blink waypoint itself
                     if (path[i].Action == WaypointAction.Blink)
                     {
@@ -295,6 +329,44 @@ namespace AutoExile.Systems
             }
 
             return result;
+        }
+
+        /// <summary>
+        /// Pull an approach waypoint back from the gap edge along the blink direction.
+        /// Moves the point away from the blink target (deeper into safe terrain) by BlinkApproachBuffer cells.
+        /// Returns null if the original position is already safe enough or pullback isn't walkable.
+        /// </summary>
+        private static Vector2? PullBackFromEdge(int[][] grid, Vector2 approachWorld, Vector2 blinkWorld,
+            int rows, int cols)
+        {
+            const int pullbackCells = 4; // how many grid cells to pull back from edge
+
+            var (ax, ay) = WorldToGridPos(approachWorld);
+            var (bx, by) = WorldToGridPos(blinkWorld);
+
+            // Direction from blink target back toward approach (away from gap)
+            var dx = ax - bx;
+            var dy = ay - by;
+            var len = MathF.Sqrt(dx * dx + dy * dy);
+            if (len < 1f) return null;
+
+            // Check if approach point is already deep in walkable terrain (pf >= 3).
+            // If the cell and its neighbors are solidly walkable, no pullback needed.
+            if (ax >= 0 && ax < cols && ay >= 0 && ay < rows && grid[ay][ax] >= 4)
+                return null;
+
+            // Pull back along the approach→blink line (opposite direction)
+            var ndx = dx / len;
+            var ndy = dy / len;
+            for (var step = pullbackCells; step >= 1; step--)
+            {
+                var px = ax + (int)MathF.Round(ndx * step);
+                var py = ay + (int)MathF.Round(ndy * step);
+                if (px >= 0 && px < cols && py >= 0 && py < rows && grid[py][px] >= 3)
+                    return GridToWorldPos(px, py);
+            }
+
+            return null; // couldn't find a safe pullback — keep original
         }
 
         /// <summary>
@@ -337,6 +409,17 @@ namespace AutoExile.Systems
             }
 
             return result;
+        }
+
+        /// <summary>
+        /// Check walkable line of sight between two world positions.
+        /// Returns true if all cells along the Bresenham line have pathfinding value >= 3
+        /// (no walls or fringe cells). Uses the pathfinding grid, NOT the targeting grid.
+        /// </summary>
+        public static bool HasLineOfSight(int[][] pfGrid, Vector2 worldA, Vector2 worldB)
+        {
+            if (pfGrid == null || pfGrid.Length == 0) return false;
+            return HasLineOfSight(pfGrid, worldA, worldB, pfGrid.Length, pfGrid[0].Length);
         }
 
         private static bool HasLineOfSight(int[][] grid, Vector2 a, Vector2 b, int rows, int cols)
