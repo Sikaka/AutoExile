@@ -134,6 +134,22 @@ namespace AutoExile.Modes
                     && ctx.Combat.NearbyMonsterCount > 0;
                 ctx.Combat.SuppressPositioning = !allowCombatMovement;
 
+                // During active encounter phases, anchor combat to the defense point:
+                // - DefenseAnchor: target scoring favors monsters closer to the pump hub
+                // - LeashAnchor: positioning won't pull player beyond network bubble of pump hub
+                bool inEncounterPhase = _phase is BlightPhase.TowerManagement or BlightPhase.WaitForCompletion or BlightPhase.Sweep;
+                if (inEncounterPhase && _blight.DefensePosition.HasValue)
+                {
+                    ctx.Combat.Profile.DefenseAnchor = _blight.DefensePosition.Value;
+                    ctx.Combat.Profile.LeashAnchor = _blight.DefensePosition.Value;
+                    ctx.Combat.Profile.LeashRadius = Systems.Pathfinding.NetworkBubbleRadius;
+                }
+                else
+                {
+                    ctx.Combat.Profile.DefenseAnchor = null;
+                    ctx.Combat.Profile.LeashAnchor = null;
+                }
+
                 ctx.Combat.Tick(ctx);
             }
 
@@ -884,7 +900,8 @@ namespace AutoExile.Modes
                 _sweepCombatEngageTime = DateTime.MinValue;
                 _sweepCombatEngageCount = 0;
 
-                // Find the monster closest to pump (biggest threat)
+                // Find the monster closest to defense point (biggest threat).
+                // The return-to-pump timer (SweepPumpReturnSeconds) prevents staying away too long.
                 var nearestToPumpPos = FindMonsterClosestToDefense(gc, defensePos);
                 if (nearestToPumpPos.HasValue)
                 {
@@ -924,7 +941,8 @@ namespace AutoExile.Modes
                 return;
             }
 
-            // Try exploration target
+            // Try exploration target. The return-to-pump timer (SweepPumpReturnSeconds)
+            // ensures we don't stay away from the defense point for too long.
             if (ctx.Exploration.IsInitialized)
             {
                 var target = ctx.Exploration.GetNextExplorationTarget(playerPos);

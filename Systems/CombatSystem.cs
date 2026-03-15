@@ -290,6 +290,15 @@ namespace AutoExile.Systems
 
                 float score = rarityWeight - dist * 0.1f;
 
+                // Defense anchor: heavily favor monsters closer to the objective
+                if (Profile.DefenseAnchor.HasValue)
+                {
+                    float distToObjective = Vector2.Distance(entity.GridPosNum, Profile.DefenseAnchor.Value);
+                    // Monsters within 30 grid units of objective get large bonus,
+                    // scaling down with distance. This dominates over rarity for nearby threats.
+                    score += MathF.Max(0f, 60f - distToObjective);
+                }
+
                 if (score > bestScore)
                 {
                     bestScore = score;
@@ -1028,6 +1037,13 @@ namespace AutoExile.Systems
 
         /// <summary>Leash radius in grid units. Only used when LeashAnchor is set.</summary>
         public float LeashRadius { get; set; }
+
+        /// <summary>
+        /// Optional defense anchor in grid coordinates. When set, target scoring
+        /// heavily favors monsters closer to this point (protect-the-objective priority).
+        /// Used by blight sweep to prioritize monsters threatening the pump hub.
+        /// </summary>
+        public Vector2? DefenseAnchor { get; set; }
 
         public static CombatProfile Default => new() { Enabled = false };
     }
