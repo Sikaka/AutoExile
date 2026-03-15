@@ -48,6 +48,11 @@ namespace AutoExile.Modes
         private DateTime _lastPathStartTime = DateTime.MinValue;
         private const float PathHysteresisMs = 500f;
 
+        // Unreachable leader detection — consecutive pathfinding failures suggest
+        // leader used a transition (visible but on other side of wall/door)
+        private int _consecutivePathFailures;
+        private const int PathFailuresBeforeTransition = 3;
+
         // Transition following
         private Vector2? _transitionGridPos; // grid pos of transition we're heading to (entity ref may go stale)
         private long _transitionEntityId;    // entity ID to re-resolve each tick
@@ -247,6 +252,7 @@ namespace AutoExile.Modes
             _hasLastLeaderPos = false;
             _transitionGridPos = null;
             _transitionEntityId = 0;
+            _consecutivePathFailures = 0;
             _status = "Area changed — searching for leader";
             _decision = "area_changed";
             ctx.Log("Follower: area changed — reset state, searching for leader");
@@ -330,6 +336,7 @@ namespace AutoExile.Modes
                 {
                     // LOS clear — direct movement, no pathfinding
                     ctx.Navigation.MoveToward(gc, leaderWorldPos);
+                    _consecutivePathFailures = 0;
                     _state = FollowerState.Following;
                     _status = $"Following {LeaderName} (LOS, dist: {dist:F0})";
                     _decision = "following_los";
@@ -339,6 +346,7 @@ namespace AutoExile.Modes
                     // No LOS (or hysteresis active) but already have a path — graft destination
                     ctx.Navigation.UpdateDestination(gc, leaderWorldPos,
                         driftThreshold: FollowDistance * Pathfinding.GridToWorld);
+                    _consecutivePathFailures = 0;
                     _state = FollowerState.Following;
                     _status = $"Following {LeaderName} (path, dist: {dist:F0})";
                     _decision = "following_path_update";
@@ -347,10 +355,29 @@ namespace AutoExile.Modes
                 {
                     // No LOS, no active path — start fresh pathfinding
                     if (ctx.Navigation.NavigateTo(gc, leaderWorldPos))
+                    {
                         _lastPathStartTime = DateTime.Now;
+                        _consecutivePathFailures = 0;
+                    }
+                    else
+                    {
+                        // Pathfinding failed — leader may be on other side of a transition
+                        _consecutivePathFailures++;
+                        if (_consecutivePathFailures >= PathFailuresBeforeTransition && FollowThroughTransitions)
+                        {
+                            ctx.Log($"Leader unreachable ({_consecutivePathFailures} path failures, dist={dist:F0}) — looking for transition near leader");
+                            if (TryFollowLeaderExit(ctx, gc, leaderGridPos))
+                            {
+                                _consecutivePathFailures = 0;
+                                return;
+                            }
+                        }
+                    }
                     _state = FollowerState.Following;
                     _status = $"Following {LeaderName} (new path, dist: {dist:F0})";
-                    _decision = "following_new_path";
+                    _decision = _consecutivePathFailures > 0
+                        ? $"following_path_failed ({_consecutivePathFailures}x)"
+                        : "following_new_path";
                 }
             }
             else if (dist < StopDistance)

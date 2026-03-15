@@ -436,11 +436,12 @@ namespace AutoExile.Systems
             var cx = ax;
             var cy = ay;
 
-            // Require pf >= 3 for LOS — values 1-2 are wall fringe cells.
-            // Walking through fringe cells causes wall clipping with cursor-based movement.
+            // Require pf >= 4 for LOS — ensures clearance from walls.
+            // Value 3 (mid-gradient) is too close to walls for direct cursor movement
+            // since the player has width and would clip narrow corridors.
             while (cx != bx || cy != by)
             {
-                if (cx < 0 || cx >= cols || cy < 0 || cy >= rows || grid[cy][cx] < 3)
+                if (cx < 0 || cx >= cols || cy < 0 || cy >= rows || grid[cy][cx] < 4)
                     return false;
 
                 var e2 = 2 * err;
