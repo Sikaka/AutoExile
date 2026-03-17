@@ -284,7 +284,7 @@ namespace AutoExile.Mechanics
             _npcGridPos = new Vector2(_npc.GridPosNum.X, _npc.GridPosNum.Y);
             var dist = Vector2.Distance(playerGrid, _npcGridPos);
 
-            if (dist < 15)
+            if (dist < ctx.Interaction.InteractRadius)
             {
                 SetPhase(WishesPhase.TalkToNPC, "Clicking NPC");
                 return MechanicResult.InProgress;
@@ -325,11 +325,11 @@ namespace AutoExile.Mechanics
                 }
             }
 
-            // Ensure we're close enough — walk closer if needed (interact range ~8 grid)
+            // Ensure we're close enough to click
             var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
             _npcGridPos = new Vector2(_npc.GridPosNum.X, _npc.GridPosNum.Y);
             var dist = Vector2.Distance(playerGrid, _npcGridPos);
-            if (dist > 10)
+            if (dist > ctx.Interaction.InteractRadius)
             {
                 var worldTarget = _npcGridPos * Pathfinding.GridToWorld;
                 ctx.Navigation.NavigateTo(gc, worldTarget);
@@ -516,7 +516,7 @@ namespace AutoExile.Mechanics
             _portalGridPos = new Vector2(_portal.GridPosNum.X, _portal.GridPosNum.Y);
             var dist = Vector2.Distance(playerGrid, _portalGridPos);
 
-            if (dist < 15)
+            if (dist < ctx.Interaction.InteractRadius)
             {
                 SetPhase(WishesPhase.EnterPortal, "Clicking portal");
                 return MechanicResult.InProgress;

@@ -263,7 +263,7 @@ namespace AutoExile.Mechanics
             var dist = Vector2.Distance(playerGrid, AnchorGridPos.Value);
 
             // Close enough to click entrance
-            if (dist <= 8f)
+            if (dist <= ctx.Interaction.InteractRadius)
             {
                 _phase = HarvestPhase.EnterGrove;
                 _phaseStartTime = DateTime.Now;
@@ -994,7 +994,7 @@ namespace AutoExile.Mechanics
             var portalGrid = new Vector2(_returnPortal.GridPosNum.X, _returnPortal.GridPosNum.Y);
             var dist = Vector2.Distance(playerGrid, portalGrid);
 
-            if (dist <= 8f)
+            if (dist <= ctx.Interaction.InteractRadius)
             {
                 _phase = HarvestPhase.ExitGrove;
                 _phaseStartTime = DateTime.Now;

@@ -1211,7 +1211,7 @@ namespace AutoExile.Modes
                 var portalGridPos = portal.GridPosNum;
                 var dist = Vector2.Distance(playerPos, portalGridPos);
 
-                if (dist > 18f)
+                if (dist > ctx.Interaction.InteractRadius)
                 {
                     if (!ctx.Navigation.IsNavigating)
                         ctx.Navigation.NavigateTo(gc, BlightState.ToWorld(portalGridPos));
@@ -1232,7 +1232,7 @@ namespace AutoExile.Modes
                 var cachedPos = _blight.PortalPosition.Value;
                 var dist = Vector2.Distance(playerPos, cachedPos);
 
-                if (dist > 18f)
+                if (dist > ctx.Interaction.InteractRadius)
                 {
                     if (!ctx.Navigation.IsNavigating)
                         ctx.Navigation.NavigateTo(gc, BlightState.ToWorld(cachedPos));

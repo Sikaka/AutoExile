@@ -612,7 +612,7 @@ namespace AutoExile.Modes
             var portalGrid = new Vector2(_exitPortal.GridPosNum.X, _exitPortal.GridPosNum.Y);
             var dist = Vector2.Distance(playerGrid, portalGrid);
 
-            if (dist > 15)
+            if (dist > ctx.Interaction.InteractRadius)
             {
                 // Navigate to portal
                 var worldTarget = portalGrid * Pathfinding.GridToWorld;

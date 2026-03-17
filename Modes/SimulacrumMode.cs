@@ -29,7 +29,6 @@ namespace AutoExile.Modes
         // Hideout/loop tracking
         private bool _mapCompleted;
         private string _lastAreaName = "";
-        private bool _nudgedForMonolith;
 
         // Loot tracking — only record on confirmed pickup
         private DateTime _lastLootScan = DateTime.MinValue;
@@ -80,7 +79,7 @@ namespace AutoExile.Modes
             _wasSearching = false;
             _waveStartAttempts = 0;
             _betweenWaveStartTime = DateTime.MinValue;
-            _nudgedForMonolith = false;
+
             _combatEngageTime = DateTime.MinValue;
             _combatEngageCount = 0;
 
@@ -268,7 +267,7 @@ namespace AutoExile.Modes
                 _state.DeathCount = deathCount;
                 _phase = SimPhase.FindMonolith;
                 _phaseStartTime = DateTime.Now;
-                _nudgedForMonolith = false;
+    
                 _lootTracker.ResetCount();
                 StatusText = "Entered map — finding monolith";
             }
@@ -291,36 +290,35 @@ namespace AutoExile.Modes
             var gc = ctx.Game;
             var elapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
 
-            // After 2s settle, navigate to hardcoded map center to find the monolith.
-            // Portal may spawn far from center — monolith is always near the middle.
-            if (!_nudgedForMonolith && elapsed > 2)
+            // Wait 2s for entity list to settle after zone load
+            if (elapsed < 2)
             {
-                _nudgedForMonolith = true;
-
-                var mapCenter = SimulacrumState.GetMapCenter(gc.Area.CurrentArea.Name ?? "");
-                if (mapCenter.HasValue)
-                {
-                    ctx.Navigation.NavigateTo(gc, SimulacrumState.ToWorld(mapCenter.Value));
-                    StatusText = $"Navigating to map center ({mapCenter.Value.X:F0}, {mapCenter.Value.Y:F0})";
-                    ctx.Log($"FindMonolith: navigating to map center ({mapCenter.Value.X:F0}, {mapCenter.Value.Y:F0})");
-                }
-                else
-                {
-                    // Unknown map — small nudge to trigger entity loading
-                    var playerGrid = gc.Player.GridPosNum;
-                    var nudgeTarget = new Vector2(playerGrid.X + 5, playerGrid.Y) * Systems.Pathfinding.GridToWorld;
-                    ctx.Navigation.NavigateTo(gc, nudgeTarget);
-                    StatusText = "Unknown map — nudging to trigger entity loading";
-                    ctx.Log($"FindMonolith: unknown map '{gc.Area.CurrentArea.Name}', nudging");
-                }
+                StatusText = "Searching for monolith...";
                 return;
             }
 
-            StatusText = _nudgedForMonolith
-                ? "Navigating to map center — searching for monolith..."
-                : "Searching for monolith...";
+            // Explore the map until the monolith entity enters the network bubble.
+            // Previous approach used hardcoded map center coordinates, but these are
+            // fragile (can land on unwalkable terrain, wrong for map variants).
+            if (ctx.Exploration.IsInitialized)
+            {
+                ctx.Exploration.Update(gc.Player.GridPosNum);
+                var playerPos = gc.Player.GridPosNum;
 
-            if (elapsed > 30)
+                if (!ctx.Navigation.IsNavigating)
+                {
+                    var target = ctx.Exploration.GetNextExplorationTarget(playerPos);
+                    if (target.HasValue)
+                    {
+                        ctx.Navigation.NavigateTo(gc,
+                            target.Value * Systems.Pathfinding.GridToWorld);
+                    }
+                }
+            }
+
+            StatusText = "Exploring to find monolith...";
+
+            if (elapsed > 60)
             {
                 StatusText = "No monolith found — timeout";
                 _phase = SimPhase.Done;
@@ -733,7 +731,7 @@ namespace AutoExile.Modes
             var dist = Vector2.Distance(playerPos, monolithPos);
 
             // Navigate close first
-            if (dist > 18f)
+            if (dist > ctx.Interaction.InteractRadius)
             {
                 if (!ctx.Navigation.IsNavigating)
                     ctx.Navigation.NavigateTo(gc, SimulacrumState.ToWorld(monolithPos));
@@ -869,7 +867,7 @@ namespace AutoExile.Modes
                     new Vector2(playerPos.X, playerPos.Y),
                     _state.StashPosition.Value);
 
-                if (dist > 20f)
+                if (dist > ctx.Interaction.InteractRadius)
                 {
                     // Cancel StashSystem if it was started — we need to navigate first
                     if (ctx.Stash.IsBusy)
@@ -944,7 +942,7 @@ namespace AutoExile.Modes
                     var dist = Vector2.Distance(
                         new Vector2(playerPos.X, playerPos.Y),
                         _state.StashPosition.Value);
-                    if (dist > 20f)
+                    if (dist > ctx.Interaction.InteractRadius)
                     {
                         if (!ctx.Navigation.IsNavigating)
                             ctx.Navigation.NavigateTo(gc, SimulacrumState.ToWorld(_state.StashPosition.Value));
@@ -1054,7 +1052,7 @@ namespace AutoExile.Modes
                 {
                     var playerPos = gc.Player.GridPosNum;
                     var dist = Vector2.Distance(playerPos, _state.PortalPosition.Value);
-                    if (dist > 18f)
+                    if (dist > ctx.Interaction.InteractRadius)
                     {
                         if (!ctx.Navigation.IsNavigating)
                             ctx.Navigation.NavigateTo(gc,
@@ -1077,7 +1075,7 @@ namespace AutoExile.Modes
             var portalGridPos = new Vector2(portal.GridPosNum.X, portal.GridPosNum.Y);
             var portalDist = Vector2.Distance(playerGridPos, portalGridPos);
 
-            if (portalDist > 8f)
+            if (portalDist > ctx.Interaction.InteractRadius)
             {
                 if (!ctx.Navigation.IsNavigating)
                     ctx.Navigation.NavigateTo(gc, portalGridPos * Systems.Pathfinding.GridToWorld);

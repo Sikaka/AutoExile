@@ -15,31 +15,6 @@ namespace AutoExile.Systems
     /// </summary>
     public class SimulacrumState
     {
-        // Hardcoded map centers — monolith is always near the center of each simulacrum map
-        private static readonly Dictionary<string, Vector2> MapCenters = new()
-        {
-            { "The Bridge Enraptured", new Vector2(551, 624) },
-            { "Oriath Delusion", new Vector2(494, 288) },
-            { "The Syndrome Encampment", new Vector2(316, 253) },
-            { "Hysteriagate", new Vector2(183, 269) },
-            { "Lunacy's Watch", new Vector2(270, 687) },
-        };
-
-        /// <summary>
-        /// Get the hardcoded center position for a simulacrum map by area name.
-        /// Returns null for unknown maps.
-        /// </summary>
-        public static Vector2? GetMapCenter(string areaName)
-        {
-            if (string.IsNullOrEmpty(areaName)) return null;
-            foreach (var kvp in MapCenters)
-            {
-                if (areaName.Contains(kvp.Key, StringComparison.OrdinalIgnoreCase))
-                    return kvp.Value;
-            }
-            return null;
-        }
-
         // Entity tracking — ID + grid position
         public long? MonolithId { get; private set; }
         public long? PortalId { get; private set; }

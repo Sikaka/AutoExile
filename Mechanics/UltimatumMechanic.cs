@@ -241,7 +241,7 @@ namespace AutoExile.Mechanics
             var settings = ctx.Settings.Mechanics.Ultimatum;
 
             // Close enough to interact
-            if (dist <= 8f)
+            if (dist <= ctx.Interaction.InteractRadius)
             {
                 // Check if encounter is already in progress (mid-encounter rejoin after death)
                 // Only trust encounter_started=1 if we already confirmed it ourselves

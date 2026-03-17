@@ -731,7 +731,7 @@ namespace AutoExile.Systems
 
         private static (int x, int y)? FindNearestWalkable(int[][] grid, int x, int y, int rows, int cols)
         {
-            for (int radius = 1; radius < 20; radius++)
+            for (int radius = 1; radius <= 60; radius++)
             {
                 for (int dx = -radius; dx <= radius; dx++)
                 {
