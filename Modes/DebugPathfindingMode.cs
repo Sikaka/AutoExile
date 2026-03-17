@@ -7,8 +7,9 @@ using System.Numerics;
 namespace AutoExile.Modes
 {
     /// <summary>
-    /// Debug mode for testing pathfinding and movement.
+    /// Debug mode for testing pathfinding, movement, and threat dodge.
     /// Set a target position, then navigate to it. Draws path and debug info.
+    /// Threat detection: monitors boss skill casts and executes dodge movements.
     /// </summary>
     public class DebugPathfindingMode : IBotMode
     {
@@ -25,6 +26,12 @@ namespace AutoExile.Modes
         // Rendering data (cached for Render())
         private List<NavWaypoint> _renderNavPath = new();
         private Vector2 _playerPos;
+
+        // Dodge state
+        private bool _dodging;
+        private DateTime _lastDodgeAt = DateTime.MinValue;
+        private Vector2 _dodgeTarget; // grid coords
+        private string _lastDodgeSkill = "";
 
         public void OnEnter(BotContext ctx)
         {
@@ -47,6 +54,38 @@ namespace AutoExile.Modes
             // Tick combat system if profile is enabled
             if (ctx.Combat.Profile.Enabled)
                 ctx.Combat.Tick(ctx);
+
+            // Tick threat detection
+            ctx.Threat.Tick(ctx.Game);
+
+            // Auto dodge: when threat system signals, move perpendicular to attack
+            if (ctx.Threat.DodgeUrgent && ctx.Settings.Threat.AutoDodge.Value)
+            {
+                var dodgeCooldown = ctx.Settings.Threat.DodgeCooldownMs.Value;
+                if ((DateTime.Now - _lastDodgeAt).TotalMilliseconds >= dodgeCooldown)
+                {
+                    var playerGrid = new Vector2(
+                        ctx.Game.Player.GridPosNum.X,
+                        ctx.Game.Player.GridPosNum.Y);
+                    var dodgeDist = ctx.Settings.Threat.DodgeDistance.Value;
+                    _dodgeTarget = playerGrid + ctx.Threat.DodgeDirection * dodgeDist;
+                    var worldTarget = _dodgeTarget * (float)Pathfinding.GridToWorld;
+
+                    if (ctx.Navigation.NavigateTo(ctx.Game, worldTarget))
+                    {
+                        _dodging = true;
+                        _navigating = true;
+                        _lastDodgeAt = DateTime.Now;
+                        _lastDodgeSkill = ctx.Threat.ThreatSkillName;
+                        _status = $"DODGING {ctx.Threat.ThreatSkillName}!";
+                        ctx.Log($"Dodge: {ctx.Threat.ThreatSkillName} prog={ctx.Threat.ThreatProgress:F2}");
+                    }
+                }
+            }
+
+            // Clear dodge state when navigation completes
+            if (_dodging && !ctx.Navigation.IsNavigating)
+                _dodging = false;
 
             // Cache path for rendering
             _renderNavPath = new List<NavWaypoint>(ctx.Navigation.CurrentNavPath);
@@ -516,6 +555,100 @@ namespace AutoExile.Modes
                     if (wp.Action == WaypointAction.Blink)
                         gfx.DrawText("BLINK", c + new Vector2(size + 2, -8), SharpDX.Color.Magenta);
                 }
+            }
+
+            // ── Threat overlays ──
+            if (ctx.Threat.Enabled)
+            {
+                var playerGrid = new Vector2(
+                    ctx.Game.Player.GridPosNum.X,
+                    ctx.Game.Player.GridPosNum.Y);
+                var gtw = (float)Pathfinding.GridToWorld;
+
+                foreach (var kv in ctx.Threat.TrackedMonsters)
+                {
+                    var mt = kv.Value;
+                    if (mt.Entity == null) continue;
+
+                    var monWorld = mt.Entity.BoundsCenterPosNum;
+                    var monScreen = camera.WorldToScreen(monWorld);
+                    if (!IsOnScreen(monScreen, ctx.Game)) continue;
+
+                    var ms = new Vector2(monScreen.X, monScreen.Y);
+
+                    if (mt.HasCast)
+                    {
+                        // Draw line from monster to cast destination
+                        var destWorld3 = new System.Numerics.Vector3(
+                            mt.CastDestination.X * gtw,
+                            mt.CastDestination.Y * gtw,
+                            playerZ);
+                        var destScreen = camera.WorldToScreen(destWorld3);
+                        var ds = new Vector2(destScreen.X, destScreen.Y);
+
+                        var lineColor = mt.DodgeSignaled
+                            ? SharpDX.Color.Orange
+                            : SharpDX.Color.Red;
+                        gfx.DrawLine(ms, ds, 2, lineColor);
+
+                        // X marker at cast destination
+                        if (IsOnScreen(destScreen, ctx.Game))
+                        {
+                            gfx.DrawLine(ds + new Vector2(-8, -8), ds + new Vector2(8, 8), 2, lineColor);
+                            gfx.DrawLine(ds + new Vector2(8, -8), ds + new Vector2(-8, 8), 2, lineColor);
+                        }
+
+                        // Progress bar above monster
+                        var barY = ms.Y - 30;
+                        var barWidth = 60f;
+                        var barX = ms.X - barWidth / 2;
+                        gfx.DrawLine(
+                            new Vector2(barX, barY),
+                            new Vector2(barX + barWidth, barY),
+                            4, SharpDX.Color.DarkGray);
+                        gfx.DrawLine(
+                            new Vector2(barX, barY),
+                            new Vector2(barX + barWidth * mt.AnimationProgress, barY),
+                            4, mt.AnimationProgress <= ctx.Settings.Threat.DodgeMaxProgress.Value
+                                ? SharpDX.Color.Yellow
+                                : SharpDX.Color.Gray);
+
+                        // Skill name + stage
+                        gfx.DrawText(
+                            $"{mt.SkillName} stg={mt.AnimationStage}",
+                            new Vector2(ms.X - 40, ms.Y - 45),
+                            SharpDX.Color.White);
+                    }
+                    else
+                    {
+                        // Not casting — show animation name in gray
+                        gfx.DrawText(mt.AnimationName, ms + new Vector2(10, -10), SharpDX.Color.Gray);
+                    }
+                }
+
+                // Draw dodge direction arrow when actively dodging
+                if (_dodging)
+                {
+                    var dodgeWorld3 = new System.Numerics.Vector3(
+                        _dodgeTarget.X * gtw,
+                        _dodgeTarget.Y * gtw,
+                        playerZ);
+                    var dodgeScreen = camera.WorldToScreen(dodgeWorld3);
+                    if (IsOnScreen(dodgeScreen, ctx.Game))
+                    {
+                        var dts = new Vector2(dodgeScreen.X, dodgeScreen.Y);
+                        gfx.DrawLine(
+                            new Vector2(_playerPos.X, _playerPos.Y),
+                            dts, 3, SharpDX.Color.LimeGreen);
+                        gfx.DrawText("DODGE", dts + new Vector2(5, -8), SharpDX.Color.LimeGreen);
+                    }
+                }
+
+                // Threat status text
+                gfx.DrawText(
+                    $"Threats: {ctx.Threat.TrackedMonsters.Count} tracked | {ctx.Threat.CastsDetected} casts | {ctx.Threat.DodgesTriggered} dodges",
+                    new Vector2(100, yOffset), SharpDX.Color.Yellow);
+                yOffset += 20;
             }
         }
 

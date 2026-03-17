@@ -21,6 +21,9 @@ namespace AutoExile
         [Menu("Dump Game State", "Hotkey to dump terrain, exploration, and pathfinding data to image + JSON files.")]
         public HotkeyNode DumpGameState { get; set; } = new HotkeyNode(Keys.F6);
 
+        [Menu("Dump Recording", "Hotkey to dump last ~10 seconds of tick-level state (decisions, threats, navigation, actions).")]
+        public HotkeyNode DumpRecording { get; set; } = new HotkeyNode(Keys.F7);
+
         [Menu("Active Mode", "Bot mode to run. Persists across reloads.")]
         public ListNode ActiveMode { get; set; } = new ListNode() { Value = "Idle" };
 
@@ -52,6 +55,14 @@ namespace AutoExile
         // --- Simulacrum (mode-specific) ---
 
         public SimulacrumSettings Simulacrum { get; set; } = new SimulacrumSettings();
+
+        // --- Heist (mode-specific) ---
+
+        public HeistSettings Heist { get; set; } = new HeistSettings();
+
+        // --- Threat / Dodge ---
+
+        public ThreatSettings Threat { get; set; } = new ThreatSettings();
 
         // --- In-map Mechanics ---
 
@@ -283,6 +294,86 @@ namespace AutoExile
 
             [Menu("Stash Item Threshold", "Stash items between waves when inventory has this many items.")]
             public RangeNode<int> StashItemThreshold { get; set; } = new RangeNode<int>(5, 1, 30);
+        }
+
+        [Submenu(CollapsedByDefault = true)]
+        public class HeistSettings
+        {
+            [Menu("Companion Interact Key", "Key to press near doors/chests for companion interaction (default V).")]
+            public System.Windows.Forms.Keys CompanionInteractKey { get; set; } = System.Windows.Forms.Keys.V;
+
+            [Menu("Alert Threshold %", "Stop opening side chests above this alert level.")]
+            public RangeNode<float> AlertThreshold { get; set; } = new RangeNode<float>(70f, 20f, 95f);
+
+            [Menu("Max Chest Detour (grid)", "Maximum grid distance to detour for a reward chest.")]
+            public RangeNode<float> MaxChestDetour { get; set; } = new RangeNode<float>(30f, 10f, 80f);
+
+            [Menu("Open Reward Chests", "Open valuable reward chests during infiltration.")]
+            public ToggleNode OpenRewardChests { get; set; } = new ToggleNode(true);
+
+            [Menu("Companion Wait Timeout (s)", "Max seconds to wait for companion to open a lock.")]
+            public RangeNode<float> CompanionWaitTimeout { get; set; } = new RangeNode<float>(30f, 10f, 60f);
+
+            [Menu("Companion Retry Delay (s)", "Re-click if companion hasn't started channeling after this.")]
+            public RangeNode<float> CompanionRetryDelay { get; set; } = new RangeNode<float>(10f, 5f, 20f);
+
+            // --- Per Reward Type Toggles ---
+
+            [Menu("Reward: Currency", "Open currency reward chests.")]
+            public ToggleNode RewardCurrency { get; set; } = new ToggleNode(true);
+
+            [Menu("Reward: Armour", "Open armour reward chests.")]
+            public ToggleNode RewardArmour { get; set; } = new ToggleNode(true);
+
+            [Menu("Reward: Weapons", "Open weapon reward chests.")]
+            public ToggleNode RewardWeapons { get; set; } = new ToggleNode(true);
+
+            [Menu("Reward: Gems", "Open gem reward chests.")]
+            public ToggleNode RewardGems { get; set; } = new ToggleNode(true);
+
+            [Menu("Reward: Divination Cards", "Open divination card reward chests.")]
+            public ToggleNode RewardDivinationCards { get; set; } = new ToggleNode(true);
+
+            [Menu("Reward: Uniques", "Open unique item reward chests.")]
+            public ToggleNode RewardUniques { get; set; } = new ToggleNode(true);
+
+            [Menu("Reward: Jewellery", "Open jewellery reward chests.")]
+            public ToggleNode RewardJewellery { get; set; } = new ToggleNode(true);
+
+            [Menu("Reward: Essences", "Open essence reward chests.")]
+            public ToggleNode RewardEssences { get; set; } = new ToggleNode(true);
+
+            [Menu("Reward: Fragments", "Open fragment reward chests.")]
+            public ToggleNode RewardFragments { get; set; } = new ToggleNode(true);
+
+            [Menu("Reward: Maps", "Open map reward chests.")]
+            public ToggleNode RewardMaps { get; set; } = new ToggleNode(false);
+
+            [Menu("Reward: Jewels", "Open jewel reward chests.")]
+            public ToggleNode RewardJewels { get; set; } = new ToggleNode(false);
+
+            [Menu("Reward: Corrupted", "Open corrupted item reward chests.")]
+            public ToggleNode RewardCorrupted { get; set; } = new ToggleNode(false);
+
+            /// <summary>Check if a reward type is enabled in settings.</summary>
+            public bool IsRewardTypeEnabled(HeistRewardType type) => type switch
+            {
+                HeistRewardType.Currency or HeistRewardType.QualityCurrency => RewardCurrency.Value,
+                HeistRewardType.Armour => RewardArmour.Value,
+                HeistRewardType.Weapons => RewardWeapons.Value,
+                HeistRewardType.Gems => RewardGems.Value,
+                HeistRewardType.DivinationCards or HeistRewardType.StackedDecks => RewardDivinationCards.Value,
+                HeistRewardType.Uniques => RewardUniques.Value,
+                HeistRewardType.Jewellery => RewardJewellery.Value,
+                HeistRewardType.Essences => RewardEssences.Value,
+                HeistRewardType.Fragments => RewardFragments.Value,
+                HeistRewardType.Maps => RewardMaps.Value,
+                HeistRewardType.Jewels => RewardJewels.Value,
+                HeistRewardType.Corrupted => RewardCorrupted.Value,
+                HeistRewardType.Smugglers => true,  // always open free chests
+                HeistRewardType.Safe => true,
+                _ => false,
+            };
         }
 
         [Submenu(CollapsedByDefault = true)]
@@ -629,6 +720,37 @@ namespace AutoExile
                     ImGui.PopItemWidth();
                 }
             }
+        }
+
+        [Submenu(CollapsedByDefault = true)]
+        public class ThreatSettings
+        {
+            [Menu("Enable Threat Scanning", "Monitor Unique/Rare monsters for dangerous skill casts.")]
+            public ToggleNode Enabled { get; set; } = new ToggleNode(false);
+
+            [Menu("Monitor Rares", "Also track Rare monsters (not just Uniques).")]
+            public ToggleNode MonitorRares { get; set; } = new ToggleNode(true);
+
+            [Menu("Auto Dodge", "Automatically dodge detected threats (move perpendicular to attack vector).")]
+            public ToggleNode AutoDodge { get; set; } = new ToggleNode(false);
+
+            [Menu("Threat Radius", "Only monitor monsters within this grid distance.")]
+            public RangeNode<int> ThreatRadius { get; set; } = new RangeNode<int>(60, 20, 150);
+
+            [Menu("Dodge Trigger Distance", "Dodge when attack destination is within this grid distance of player.")]
+            public RangeNode<int> DodgeTriggerDistance { get; set; } = new RangeNode<int>(15, 5, 40);
+
+            [Menu("Dodge Distance", "How far to sidestep when dodging (grid units).")]
+            public RangeNode<int> DodgeDistance { get; set; } = new RangeNode<int>(20, 5, 50);
+
+            [Menu("Dodge Min Progress", "Earliest animation progress to trigger dodge (dest not locked before this). 0.15 = 15%.")]
+            public RangeNode<float> DodgeMinProgress { get; set; } = new RangeNode<float>(0.15f, 0.0f, 0.5f);
+
+            [Menu("Dodge Max Progress", "Latest animation progress to trigger dodge (too late after this). 0.50 = 50%.")]
+            public RangeNode<float> DodgeMaxProgress { get; set; } = new RangeNode<float>(0.50f, 0.2f, 0.8f);
+
+            [Menu("Dodge Cooldown (ms)", "Minimum time between dodge movements.")]
+            public RangeNode<int> DodgeCooldownMs { get; set; } = new RangeNode<int>(500, 100, 2000);
         }
     }
 }

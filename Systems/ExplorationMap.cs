@@ -10,7 +10,16 @@ namespace AutoExile.Systems
     /// </summary>
     public class ExplorationMap
     {
-        private static int RenderRange => (int)Pathfinding.NetworkBubbleRadius;
+        private static int DefaultRange => (int)Pathfinding.NetworkBubbleRadius;
+
+        /// <summary>
+        /// Override the seen radius for Update(). Set to a smaller value (e.g., 40) on small maps
+        /// so exploration route planning works — the bot must physically visit each region.
+        /// Set to 0 to use the default network bubble radius.
+        /// </summary>
+        public int SeenRadiusOverride { get; set; }
+
+        private int RenderRange => SeenRadiusOverride > 0 ? SeenRadiusOverride : DefaultRange;
 
         // Region chunk size — blob is divided into NxN grid chunks for navigation targeting
         private const int RegionChunkSize = 80;
@@ -279,8 +288,11 @@ namespace AutoExile.Systems
 
             foreach (var region in blob.Regions)
             {
-                // Skip fully explored regions (>80% seen)
-                if (region.ExploredRatio > 0.8f) continue;
+                // Skip fully explored regions. When SeenRadiusOverride is active (small maps),
+                // use a tighter threshold — the small radius means even visited regions may
+                // only be 90-95% seen, so 80% would skip regions we haven't fully swept.
+                float exploredThreshold = SeenRadiusOverride > 0 ? 0.98f : 0.8f;
+                if (region.ExploredRatio > exploredThreshold) continue;
 
                 // Skip tiny dead-end pockets
                 if (region.CellCount < MinRegionSize) continue;

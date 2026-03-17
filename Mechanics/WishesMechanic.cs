@@ -47,23 +47,30 @@ namespace AutoExile.Mechanics
         private Vector2 _npcGridPos;
         private Vector2 _portalGridPos;
 
+
         // UI interaction state
         private int _wishClickAttempts;
         private int _confirmClickAttempts;
+        private int _npcClickAttempts;
+        private int _portalClickAttempts;
+        private int _navFailCount;
         private DateTime _lastClickTime = DateTime.MinValue;
         private const float ClickCooldownMs = 500;
-        private const float PhaseTimeoutSeconds = 30;
+        private const float PhaseTimeoutSeconds = 60;
+        private const int MaxClickAttempts = 8;
+        private const int MaxNavFails = 10;
 
         // Wishes panel — discovered dynamically, cached until reset
         private int _wishesPanelIndex = -1;
 
         public bool Detect(BotContext ctx)
         {
+            // Already active (including wish zone phases) — stay detected
             if (_phase != WishesPhase.Idle) return true;
 
             var gc = ctx.Game;
 
-            // Don't detect in wish zones (mirage maps).
+            // Don't detect NEW encounters in wish zones (mirage maps).
             // SekhemaPortal = return portal, only exists in wish zones.
             foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
             {
@@ -140,6 +147,9 @@ namespace AutoExile.Mechanics
             Status = "";
             _wishClickAttempts = 0;
             _confirmClickAttempts = 0;
+            _npcClickAttempts = 0;
+            _portalClickAttempts = 0;
+            _navFailCount = 0;
             _wishesPanelIndex = -1;
         }
 
@@ -170,6 +180,11 @@ namespace AutoExile.Mechanics
         private MechanicResult TickNavigateToEncounter(BotContext ctx)
         {
             var gc = ctx.Game;
+
+            // Resume navigation if combat paused it
+            if (ctx.Navigation.IsPaused)
+                ctx.Navigation.Resume(gc);
+
             ctx.Combat.Tick(ctx);
 
             ScanFaridunEntities(ctx);
@@ -188,8 +203,25 @@ namespace AutoExile.Mechanics
                 return MechanicResult.InProgress;
             }
 
+            // Resume navigation if combat paused it (check again after combat tick)
+            if (ctx.Navigation.IsPaused)
+                ctx.Navigation.Resume(gc);
+
             var worldTarget = _initiatorGridPos * Pathfinding.GridToWorld;
-            ctx.Navigation.NavigateTo(gc, worldTarget);
+            if (!ctx.Navigation.NavigateTo(gc, worldTarget))
+            {
+                _navFailCount++;
+                Status = $"[Nav] Can't path to encounter (fail {_navFailCount}/{MaxNavFails})";
+                if (_navFailCount >= MaxNavFails)
+                {
+                    ctx.Log("[Wishes] Navigation failed too many times, abandoning");
+                    _phase = WishesPhase.Complete;
+                    return MechanicResult.Abandoned;
+                }
+                return MechanicResult.InProgress;
+            }
+
+            _navFailCount = 0;
             Status = $"[Nav] Walking to encounter ({dist:F0}g away)";
             return MechanicResult.InProgress;
         }
@@ -197,9 +229,16 @@ namespace AutoExile.Mechanics
         private MechanicResult TickWaitForCombatClear(BotContext ctx)
         {
             var gc = ctx.Game;
+
+            // Resume navigation if combat paused it
+            if (ctx.Navigation.IsPaused)
+                ctx.Navigation.Resume(gc);
+
             ctx.Combat.Tick(ctx);
 
             ScanFaridunEntities(ctx);
+
+            // NPC targetable = combat phase is done, regardless of monster count
             if (_npc != null && _npc.IsTargetable)
             {
                 SetPhase(WishesPhase.NavigateToNPC, "NPC available, going to talk");
@@ -210,7 +249,9 @@ namespace AutoExile.Mechanics
             if (monsterCount == 0)
             {
                 var elapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
-                Status = $"[Combat] Monsters dead, waiting for NPC ({elapsed:F0}s)";
+                Status = $"[Combat] Monsters cleared, waiting for NPC ({elapsed:F0}s)";
+                // Don't timeout here — NPC can take a while to spawn after combat.
+                // The phase-level timeout (60s) handles true stuck states.
                 return MechanicResult.InProgress;
             }
 
@@ -221,17 +262,20 @@ namespace AutoExile.Mechanics
         private MechanicResult TickNavigateToNPC(BotContext ctx)
         {
             var gc = ctx.Game;
-            ctx.Combat.Tick(ctx);
 
+            // Resume navigation if combat paused it
             if (ctx.Navigation.IsPaused)
                 ctx.Navigation.Resume(gc);
+
+            ctx.Combat.Tick(ctx);
 
             if (_npc == null || !_npc.IsTargetable)
             {
                 ScanFaridunEntities(ctx);
-                if (_npc == null)
+                if (_npc == null || !_npc.IsTargetable)
                 {
-                    Status = "[NPC] Can't find Varashta";
+                    // NPC disappeared — go back to waiting
+                    SetPhase(WishesPhase.WaitForCombatClear, "NPC not ready, returning to combat wait");
                     return MechanicResult.InProgress;
                 }
             }
@@ -246,8 +290,17 @@ namespace AutoExile.Mechanics
                 return MechanicResult.InProgress;
             }
 
+            // Resume again after combat tick
+            if (ctx.Navigation.IsPaused)
+                ctx.Navigation.Resume(gc);
+
             var worldTarget = _npcGridPos * Pathfinding.GridToWorld;
-            ctx.Navigation.NavigateTo(gc, worldTarget);
+            if (!ctx.Navigation.NavigateTo(gc, worldTarget))
+            {
+                Status = $"[Nav] Can't path to Varashta ({dist:F0}g)";
+                return MechanicResult.InProgress;
+            }
+
             Status = $"[Nav] Walking to Varashta ({dist:F0}g away)";
             return MechanicResult.InProgress;
         }
@@ -264,8 +317,12 @@ namespace AutoExile.Mechanics
 
             if (_npc == null || !_npc.IsTargetable)
             {
-                Status = "[NPC] Varashta not targetable";
-                return MechanicResult.InProgress;
+                ScanFaridunEntities(ctx);
+                if (_npc == null || !_npc.IsTargetable)
+                {
+                    Status = "[NPC] Varashta not targetable, waiting";
+                    return MechanicResult.InProgress;
+                }
             }
 
             // Ensure we're close enough — walk closer if needed (interact range ~8 grid)
@@ -289,7 +346,15 @@ namespace AutoExile.Mechanics
             if (BotInput.Click(absPos))
             {
                 _lastClickTime = DateTime.Now;
-                Status = $"[NPC] Clicked Varashta (dist={dist:F0}), waiting for Wishes panel";
+                _npcClickAttempts++;
+                Status = $"[NPC] Clicked Varashta (attempt {_npcClickAttempts}/{MaxClickAttempts})";
+            }
+
+            if (_npcClickAttempts >= MaxClickAttempts)
+            {
+                ctx.Log("[Wishes] Failed to talk to NPC after max attempts, abandoning");
+                _phase = WishesPhase.Complete;
+                return MechanicResult.Abandoned;
             }
 
             return MechanicResult.InProgress;
@@ -348,14 +413,14 @@ namespace AutoExile.Mechanics
                 _lastClickTime = DateTime.Now;
                 _wishClickAttempts++;
                 var wishName = GetWishName(option);
-                Status = $"[Wish] Clicking '{wishName}' (attempt {_wishClickAttempts})";
+                Status = $"[Wish] Clicking '{wishName}' (attempt {_wishClickAttempts}/{MaxClickAttempts})";
             }
 
-            if (_wishClickAttempts > 5)
+            if (_wishClickAttempts >= MaxClickAttempts)
             {
-                ctx.Log("[Wishes] Failed to select wish after 5 attempts");
+                ctx.Log("[Wishes] Failed to select wish after max attempts, abandoning");
                 _phase = WishesPhase.Complete;
-                return MechanicResult.Failed;
+                return MechanicResult.Abandoned;
             }
 
             return MechanicResult.InProgress;
@@ -396,14 +461,14 @@ namespace AutoExile.Mechanics
             {
                 _lastClickTime = DateTime.Now;
                 _confirmClickAttempts++;
-                Status = $"[Wish] Clicked confirm (attempt {_confirmClickAttempts})";
+                Status = $"[Wish] Clicked confirm (attempt {_confirmClickAttempts}/{MaxClickAttempts})";
             }
 
-            if (_confirmClickAttempts > 5)
+            if (_confirmClickAttempts >= MaxClickAttempts)
             {
-                ctx.Log("[Wishes] Failed to confirm wish after 5 attempts");
+                ctx.Log("[Wishes] Failed to confirm wish after max attempts, abandoning");
                 _phase = WishesPhase.Complete;
-                return MechanicResult.Failed;
+                return MechanicResult.Abandoned;
             }
 
             return MechanicResult.InProgress;
@@ -478,9 +543,10 @@ namespace AutoExile.Mechanics
 
             if (_portal == null || !_portal.IsTargetable)
             {
-                // Portal gone — area change handles the transition.
-                // BotCore will reset mechanics on area change.
-                // In the wish zone, Detect() won't re-fire (SekhemaPortal check).
+                // Portal gone — area change triggers loading screen.
+                // BotCore will ForceCompleteActive() this mechanic and cache it.
+                // MappingMode handles the wish zone (fight, loot, exit via SekhemaPortal)
+                // with a minimum zone time before allowing exit.
                 var elapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
                 Status = $"[Enter] Portal gone, waiting for area change ({elapsed:F0}s)";
                 return MechanicResult.InProgress;
@@ -495,7 +561,15 @@ namespace AutoExile.Mechanics
             if (BotInput.Click(absPos))
             {
                 _lastClickTime = DateTime.Now;
-                Status = "[Enter] Clicked portal";
+                _portalClickAttempts++;
+                Status = $"[Enter] Clicked portal (attempt {_portalClickAttempts}/{MaxClickAttempts})";
+            }
+
+            if (_portalClickAttempts >= MaxClickAttempts)
+            {
+                ctx.Log("[Wishes] Failed to enter portal after max attempts, abandoning");
+                _phase = WishesPhase.Complete;
+                return MechanicResult.Abandoned;
             }
 
             return MechanicResult.InProgress;
@@ -568,7 +642,7 @@ namespace AutoExile.Mechanics
             {
                 if (entity.Path == null) continue;
                 if (!entity.Path.Contains("FaridunLeague")) continue;
-                if (!entity.IsTargetable) continue;
+                if (!entity.IsAlive || !entity.IsHostile) continue;
 
                 var entityGrid = new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y);
                 if (Vector2.Distance(playerGrid, entityGrid) < 120)
@@ -671,5 +745,7 @@ namespace AutoExile.Mechanics
 
             return 3;
         }
+
+        public void Render(BotContext ctx) { }
     }
 }

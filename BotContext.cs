@@ -21,6 +21,7 @@ namespace AutoExile
         public required ExplorationMap Exploration { get; init; }
         public required LootTracker LootTracker { get; init; }
         public required MapMechanicManager Mechanics { get; init; }
+        public required ThreatSystem Threat { get; init; }
         public required BotSettings Settings { get; init; }
 
         /// <summary>

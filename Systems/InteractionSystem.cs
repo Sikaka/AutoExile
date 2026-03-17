@@ -97,6 +97,7 @@ namespace AutoExile.Systems
                 EntityGridPos = new Vector2(itemEntity.GridPosNum.X, itemEntity.GridPosNum.Y),
             };
             _clickAttempts = 0;
+            _navStoppedAt = DateTime.MinValue;
             _interactionStartTime = DateTime.Now;
             _currentTimeout = ComputeTimeout(requireProximity, itemEntity.DistancePlayer);
             Status = $"Picking up item (id={itemEntity.Id})";
@@ -230,9 +231,31 @@ namespace AutoExile.Systems
 
         // --- Clicking phase ---
 
+        // Settle time after stopping navigation before clicking — character has movement
+        // inertia and needs a few frames to fully stop, otherwise label positions shift mid-click.
+        private DateTime _navStoppedAt = DateTime.MinValue;
+        private const int NavSettleMs = 200;
+
         private InteractionResult TickGroundItem(GameController gc)
         {
             var target = _currentTarget!;
+
+            // Stop navigation before clicking — if the player is walking, clicks miss because
+            // the camera/label positions are shifting every frame. This is critical for items
+            // picked up "in radius" (requireProximity=false) where no navigate phase runs.
+            if (target.Nav != null && target.Nav.IsNavigating)
+            {
+                target.Nav.Stop(gc);
+                _navStoppedAt = DateTime.Now;
+            }
+
+            // Wait for character to settle after stopping navigation
+            if (_navStoppedAt != DateTime.MinValue &&
+                (DateTime.Now - _navStoppedAt).TotalMilliseconds < NavSettleMs)
+            {
+                Status = "Stopping to pick up item...";
+                return InteractionResult.InProgress;
+            }
 
             var (found, labelDesc) = FindGroundItemLabel(gc, target.EntityId);
             if (!found)

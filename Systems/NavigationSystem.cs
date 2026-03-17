@@ -140,6 +140,37 @@ namespace AutoExile.Systems
                 CurrentWaypointIndex++;
                 _stuckTimer = 0;
             }
+            else if (!isLastWaypoint)
+            {
+                // Pass-through detection: if a dash/blink overshot the current waypoint,
+                // skip ahead to the furthest waypoint the player has passed beyond.
+                // Uses dot product: if player is past waypoint along the path direction,
+                // the waypoint is behind us and should be skipped.
+                var advanced = false;
+                for (var i = CurrentWaypointIndex; i < CurrentNavPath.Count - 1; i++)
+                {
+                    var wp = CurrentNavPath[i];
+                    var nextWp = CurrentNavPath[i + 1];
+
+                    // Don't skip past blink waypoints — they represent gap crossings
+                    // that require precise positioning
+                    if (nextWp.Action == WaypointAction.Blink)
+                        break;
+
+                    var toNext = nextWp.Position - wp.Position;
+                    var toPlayer = playerWorld - wp.Position;
+
+                    if (Vector2.Dot(toNext, toPlayer) > 0)
+                    {
+                        CurrentWaypointIndex = i + 1;
+                        advanced = true;
+                    }
+                    else
+                        break;
+                }
+                if (advanced)
+                    _stuckTimer = 0;
+            }
 
             // Stuck detection
             var moved = Vector2.Distance(playerWorld, _lastPosition);
@@ -418,7 +449,7 @@ namespace AutoExile.Systems
             return true;
         }
 
-        public bool NavigateTo(GameController gc, Vector2 worldTarget, int maxNodes = 80000)
+        public bool NavigateTo(GameController gc, Vector2 worldTarget, int maxNodes = 0)
         {
             var playerPos = gc.Player.PosNum;
             var start = new Vector2(playerPos.X, playerPos.Y);
@@ -426,6 +457,14 @@ namespace AutoExile.Systems
 
             if (pfGrid == null || pfGrid.Length == 0)
                 return false;
+
+            // Auto-scale node budget based on grid size.
+            // Atlas maps (~800x800) need ~200K, campaign zones (~1800x1800) need ~500K+.
+            if (maxNodes <= 0)
+            {
+                var gridArea = (long)pfGrid.Length * pfGrid[0].Length;
+                maxNodes = gridArea > 2_000_000 ? 500_000 : 200_000;
+            }
 
             var sw = System.Diagnostics.Stopwatch.StartNew();
 
@@ -436,6 +475,17 @@ namespace AutoExile.Systems
                 rawPath = Pathfinding.FindPathWithBlinks(
                     pfGrid, tgtGrid, start, worldTarget,
                     BlinkRange, BlinkCostPenalty, maxNodes);
+
+                // Fallback: blink scanning is expensive on large grids and may exhaust
+                // the node budget before reaching the goal. Retry without blinks —
+                // regular A* is much cheaper per node and can reach farther.
+                // If the path truly needs a blink crossing, navigation will repath
+                // when it reaches the gap (closer = smaller search space).
+                if (rawPath.Count == 0)
+                {
+                    var simplePath = Pathfinding.FindPath(pfGrid, start, worldTarget, maxNodes);
+                    rawPath = simplePath.Select(p => new NavWaypoint(p, WaypointAction.Walk)).ToList();
+                }
             }
             else
             {

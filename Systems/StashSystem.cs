@@ -22,7 +22,11 @@ namespace AutoExile.Systems
         private int _prevItemCount; // track item count to detect failed transfers
         private const float PhaseTimeoutSeconds = 30f;
         private const int MaxAttempts = 50;
-        private const float NearStashGridDist = 8f;
+        /// <summary>
+        /// Grid distance to consider "close enough" to interact with stash.
+        /// Synced from InteractionSystem.InteractRadius (which comes from LootRadius setting).
+        /// </summary>
+        public float InteractRadius { get; set; } = 20f;
         private const int MaxConsecutiveFailures = 3;
         private int _consecutiveFailures;
 
@@ -118,7 +122,7 @@ namespace AutoExile.Systems
                 new Vector2(playerGrid.X, playerGrid.Y),
                 new Vector2(stashGrid.X, stashGrid.Y));
 
-            if (dist < NearStashGridDist)
+            if (dist <= InteractRadius)
             {
                 nav.Stop(gc);
                 _phase = StashPhase.OpenStash;

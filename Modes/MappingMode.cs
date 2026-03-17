@@ -49,6 +49,9 @@ namespace AutoExile.Modes
         // ── Exit portal (wish zones, sub-zones with return portals) ──
         private Entity? _exitPortal;
         private DateTime _lastExitClickTime = DateTime.MinValue;
+        private DateTime _zoneEnteredAt = DateTime.Now;
+        private string _lastZoneName = "";
+        private const float MinZoneSecondsBeforeExit = 20f; // don't exit sub-zones before clearing them
 
         // ── Stats ──
         private DateTime _startTime;
@@ -76,6 +79,7 @@ namespace AutoExile.Modes
         public void OnEnter(BotContext ctx)
         {
             _startTime = DateTime.Now;
+            _zoneEnteredAt = DateTime.Now;
             _exploreTargetsVisited = 0;
             _navFailures = 0;
             _navTarget = null;
@@ -141,6 +145,20 @@ namespace AutoExile.Modes
 
             var gc = ctx.Game;
             if (gc?.Player == null || !gc.InGame || !gc.Player.IsAlive) return;
+
+            // Detect zone changes (sub-zone transitions like wish zones)
+            var currentZone = gc.Area?.CurrentArea?.Name ?? "";
+            if (!string.IsNullOrEmpty(currentZone) && currentZone != _lastZoneName)
+            {
+                if (!string.IsNullOrEmpty(_lastZoneName))
+                {
+                    _zoneEnteredAt = DateTime.Now;
+                    _exitPortal = null;
+                    if (_phase == MappingPhase.Exiting)
+                        _phase = MappingPhase.Exploring;
+                }
+                _lastZoneName = currentZone;
+            }
 
             var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
 
@@ -353,7 +371,7 @@ namespace AutoExile.Modes
                     else
                     {
                         // Exploration done — check for exit portal (wish zones / sub-zones)
-                        var exitPortal = FindExitPortal(gc);
+                        var exitPortal = FindExitPortal(gc, ctx.Combat);
                         if (exitPortal != null)
                         {
                             _exitPortal = exitPortal;
@@ -410,7 +428,7 @@ namespace AutoExile.Modes
                     // Only consider exit portals after meaningful exploration (>10% coverage).
                     // Prevents immediately exiting wish zones / sub-zones before exploring them
                     // (exploration can return null briefly on fresh zone init).
-                    var exitPortal = coverage > 0.10f ? FindExitPortal(gc) : null;
+                    var exitPortal = coverage > 0.10f ? FindExitPortal(gc, ctx.Combat) : null;
                     if (exitPortal != null)
                     {
                         _exitPortal = exitPortal;
@@ -549,9 +567,18 @@ namespace AutoExile.Modes
 
         /// <summary>
         /// Find a return/exit portal in the current zone (e.g., SekhemaPortal in wish zones).
+        /// Requires minimum time in zone AND no nearby combat before allowing exit.
         /// </summary>
-        private static Entity? FindExitPortal(GameController gc)
+        private Entity? FindExitPortal(GameController gc, CombatSystem combat)
         {
+            // Don't exit sub-zones too quickly — need time to fight and loot
+            if ((DateTime.Now - _zoneEnteredAt).TotalSeconds < MinZoneSecondsBeforeExit)
+                return null;
+
+            // Don't exit while monsters are still nearby
+            if (combat.NearbyMonsterCount > 0)
+                return null;
+
             foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
             {
                 if (entity.Path == null) continue;

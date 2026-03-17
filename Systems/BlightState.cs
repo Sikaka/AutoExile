@@ -22,9 +22,10 @@ namespace AutoExile.Systems
         public bool IsPumpInRange { get; private set; }
 
         /// <summary>
-        /// The actual point monsters converge on — the lane hub, NOT the clickable pump.
-        /// Use this for all defense/danger/safety positioning. Falls back to PumpPosition
-        /// if hub hasn't been computed yet (lanes not loaded).
+        /// The actual point monsters converge on — the base of the blight organism,
+        /// computed as the average lane endpoint closest to the pump. This is NOT the
+        /// clickable pump entity (which is offset from the organism). Falls back to
+        /// PumpPosition if lanes haven't been computed yet.
         /// </summary>
         public Vector2? DefensePosition => LaneTracker.HubPosition ?? PumpPosition;
 

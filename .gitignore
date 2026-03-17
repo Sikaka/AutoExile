@@ -8,6 +8,9 @@ Logs/
 # Game state dumps
 Dumps/
 
+# Research notes
+Research/
+
 # IDE / editor
 .vs/
 .idea/

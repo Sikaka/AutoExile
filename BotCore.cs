@@ -5,6 +5,7 @@ using ImGuiNET;
 using AutoExile.Mechanics;
 using AutoExile.Modes;
 using AutoExile.Systems;
+using System.IO;
 using System.Linq;
 using System.Numerics;
 
@@ -12,6 +13,12 @@ namespace AutoExile
 {
     public class BotCore : BaseSettingsPlugin<BotSettings>
     {
+        /// <summary>
+        /// Static accessor for external tools (POEMCP /eval) to reach live AutoExile systems.
+        /// Set in Initialise(), cleared in Dispose/OnClose.
+        /// </summary>
+        public static BotCore? Instance { get; private set; }
+
         private BotContext _ctx = null!;
         private IBotMode _mode = new IdleMode();
         private readonly Dictionary<string, IBotMode> _modes = new();
@@ -31,6 +38,22 @@ namespace AutoExile
         private ExplorationMap _exploration = new();
         private LootTracker _lootTracker = new();
         private MapMechanicManager _mechanics = new();
+        private ThreatSystem _threat = new();
+        private BotRecorder _recorder = new();
+
+        // Public accessors for external tools (POEMCP /eval)
+        public NavigationSystem Navigation => _navigation;
+        public CombatSystem Combat => _combat;
+        public LootSystem Loot => _loot;
+        public InteractionSystem Interaction => _interaction;
+        public ExplorationMap Exploration => _exploration;
+        public LootTracker LootTrackerInstance => _lootTracker;
+        public MapMechanicManager Mechanics => _mechanics;
+        public ThreatSystem Threat => _threat;
+        public BotRecorder Recorder => _recorder;
+        public IBotMode ActiveMode => _mode;
+        public BotContext Context => _ctx;
+        public HeistState? HeistState => _heistMode?.State;
 
         // Mode references for ImGui buttons
         private DebugPathfindingMode? _debugMode;
@@ -38,6 +61,7 @@ namespace AutoExile
         private BlightMode? _blightMode;
         private MappingMode? _mappingMode;
         private SimulacrumMode? _simulacrumMode;
+        private HeistMode? _heistMode;
 
         // Area change tracking for tile map reload
         private string _lastAreaName = "";
@@ -67,6 +91,8 @@ namespace AutoExile
         public override bool Initialise()
         {
             Name = "AutoExile";
+            Instance = this;
+            _recorder.SetOutputDir(Path.Combine(DirectoryFullName, "Recordings"));
 
             _ctx = new BotContext
             {
@@ -81,6 +107,7 @@ namespace AutoExile
                 Exploration = _exploration,
                 LootTracker = _lootTracker,
                 Mechanics = _mechanics,
+                Threat = _threat,
                 Settings = Settings,
                 Log = msg => LogMessage($"[AutoExile] {msg}")
             };
@@ -96,6 +123,8 @@ namespace AutoExile
             RegisterMode(_mappingMode);
             _simulacrumMode = new SimulacrumMode();
             RegisterMode(_simulacrumMode);
+            _heistMode = new HeistMode();
+            RegisterMode(_heistMode);
 
             // Register in-map mechanics
             _mechanics.Register(new UltimatumMechanic());
@@ -238,6 +267,21 @@ namespace AutoExile
                 }
             }
 
+            // Retry exploration init if it was missed (terrain data not ready on area change tick)
+            if (!_exploration.IsInitialized && GameController.Player != null)
+            {
+                var terrainData = GameController.IngameState?.Data?.RawPathfindingData;
+                var targetingData = GameController.IngameState?.Data?.RawTerrainTargetingData;
+                if (terrainData != null)
+                {
+                    var playerGrid = new Vector2(
+                        GameController.Player.GridPosNum.X,
+                        GameController.Player.GridPosNum.Y);
+                    _exploration.Initialize(terrainData, targetingData, playerGrid,
+                        Settings.Build.BlinkRange.Value);
+                }
+            }
+
             // Update exploration coverage each tick
             if (_exploration.IsInitialized && GameController.Player != null)
             {
@@ -265,6 +309,15 @@ namespace AutoExile
 
             // Sync movement skills (dash/blink) from CombatSystem → NavigationSystem
             _navigation.MovementSkills = _combat.MovementSkills;
+
+            // Sync threat settings
+            var threatSettings = Settings.Threat;
+            _threat.Enabled = threatSettings.Enabled.Value;
+            _threat.ThreatRadius = threatSettings.ThreatRadius.Value;
+            _threat.DodgeTriggerDistance = threatSettings.DodgeTriggerDistance.Value;
+            _threat.DodgeMinProgress = threatSettings.DodgeMinProgress.Value;
+            _threat.DodgeMaxProgress = threatSettings.DodgeMaxProgress.Value;
+            _threat.MonitorRares = threatSettings.MonitorRares.Value;
 
             // Mapping mode hotkey — F5 cycles: start → pause → resume → pause ...
             // Double-tap from paused switches back to previous mode
@@ -297,6 +350,13 @@ namespace AutoExile
             if (Settings.DumpGameState.PressedOnce())
                 TriggerGameStateDump();
 
+            // Recording dump hotkey — F7 (last ~10s of tick-level state)
+            if (Settings.DumpRecording.PressedOnce())
+            {
+                _recorder.ForceDump("hotkey");
+                LogMessage($"[AutoExile] {_recorder.LastDumpStatus}");
+            }
+
             // Sync loot settings
             _loot.SkipLowValueUniques = Settings.Loot.SkipLowValueUniques.Value;
             _loot.MinUniqueChaosValue = Settings.Loot.MinUniqueChaosValue.Value;
@@ -306,6 +366,7 @@ namespace AutoExile
             _loot.IgnoreQuestItems = Settings.Loot.IgnoreQuestItems.Value;
 
             // Sync stash settings
+            _stash.InteractRadius = Settings.Loot.LootRadius.Value;
             _stash.ActionCooldownMs = Settings.Loot.StashItemCooldownMs.Value;
             _stash.ApplyIncubators = Settings.AutoApplyIncubators.Value;
 
@@ -336,6 +397,21 @@ namespace AutoExile
             // This prevents stale walk commands: the walk command always targets the current path,
             // not a path that's about to be replaced.
             _navigation.Tick(GameController);
+
+            // Record tick state for post-hoc analysis (combat, navigation, decisions)
+            _recorder.RecordTick(GameController, _mode.Name,
+                (_mode as MappingMode)?.Phase.ToString()
+                ?? (_mode as BlightMode)?.Phase.ToString()
+                ?? (_mode as SimulacrumMode)?.Phase.ToString()
+                ?? (_mode as HeistMode)?.Phase.ToString()
+                ?? (_mode as FollowerMode)?.State.ToString()
+                ?? "",
+                (_mode as MappingMode)?.Decision
+                ?? (_mode as SimulacrumMode)?.Decision
+                ?? (_mode as HeistMode)?.Decision
+                ?? (_mode as FollowerMode)?.Decision
+                ?? "",
+                _navigation, _interaction, _loot);
 
             // Auto level gems (global, runs across all modes)
             TickGemLevelUp();
@@ -552,6 +628,30 @@ namespace AutoExile
 
                 if (_mapDevice.IsBusy)
                     ImGui.Text($"MapDevice: {_mapDevice.Phase} — {_mapDevice.Status}");
+
+                // Threat detection testing
+                ImGui.Separator();
+                ImGui.Text("=== Threat Detection ===");
+
+                ImGui.Text($"Status: {_threat.LastAction}");
+                ImGui.Text($"Casts detected: {_threat.CastsDetected} | Dodges triggered: {_threat.DodgesTriggered}");
+
+                if (_threat.TrackedMonsters.Count > 0)
+                {
+                    ImGui.BeginChild("ThreatMonsters", new Vector2(0, 120), ImGuiChildFlags.Border);
+                    foreach (var kv in _threat.TrackedMonsters)
+                    {
+                        var mt = kv.Value;
+                        var castInfo = mt.HasCast
+                            ? $" CASTING {mt.SkillName} stg={mt.AnimationStage} prog={mt.AnimationProgress:F2} in={mt.TimeRemainingMs:F0}ms dest=({mt.CastDestination.X:F0},{mt.CastDestination.Y:F0}){(mt.DodgeSignaled ? " [DODGED]" : "")}"
+                            : $" {mt.AnimationName}";
+                        var color = mt.HasCast
+                            ? (mt.DodgeSignaled ? new Vector4(1, 0.5f, 0, 1) : new Vector4(1, 1, 0, 1))
+                            : new Vector4(0.6f, 0.6f, 0.6f, 1);
+                        ImGui.TextColored(color, $"#{mt.EntityId} d={Vector2.Distance(mt.GridPos, new Vector2(GameController.Player.GridPosNum.X, GameController.Player.GridPosNum.Y)):F0}{castInfo}");
+                    }
+                    ImGui.EndChild();
+                }
             }
 
             if (_mode == _followerMode && _followerMode != null)
@@ -1116,6 +1216,8 @@ namespace AutoExile
                     _blightMode.State.DeathCount++;
                 if (!_wasDead && _simulacrumMode != null)
                     _simulacrumMode.State.DeathCount++;
+                if (!_wasDead && _heistMode != null)
+                    _heistMode.State.DeathCount++;
                 _wasDead = true;
 
                 // Click resurrect button

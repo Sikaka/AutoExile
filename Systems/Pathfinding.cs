@@ -55,7 +55,7 @@ namespace AutoExile.Systems
         /// Run A* from start to goal on the pathfinding grid.
         /// Returns a list of world positions from start to goal, or empty if no path.
         /// </summary>
-        public static List<Vector2> FindPath(int[][] grid, Vector2 worldStart, Vector2 worldEnd, int maxNodes = 50000)
+        public static List<Vector2> FindPath(int[][] grid, Vector2 worldStart, Vector2 worldEnd, int maxNodes = 200000)
         {
             var result = FindPathInternal(grid, null, worldStart, worldEnd, 0, 0, maxNodes);
             return result.Select(w => w.Position).ToList();
@@ -77,7 +77,7 @@ namespace AutoExile.Systems
             int[][] pfGrid, int[][] tgtGrid,
             Vector2 worldStart, Vector2 worldEnd,
             int blinkRange = 40, float blinkCostPenalty = 30f,
-            int maxNodes = 80000)
+            int maxNodes = 200000)
         {
             if (tgtGrid == null || tgtGrid.Length == 0)
             {

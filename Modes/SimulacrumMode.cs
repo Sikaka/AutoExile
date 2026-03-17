@@ -102,6 +102,19 @@ namespace AutoExile.Modes
                 _phase = SimPhase.FindMonolith;
                 _phaseStartTime = DateTime.Now;
                 StatusText = "In map — finding monolith";
+
+                // Initialize exploration if BotCore missed it (plugin reload mid-game)
+                if (!ctx.Exploration.IsInitialized)
+                {
+                    var pfGrid = gc.IngameState?.Data?.RawPathfindingData;
+                    var tgtGrid = gc.IngameState?.Data?.RawTerrainTargetingData;
+                    if (pfGrid != null && gc.Player != null)
+                    {
+                        var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
+                        ctx.Exploration.Initialize(pfGrid, tgtGrid, playerGrid,
+                            ctx.Settings.Build.BlinkRange.Value);
+                    }
+                }
             }
         }
 
@@ -375,10 +388,22 @@ namespace AutoExile.Modes
             if (_state.CurrentWave != _lastKnownWave)
             {
                 _lastKnownWave = _state.CurrentWave;
+                ctx.Exploration.SeenRadiusOverride = 0; // restore normal radius for new wave
                 ctx.Exploration.ResetSeen();
+                ctx.Loot.ClearFailed(); // items that failed in earlier waves may be pickable now
                 _wasSearching = false;
                 _waveStartAttempts = 0;
                 _betweenWaveStartTime = DateTime.MinValue;
+            }
+
+            // --- Priority 0: Don't interrupt active loot pickup ---
+            // If interaction is busy (navigating to or clicking an item), let it finish.
+            // Without this guard, exploration/combat navigation overwrites the loot path.
+            if (ctx.Interaction.IsBusy && _lootTracker.HasPending)
+            {
+                Decision = $"Loot pickup in progress: {_lootTracker.PendingItemName}";
+                StatusText = $"Picking up {_lootTracker.PendingItemName}";
+                return;
             }
 
             // --- Priority 1: Pick up nearby loot (during active waves only) ---
@@ -441,6 +466,7 @@ namespace AutoExile.Modes
                         if (!_wasSearching)
                         {
                             _wasSearching = true;
+                            ctx.Exploration.SeenRadiusOverride = 40;
                             ctx.Exploration.ResetSeen();
                         }
                         Decision = $"Wave {_state.CurrentWave} — combat stuck ({combatElapsed:F0}s), moving on ({ctx.Combat.NearbyMonsterCount} unreachable)";
@@ -448,7 +474,12 @@ namespace AutoExile.Modes
                     }
                     else
                     {
-                        _wasSearching = false;
+                        if (_wasSearching)
+                        {
+                            _wasSearching = false;
+                            // Restore normal seen radius now that we're fighting
+                            ctx.Exploration.SeenRadiusOverride = 0;
+                        }
 
                         // Combat system handles fighting + positioning automatically via Tick above
                         Decision = $"Wave {_state.CurrentWave} — fighting ({ctx.Combat.NearbyMonsterCount} nearby, {ctx.Combat.CachedMonsterCount} total)";
@@ -457,11 +488,14 @@ namespace AutoExile.Modes
                 }
                 else
                 {
-                    // Transition from fighting → searching: reset exploration so we re-sweep
-                    // the whole map (monsters spawn in areas we already visited)
+                    // Transition from fighting → searching: reset exploration and use small
+                    // seen radius so the bot must physically visit each region. Simulacrum maps
+                    // are tiny (~15K cells) — the default network bubble (radius 180) covers
+                    // the entire map, making exploration targets useless without this.
                     if (!_wasSearching)
                     {
                         _wasSearching = true;
+                        ctx.Exploration.SeenRadiusOverride = 40;
                         ctx.Exploration.ResetSeen();
                     }
                     _combatEngageTime = DateTime.MinValue;
@@ -520,6 +554,8 @@ namespace AutoExile.Modes
             }
 
             // Priority 5: Stash items if inventory above threshold
+            // Don't start StashSystem here — TickBetweenWaveStash navigates to the
+            // cached stash position first so the entity loads into the entity list.
             if (_state.StashPosition.HasValue && !ctx.Interaction.IsBusy)
             {
                 var invCount = (StashSystem.GetInventorySlotItems(gc)?.Count ?? 0);
@@ -532,8 +568,6 @@ namespace AutoExile.Modes
                     Decision = $"Between waves → Stash ({invCount} items)";
                     _phase = SimPhase.BetweenWaveStash;
                     _phaseStartTime = DateTime.Now;
-                    if (!ctx.Stash.IsBusy)
-                        ctx.Stash.Start();
                     StatusText = $"Stashing items ({invCount} in inventory)";
                     return;
                 }
@@ -636,7 +670,10 @@ namespace AutoExile.Modes
                 }
             }
 
-            // Tier 3: Exploration exhausted — orbit the monolith
+            // Tier 3: Exploration exhausted — sweep the map around the monolith
+            // Simulacrum maps are small (~18K cells) — the network bubble (radius 180) covers
+            // the entire map, so exploration coverage resets are useless. Instead, physically
+            // patrol at varying radii to find spawned monsters.
             if (_state.MonolithPosition.HasValue)
             {
                 var distToMonolith = Vector2.Distance(playerPos, _state.MonolithPosition.Value);
@@ -646,14 +683,17 @@ namespace AutoExile.Modes
                     StatusText = $"Wave {_state.CurrentWave}/15 — returning to monolith (dist: {distToMonolith:F0})";
                     return;
                 }
-                if (distToMonolith < 30f)
+
+                if (!ctx.Navigation.IsNavigating)
                 {
-                    var angle = (float)(DateTime.Now.Ticks % 6283) / 1000f;
-                    var orbitTarget = _state.MonolithPosition.Value + new Vector2(MathF.Cos(angle), MathF.Sin(angle)) * 50f;
+                    // Sweep at varying radius — cycles through the arena to find spawns
+                    var angle = (float)(DateTime.Now.Ticks % 62830) / 10000f;
+                    var radius = 40f + 25f * MathF.Sin(angle * 0.3f); // 15-65 radius sweep
+                    var orbitTarget = _state.MonolithPosition.Value + new Vector2(MathF.Cos(angle), MathF.Sin(angle)) * radius;
                     ctx.Navigation.NavigateTo(gc, SimulacrumState.ToWorld(orbitTarget));
-                    StatusText = $"Wave {_state.CurrentWave}/15 — orbiting monolith for monsters";
-                    return;
                 }
+                StatusText = $"Wave {_state.CurrentWave}/15 — sweeping for monsters";
+                return;
             }
 
             StatusText = $"Wave {_state.CurrentWave}/15 — searching (no exploration targets)";
@@ -806,7 +846,50 @@ namespace AutoExile.Modes
                 return;
             }
 
-            var result = ctx.Stash.Tick(ctx.Game, ctx.Navigation);
+            // Timeout
+            if ((DateTime.Now - _phaseStartTime).TotalSeconds > 30)
+            {
+                if (ctx.Stash.IsBusy)
+                    ctx.Stash.Cancel(ctx.Game, ctx.Navigation);
+                _isStashing = false;
+                _phase = SimPhase.WaveCycle;
+                _phaseStartTime = DateTime.Now;
+                StatusText = "Stash timeout — resuming wave cycle";
+                return;
+            }
+
+            var gc = ctx.Game;
+
+            // Step 1: Navigate to cached stash position so the entity loads into the entity list.
+            // StashSystem.FindStashEntity only finds entities within network bubble range.
+            if (_state.StashPosition.HasValue)
+            {
+                var playerPos = gc.Player.GridPosNum;
+                var dist = Vector2.Distance(
+                    new Vector2(playerPos.X, playerPos.Y),
+                    _state.StashPosition.Value);
+
+                if (dist > 20f)
+                {
+                    // Cancel StashSystem if it was started — we need to navigate first
+                    if (ctx.Stash.IsBusy)
+                        ctx.Stash.Cancel(gc, ctx.Navigation);
+                    if (!ctx.Navigation.IsNavigating)
+                        ctx.Navigation.NavigateTo(gc, SimulacrumState.ToWorld(_state.StashPosition.Value));
+                    StatusText = $"Navigating to stash (dist: {dist:F0})";
+                    return;
+                }
+            }
+
+            // Step 2: Close enough — start StashSystem if not already running
+            if (!ctx.Stash.IsBusy)
+            {
+                ctx.Navigation.Stop(gc);
+                ctx.Stash.Start();
+            }
+
+            // Step 3: Tick StashSystem
+            var result = ctx.Stash.Tick(gc, ctx.Navigation);
 
             switch (result)
             {
@@ -817,10 +900,9 @@ namespace AutoExile.Modes
                     StatusText = $"Stashed {ctx.Stash.ItemsStored} items — resuming wave cycle";
                     break;
                 case StashResult.Failed:
-                    _isStashing = false;
-                    _phase = SimPhase.WaveCycle;
-                    _phaseStartTime = DateTime.Now;
-                    StatusText = $"Stash failed: {ctx.Stash.Status} — resuming wave cycle";
+                    // StashSystem failed (entity not found, no path, etc.)
+                    // Don't immediately give up — go back to navigating to stash position
+                    StatusText = $"Stash failed ({ctx.Stash.Status}) — retrying";
                     break;
                 default:
                     StatusText = $"Between-wave stash: {ctx.Stash.Status}";
@@ -855,9 +937,26 @@ namespace AutoExile.Modes
             if (_state.StashPosition.HasValue)
             {
                 var invCount = (StashSystem.GetInventorySlotItems(gc)?.Count ?? 0);
-                if (invCount > 0 && !ctx.Stash.IsBusy)
+                if (invCount > 0)
                 {
-                    ctx.Stash.Start();
+                    // Navigate close to stash so the entity loads into the entity list
+                    var playerPos = gc.Player.GridPosNum;
+                    var dist = Vector2.Distance(
+                        new Vector2(playerPos.X, playerPos.Y),
+                        _state.StashPosition.Value);
+                    if (dist > 20f)
+                    {
+                        if (!ctx.Navigation.IsNavigating)
+                            ctx.Navigation.NavigateTo(gc, SimulacrumState.ToWorld(_state.StashPosition.Value));
+                        StatusText = $"Navigating to stash before exit (dist: {dist:F0})";
+                        return;
+                    }
+
+                    if (!ctx.Stash.IsBusy)
+                    {
+                        ctx.Navigation.Stop(gc);
+                        ctx.Stash.Start();
+                    }
                 }
                 if (ctx.Stash.IsBusy)
                 {

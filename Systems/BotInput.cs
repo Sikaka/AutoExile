@@ -5,6 +5,17 @@ using Input = ExileCore.Input;
 namespace AutoExile.Systems
 {
     /// <summary>
+    /// Record of a single action sent (or rejected) by BotInput.
+    /// </summary>
+    public record ActionRecord(
+        DateTime Timestamp,
+        string Type,        // CursorPressKey, PressKey, Click, RightClick, CtrlClick
+        Vector2? Position,  // screen position (null for PressKey)
+        Keys? Key,          // key pressed (null for Click/RightClick)
+        bool Accepted       // true if gate was open and action fired
+    );
+
+    /// <summary>
     /// Global action gate. ALL game inputs go through here.
     ///
     /// Design:
@@ -12,9 +23,37 @@ namespace AutoExile.Systems
     /// - When an action fires: set NextActionAt to now + full duration, then run async sequence.
     /// - Sequence: move cursor → random delay (30-50ms) → button/key down → random delay (30-50ms) → up.
     /// - No bot logic runs during the async sequence because NextActionAt is already in the future.
+    /// - All actions are logged to a ring buffer for post-hoc analysis.
     /// </summary>
     public static class BotInput
     {
+        // ── Action Log ──
+        private static readonly ActionRecord[] _actionLog = new ActionRecord[500];
+        private static int _actionLogIndex;
+        private static int _actionLogCount;
+
+        /// <summary>Get the last N action records (newest first).</summary>
+        public static List<ActionRecord> GetRecentActions(int count = 50)
+        {
+            var result = new List<ActionRecord>(Math.Min(count, _actionLogCount));
+            for (int i = 0; i < count && i < _actionLogCount; i++)
+            {
+                var idx = (_actionLogIndex - 1 - i + _actionLog.Length) % _actionLog.Length;
+                result.Add(_actionLog[idx]);
+            }
+            return result;
+        }
+
+        /// <summary>Total actions logged this session.</summary>
+        public static int TotalActionsLogged => _actionLogCount;
+
+        private static void LogAction(string type, Vector2? position, Keys? key, bool accepted)
+        {
+            _actionLog[_actionLogIndex] = new ActionRecord(DateTime.Now, type, position, key, accepted);
+            _actionLogIndex = (_actionLogIndex + 1) % _actionLog.Length;
+            if (_actionLogCount < _actionLog.Length) _actionLogCount++;
+        }
+
         /// <summary>Minimum ms between actions (end of one action to start of next). Configurable.</summary>
         public static int ActionCooldownMs = 75;
 
@@ -46,11 +85,12 @@ namespace AutoExile.Systems
         /// <summary>Move cursor, settle, press+hold+release key.</summary>
         public static bool CursorPressKey(Vector2 absPos, Keys key)
         {
-            if (!CanAct) return false;
+            if (!CanAct) { LogAction("CursorPressKey", absPos, key, false); return false; }
             var settle = RandSettle();
             var hold = RandHold();
             NextActionAt = DateTime.Now.AddMilliseconds(settle + hold + ActionCooldownMs);
             _ = DoCursorPressKey(absPos, key, settle, hold);
+            LogAction("CursorPressKey", absPos, key, true);
             return true;
         }
 
@@ -69,10 +109,11 @@ namespace AutoExile.Systems
         /// <summary>Press and release a key. Returns false if gate is closed.</summary>
         public static bool PressKey(Keys key)
         {
-            if (!CanAct) return false;
+            if (!CanAct) { LogAction("PressKey", null, key, false); return false; }
             var hold = RandHold();
             NextActionAt = DateTime.Now.AddMilliseconds(hold + ActionCooldownMs);
             _ = DoPressKey(key, hold);
+            LogAction("PressKey", null, key, true);
             return true;
         }
 
@@ -88,22 +129,24 @@ namespace AutoExile.Systems
         /// <summary>Move cursor, settle, left-click (hold+release).</summary>
         public static bool Click(Vector2 absPos)
         {
-            if (!CanAct) return false;
+            if (!CanAct) { LogAction("Click", absPos, null, false); return false; }
             var settle = RandSettle();
             var hold = RandHold();
             NextActionAt = DateTime.Now.AddMilliseconds(settle + hold + ActionCooldownMs);
             _ = DoClick(absPos, rightClick: false, settle, hold);
+            LogAction("Click", absPos, null, true);
             return true;
         }
 
         /// <summary>Move cursor, settle, right-click.</summary>
         public static bool RightClick(Vector2 absPos)
         {
-            if (!CanAct) return false;
+            if (!CanAct) { LogAction("RightClick", absPos, null, false); return false; }
             var settle = RandSettle();
             var hold = RandHold();
             NextActionAt = DateTime.Now.AddMilliseconds(settle + hold + ActionCooldownMs);
             _ = DoClick(absPos, rightClick: true, settle, hold);
+            LogAction("RightClick", absPos, null, true);
             return true;
         }
 
@@ -129,12 +172,13 @@ namespace AutoExile.Systems
         /// <summary>Ctrl+left-click (stash transfers).</summary>
         public static bool CtrlClick(Vector2 absPos)
         {
-            if (!CanAct) return false;
+            if (!CanAct) { LogAction("CtrlClick", absPos, null, false); return false; }
             var settle = RandSettle();
             var hold = RandHold();
             // Ctrl down + settle + cursor + settle + click hold + release + ctrl up
             NextActionAt = DateTime.Now.AddMilliseconds(hold + settle + hold + ActionCooldownMs);
             _ = DoCtrlClick(absPos, settle, hold);
+            LogAction("CtrlClick", absPos, null, true);
             return true;
         }
 
