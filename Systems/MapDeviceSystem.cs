@@ -22,6 +22,16 @@ namespace AutoExile.Systems
         private const float PhaseTimeoutSeconds = 30f;
         private const float PortalWaitTimeoutSeconds = 10f;
 
+        /// <summary>
+        /// Grid distance considered "close enough" to interact with device/portal.
+        /// Synced from InteractionSystem.InteractRadius (which comes from LootRadius setting).
+        /// </summary>
+        public float InteractRadius { get; set; } = 20f;
+
+        // Navigation to device — track failed close-approach attempts
+        private int _navAttempts;
+        private float _bestDistSeen = float.MaxValue;
+
         // UI element indices for atlas panel
         // Map stash: atlas[3][0][1] — children are InventoryItem elements
         // Device slots: atlas[7][0][2] — 6 slots, occupied slot has ChildCount==2, child[1] is the item
@@ -48,6 +58,8 @@ namespace AutoExile.Systems
             _phase = MapDevicePhase.NavigateToDevice;
             _phaseStartTime = DateTime.Now;
             _lastActionTime = DateTime.MinValue;
+            _navAttempts = 0;
+            _bestDistSeen = float.MaxValue;
             Status = "Starting map creation";
             return true;
         }
@@ -142,7 +154,10 @@ namespace AutoExile.Systems
                 new Vector2(playerGrid.X, playerGrid.Y),
                 new Vector2(deviceGrid.X, deviceGrid.Y));
 
-            if (dist < 8f) // ~80 world units / 10.88
+            if (dist < _bestDistSeen)
+                _bestDistSeen = dist;
+
+            if (dist < InteractRadius)
             {
                 // Close enough — switch to clicking the device
                 nav.Stop(gc);
@@ -155,6 +170,20 @@ namespace AutoExile.Systems
             // Navigate to device (NavigateTo expects world coordinates)
             if (!nav.IsNavigating)
             {
+                _navAttempts++;
+
+                // After first nav attempt completes, the device may be on unwalkable
+                // terrain (e.g., hideout decorations). A* snaps to the nearest walkable
+                // cell, so we can't get closer. Accept current position if within 2x radius.
+                if (_navAttempts > 1 && _bestDistSeen < InteractRadius * 2)
+                {
+                    nav.Stop(gc);
+                    _phase = MapDevicePhase.OpenDevice;
+                    _phaseStartTime = DateTime.Now;
+                    Status = $"Near device (best dist: {_bestDistSeen:F0}) — opening";
+                    return MapDeviceResult.InProgress;
+                }
+
                 var worldTarget = new Vector2(
                     deviceGrid.X * Pathfinding.GridToWorld,
                     deviceGrid.Y * Pathfinding.GridToWorld);

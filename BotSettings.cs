@@ -379,6 +379,9 @@ namespace AutoExile
         [Submenu(CollapsedByDefault = true)]
         public class BlightSettings
         {
+            [Menu("Ignore Currency", "Skip currency checks when building/upgrading towers (debug: use if currency UI isn't being read).")]
+            public ToggleNode IgnoreCurrency { get; set; } = new ToggleNode(false);
+
             [Menu("Tower Build Radius", "Max grid distance from pump to consider foundations for building.")]
             public RangeNode<float> TowerBuildRadius { get; set; } = new RangeNode<float>(90f, 40f, 200f);
 

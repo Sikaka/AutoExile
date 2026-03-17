@@ -387,7 +387,7 @@ namespace AutoExile.Systems
         private long FindBestFoundation(GameController gc)
         {
             // Building a new tower costs 150
-            if (_blight.Currency < GetCostForTier(0))
+            if (!_config.IgnoreCurrency.Value && _blight.Currency < GetCostForTier(0))
                 return 0;
 
             long bestId = 0;
@@ -501,7 +501,7 @@ namespace AutoExile.Systems
                 }
 
                 // Check if we have enough currency for this upgrade
-                if (_blight.Currency < GetCostForTier(ct.Tier))
+                if (!_config.IgnoreCurrency.Value && _blight.Currency < GetCostForTier(ct.Tier))
                     continue;
 
                 // Must be within build radius of pump (grid units)

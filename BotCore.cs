@@ -365,7 +365,8 @@ namespace AutoExile
             _interaction.InteractRadius = Settings.Loot.LootRadius.Value;
             _loot.IgnoreQuestItems = Settings.Loot.IgnoreQuestItems.Value;
 
-            // Sync stash settings
+            // Sync stash/map device settings
+            _mapDevice.InteractRadius = Settings.Loot.LootRadius.Value;
             _stash.InteractRadius = Settings.Loot.LootRadius.Value;
             _stash.ActionCooldownMs = Settings.Loot.StashItemCooldownMs.Value;
             _stash.ApplyIncubators = Settings.AutoApplyIncubators.Value;
