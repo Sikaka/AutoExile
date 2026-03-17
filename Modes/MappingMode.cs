@@ -315,6 +315,8 @@ namespace AutoExile.Modes
             // ── Combat hold — don't explore while fighting ──
             if (ctx.Combat.InCombat && ctx.Combat.WantsToMove)
             {
+                if (_phase != MappingPhase.Fighting)
+                    ctx.Navigation.Stop(gc); // stop stale exploration nav — combat handles movement
                 _phase = MappingPhase.Fighting;
                 Status = $"Fighting: {ctx.Combat.NearbyMonsterCount} monsters ({ctx.Combat.LastSkillAction})";
                 return;

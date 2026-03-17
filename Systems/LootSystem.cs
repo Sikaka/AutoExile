@@ -123,6 +123,10 @@ namespace AutoExile.Systems
                     if (worldItemEntity.TryGetComponent<WorldItem>(out var worldItem))
                         itemEntity = worldItem.ItemEntity;
 
+                    // Skip gold — auto-pickup on walk-over, no click needed
+                    if (itemName.EndsWith(" Gold"))
+                        continue;
+
                     // Skip quest items (heist quest contracts, etc.)
                     if (IgnoreQuestItems && itemEntity is { IsValid: true } &&
                         itemEntity.Path.Contains("/Quest", StringComparison.OrdinalIgnoreCase))

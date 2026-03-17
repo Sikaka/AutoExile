@@ -58,6 +58,10 @@ namespace AutoExile.Modes
         private int _combatEngageCount;
         private const float CombatStuckSeconds = 15f;
 
+        // Monster blacklist — temporarily ignore monsters we can't kill so we reposition via explore
+        private readonly Dictionary<long, DateTime> _blacklistedMonsters = new();
+        private const float MonsterBlacklistSeconds = 10f;
+
 
         // Action cooldown
         private const float MajorActionCooldownMs = 500f;
@@ -82,6 +86,7 @@ namespace AutoExile.Modes
 
             _combatEngageTime = DateTime.MinValue;
             _combatEngageCount = 0;
+            _blacklistedMonsters.Clear();
 
             // Enable combat
             ModeHelpers.EnableDefaultCombat(ctx);
@@ -389,6 +394,7 @@ namespace AutoExile.Modes
                 ctx.Exploration.SeenRadiusOverride = 0; // restore normal radius for new wave
                 ctx.Exploration.ResetSeen();
                 ctx.Loot.ClearFailed(); // items that failed in earlier waves may be pickable now
+                _blacklistedMonsters.Clear(); // new wave = fresh monster spawns
                 _wasSearching = false;
                 _waveStartAttempts = 0;
                 _betweenWaveStartTime = DateTime.MinValue;
@@ -458,16 +464,18 @@ namespace AutoExile.Modes
                     var combatElapsed = (DateTime.Now - _combatEngageTime).TotalSeconds;
                     if (combatElapsed > CombatStuckSeconds)
                     {
-                        // Stuck fighting same monsters too long — treat as no monsters and explore elsewhere
+                        // Stuck fighting same monsters too long — blacklist nearby monsters and explore elsewhere
                         _combatEngageTime = DateTime.MinValue;
                         _combatEngageCount = 0;
+                        BlacklistNearbyMonsters(gc, gc.Player.GridPosNum, ctx.Settings.Build.CombatRange.Value);
+                        ctx.Navigation.Stop(gc);
                         if (!_wasSearching)
                         {
                             _wasSearching = true;
                             ctx.Exploration.SeenRadiusOverride = 40;
                             ctx.Exploration.ResetSeen();
                         }
-                        Decision = $"Wave {_state.CurrentWave} — combat stuck ({combatElapsed:F0}s), moving on ({ctx.Combat.NearbyMonsterCount} unreachable)";
+                        Decision = $"Wave {_state.CurrentWave} — combat stuck ({combatElapsed:F0}s), blacklisted {_blacklistedMonsters.Count} monsters";
                         TickExploreForMonsters(ctx);
                     }
                     else
@@ -475,6 +483,8 @@ namespace AutoExile.Modes
                         if (_wasSearching)
                         {
                             _wasSearching = false;
+                            // Stop stale navigation from patrolling — combat handles movement now
+                            ctx.Navigation.Stop(gc);
                             // Restore normal seen radius now that we're fighting
                             ctx.Exploration.SeenRadiusOverride = 0;
                         }
@@ -635,16 +645,23 @@ namespace AutoExile.Modes
             var gc = ctx.Game;
             var playerPos = gc.Player.GridPosNum;
 
-            // Tier 1: Known monsters exist — navigate toward the nearest one
-            if (ctx.Combat.CachedMonsterCount > 0 && ctx.Combat.NearestMonsterPos.HasValue)
+            // Expire old blacklist entries
+            PruneBlacklist();
+
+            // Tier 1: Known monsters exist — navigate toward the nearest non-blacklisted one
+            if (ctx.Combat.CachedMonsterCount > 0)
             {
-                _wasSearching = true;
-                var nearestPos = ctx.Combat.NearestMonsterPos.Value;
-                var monsterDist = Vector2.Distance(playerPos, nearestPos);
-                if (monsterDist > 20f && !ctx.Navigation.IsNavigating)
-                    ctx.Navigation.NavigateTo(gc, SimulacrumState.ToWorld(nearestPos));
-                StatusText = $"Wave {_state.CurrentWave}/15 — chasing nearest monster (dist: {monsterDist:F0}, {ctx.Combat.CachedMonsterCount} alive)";
-                return;
+                var nearestPos = FindNearestNonBlacklisted(gc, playerPos);
+                if (nearestPos.HasValue)
+                {
+                    _wasSearching = true;
+                    var monsterDist = Vector2.Distance(playerPos, nearestPos.Value);
+                    if (monsterDist > 20f && !ctx.Navigation.IsNavigating)
+                        ctx.Navigation.NavigateTo(gc, SimulacrumState.ToWorld(nearestPos.Value));
+                    StatusText = $"Wave {_state.CurrentWave}/15 — chasing nearest monster (dist: {monsterDist:F0}, {ctx.Combat.CachedMonsterCount} alive, {_blacklistedMonsters.Count} blacklisted)";
+                    return;
+                }
+                // All cached monsters are blacklisted — fall through to explore
             }
 
             // Tier 2: No cached monsters — explore to find stragglers
@@ -695,6 +712,69 @@ namespace AutoExile.Modes
             }
 
             StatusText = $"Wave {_state.CurrentWave}/15 — searching (no exploration targets)";
+        }
+
+        // ═══════════════════════════════════════════════════
+        // Monster blacklist helpers
+        // ═══════════════════════════════════════════════════
+
+        /// <summary>
+        /// Blacklist all alive hostile monsters within the given grid radius.
+        /// Blacklisted monsters are ignored by TickExploreForMonsters tier 1
+        /// so the bot repositions via exploration instead of chasing the same unreachable pack.
+        /// </summary>
+        private void BlacklistNearbyMonsters(GameController gc, Vector2 playerGrid, float radius)
+        {
+            var now = DateTime.Now;
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (entity.Type != EntityType.Monster || !entity.IsHostile || !entity.IsAlive)
+                    continue;
+                if (Vector2.Distance(entity.GridPosNum, playerGrid) <= radius)
+                    _blacklistedMonsters[entity.Id] = now;
+            }
+        }
+
+        /// <summary>
+        /// Find the nearest alive hostile monster that isn't blacklisted.
+        /// Returns null if all cached monsters are blacklisted (or none exist).
+        /// </summary>
+        private Vector2? FindNearestNonBlacklisted(GameController gc, Vector2 playerGrid)
+        {
+            float nearestDist = float.MaxValue;
+            Vector2? nearestPos = null;
+
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (entity.Type != EntityType.Monster || !entity.IsHostile || !entity.IsAlive || !entity.IsTargetable)
+                    continue;
+                if (_blacklistedMonsters.ContainsKey(entity.Id))
+                    continue;
+
+                var dist = Vector2.Distance(entity.GridPosNum, playerGrid);
+                if (dist < nearestDist)
+                {
+                    nearestDist = dist;
+                    nearestPos = entity.GridPosNum;
+                }
+            }
+
+            return nearestPos;
+        }
+
+        /// <summary>Remove expired blacklist entries.</summary>
+        private void PruneBlacklist()
+        {
+            if (_blacklistedMonsters.Count == 0) return;
+            var now = DateTime.Now;
+            var expired = new List<long>();
+            foreach (var kvp in _blacklistedMonsters)
+            {
+                if ((now - kvp.Value).TotalSeconds > MonsterBlacklistSeconds)
+                    expired.Add(kvp.Key);
+            }
+            foreach (var id in expired)
+                _blacklistedMonsters.Remove(id);
         }
 
         /// <summary>
