@@ -6,7 +6,7 @@ namespace AutoExile.Systems
 
     public struct NavWaypoint
     {
-        public Vector2 Position;
+        public Vector2 Position; // grid coordinates
         public WaypointAction Action;
 
         public NavWaypoint(Vector2 pos, WaypointAction action = WaypointAction.Walk)
@@ -20,6 +20,7 @@ namespace AutoExile.Systems
     /// A* pathfinding on the terrain grid.
     /// Grid values: 0=impassable, 1-5=walkable with cost = 6-value.
     /// Grid layout: data[row][col] = data[y][x].
+    /// All positions are in grid coordinates. Convert to world only at camera/input call sites.
     /// </summary>
     public static class Pathfinding
     {
@@ -53,11 +54,12 @@ namespace AutoExile.Systems
 
         /// <summary>
         /// Run A* from start to goal on the pathfinding grid.
-        /// Returns a list of world positions from start to goal, or empty if no path.
+        /// All positions in grid coordinates.
+        /// Returns a list of grid positions from start to goal, or empty if no path.
         /// </summary>
-        public static List<Vector2> FindPath(int[][] grid, Vector2 worldStart, Vector2 worldEnd, int maxNodes = 200000)
+        public static List<Vector2> FindPath(int[][] grid, Vector2 gridStart, Vector2 gridEnd, int maxNodes = 200000)
         {
-            var result = FindPathInternal(grid, null, worldStart, worldEnd, 0, 0, maxNodes);
+            var result = FindPathInternal(grid, null, gridStart, gridEnd, 0, 0, maxNodes);
             return result.Select(w => w.Position).ToList();
         }
 
@@ -65,38 +67,34 @@ namespace AutoExile.Systems
         /// Run A* with blink support. When the pathfinder hits a boundary cell (adjacent to pf=0),
         /// it scans across the gap through cells where targeting > 0 to find landing spots.
         /// Only uses blinks when walking the detour costs more than blinkCostPenalty.
+        /// All positions in grid coordinates.
         /// </summary>
-        /// <param name="pfGrid">Pathfinding grid (0=blocked, 1-5=walkable)</param>
-        /// <param name="tgtGrid">Targeting grid (0=solid wall, >0=open air/jumpable)</param>
-        /// <param name="worldStart">Start position in world coordinates</param>
-        /// <param name="worldEnd">Goal position in world coordinates</param>
-        /// <param name="blinkRange">Max blink distance in grid cells</param>
-        /// <param name="blinkCostPenalty">Extra cost added to blink edges (higher = prefer walking)</param>
-        /// <param name="maxNodes">Max A* nodes to explore</param>
         public static List<NavWaypoint> FindPathWithBlinks(
             int[][] pfGrid, int[][] tgtGrid,
-            Vector2 worldStart, Vector2 worldEnd,
+            Vector2 gridStart, Vector2 gridEnd,
             int blinkRange = 40, float blinkCostPenalty = 30f,
             int maxNodes = 200000)
         {
             if (tgtGrid == null || tgtGrid.Length == 0)
             {
                 // Fall back to normal pathfinding
-                var fallback = FindPath(pfGrid, worldStart, worldEnd, maxNodes);
+                var fallback = FindPath(pfGrid, gridStart, gridEnd, maxNodes);
                 return fallback.Select(p => new NavWaypoint(p, WaypointAction.Walk)).ToList();
             }
 
-            return FindPathInternal(pfGrid, tgtGrid, worldStart, worldEnd, blinkRange, blinkCostPenalty, maxNodes);
+            return FindPathInternal(pfGrid, tgtGrid, gridStart, gridEnd, blinkRange, blinkCostPenalty, maxNodes);
         }
 
         private static List<NavWaypoint> FindPathInternal(
             int[][] pfGrid, int[][]? tgtGrid,
-            Vector2 worldStart, Vector2 worldEnd,
+            Vector2 gridStart, Vector2 gridEnd,
             int blinkRange, float blinkCostPenalty,
             int maxNodes)
         {
-            var (sx, sy) = WorldToGridPos(worldStart);
-            var (gx, gy) = WorldToGridPos(worldEnd);
+            var sx = (int)gridStart.X;
+            var sy = (int)gridStart.Y;
+            var gx = (int)gridEnd.X;
+            var gy = (int)gridEnd.Y;
 
             var rows = pfGrid.Length;
             var cols = pfGrid[0].Length;
@@ -174,8 +172,6 @@ namespace AutoExile.Systems
                         var dist = MathF.Sqrt((landing.x - cx) * (landing.x - cx) + (landing.y - cy) * (landing.y - cy));
                         // Penalize wider gaps heavily — perpendicular crossings have fewer gap cells
                         // than diagonal ones for the same wall, strongly preferring straight-across jumps.
-                        // A diagonal scan across a 2-wide wall traverses ~3 cells vs 2 for cardinal,
-                        // so penalty must outweigh the walking detour to reach a perpendicular approach.
                         var gapPenalty = landing.gapWidth * 5f;
                         var blinkCost = dist + blinkCostPenalty + gapPenalty;
                         var tentativeG = currentG + blinkCost;
@@ -277,6 +273,7 @@ namespace AutoExile.Systems
         /// within the same walking segment — never smooths across blink boundaries.
         /// After smoothing, pulls back the last walk waypoint before each blink so
         /// the player approaches from a few cells back, giving clean blink line-up.
+        /// All positions in grid coordinates.
         /// </summary>
         public static List<NavWaypoint> SmoothNavPath(int[][] grid, List<NavWaypoint> path)
         {
@@ -333,16 +330,19 @@ namespace AutoExile.Systems
 
         /// <summary>
         /// Pull an approach waypoint back from the gap edge along the blink direction.
-        /// Moves the point away from the blink target (deeper into safe terrain) by BlinkApproachBuffer cells.
+        /// Moves the point away from the blink target (deeper into safe terrain) by pullbackCells.
         /// Returns null if the original position is already safe enough or pullback isn't walkable.
+        /// All positions in grid coordinates.
         /// </summary>
-        private static Vector2? PullBackFromEdge(int[][] grid, Vector2 approachWorld, Vector2 blinkWorld,
+        private static Vector2? PullBackFromEdge(int[][] grid, Vector2 approachGrid, Vector2 blinkGrid,
             int rows, int cols)
         {
             const int pullbackCells = 4; // how many grid cells to pull back from edge
 
-            var (ax, ay) = WorldToGridPos(approachWorld);
-            var (bx, by) = WorldToGridPos(blinkWorld);
+            var ax = (int)approachGrid.X;
+            var ay = (int)approachGrid.Y;
+            var bx = (int)blinkGrid.X;
+            var by = (int)blinkGrid.Y;
 
             // Direction from blink target back toward approach (away from gap)
             var dx = ax - bx;
@@ -363,7 +363,7 @@ namespace AutoExile.Systems
                 var px = ax + (int)MathF.Round(ndx * step);
                 var py = ay + (int)MathF.Round(ndy * step);
                 if (px >= 0 && px < cols && py >= 0 && py < rows && grid[py][px] >= 3)
-                    return GridToWorldPos(px, py);
+                    return new Vector2(px, py);
             }
 
             return null; // couldn't find a safe pullback — keep original
@@ -374,14 +374,15 @@ namespace AutoExile.Systems
         /// Uses line-of-sight checks on the grid to skip unnecessary waypoints.
         /// Limits max segment length to avoid long shortcuts past wall corners
         /// where cursor-based movement can clip obstacles.
+        /// All positions in grid coordinates.
         /// </summary>
         public static List<Vector2> SmoothPath(int[][] grid, List<Vector2> path)
         {
             if (path.Count <= 2)
                 return path;
 
-            // Max smoothed segment length in world units (~100 grid cells)
-            const float maxSegmentLength = 100f * GridToWorld;
+            // Max smoothed segment length in grid units
+            const float maxSegmentLength = 100f;
 
             var rows = grid.Length;
             var cols = grid[0].Length;
@@ -412,20 +413,22 @@ namespace AutoExile.Systems
         }
 
         /// <summary>
-        /// Check walkable line of sight between two world positions.
-        /// Returns true if all cells along the Bresenham line have pathfinding value >= 3
+        /// Check walkable line of sight between two grid positions.
+        /// Returns true if all cells along the Bresenham line have pathfinding value >= 4
         /// (no walls or fringe cells). Uses the pathfinding grid, NOT the targeting grid.
         /// </summary>
-        public static bool HasLineOfSight(int[][] pfGrid, Vector2 worldA, Vector2 worldB)
+        public static bool HasLineOfSight(int[][] pfGrid, Vector2 gridA, Vector2 gridB)
         {
             if (pfGrid == null || pfGrid.Length == 0) return false;
-            return HasLineOfSight(pfGrid, worldA, worldB, pfGrid.Length, pfGrid[0].Length);
+            return HasLineOfSight(pfGrid, gridA, gridB, pfGrid.Length, pfGrid[0].Length);
         }
 
         private static bool HasLineOfSight(int[][] grid, Vector2 a, Vector2 b, int rows, int cols)
         {
-            var (ax, ay) = WorldToGridPos(a);
-            var (bx, by) = WorldToGridPos(b);
+            var ax = (int)a.X;
+            var ay = (int)a.Y;
+            var bx = (int)b.X;
+            var by = (int)b.Y;
 
             var dx = Math.Abs(bx - ax);
             var dy = Math.Abs(by - ay);
@@ -522,6 +525,19 @@ namespace AutoExile.Systems
             return null;
         }
 
+        /// <summary>
+        /// Get terrain height at a grid position from the height data.
+        /// Returns fallbackZ if height data is unavailable or position is out of bounds.
+        /// </summary>
+        public static float GetTerrainHeight(float[][]? heightGrid, int gx, int gy, float fallbackZ)
+        {
+            if (heightGrid == null) return fallbackZ;
+            if (gy < 0 || gy >= heightGrid.Length) return fallbackZ;
+            var row = heightGrid[gy];
+            if (row == null || gx < 0 || gx >= row.Length) return fallbackZ;
+            return row[gx];
+        }
+
         private static float Heuristic(int ax, int ay, int bx, int by)
         {
             var dx = Math.Abs(ax - bx);
@@ -547,7 +563,7 @@ namespace AutoExile.Systems
             gridPath.Reverse();
 
             return gridPath.Select(p =>
-                new NavWaypoint(GridToWorldPos(p.x, p.y), p.isBlink ? WaypointAction.Blink : WaypointAction.Walk)
+                new NavWaypoint(new Vector2(p.x, p.y), p.isBlink ? WaypointAction.Blink : WaypointAction.Walk)
             ).ToList();
         }
 
@@ -565,7 +581,7 @@ namespace AutoExile.Systems
             path.Add((sx, sy));
             path.Reverse();
 
-            return path.Select(p => GridToWorldPos(p.x, p.y)).ToList();
+            return path.Select(p => new Vector2(p.x, p.y)).ToList();
         }
 
         private static (int x, int y) FindNearestWalkable(int[][] grid, int x, int y, int rows, int cols)

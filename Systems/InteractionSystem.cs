@@ -189,14 +189,13 @@ namespace AutoExile.Systems
                 return InteractionResult.Failed;
             }
 
-            // Start or update navigation — convert grid to world for NavigateTo
+            // Start or update navigation
             if (target.Nav != null)
             {
-                var worldTarget = target.EntityGridPos * Pathfinding.GridToWorld;
                 if (!target.Nav.IsNavigating)
                 {
                     // Not navigating yet, or arrived but not close enough — start path
-                    var success = target.Nav.NavigateTo(gc, worldTarget);
+                    var success = target.Nav.NavigateTo(gc, target.EntityGridPos);
                     if (!success)
                     {
                         Status = "No path to target";
@@ -210,9 +209,9 @@ namespace AutoExile.Systems
                 {
                     // Check if destination is stale (entity moved significantly)
                     var navDest = target.Nav.Destination ?? Vector2.Zero;
-                    if (Vector2.Distance(navDest, worldTarget) > target.InteractRange * Pathfinding.GridToWorld * 2)
+                    if (Vector2.Distance(navDest, target.EntityGridPos) > target.InteractRange * 2)
                     {
-                        target.Nav.NavigateTo(gc, worldTarget);
+                        target.Nav.NavigateTo(gc, target.EntityGridPos);
                     }
                     Status = $"Navigating (dist: {dist:F0})";
                 }

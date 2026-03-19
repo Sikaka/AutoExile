@@ -139,7 +139,7 @@ namespace AutoExile.Systems
             {
                 // Navigate to approach point — close enough per config but not on top of the tower
                 var approachGridPos = GetApproachPosition(playerGridPos, _targetGridPos, approachDist);
-                var success = _nav.NavigateTo(gc, BlightState.ToWorld(approachGridPos));
+                var success = _nav.NavigateTo(gc, approachGridPos);
                 if (!success)
                 {
                     Fail("No path to target");

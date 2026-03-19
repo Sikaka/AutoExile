@@ -2,6 +2,7 @@ using ExileCore;
 using ExileCore.PoEMemory.Components;
 using ExileCore.PoEMemory.MemoryObjects;
 using ExileCore.Shared.Enums;
+using System.Collections.Generic;
 using System.Numerics;
 using System.Linq;
 
@@ -34,6 +35,16 @@ namespace AutoExile.Systems
         public int DeathCount { get; set; }
         public int RunsCompleted { get; private set; }
         public int HighestWaveThisRun { get; private set; }
+        public DateTime RunStartedAt { get; private set; } = DateTime.Now;
+
+        // Run history for session stats
+        public struct RunRecord
+        {
+            public int HighestWave;
+            public TimeSpan Duration;
+        }
+        private readonly List<RunRecord> _runHistory = new();
+        public IReadOnlyList<RunRecord> RunHistory => _runHistory;
 
         // Last valid monolith update — if stale >10s, assume wave inactive
         private DateTime _lastMonolithUpdate = DateTime.MinValue;
@@ -64,6 +75,7 @@ namespace AutoExile.Systems
             CanStartWaveAt = DateTime.MinValue;
             DeathCount = 0;
             HighestWaveThisRun = 0;
+            RunStartedAt = DateTime.Now;
             _lastMonolithUpdate = DateTime.MinValue;
         }
 
@@ -86,9 +98,20 @@ namespace AutoExile.Systems
 
         public void RecordRunComplete()
         {
+            _runHistory.Add(new RunRecord
+            {
+                HighestWave = HighestWaveThisRun,
+                Duration = DateTime.Now - RunStartedAt,
+            });
             RunsCompleted++;
             HighestWaveThisRun = 0;
         }
+
+        public double AverageWavesPerRun => _runHistory.Count == 0 ? 0 :
+            _runHistory.Average(r => r.HighestWave);
+
+        public TimeSpan AverageRunDuration => _runHistory.Count == 0 ? TimeSpan.Zero :
+            TimeSpan.FromSeconds(_runHistory.Average(r => r.Duration.TotalSeconds));
 
         /// <summary>
         /// Push the wave start timer forward. Called when loot is detected between waves

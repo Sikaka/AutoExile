@@ -285,10 +285,10 @@ namespace AutoExile.Modes
 
             if (_state.CurioTargetPosition != null)
             {
-                var targetWorld = _state.CurioTargetPosition.Value * Pathfinding.GridToWorld;
+                var curioGridTarget = _state.CurioTargetPosition.Value;
                 if (!ctx.Navigation.IsNavigating)
                 {
-                    if (!ctx.Navigation.NavigateTo(gc, targetWorld))
+                    if (!ctx.Navigation.NavigateTo(gc, curioGridTarget))
                     {
                         // Can't path to curio — check for blocking door first, then stepping stone
                         var nextDoor = FindNextLockedDoor(gc, playerGrid);
@@ -299,7 +299,7 @@ namespace AutoExile.Modes
                         }
 
                         var stepNode = FindPathNodeToward(gc, playerGrid, _state.CurioTargetPosition.Value);
-                        if (stepNode.HasValue && ctx.Navigation.NavigateTo(gc, stepNode.Value * Pathfinding.GridToWorld))
+                        if (stepNode.HasValue && ctx.Navigation.NavigateTo(gc, stepNode.Value))
                         {
                             Decision = $"curio_step ({stepNode.Value.X:F0},{stepNode.Value.Y:F0})";
                         }
@@ -318,7 +318,7 @@ namespace AutoExile.Modes
                 else
                 {
                     // Update destination if curio position changed (e.g., actual curio entity found)
-                    ctx.Navigation.UpdateDestination(gc, targetWorld, 30 * Pathfinding.GridToWorld);
+                    ctx.Navigation.UpdateDestination(gc, curioGridTarget, 30);
                     _status = $"Navigating to curio — alert: {_state.AlertPercent:F0}%";
                     Decision = "navigating_to_curio";
                 }
@@ -355,8 +355,7 @@ namespace AutoExile.Modes
                     var bestNode = FindNextPathNode(gc, playerGrid);
                     if (bestNode.HasValue)
                     {
-                        var worldTarget = bestNode.Value * Pathfinding.GridToWorld;
-                        if (ctx.Navigation.NavigateTo(gc, worldTarget))
+                        if (ctx.Navigation.NavigateTo(gc, bestNode.Value))
                         {
                             _currentExploreTarget = bestNode.Value;
                             _lastStuckCount = ctx.Navigation.StuckRecoveries;
@@ -388,8 +387,7 @@ namespace AutoExile.Modes
                                 var nearWalkable = ctx.Navigation.FindNearestWalkable(gc, nextDoor.GridPosNum, 20);
                                 if (nearWalkable.HasValue)
                                 {
-                                    var doorWorld = nearWalkable.Value * Pathfinding.GridToWorld;
-                                    ctx.Navigation.NavigateTo(gc, doorWorld);
+                                        ctx.Navigation.NavigateTo(gc, nearWalkable.Value);
                                     _currentExploreTarget = nearWalkable.Value;
                                     _lastStuckCount = ctx.Navigation.StuckRecoveries;
                                 }
@@ -454,12 +452,12 @@ namespace AutoExile.Modes
                         var nearWalkable = ctx.Navigation.FindNearestWalkable(gc, doorEntity.GridPosNum, 20);
                         bool started = false;
                         if (nearWalkable.HasValue)
-                            started = ctx.Navigation.NavigateTo(gc, nearWalkable.Value * Pathfinding.GridToWorld);
+                            started = ctx.Navigation.NavigateTo(gc, nearWalkable.Value);
                         if (!started)
                         {
                             var stepNode = FindPathNodeToward(gc, gc.Player.GridPosNum, doorEntity.GridPosNum);
                             if (stepNode.HasValue)
-                                ctx.Navigation.NavigateTo(gc, stepNode.Value * Pathfinding.GridToWorld);
+                                ctx.Navigation.NavigateTo(gc, stepNode.Value);
                         }
                     }
                     _status = $"Moving to basic door... dist: {distToDoor:F0}";
@@ -514,12 +512,12 @@ namespace AutoExile.Modes
                     var nearWalkable = ctx.Navigation.FindNearestWalkable(gc, doorEntity.GridPosNum, 20);
                     bool started = false;
                     if (nearWalkable.HasValue)
-                        started = ctx.Navigation.NavigateTo(gc, nearWalkable.Value * Pathfinding.GridToWorld);
+                        started = ctx.Navigation.NavigateTo(gc, nearWalkable.Value);
                     if (!started)
                     {
                         var stepNode = FindPathNodeToward(gc, gc.Player.GridPosNum, doorEntity.GridPosNum);
                         if (stepNode.HasValue)
-                            ctx.Navigation.NavigateTo(gc, stepNode.Value * Pathfinding.GridToWorld);
+                            ctx.Navigation.NavigateTo(gc, stepNode.Value);
                     }
                 }
                 _status = $"Moving to door... dist: {distToDoor:F0}";
@@ -608,7 +606,7 @@ namespace AutoExile.Modes
                 {
                     var nearWalkable = ctx.Navigation.FindNearestWalkable(gc, chestEntity.GridPosNum, 20);
                     if (nearWalkable.HasValue)
-                        ctx.Navigation.NavigateTo(gc, nearWalkable.Value * Pathfinding.GridToWorld);
+                        ctx.Navigation.NavigateTo(gc, nearWalkable.Value);
                 }
                 _status = $"Moving to chest... dist: {distToChest:F0}";
                 Decision = "chest_approach";
@@ -785,8 +783,7 @@ namespace AutoExile.Modes
                 if (!ctx.Navigation.IsNavigating)
                 {
                     _lastStuckCount = ctx.Navigation.StuckRecoveries;
-                    var exitWorld = _state.ExitPosition.Value * Pathfinding.GridToWorld;
-                    if (!ctx.Navigation.NavigateTo(gc, exitWorld))
+                    if (!ctx.Navigation.NavigateTo(gc, _state.ExitPosition.Value))
                     {
                         // Direct path blocked — check for door first
                         var nextDoor = FindNextLockedDoor(gc, playerGrid);
@@ -800,8 +797,7 @@ namespace AutoExile.Modes
                         var stepNode = FindPathNodeToward(gc, playerGrid, _state.ExitPosition.Value);
                         if (stepNode.HasValue)
                         {
-                            var stepWorld = stepNode.Value * Pathfinding.GridToWorld;
-                            ctx.Navigation.NavigateTo(gc, stepWorld);
+                                ctx.Navigation.NavigateTo(gc, stepNode.Value);
                             Decision = $"escape_step ({stepNode.Value.X:F0},{stepNode.Value.Y:F0})";
                         }
                         else
@@ -852,7 +848,7 @@ namespace AutoExile.Modes
             {
                 // Retry — navigate to exit position and try again
                 if (_state.ExitPosition != null)
-                    ctx.Navigation.NavigateTo(gc, _state.ExitPosition.Value * Pathfinding.GridToWorld);
+                    ctx.Navigation.NavigateTo(gc, _state.ExitPosition.Value);
                 _phaseStartTime = DateTime.Now;
             }
         }
@@ -1263,8 +1259,8 @@ namespace AutoExile.Modes
                 var path = ctx.Navigation.CurrentNavPath;
                 for (int i = ctx.Navigation.CurrentWaypointIndex; i < path.Count - 1; i++)
                 {
-                    var from = cam.WorldToScreen(new Vector3(path[i].Position.X, path[i].Position.Y, playerZ));
-                    var to = cam.WorldToScreen(new Vector3(path[i + 1].Position.X, path[i + 1].Position.Y, playerZ));
+                    var from = cam.WorldToScreen(new Vector3(path[i].Position.X * Pathfinding.GridToWorld, path[i].Position.Y * Pathfinding.GridToWorld, playerZ));
+                    var to = cam.WorldToScreen(new Vector3(path[i + 1].Position.X * Pathfinding.GridToWorld, path[i + 1].Position.Y * Pathfinding.GridToWorld, playerZ));
                     if (from.X < -200 || from.X > 2400 || to.X < -200 || to.X > 2400) continue;
                     var isBlink = path[i + 1].Action == WaypointAction.Blink;
                     g.DrawLine(from, to, isBlink ? 3f : 2f, isBlink ? SharpDX.Color.Magenta : SharpDX.Color.Orange);

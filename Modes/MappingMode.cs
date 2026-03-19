@@ -50,7 +50,7 @@ namespace AutoExile.Modes
         private Entity? _exitPortal;
         private DateTime _lastExitClickTime = DateTime.MinValue;
         private DateTime _zoneEnteredAt = DateTime.Now;
-        private string _lastZoneName = "";
+        private long _lastZoneHash;
         private const float MinZoneSecondsBeforeExit = 20f; // don't exit sub-zones before clearing them
 
         // ── Stats ──
@@ -80,6 +80,7 @@ namespace AutoExile.Modes
         {
             _startTime = DateTime.Now;
             _zoneEnteredAt = DateTime.Now;
+            _lastZoneHash = ctx.Game?.IngameState?.Data?.CurrentAreaHash ?? 0;
             _exploreTargetsVisited = 0;
             _navFailures = 0;
             _navTarget = null;
@@ -119,6 +120,7 @@ namespace AutoExile.Modes
             _interactableClickAttempts = 0;
             _failedInteractables.Clear();
             _exitPortal = null;
+            _lastZoneHash = 0;
             Status = "Stopped";
             Decision = "";
         }
@@ -147,17 +149,18 @@ namespace AutoExile.Modes
             if (gc?.Player == null || !gc.InGame || !gc.Player.IsAlive) return;
 
             // Detect zone changes (sub-zone transitions like wish zones)
-            var currentZone = gc.Area?.CurrentArea?.Name ?? "";
-            if (!string.IsNullOrEmpty(currentZone) && currentZone != _lastZoneName)
+            // Use area hash — area name can be identical between parent map and sub-zone
+            var currentHash = gc.IngameState?.Data?.CurrentAreaHash ?? 0;
+            if (currentHash != 0 && currentHash != _lastZoneHash)
             {
-                if (!string.IsNullOrEmpty(_lastZoneName))
+                if (_lastZoneHash != 0)
                 {
                     _zoneEnteredAt = DateTime.Now;
                     _exitPortal = null;
                     if (_phase == MappingPhase.Exiting)
                         _phase = MappingPhase.Exploring;
                 }
-                _lastZoneName = currentZone;
+                _lastZoneHash = currentHash;
             }
 
             var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
@@ -174,15 +177,19 @@ namespace AutoExile.Modes
             }
 
             // Pause/resume navigation based on combat state
-            if (!_mechanicActive && ctx.Combat.InCombat && ctx.Combat.WantsToMove)
+            // Don't pause nav when interaction is busy (navigating to loot/interactable) —
+            // combat positioning is already suppressed, and pausing nav would stall the pickup
+            if (!_mechanicActive && !ctx.Interaction.IsBusy && ctx.Combat.InCombat && ctx.Combat.WantsToMove)
             {
                 // Combat wants to reposition — pause nav so combat controls movement
                 if (ctx.Navigation.IsNavigating)
                     ctx.Navigation.Pause();
             }
-            else if (!_mechanicActive && !ctx.Combat.InCombat && ctx.Navigation.IsPaused)
+            else if (!_mechanicActive && ctx.Navigation.IsPaused &&
+                     (!ctx.Combat.InCombat || ctx.Interaction.IsBusy))
             {
-                // Combat over — resume navigation
+                // Resume navigation when combat ends, OR when interaction needs nav
+                // (e.g. loot pickup started while combat had nav paused)
                 ctx.Navigation.Resume(gc);
             }
 
@@ -401,8 +408,7 @@ namespace AutoExile.Modes
 
         private void NavigateToTarget(BotContext ctx, GameController gc, Vector2 playerGrid, Vector2 targetGrid)
         {
-            var worldTarget = targetGrid * Pathfinding.GridToWorld;
-            if (ctx.Navigation.NavigateTo(gc, worldTarget))
+            if (ctx.Navigation.NavigateTo(gc, targetGrid))
             {
                 _navTarget = targetGrid;
                 _exploreTargetsVisited++;
@@ -449,8 +455,7 @@ namespace AutoExile.Modes
                     return;
                 }
 
-                var worldTarget = target.Value * Pathfinding.GridToWorld;
-                if (ctx.Navigation.NavigateTo(gc, worldTarget))
+                if (ctx.Navigation.NavigateTo(gc, target.Value))
                 {
                     _navTarget = target.Value;
                     _exploreTargetsVisited++;
@@ -617,8 +622,7 @@ namespace AutoExile.Modes
             if (dist > ctx.Interaction.InteractRadius)
             {
                 // Navigate to portal
-                var worldTarget = portalGrid * Pathfinding.GridToWorld;
-                ctx.Navigation.NavigateTo(gc, worldTarget);
+                ctx.Navigation.NavigateTo(gc, portalGrid);
                 Status = $"Exiting — walking to portal ({dist:F0}g)";
                 return;
             }
@@ -844,8 +848,8 @@ namespace AutoExile.Modes
                 var path = ctx.Navigation.CurrentNavPath;
                 for (int i = ctx.Navigation.CurrentWaypointIndex; i < path.Count - 1; i++)
                 {
-                    var from = cam.WorldToScreen(new Vector3(path[i].Position.X, path[i].Position.Y, playerZ));
-                    var to = cam.WorldToScreen(new Vector3(path[i + 1].Position.X, path[i + 1].Position.Y, playerZ));
+                    var from = cam.WorldToScreen(new Vector3(path[i].Position.X * Pathfinding.GridToWorld, path[i].Position.Y * Pathfinding.GridToWorld, playerZ));
+                    var to = cam.WorldToScreen(new Vector3(path[i + 1].Position.X * Pathfinding.GridToWorld, path[i + 1].Position.Y * Pathfinding.GridToWorld, playerZ));
                     if (from.X < -200 || from.X > 2400 || to.X < -200 || to.X > 2400) continue;
 
                     var isBlink = path[i + 1].Action == WaypointAction.Blink;

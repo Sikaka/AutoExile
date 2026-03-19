@@ -252,8 +252,7 @@ namespace AutoExile.Mechanics
                 return MechanicResult.InProgress;
             }
 
-            var worldTarget = _monolithGridPos * Pathfinding.GridToWorld;
-            ctx.Navigation.NavigateTo(gc, worldTarget);
+            ctx.Navigation.NavigateTo(gc, _monolithGridPos);
             Status = $"[Nav] Walking to monolith ({dist:F0}g away)";
             return MechanicResult.InProgress;
         }

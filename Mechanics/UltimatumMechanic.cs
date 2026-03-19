@@ -282,8 +282,7 @@ namespace AutoExile.Mechanics
             // Start or continue navigation
             if (!ctx.Navigation.IsNavigating)
             {
-                var worldTarget = AnchorGridPos.Value * Pathfinding.GridToWorld;
-                if (!ctx.Navigation.NavigateTo(gc, worldTarget))
+                if (!ctx.Navigation.NavigateTo(gc, AnchorGridPos.Value))
                 {
                     _phase = UltimatumPhase.Failed;
                     Status = "Cannot path to altar";
@@ -524,7 +523,19 @@ namespace AutoExile.Mechanics
         {
             var settings = ctx.Settings.Mechanics.Ultimatum;
 
+            // Suppress combat positioning when leash will pull us back,
+            // otherwise combat movement fights navigation for cursor control
+            bool leashing = false;
+            if (AnchorGridPos.HasValue)
+            {
+                var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
+                var dist = Vector2.Distance(playerGrid, AnchorGridPos.Value);
+                var effectiveRadius = GetEffectiveOrbitRadius(settings.OrbitRadius.Value);
+                leashing = dist > effectiveRadius;
+            }
+            ctx.Combat.SuppressPositioning = leashing;
             ctx.Combat.Tick(ctx);
+            ctx.Combat.SuppressPositioning = false;
 
             // Check if wave ended (UltimatumPanel appeared for between-wave choices)
             var panel = gc.IngameState.IngameUi.UltimatumPanel;
@@ -561,8 +572,7 @@ namespace AutoExile.Mechanics
                 var effectiveRadius = GetEffectiveOrbitRadius(settings.OrbitRadius.Value);
                 if (dist > effectiveRadius)
                 {
-                    var worldTarget = AnchorGridPos.Value * Pathfinding.GridToWorld;
-                    ctx.Navigation.NavigateTo(gc, worldTarget);
+                    ctx.Navigation.NavigateTo(gc, AnchorGridPos.Value);
                     Status = $"Fighting round {_currentRound} — leashing back (dist={dist:F0}, radius={effectiveRadius:F0})";
                 }
                 else

@@ -167,7 +167,6 @@ namespace AutoExile.Systems
                 return MapDeviceResult.InProgress;
             }
 
-            // Navigate to device (NavigateTo expects world coordinates)
             if (!nav.IsNavigating)
             {
                 _navAttempts++;
@@ -184,10 +183,8 @@ namespace AutoExile.Systems
                     return MapDeviceResult.InProgress;
                 }
 
-                var worldTarget = new Vector2(
-                    deviceGrid.X * Pathfinding.GridToWorld,
-                    deviceGrid.Y * Pathfinding.GridToWorld);
-                var success = nav.NavigateTo(gc, worldTarget);
+                var gridTarget = new Vector2(deviceGrid.X, deviceGrid.Y);
+                var success = nav.NavigateTo(gc, gridTarget);
                 if (!success)
                 {
                     // A* can't find a path — common in hideouts where decorations create
@@ -412,10 +409,8 @@ namespace AutoExile.Systems
                 if (!nav.IsNavigating)
                 {
                     var portalGrid = portal.GridPosNum;
-                    var worldTarget = new Vector2(
-                        portalGrid.X * Pathfinding.GridToWorld,
-                        portalGrid.Y * Pathfinding.GridToWorld);
-                    var success = nav.NavigateTo(gc, worldTarget);
+                    var gridTarget = new Vector2(portalGrid.X, portalGrid.Y);
+                    var success = nav.NavigateTo(gc, gridTarget);
                     if (!success && gc.Area.CurrentArea.IsHideout && BotInput.CanAct)
                     {
                         // Hideout decoration walls — direct walk toward portal

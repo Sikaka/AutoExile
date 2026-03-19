@@ -316,7 +316,7 @@ namespace AutoExile.Modes
                     if (target.HasValue)
                     {
                         ctx.Navigation.NavigateTo(gc,
-                            target.Value * Systems.Pathfinding.GridToWorld);
+                            target.Value);
                     }
                 }
             }
@@ -363,7 +363,7 @@ namespace AutoExile.Modes
             if (!ctx.Navigation.IsNavigating)
             {
                 var success = ctx.Navigation.NavigateTo(ctx.Game,
-                    SimulacrumState.ToWorld(_state.MonolithPosition.Value));
+                    _state.MonolithPosition.Value);
                 if (!success)
                 {
                     StatusText = "No path to monolith";
@@ -657,7 +657,7 @@ namespace AutoExile.Modes
                     _wasSearching = true;
                     var monsterDist = Vector2.Distance(playerPos, nearestPos.Value);
                     if (monsterDist > 20f && !ctx.Navigation.IsNavigating)
-                        ctx.Navigation.NavigateTo(gc, SimulacrumState.ToWorld(nearestPos.Value));
+                        ctx.Navigation.NavigateTo(gc, nearestPos.Value);
                     StatusText = $"Wave {_state.CurrentWave}/15 — chasing nearest monster (dist: {monsterDist:F0}, {ctx.Combat.CachedMonsterCount} alive, {_blacklistedMonsters.Count} blacklisted)";
                     return;
                 }
@@ -679,7 +679,7 @@ namespace AutoExile.Modes
                 var target = ctx.Exploration.GetNextExplorationTarget(playerPos);
                 if (target.HasValue)
                 {
-                    ctx.Navigation.NavigateTo(gc, SimulacrumState.ToWorld(target.Value));
+                    ctx.Navigation.NavigateTo(gc, target.Value);
                     StatusText = $"Wave {_state.CurrentWave}/15 — exploring for monsters";
                     return;
                 }
@@ -694,7 +694,7 @@ namespace AutoExile.Modes
                 var distToMonolith = Vector2.Distance(playerPos, _state.MonolithPosition.Value);
                 if (distToMonolith > 80f)
                 {
-                    ctx.Navigation.NavigateTo(gc, SimulacrumState.ToWorld(_state.MonolithPosition.Value));
+                    ctx.Navigation.NavigateTo(gc, _state.MonolithPosition.Value);
                     StatusText = $"Wave {_state.CurrentWave}/15 — returning to monolith (dist: {distToMonolith:F0})";
                     return;
                 }
@@ -705,7 +705,7 @@ namespace AutoExile.Modes
                     var angle = (float)(DateTime.Now.Ticks % 62830) / 10000f;
                     var radius = 40f + 25f * MathF.Sin(angle * 0.3f); // 15-65 radius sweep
                     var orbitTarget = _state.MonolithPosition.Value + new Vector2(MathF.Cos(angle), MathF.Sin(angle)) * radius;
-                    ctx.Navigation.NavigateTo(gc, SimulacrumState.ToWorld(orbitTarget));
+                    ctx.Navigation.NavigateTo(gc, orbitTarget);
                 }
                 StatusText = $"Wave {_state.CurrentWave}/15 — sweeping for monsters";
                 return;
@@ -787,7 +787,7 @@ namespace AutoExile.Modes
             var dist = Vector2.Distance(gc.Player.GridPosNum, _state.MonolithPosition.Value);
 
             if (dist > 30f && !ctx.Navigation.IsNavigating)
-                ctx.Navigation.NavigateTo(gc, SimulacrumState.ToWorld(_state.MonolithPosition.Value));
+                ctx.Navigation.NavigateTo(gc, _state.MonolithPosition.Value);
             else if (dist <= 20f && ctx.Navigation.IsNavigating)
                 ctx.Navigation.Stop(gc);
         }
@@ -814,7 +814,7 @@ namespace AutoExile.Modes
             if (dist > ctx.Interaction.InteractRadius)
             {
                 if (!ctx.Navigation.IsNavigating)
-                    ctx.Navigation.NavigateTo(gc, SimulacrumState.ToWorld(monolithPos));
+                    ctx.Navigation.NavigateTo(gc, monolithPos);
                 StatusText = $"Navigating to monolith to start wave {_state.CurrentWave + 1} (dist: {dist:F0})";
                 return;
             }
@@ -953,7 +953,7 @@ namespace AutoExile.Modes
                     if (ctx.Stash.IsBusy)
                         ctx.Stash.Cancel(gc, ctx.Navigation);
                     if (!ctx.Navigation.IsNavigating)
-                        ctx.Navigation.NavigateTo(gc, SimulacrumState.ToWorld(_state.StashPosition.Value));
+                        ctx.Navigation.NavigateTo(gc, _state.StashPosition.Value);
                     StatusText = $"Navigating to stash (dist: {dist:F0})";
                     return;
                 }
@@ -1025,7 +1025,7 @@ namespace AutoExile.Modes
                     if (dist > ctx.Interaction.InteractRadius)
                     {
                         if (!ctx.Navigation.IsNavigating)
-                            ctx.Navigation.NavigateTo(gc, SimulacrumState.ToWorld(_state.StashPosition.Value));
+                            ctx.Navigation.NavigateTo(gc, _state.StashPosition.Value);
                         StatusText = $"Navigating to stash before exit (dist: {dist:F0})";
                         return;
                     }
@@ -1136,7 +1136,7 @@ namespace AutoExile.Modes
                     {
                         if (!ctx.Navigation.IsNavigating)
                             ctx.Navigation.NavigateTo(gc,
-                                SimulacrumState.ToWorld(_state.PortalPosition.Value));
+                                _state.PortalPosition.Value);
                         StatusText = $"Walking to cached portal (dist: {dist:F0})";
                     }
                     else
@@ -1158,7 +1158,7 @@ namespace AutoExile.Modes
             if (portalDist > ctx.Interaction.InteractRadius)
             {
                 if (!ctx.Navigation.IsNavigating)
-                    ctx.Navigation.NavigateTo(gc, portalGridPos * Systems.Pathfinding.GridToWorld);
+                    ctx.Navigation.NavigateTo(gc, portalGridPos);
                 StatusText = $"Walking to portal (dist: {portalDist:F0})";
                 return;
             }
@@ -1201,7 +1201,20 @@ namespace AutoExile.Modes
                 hudY += lineH;
             }
 
-            g.DrawText($"Runs: {_state.RunsCompleted} | Loot: {_lootTracker.PickupCount}",
+            var runElapsed = DateTime.Now - _state.RunStartedAt;
+            g.DrawText($"Runs: {_state.RunsCompleted} | This run: {runElapsed.Minutes}m{runElapsed.Seconds:D2}s",
+                new Vector2(hudX, hudY), SharpDX.Color.Gold);
+            hudY += lineH;
+
+            if (_state.RunsCompleted > 0)
+            {
+                var avgDur = _state.AverageRunDuration;
+                g.DrawText($"Avg: {avgDur.Minutes}m{avgDur.Seconds:D2}s | {_state.AverageWavesPerRun:F1} waves/run",
+                    new Vector2(hudX, hudY), SharpDX.Color.Gold);
+                hudY += lineH;
+            }
+
+            g.DrawText($"Loot: {_lootTracker.PickupCount} items",
                 new Vector2(hudX, hudY), SharpDX.Color.Gold);
             hudY += lineH;
 
@@ -1256,9 +1269,9 @@ namespace AutoExile.Modes
                 for (int i = ctx.Navigation.CurrentWaypointIndex; i < path.Count - 1; i++)
                 {
                     var from = cam.WorldToScreen(new Vector3(
-                        path[i].Position.X, path[i].Position.Y, playerZ));
+                        path[i].Position.X * Systems.Pathfinding.GridToWorld, path[i].Position.Y * Systems.Pathfinding.GridToWorld, playerZ));
                     var to = cam.WorldToScreen(new Vector3(
-                        path[i + 1].Position.X, path[i + 1].Position.Y, playerZ));
+                        path[i + 1].Position.X * Systems.Pathfinding.GridToWorld, path[i + 1].Position.Y * Systems.Pathfinding.GridToWorld, playerZ));
                     g.DrawLine(from, to, 1.5f, SharpDX.Color.CornflowerBlue);
                 }
             }

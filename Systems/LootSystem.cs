@@ -59,11 +59,13 @@ namespace AutoExile.Systems
         /// </summary>
         public void MarkFailed(long entityId, string reason = "unknown")
         {
+            var prevCount = _failedEntities.TryGetValue(entityId, out var prev) ? prev.FailCount : 0;
             _failedEntities[entityId] = new FailedLootEntry
             {
                 EntityId = entityId,
                 Reason = reason,
                 FailedAt = DateTime.Now,
+                FailCount = prevCount + 1,
             };
         }
 
@@ -113,7 +115,7 @@ namespace AutoExile.Systems
                         continue;
 
                     var worldItemEntity = label.Entity;
-                    if (_failedEntities.ContainsKey(worldItemEntity.Id))
+                    if (_failedEntities.TryGetValue(worldItemEntity.Id, out var failEntry) && !failEntry.IsExpired)
                         continue;
 
                     var itemName = label.Label.Text ?? "?";
@@ -275,5 +277,28 @@ namespace AutoExile.Systems
         public long EntityId;
         public string Reason = "";
         public DateTime FailedAt;
+        public int FailCount;
+
+        /// <summary>
+        /// Cooldown before retry. Flicker (entity gone before click) gets 0.5s.
+        /// Actual click failures escalate: 5s, 15s, 30s.
+        /// </summary>
+        public TimeSpan Cooldown
+        {
+            get
+            {
+                if (Reason == "entity gone before click")
+                    return TimeSpan.FromSeconds(0.5);
+
+                return FailCount switch
+                {
+                    1 => TimeSpan.FromSeconds(5),
+                    2 => TimeSpan.FromSeconds(15),
+                    _ => TimeSpan.FromSeconds(30),
+                };
+            }
+        }
+
+        public bool IsExpired => DateTime.Now >= FailedAt + Cooldown;
     }
 }

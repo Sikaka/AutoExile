@@ -726,6 +726,11 @@ namespace AutoExile
                 ImGui.Text($"Monolith: {(simState.MonolithPosition.HasValue ? $"({simState.MonolithPosition.Value.X:F0}, {simState.MonolithPosition.Value.Y:F0})" : "not found")}");
                 ImGui.Text($"Stash: {(simState.StashPosition.HasValue ? "found" : "not found")} | Portal: {(simState.PortalPosition.HasValue ? "found" : "not found")}");
                 ImGui.Text($"Deaths: {simState.DeathCount}/{Settings.Simulacrum.MaxDeaths.Value} | Runs: {simState.RunsCompleted}");
+                if (simState.RunsCompleted > 0)
+                {
+                    var avgDur = simState.AverageRunDuration;
+                    ImGui.Text($"Avg: {avgDur.Minutes}m{avgDur.Seconds:D2}s/run | {simState.AverageWavesPerRun:F1} waves/run");
+                }
             }
 
             // Game state dump

@@ -15,7 +15,7 @@ namespace AutoExile.Modes
     {
         public string Name => "Debug Pathfinding";
 
-        private Vector2? _targetWorldPos;
+        private Vector2? _targetGridPos;
         private bool _navigating;
         private string _status = "Ready";
 
@@ -41,7 +41,7 @@ namespace AutoExile.Modes
 
         public void OnExit()
         {
-            _targetWorldPos = null;
+            _targetGridPos = null;
             _navigating = false;
             _renderNavPath.Clear();
         }
@@ -69,9 +69,8 @@ namespace AutoExile.Modes
                         ctx.Game.Player.GridPosNum.Y);
                     var dodgeDist = ctx.Settings.Threat.DodgeDistance.Value;
                     _dodgeTarget = playerGrid + ctx.Threat.DodgeDirection * dodgeDist;
-                    var worldTarget = _dodgeTarget * (float)Pathfinding.GridToWorld;
 
-                    if (ctx.Navigation.NavigateTo(ctx.Game, worldTarget))
+                    if (ctx.Navigation.NavigateTo(ctx.Game, _dodgeTarget))
                     {
                         _dodging = true;
                         _navigating = true;
@@ -93,8 +92,9 @@ namespace AutoExile.Modes
             if (_navigating && !ctx.Navigation.IsNavigating)
             {
                 _navigating = false;
-                var dist = _targetWorldPos.HasValue
-                    ? Vector2.Distance(_playerPos, _targetWorldPos.Value)
+                var playerGrid = new Vector2(ctx.Game.Player.GridPosNum.X, ctx.Game.Player.GridPosNum.Y);
+                var dist = _targetGridPos.HasValue
+                    ? Vector2.Distance(playerGrid, _targetGridPos.Value)
                     : 0;
                 _status = $"Navigation complete (dist to target: {dist:F0})";
                 ctx.Log("Navigation complete");
@@ -164,17 +164,17 @@ namespace AutoExile.Modes
 
         public void SetTarget(BotContext ctx)
         {
-            var pos = ctx.Game.Player.PosNum;
-            _targetWorldPos = new Vector2(pos.X, pos.Y);
+            var pos = ctx.Game.Player.GridPosNum;
+            _targetGridPos = new Vector2(pos.X, pos.Y);
             _navigating = false;
             ctx.Navigation.Stop(ctx.Game);
-            _status = $"Target set at ({pos.X:F0}, {pos.Y:F0})";
-            ctx.Log($"Target set at ({pos.X:F0}, {pos.Y:F0})");
+            _status = $"Target set at grid ({pos.X:F0}, {pos.Y:F0})";
+            ctx.Log($"Target set at grid ({pos.X:F0}, {pos.Y:F0})");
         }
 
         public void Navigate(BotContext ctx)
         {
-            if (_targetWorldPos == null)
+            if (_targetGridPos == null)
             {
                 _status = "No target set";
                 return;
@@ -182,7 +182,7 @@ namespace AutoExile.Modes
 
             _status = "Computing path...";
 
-            var success = ctx.Navigation.NavigateTo(ctx.Game, _targetWorldPos.Value);
+            var success = ctx.Navigation.NavigateTo(ctx.Game, _targetGridPos.Value);
 
             if (success)
             {
@@ -205,7 +205,7 @@ namespace AutoExile.Modes
         {
             _navigating = false;
             ctx.Navigation.Stop(ctx.Game);
-            _status = _targetWorldPos != null ? "Stopped — target still set" : "Stopped";
+            _status = _targetGridPos != null ? "Stopped — target still set" : "Stopped";
         }
 
         public void SearchTiles(BotContext ctx)
@@ -491,10 +491,11 @@ namespace AutoExile.Modes
             var playerZ = ctx.Game.Player.PosNum.Z;
 
             // Draw target marker
-            if (_targetWorldPos != null)
+            if (_targetGridPos != null)
             {
+                var gtw = (float)Pathfinding.GridToWorld;
                 var targetScreen = camera.WorldToScreen(
-                    new System.Numerics.Vector3(_targetWorldPos.Value.X, _targetWorldPos.Value.Y, playerZ));
+                    new System.Numerics.Vector3(_targetGridPos.Value.X * gtw, _targetGridPos.Value.Y * gtw, playerZ));
 
                 if (IsOnScreen(targetScreen, ctx.Game))
                 {
@@ -534,7 +535,7 @@ namespace AutoExile.Modes
                 for (var i = 0; i < _renderNavPath.Count; i++)
                 {
                     var wp = _renderNavPath[i];
-                    var sw = camera.WorldToScreen(new System.Numerics.Vector3(wp.Position.X, wp.Position.Y, playerZ));
+                    var sw = camera.WorldToScreen(new System.Numerics.Vector3(wp.Position.X * Pathfinding.GridToWorld, wp.Position.Y * Pathfinding.GridToWorld, playerZ));
                     if (!IsOnScreen(sw, ctx.Game))
                         continue;
 

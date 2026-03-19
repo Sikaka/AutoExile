@@ -321,11 +321,8 @@ namespace AutoExile.Modes
 
             if (dist > FollowDistance)
             {
-                var leaderWorldPos = leaderGridPos * Pathfinding.GridToWorld;
-                var playerWorldPos = playerGridPos * Pathfinding.GridToWorld;
-
                 // Check walkable LOS to leader
-                var hasLOS = ctx.Navigation.HasWalkableLOS(gc, playerWorldPos, leaderWorldPos);
+                var hasLOS = ctx.Navigation.HasWalkableLOS(gc, playerGridPos, leaderGridPos);
 
                 // Hysteresis: if we recently started a path, don't switch back to LOS movement
                 // too quickly — prevents flicker near terrain corners
@@ -335,7 +332,7 @@ namespace AutoExile.Modes
                 if (hasLOS && !preferPath)
                 {
                     // LOS clear — direct movement, no pathfinding
-                    ctx.Navigation.MoveToward(gc, leaderWorldPos);
+                    ctx.Navigation.MoveToward(gc, leaderGridPos);
                     _consecutivePathFailures = 0;
                     _state = FollowerState.Following;
                     _status = $"Following {LeaderName} (LOS, dist: {dist:F0})";
@@ -344,8 +341,8 @@ namespace AutoExile.Modes
                 else if (ctx.Navigation.IsNavigating)
                 {
                     // No LOS (or hysteresis active) but already have a path — graft destination
-                    ctx.Navigation.UpdateDestination(gc, leaderWorldPos,
-                        driftThreshold: FollowDistance * Pathfinding.GridToWorld);
+                    ctx.Navigation.UpdateDestination(gc, leaderGridPos,
+                        driftThreshold: FollowDistance);
                     _consecutivePathFailures = 0;
                     _state = FollowerState.Following;
                     _status = $"Following {LeaderName} (path, dist: {dist:F0})";
@@ -354,7 +351,7 @@ namespace AutoExile.Modes
                 else
                 {
                     // No LOS, no active path — start fresh pathfinding
-                    if (ctx.Navigation.NavigateTo(gc, leaderWorldPos))
+                    if (ctx.Navigation.NavigateTo(gc, leaderGridPos))
                     {
                         _lastPathStartTime = DateTime.Now;
                         _consecutivePathFailures = 0;
@@ -395,10 +392,8 @@ namespace AutoExile.Modes
                 // If no active path, keep direct-moving toward leader when LOS is clear.
                 if (!ctx.Navigation.IsNavigating)
                 {
-                    var leaderWorldPos = leaderGridPos * Pathfinding.GridToWorld;
-                    var playerWorldPos = playerGridPos * Pathfinding.GridToWorld;
-                    if (ctx.Navigation.HasWalkableLOS(gc, playerWorldPos, leaderWorldPos))
-                        ctx.Navigation.MoveToward(gc, leaderWorldPos);
+                    if (ctx.Navigation.HasWalkableLOS(gc, playerGridPos, leaderGridPos))
+                        ctx.Navigation.MoveToward(gc, leaderGridPos);
                 }
                 _state = FollowerState.Following;
                 _status = $"Following {LeaderName} (dist: {dist:F0})";
@@ -760,7 +755,7 @@ namespace AutoExile.Modes
             _transitionEntityId = target.Id;
             _state = FollowerState.NavigatingToTransition;
             ctx.Navigation.Stop(gc);
-            ctx.Navigation.NavigateTo(gc, transGridPos * Pathfinding.GridToWorld, maxNodes: 200000);
+            ctx.Navigation.NavigateTo(gc, transGridPos, maxNodes: 200000);
 
             var isPortal = target.Type == EntityType.TownPortal || target.Type == EntityType.Portal;
             _status = isPortal
@@ -1113,8 +1108,8 @@ namespace AutoExile.Modes
                 {
                     var a = path[i].Position;
                     var b = path[i + 1].Position;
-                    var sa = camera.WorldToScreen(new System.Numerics.Vector3(a.X, a.Y, playerZ));
-                    var sb = camera.WorldToScreen(new System.Numerics.Vector3(b.X, b.Y, playerZ));
+                    var sa = camera.WorldToScreen(new System.Numerics.Vector3(a.X * Pathfinding.GridToWorld, a.Y * Pathfinding.GridToWorld, playerZ));
+                    var sb = camera.WorldToScreen(new System.Numerics.Vector3(b.X * Pathfinding.GridToWorld, b.Y * Pathfinding.GridToWorld, playerZ));
                     var windowRect = ctx.Game.Window.GetWindowRectangle();
 
                     if (sa.X > 0 && sa.X < windowRect.Width && sa.Y > 0 && sa.Y < windowRect.Height)

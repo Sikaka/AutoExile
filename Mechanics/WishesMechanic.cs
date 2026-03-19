@@ -185,7 +185,11 @@ namespace AutoExile.Mechanics
             if (ctx.Navigation.IsPaused)
                 ctx.Navigation.Resume(gc);
 
+            // Fire skills at nearby monsters but don't let combat positioning
+            // fight with navigation for cursor control
+            ctx.Combat.SuppressPositioning = true;
             ctx.Combat.Tick(ctx);
+            ctx.Combat.SuppressPositioning = false;
 
             ScanFaridunEntities(ctx);
             if (_npc != null && _npc.IsTargetable)
@@ -203,12 +207,7 @@ namespace AutoExile.Mechanics
                 return MechanicResult.InProgress;
             }
 
-            // Resume navigation if combat paused it (check again after combat tick)
-            if (ctx.Navigation.IsPaused)
-                ctx.Navigation.Resume(gc);
-
-            var worldTarget = _initiatorGridPos * Pathfinding.GridToWorld;
-            if (!ctx.Navigation.NavigateTo(gc, worldTarget))
+            if (!ctx.Navigation.NavigateTo(gc, _initiatorGridPos))
             {
                 _navFailCount++;
                 Status = $"[Nav] Can't path to encounter (fail {_navFailCount}/{MaxNavFails})";
@@ -267,7 +266,10 @@ namespace AutoExile.Mechanics
             if (ctx.Navigation.IsPaused)
                 ctx.Navigation.Resume(gc);
 
+            // Fire skills but suppress positioning — navigation to NPC owns movement
+            ctx.Combat.SuppressPositioning = true;
             ctx.Combat.Tick(ctx);
+            ctx.Combat.SuppressPositioning = false;
 
             if (_npc == null || !_npc.IsTargetable)
             {
@@ -290,12 +292,7 @@ namespace AutoExile.Mechanics
                 return MechanicResult.InProgress;
             }
 
-            // Resume again after combat tick
-            if (ctx.Navigation.IsPaused)
-                ctx.Navigation.Resume(gc);
-
-            var worldTarget = _npcGridPos * Pathfinding.GridToWorld;
-            if (!ctx.Navigation.NavigateTo(gc, worldTarget))
+            if (!ctx.Navigation.NavigateTo(gc, _npcGridPos))
             {
                 Status = $"[Nav] Can't path to Varashta ({dist:F0}g)";
                 return MechanicResult.InProgress;
@@ -331,8 +328,7 @@ namespace AutoExile.Mechanics
             var dist = Vector2.Distance(playerGrid, _npcGridPos);
             if (dist > ctx.Interaction.InteractRadius)
             {
-                var worldTarget = _npcGridPos * Pathfinding.GridToWorld;
-                ctx.Navigation.NavigateTo(gc, worldTarget);
+                ctx.Navigation.NavigateTo(gc, _npcGridPos);
                 Status = $"[NPC] Walking closer to Varashta ({dist:F0}g)";
                 return MechanicResult.InProgress;
             }
@@ -522,8 +518,7 @@ namespace AutoExile.Mechanics
                 return MechanicResult.InProgress;
             }
 
-            var worldTarget = _portalGridPos * Pathfinding.GridToWorld;
-            ctx.Navigation.NavigateTo(gc, worldTarget);
+            ctx.Navigation.NavigateTo(gc, _portalGridPos);
             Status = $"[Nav] Walking to portal ({dist:F0}g away)";
             return MechanicResult.InProgress;
         }

@@ -276,8 +276,7 @@ namespace AutoExile.Mechanics
 
             if (!ctx.Navigation.IsNavigating)
             {
-                var worldTarget = AnchorGridPos.Value * Pathfinding.GridToWorld;
-                if (!ctx.Navigation.NavigateTo(gc, worldTarget))
+                if (!ctx.Navigation.NavigateTo(gc, AnchorGridPos.Value))
                 {
                     _phase = HarvestPhase.Failed;
                     Status = "Cannot path to entrance";
@@ -527,21 +526,22 @@ namespace AutoExile.Mechanics
                 return MechanicResult.InProgress;
             }
 
-            // Run combat while navigating
+            // Run combat while navigating — suppress positioning so it doesn't fight navigation
+            ctx.Combat.SuppressPositioning = true;
             ctx.Combat.Tick(ctx);
+            ctx.Combat.SuppressPositioning = false;
 
             if (!ctx.Navigation.IsNavigating)
             {
-                var worldTarget = navTarget * Pathfinding.GridToWorld;
-                ctx.Log($"[Harvest] NavigateTo grid=({navTarget.X:F0},{navTarget.Y:F0}) world=({worldTarget.X:F0},{worldTarget.Y:F0}) playerGrid=({playerGrid.X:F0},{playerGrid.Y:F0}) dist={dist:F0}");
-                if (!ctx.Navigation.NavigateTo(gc, worldTarget))
+                ctx.Log($"[Harvest] NavigateTo grid=({navTarget.X:F0},{navTarget.Y:F0}) playerGrid=({playerGrid.X:F0},{playerGrid.Y:F0}) dist={dist:F0}");
+                if (!ctx.Navigation.NavigateTo(gc, navTarget))
                 {
                     ctx.Log($"[Harvest] NavigateTo FAILED. FramePF null={gc.IngameState.Data.RawFramePathfindingData == null}");
                     _navRetries++;
                     // Try the other irrigator on second attempt
                     if (_navRetries == 1)
                     {
-                        var altTarget = (navTarget == targetA ? targetB : targetA) * Pathfinding.GridToWorld;
+                        var altTarget = navTarget == targetA ? targetB : targetA;
                         if (ctx.Navigation.NavigateTo(gc, altTarget))
                         {
                             Status = "Retrying path to other irrigator...";
@@ -638,7 +638,7 @@ namespace AutoExile.Mechanics
                 // Navigate closer to irrigator A
                 var posA = new Vector2(_currentPair.A.GridPosNum.X, _currentPair.A.GridPosNum.Y);
                 if (!ctx.Navigation.IsNavigating)
-                    ctx.Navigation.NavigateTo(gc, posA * Pathfinding.GridToWorld);
+                    ctx.Navigation.NavigateTo(gc, posA);
 
                 Status = "Moving closer to read labels...";
                 return MechanicResult.InProgress;
@@ -788,7 +788,18 @@ namespace AutoExile.Mechanics
 
         private MechanicResult TickFighting(BotContext ctx, GameController gc)
         {
+            // Suppress combat positioning when leash will pull us back,
+            // otherwise combat movement fights navigation for cursor control
+            bool leashing = false;
+            if (_currentPair?.Selected != null)
+            {
+                var irrigatorPos = new Vector2(_currentPair.Selected.GridPosNum.X, _currentPair.Selected.GridPosNum.Y);
+                var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
+                leashing = Vector2.Distance(playerGrid, irrigatorPos) > 60;
+            }
+            ctx.Combat.SuppressPositioning = leashing;
             ctx.Combat.Tick(ctx);
+            ctx.Combat.SuppressPositioning = false;
 
             if (_currentPair?.Selected == null) return MechanicResult.Failed;
 
@@ -868,8 +879,7 @@ namespace AutoExile.Mechanics
                 var dist = Vector2.Distance(playerGrid, irrigatorPos);
                 if (dist > 60)
                 {
-                    var worldTarget = irrigatorPos * Pathfinding.GridToWorld;
-                    ctx.Navigation.NavigateTo(gc, worldTarget);
+                    ctx.Navigation.NavigateTo(gc, irrigatorPos);
                 }
             }
 
@@ -1005,13 +1015,14 @@ namespace AutoExile.Mechanics
                 return MechanicResult.InProgress;
             }
 
-            // Run combat while walking back
+            // Run combat while walking back — suppress positioning so it doesn't fight navigation
+            ctx.Combat.SuppressPositioning = true;
             ctx.Combat.Tick(ctx);
+            ctx.Combat.SuppressPositioning = false;
 
             if (!ctx.Navigation.IsNavigating)
             {
-                var worldTarget = portalGrid * Pathfinding.GridToWorld;
-                if (!ctx.Navigation.NavigateTo(gc, worldTarget))
+                if (!ctx.Navigation.NavigateTo(gc, portalGrid))
                 {
                     _phase = HarvestPhase.Failed;
                     Status = "Cannot path to return portal";

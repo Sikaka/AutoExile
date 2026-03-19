@@ -324,7 +324,7 @@ namespace AutoExile.Modes
             {
                 _nudgedForPump = true;
                 var playerGrid = gc.Player.GridPosNum;
-                var nudgeTarget = new Vector2(playerGrid.X + 5, playerGrid.Y) * Systems.Pathfinding.GridToWorld;
+                var nudgeTarget = new Vector2(playerGrid.X + 5, playerGrid.Y);
                 ctx.Navigation.NavigateTo(gc, nudgeTarget);
                 StatusText = "Nudging to trigger entity loading...";
                 return;
@@ -401,7 +401,7 @@ namespace AutoExile.Modes
 
             if (!ctx.Navigation.IsNavigating)
             {
-                var success = ctx.Navigation.NavigateTo(ctx.Game, BlightState.ToWorld(_blight.PumpPosition.Value));
+                var success = ctx.Navigation.NavigateTo(ctx.Game, _blight.PumpPosition.Value);
                 if (!success)
                 {
                     StatusText = "No path to pump";
@@ -741,7 +741,7 @@ namespace AutoExile.Modes
                 // Move back toward defense point (but not on top of it)
                 var dir = Vector2.Normalize(defensePos - playerPos);
                 var targetPos = defensePos - dir * 10f; // stand 10 grid units from hub
-                ctx.Navigation.NavigateTo(gc, BlightState.ToWorld(targetPos));
+                ctx.Navigation.NavigateTo(gc, targetPos);
             }
         }
 
@@ -836,7 +836,7 @@ namespace AutoExile.Modes
                 }
 
                 if (!ctx.Navigation.IsNavigating)
-                    ctx.Navigation.NavigateTo(gc, BlightState.ToWorld(defensePos));
+                    ctx.Navigation.NavigateTo(gc, defensePos);
                 StatusText = $"Returning to defense point (dist: {distToDefense:F0})";
                 return;
             }
@@ -909,7 +909,7 @@ namespace AutoExile.Modes
                 {
                     var monsterDist = Vector2.Distance(playerPos, nearestToPumpPos.Value);
                     if (monsterDist > 20f && !ctx.Navigation.IsNavigating)
-                        ctx.Navigation.NavigateTo(gc, BlightState.ToWorld(nearestToPumpPos.Value));
+                        ctx.Navigation.NavigateTo(gc, nearestToPumpPos.Value);
                     StatusText = $"Sweep: chasing monster near pump (dist: {monsterDist:F0}, {ctx.Combat.CachedMonsterCount} alive)";
                     return;
                 }
@@ -950,7 +950,7 @@ namespace AutoExile.Modes
                 var target = ctx.Exploration.GetNextExplorationTarget(playerPos);
                 if (target.HasValue)
                 {
-                    ctx.Navigation.NavigateTo(gc, BlightState.ToWorld(target.Value));
+                    ctx.Navigation.NavigateTo(gc, target.Value);
                     StatusText = $"Sweep: exploring for monsters ({ctx.Combat.CachedMonsterCount} alive)";
                     return;
                 }
@@ -962,7 +962,7 @@ namespace AutoExile.Modes
                 var distOrbit = Vector2.Distance(playerPos, defensePos);
                 if (distOrbit > 60f)
                 {
-                    ctx.Navigation.NavigateTo(gc, BlightState.ToWorld(defensePos));
+                    ctx.Navigation.NavigateTo(gc, defensePos);
                     StatusText = $"Sweep: returning to defense point (exploration exhausted, dist: {distOrbit:F0})";
                     return;
                 }
@@ -970,7 +970,7 @@ namespace AutoExile.Modes
                 {
                     var angle = (float)(DateTime.Now.Ticks % 6283) / 1000f;
                     var orbitTarget = defensePos + new Vector2(MathF.Cos(angle), MathF.Sin(angle)) * 50f;
-                    ctx.Navigation.NavigateTo(gc, BlightState.ToWorld(orbitTarget));
+                    ctx.Navigation.NavigateTo(gc, orbitTarget);
                     StatusText = $"Sweep: orbiting defense point ({ctx.Combat.CachedMonsterCount} alive)";
                     return;
                 }
@@ -1104,7 +1104,7 @@ namespace AutoExile.Modes
                     if (!ctx.Navigation.IsNavigating)
                     {
                         _lastEmptyScanAt = DateTime.MinValue;
-                        var pathFound = ctx.Navigation.NavigateTo(gc, BlightState.ToWorld(nearestCachedChest.Value));
+                        var pathFound = ctx.Navigation.NavigateTo(gc, nearestCachedChest.Value);
                         if (!pathFound)
                         {
                             // Can't path to this chest — remove it and try another next tick
@@ -1214,7 +1214,7 @@ namespace AutoExile.Modes
                 if (dist > ctx.Interaction.InteractRadius)
                 {
                     if (!ctx.Navigation.IsNavigating)
-                        ctx.Navigation.NavigateTo(gc, BlightState.ToWorld(portalGridPos));
+                        ctx.Navigation.NavigateTo(gc, portalGridPos);
                     StatusText = $"Walking to portal (dist: {dist:F0})";
                     return;
                 }
@@ -1235,7 +1235,7 @@ namespace AutoExile.Modes
                 if (dist > ctx.Interaction.InteractRadius)
                 {
                     if (!ctx.Navigation.IsNavigating)
-                        ctx.Navigation.NavigateTo(gc, BlightState.ToWorld(cachedPos));
+                        ctx.Navigation.NavigateTo(gc, cachedPos);
                     StatusText = $"Walking to cached portal (dist: {dist:F0})";
                     return;
                 }
@@ -1387,8 +1387,8 @@ namespace AutoExile.Modes
                 var path = ctx.Navigation.CurrentNavPath;
                 for (int i = ctx.Navigation.CurrentWaypointIndex; i < path.Count - 1; i++)
                 {
-                    var from = cam.WorldToScreen(new Vector3(path[i].Position.X, path[i].Position.Y, playerZ));
-                    var to = cam.WorldToScreen(new Vector3(path[i + 1].Position.X, path[i + 1].Position.Y, playerZ));
+                    var from = cam.WorldToScreen(new Vector3(path[i].Position.X * Systems.Pathfinding.GridToWorld, path[i].Position.Y * Systems.Pathfinding.GridToWorld, playerZ));
+                    var to = cam.WorldToScreen(new Vector3(path[i + 1].Position.X * Systems.Pathfinding.GridToWorld, path[i + 1].Position.Y * Systems.Pathfinding.GridToWorld, playerZ));
                     g.DrawLine(from, to, 1.5f, SharpDX.Color.CornflowerBlue);
                 }
             }

@@ -133,11 +133,8 @@ namespace AutoExile.Systems
 
             if (!nav.IsNavigating)
             {
-                // NavigateTo expects world coordinates
-                var worldTarget = new Vector2(
-                    stashGrid.X * Pathfinding.GridToWorld,
-                    stashGrid.Y * Pathfinding.GridToWorld);
-                if (!nav.NavigateTo(gc, worldTarget))
+                var gridTarget = new Vector2(stashGrid.X, stashGrid.Y);
+                if (!nav.NavigateTo(gc, gridTarget))
                 {
                     // Hideout decorations create fake walls — direct walk toward stash
                     if (gc.Area.CurrentArea.IsHideout && BotInput.CanAct)

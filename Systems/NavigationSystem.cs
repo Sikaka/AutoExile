@@ -8,6 +8,7 @@ namespace AutoExile.Systems
 {
     /// <summary>
     /// Handles pathfinding and movement execution.
+    /// All positions stored in grid coordinates. Converts to world only at WorldToScreen call sites.
     /// All input goes through BotInput for global action gating.
     /// Supports blink skills to jump across gaps detected via the targeting layer.
     /// </summary>
@@ -35,21 +36,21 @@ namespace AutoExile.Systems
 
         public bool IsNavigating { get; private set; }
         public bool IsPaused { get; private set; }
-        public List<NavWaypoint> CurrentNavPath { get; private set; } = new();
+        public List<NavWaypoint> CurrentNavPath { get; private set; } = new(); // grid coordinates
         public int CurrentWaypointIndex { get; private set; }
-        public Vector2? Destination { get; private set; }
+        public Vector2? Destination { get; private set; } // grid coordinates
         public long LastPathfindMs { get; private set; }
         public int BlinkCount { get; private set; }
 
-        // For rendering compatibility
+        // For rendering compatibility — returns grid positions
         public List<Vector2> CurrentPath => CurrentNavPath.Select(w => w.Position).ToList();
 
-        // Stuck detection and recovery
-        private Vector2 _lastPosition;
+        // Stuck detection and recovery (all in grid units)
+        private Vector2 _lastPosition; // grid coordinates
         private float _stuckTimer;
-        private const float StuckThreshold = 3f;
+        private const float StuckThreshold = 0.3f;   // grid units — ~3 world units
         private const float StuckTimeLimit = 1.0f;
-        // Waypoint reach thresholds in grid units — converted to world at check time
+        // Waypoint reach thresholds in grid units
         private const float WaypointReachedGrid = 10f;   // intermediate waypoints
         private const float FinalWaypointGrid = 14f;     // final destination
         private const float BlinkApproachGrid = 4f;      // tight approach before blink
@@ -58,12 +59,12 @@ namespace AutoExile.Systems
         private int _stuckRecoveryCount;
         private int _totalStuckRecoveries; // persists across repaths, only resets on new target
         private const int MaxRecoveriesBeforeRepath = 3;
-        private const float InteractSearchRadius = 300f; // world units to search for interactables
+        private const float InteractSearchRadius = 28f; // grid units to search for interactables
         public int StuckRecoveries => _totalStuckRecoveries;
         public string LastRecoveryAction { get; private set; } = "";
         private static readonly Random _rng = new();
 
-        // Blink tracking — geometry for wall-side detection
+        // Blink tracking — geometry for wall-side detection (grid coordinates)
         private bool _blinkPending;           // true after blink fires, waiting to confirm crossing
         private Vector2 _blinkBoundary;       // walk waypoint before blink (origin side of gap)
         private Vector2 _blinkLanding;        // blink waypoint position (far side of gap)
@@ -83,13 +84,12 @@ namespace AutoExile.Systems
             if (_dashActive && (DateTime.Now - _dashStartTime).TotalMilliseconds > DashAnimationMs)
                 _dashActive = false;
 
-            var playerPos = gc.Player.PosNum;
-            var playerWorld = new Vector2(playerPos.X, playerPos.Y);
+            var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
 
             // If we fired a blink, check each tick which side of the wall we're on
             if (_blinkPending)
             {
-                var side = GetWallSide(playerWorld);
+                var side = GetWallSide(playerGrid);
                 var elapsed = (DateTime.Now - _blinkPendingStart).TotalMilliseconds;
 
                 if (side > 0)
@@ -119,16 +119,15 @@ namespace AutoExile.Systems
             if (_dashActive)
                 return;
 
-            // Check if we've reached the current waypoint
+            // Check if we've reached the current waypoint (grid distance)
             var currentWp = CurrentNavPath[CurrentWaypointIndex];
-            var distToWaypoint = Vector2.Distance(playerWorld, currentWp.Position);
+            var distToWaypoint = Vector2.Distance(playerGrid, currentWp.Position);
 
             var isLastWaypoint = CurrentWaypointIndex >= CurrentNavPath.Count - 1;
             var nextIsBlink = !isLastWaypoint && CurrentNavPath[CurrentWaypointIndex + 1].Action == WaypointAction.Blink;
-            var reachGrid = isLastWaypoint ? FinalWaypointGrid
+            var reachDist = isLastWaypoint ? FinalWaypointGrid
                 : nextIsBlink ? BlinkApproachGrid
                 : WaypointReachedGrid;
-            var reachDist = reachGrid * Pathfinding.GridToWorld;
 
             if (distToWaypoint < reachDist)
             {
@@ -144,8 +143,6 @@ namespace AutoExile.Systems
             {
                 // Pass-through detection: if a dash/blink overshot the current waypoint,
                 // skip ahead to the furthest waypoint the player has passed beyond.
-                // Uses dot product: if player is past waypoint along the path direction,
-                // the waypoint is behind us and should be skipped.
                 var advanced = false;
                 for (var i = CurrentWaypointIndex; i < CurrentNavPath.Count - 1; i++)
                 {
@@ -153,12 +150,11 @@ namespace AutoExile.Systems
                     var nextWp = CurrentNavPath[i + 1];
 
                     // Don't skip past blink waypoints — they represent gap crossings
-                    // that require precise positioning
                     if (nextWp.Action == WaypointAction.Blink)
                         break;
 
                     var toNext = nextWp.Position - wp.Position;
-                    var toPlayer = playerWorld - wp.Position;
+                    var toPlayer = playerGrid - wp.Position;
 
                     if (Vector2.Dot(toNext, toPlayer) > 0)
                     {
@@ -172,8 +168,8 @@ namespace AutoExile.Systems
                     _stuckTimer = 0;
             }
 
-            // Stuck detection
-            var moved = Vector2.Distance(playerWorld, _lastPosition);
+            // Stuck detection (grid distance)
+            var moved = Vector2.Distance(playerGrid, _lastPosition);
             if (moved < StuckThreshold)
             {
                 _stuckTimer += (float)gc.DeltaTime;
@@ -193,11 +189,11 @@ namespace AutoExile.Systems
                     }
 
                     // Try to find and interact with a door/breakable
-                    if (TryInteractWithObstacle(gc, playerWorld))
+                    if (TryInteractWithObstacle(gc, playerGrid))
                         return;
 
                     // Fallback: micro-movement in a random direction
-                    MicroMovement(gc, playerWorld);
+                    MicroMovement(gc, playerGrid);
                 }
             }
             else
@@ -206,7 +202,7 @@ namespace AutoExile.Systems
                 if (moved > StuckThreshold * 5)
                     _stuckRecoveryCount = 0;
             }
-            _lastPosition = playerWorld;
+            _lastPosition = playerGrid;
 
             // All input goes through BotInput — if gate is closed, skip this tick
             if (!BotInput.CanAct)
@@ -214,14 +210,13 @@ namespace AutoExile.Systems
 
             // Get current waypoint and determine action
             var waypoint = CurrentNavPath[CurrentWaypointIndex];
-            var playerZ = gc.Player.PosNum.Z;
             var windowRect = gc.Window.GetWindowRectangle();
 
             if (waypoint.Action == WaypointAction.Blink)
             {
                 var boundary = CurrentWaypointIndex > 0
                     ? CurrentNavPath[CurrentWaypointIndex - 1].Position
-                    : playerWorld;
+                    : playerGrid;
 
                 var crossDir = waypoint.Position - boundary;
                 var crossLen = crossDir.Length();
@@ -233,31 +228,42 @@ namespace AutoExile.Systems
                 }
                 var crossDirNorm = crossDir / crossLen;
 
-                var aimDist = BlinkRange * Pathfinding.GridToWorld;
-                var aimPos = playerWorld + crossDirNorm * aimDist;
-
-                var blinkScreen = gc.IngameState.Camera.WorldToScreen(
-                    new Vector3(aimPos.X, aimPos.Y, playerZ));
-                ExecuteBlink(blinkScreen, windowRect, playerWorld, boundary, waypoint.Position, crossDirNorm);
+                // Aim past the landing — overshoot in grid then convert to world for screen
+                var aimGridPos = playerGrid + crossDirNorm * BlinkRange;
+                var blinkScreen = GridToScreen(gc, aimGridPos);
+                ExecuteBlink(blinkScreen, windowRect, playerGrid, boundary, waypoint.Position, crossDirNorm);
             }
             else
             {
-                var screenPos = gc.IngameState.Camera.WorldToScreen(
-                    new Vector3(waypoint.Position.X, waypoint.Position.Y, playerZ));
+                var screenPos = GridToScreen(gc, waypoint.Position);
 
                 // Try dash-for-speed on long straight segments
-                if (!TryDashForSpeed(gc, playerWorld, playerZ, windowRect))
+                if (!TryDashForSpeed(gc, playerGrid, windowRect))
                     ExecuteWalk(screenPos, windowRect);
             }
         }
 
         /// <summary>
-        /// Determine which side of the wall the player is on.
+        /// Convert a grid position to screen coordinates using terrain height.
+        /// This is the ONLY place grid→world→screen conversion should happen for navigation.
+        /// </summary>
+        private static Vector2 GridToScreen(GameController gc, Vector2 gridPos)
+        {
+            var heightGrid = gc.IngameState?.Data?.RawTerrainHeightData;
+            var gx = (int)gridPos.X;
+            var gy = (int)gridPos.Y;
+            var z = Pathfinding.GetTerrainHeight(heightGrid, gx, gy, gc.Player.PosNum.Z);
+            return gc.IngameState.Camera.WorldToScreen(
+                new Vector3(gridPos.X * Pathfinding.GridToWorld, gridPos.Y * Pathfinding.GridToWorld, z));
+        }
+
+        /// <summary>
+        /// Determine which side of the wall the player is on (grid coordinates).
         /// Returns: positive = landing side (crossed), negative = origin side, ~0 = on the wall.
         /// </summary>
-        private float GetWallSide(Vector2 playerWorld)
+        private float GetWallSide(Vector2 playerGrid)
         {
-            var offset = playerWorld - _blinkWallMidpoint;
+            var offset = playerGrid - _blinkWallMidpoint;
             return Vector2.Dot(offset, _blinkDirection);
         }
 
@@ -283,7 +289,7 @@ namespace AutoExile.Systems
         }
 
         private void ExecuteBlink(Vector2 screenPos, SharpDX.RectangleF windowRect,
-            Vector2 playerWorld, Vector2 boundary, Vector2 landing, Vector2 crossDirNorm)
+            Vector2 playerGrid, Vector2 boundary, Vector2 landing, Vector2 crossDirNorm)
         {
             if ((DateTime.Now - _lastBlinkTime).TotalMilliseconds < BlinkCooldownMs)
                 return;
@@ -303,7 +309,7 @@ namespace AutoExile.Systems
                 _dashActive = true;
                 _dashStartTime = DateTime.Now;
 
-                // Store wall geometry for side detection
+                // Store wall geometry for side detection (grid coords)
                 _blinkPending = true;
                 _blinkPendingStart = DateTime.Now;
                 _blinkBoundary = boundary;
@@ -319,18 +325,14 @@ namespace AutoExile.Systems
 
         /// <summary>
         /// Use a movement skill to speed up travel when the path ahead is long and straight.
-        /// Prefers non-gap-crossing skills (Dash, Shield Charge). Falls back to gap-crossing
-        /// skills (Blink, Leap Slam) when no upcoming blink waypoint needs them reserved.
-        /// Returns true if a skill was fired.
+        /// All distance calculations in grid units.
         /// </summary>
-        private bool TryDashForSpeed(GameController gc, Vector2 playerWorld, float playerZ,
+        private bool TryDashForSpeed(GameController gc, Vector2 playerGrid,
             SharpDX.RectangleF windowRect)
         {
             if (DashMinDistance <= 0)
                 return false;
 
-            // Measure straight-line distance from the CURRENT waypoint forward along the path.
-            // Also detect if any blink waypoints lie ahead (gap crossings that need a blink skill).
             var idx = CurrentWaypointIndex;
             if (idx >= CurrentNavPath.Count)
                 return false;
@@ -348,17 +350,15 @@ namespace AutoExile.Systems
             }
             else
             {
-                // Only one waypoint left — use player-to-waypoint direction
-                travelDir = startWp - playerWorld;
+                travelDir = startWp - playerGrid;
                 if (travelDir.Length() < 1f)
                     return false;
                 travelDir = Vector2.Normalize(travelDir);
             }
 
             // Walk forward from current waypoint, accumulating distance while path stays straight.
-            // Also scan the full remaining path for any blink waypoints.
             var straightDist = 0f;
-            var straightMeasured = false; // true once we've hit a deviation or blink
+            var straightMeasured = false;
             var hasUpcomingBlink = false;
             var prev = startWp;
             for (var i = idx + 1; i < CurrentNavPath.Count; i++)
@@ -368,7 +368,7 @@ namespace AutoExile.Systems
                 if (wp.Action == WaypointAction.Blink)
                 {
                     hasUpcomingBlink = true;
-                    straightMeasured = true; // stop accumulating straight distance at blink
+                    straightMeasured = true;
                 }
 
                 if (!straightMeasured)
@@ -391,7 +391,6 @@ namespace AutoExile.Systems
                         straightDist += segLen;
                     }
                 }
-                // Once we've found a blink we can stop scanning entirely
                 else if (hasUpcomingBlink)
                 {
                     break;
@@ -400,14 +399,11 @@ namespace AutoExile.Systems
                 prev = wp.Position;
             }
 
-            // Not enough straight distance ahead — don't waste the skill
-            var minStraightWorld = DashMinDistance * Pathfinding.GridToWorld;
-            if (straightDist < minStraightWorld)
+            // Not enough straight distance ahead (grid units)
+            if (straightDist < DashMinDistance)
                 return false;
 
             // Find a movement skill to use.
-            // Prefer non-gap-crossing skills. Use gap-crossing skills only when
-            // no blink waypoints ahead need them reserved for gap traversal.
             MovementSkillInfo? dashSkill = null;
             foreach (var ms in MovementSkills)
             {
@@ -417,23 +413,20 @@ namespace AutoExile.Systems
                     (DateTime.Now - ms.LastUsedAt).TotalMilliseconds < ms.MinCastIntervalMs)
                     continue;
                 if (ms.CanCrossTerrain && hasUpcomingBlink)
-                    continue; // reserve gap-crosser for upcoming blink waypoint
+                    continue;
 
-                // Prefer non-gap-crossing; take gap-crossing only if we haven't found one yet
                 if (dashSkill == null || (dashSkill.CanCrossTerrain && !ms.CanCrossTerrain))
                     dashSkill = ms;
 
-                // Found a non-gap-crossing skill — that's ideal, stop looking
                 if (!ms.CanCrossTerrain)
                     break;
             }
             if (dashSkill == null)
                 return false;
 
-            // Aim along the travel direction
-            var aimTarget = playerWorld + travelDir * minStraightWorld;
-            var aimScreen = gc.IngameState.Camera.WorldToScreen(
-                new Vector3(aimTarget.X, aimTarget.Y, playerZ));
+            // Aim along the travel direction (grid coords → screen)
+            var aimTarget = playerGrid + travelDir * DashMinDistance;
+            var aimScreen = GridToScreen(gc, aimTarget);
 
             if (aimScreen.X <= 0 || aimScreen.X >= windowRect.Width ||
                 aimScreen.Y <= 0 || aimScreen.Y >= windowRect.Height)
@@ -449,17 +442,18 @@ namespace AutoExile.Systems
             return true;
         }
 
-        public bool NavigateTo(GameController gc, Vector2 worldTarget, int maxNodes = 0)
+        /// <summary>
+        /// Navigate to a grid position using A* pathfinding.
+        /// </summary>
+        public bool NavigateTo(GameController gc, Vector2 gridTarget, int maxNodes = 0)
         {
-            var playerPos = gc.Player.PosNum;
-            var start = new Vector2(playerPos.X, playerPos.Y);
+            var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
             var pfGrid = gc.IngameState.Data.RawFramePathfindingData;
 
             if (pfGrid == null || pfGrid.Length == 0)
                 return false;
 
             // Auto-scale node budget based on grid size.
-            // Atlas maps (~800x800) need ~200K, campaign zones (~1800x1800) need ~500K+.
             if (maxNodes <= 0)
             {
                 var gridArea = (long)pfGrid.Length * pfGrid[0].Length;
@@ -473,23 +467,20 @@ namespace AutoExile.Systems
             {
                 var tgtGrid = gc.IngameState.Data.RawTerrainTargetingData;
                 rawPath = Pathfinding.FindPathWithBlinks(
-                    pfGrid, tgtGrid, start, worldTarget,
+                    pfGrid, tgtGrid, playerGrid, gridTarget,
                     BlinkRange, BlinkCostPenalty, maxNodes);
 
                 // Fallback: blink scanning is expensive on large grids and may exhaust
-                // the node budget before reaching the goal. Retry without blinks —
-                // regular A* is much cheaper per node and can reach farther.
-                // If the path truly needs a blink crossing, navigation will repath
-                // when it reaches the gap (closer = smaller search space).
+                // the node budget. Retry without blinks.
                 if (rawPath.Count == 0)
                 {
-                    var simplePath = Pathfinding.FindPath(pfGrid, start, worldTarget, maxNodes);
+                    var simplePath = Pathfinding.FindPath(pfGrid, playerGrid, gridTarget, maxNodes);
                     rawPath = simplePath.Select(p => new NavWaypoint(p, WaypointAction.Walk)).ToList();
                 }
             }
             else
             {
-                var simplePath = Pathfinding.FindPath(pfGrid, start, worldTarget, maxNodes);
+                var simplePath = Pathfinding.FindPath(pfGrid, playerGrid, gridTarget, maxNodes);
                 rawPath = simplePath.Select(p => new NavWaypoint(p, WaypointAction.Walk)).ToList();
             }
 
@@ -503,17 +494,13 @@ namespace AutoExile.Systems
             CurrentWaypointIndex = 0;
 
             // Forward-trim: skip walk waypoints the player has already passed.
-            // Prevents stutter-stepping backward when repathing to a moving target.
-            // Uses dot product to check if player is on the "far side" of each waypoint
-            // (i.e., closer to the next waypoint than back toward this one).
             for (int i = 0; i < CurrentNavPath.Count - 1; i++)
             {
-                // Don't skip past blink approach points
                 if (CurrentNavPath[i + 1].Action == WaypointAction.Blink)
                     break;
 
                 var toNext = CurrentNavPath[i + 1].Position - CurrentNavPath[i].Position;
-                var toPlayer = start - CurrentNavPath[i].Position;
+                var toPlayer = playerGrid - CurrentNavPath[i].Position;
 
                 if (Vector2.Dot(toNext, toPlayer) > 0)
                     CurrentWaypointIndex = i + 1;
@@ -521,14 +508,14 @@ namespace AutoExile.Systems
                     break;
             }
 
-            if (!Destination.HasValue || Vector2.Distance(Destination.Value, worldTarget) > 100f)
+            if (!Destination.HasValue || Vector2.Distance(Destination.Value, gridTarget) > 10f)
                 _totalStuckRecoveries = 0;
-            Destination = worldTarget;
+            Destination = gridTarget;
             IsNavigating = true;
             BlinkCount = CurrentNavPath.Count(w => w.Action == WaypointAction.Blink);
             _blinkPending = false;
             _stuckTimer = 0;
-            _lastPosition = start;
+            _lastPosition = playerGrid;
 
             return true;
         }
@@ -536,10 +523,10 @@ namespace AutoExile.Systems
         /// <summary>
         /// Look for interactable entities (doors, breakables) between player and next waypoint.
         /// </summary>
-        private bool TryInteractWithObstacle(GameController gc, Vector2 playerWorld)
+        private bool TryInteractWithObstacle(GameController gc, Vector2 playerGrid)
         {
             var waypoint = CurrentNavPath[CurrentWaypointIndex];
-            var dirToWaypoint = Vector2.Normalize(waypoint.Position - playerWorld);
+            var dirToWaypoint = Vector2.Normalize(waypoint.Position - playerGrid);
 
             Entity? bestTarget = null;
             float bestScore = float.MaxValue;
@@ -549,13 +536,13 @@ namespace AutoExile.Systems
                 if (!IsInteractableObstacle(entity))
                     continue;
 
-                var entityPos = new Vector2(entity.PosNum.X, entity.PosNum.Y);
-                var dist = Vector2.Distance(playerWorld, entityPos);
+                var entityGrid = new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y);
+                var dist = Vector2.Distance(playerGrid, entityGrid);
 
-                if (dist > InteractSearchRadius || dist < 10f)
+                if (dist > InteractSearchRadius || dist < 1f)
                     continue;
 
-                var dirToEntity = Vector2.Normalize(entityPos - playerWorld);
+                var dirToEntity = Vector2.Normalize(entityGrid - playerGrid);
                 var dot = Vector2.Dot(dirToEntity, dirToWaypoint);
 
                 if (dot < 0f)
@@ -572,10 +559,8 @@ namespace AutoExile.Systems
             if (bestTarget == null)
                 return false;
 
-            var targetPos = new Vector2(bestTarget.PosNum.X, bestTarget.PosNum.Y);
-            var playerZ = gc.Player.PosNum.Z;
-            var screenPos = gc.IngameState.Camera.WorldToScreen(
-                new Vector3(targetPos.X, targetPos.Y, playerZ));
+            // Convert entity position to screen for clicking (use entity's own world pos for accuracy)
+            var screenPos = gc.IngameState.Camera.WorldToScreen(bestTarget.BoundsCenterPosNum);
             var windowRect = gc.Window.GetWindowRectangle();
 
             if (screenPos.X > 0 && screenPos.X < windowRect.Width &&
@@ -606,10 +591,10 @@ namespace AutoExile.Systems
             return false;
         }
 
-        private void MicroMovement(GameController gc, Vector2 playerWorld)
+        private void MicroMovement(GameController gc, Vector2 playerGrid)
         {
             var waypoint = CurrentNavPath[CurrentWaypointIndex];
-            var dirToWaypoint = waypoint.Position - playerWorld;
+            var dirToWaypoint = waypoint.Position - playerGrid;
             if (dirToWaypoint.Length() > 0)
                 dirToWaypoint = Vector2.Normalize(dirToWaypoint);
 
@@ -620,10 +605,9 @@ namespace AutoExile.Systems
                 dirToWaypoint.X * cos - dirToWaypoint.Y * sin,
                 dirToWaypoint.X * sin + dirToWaypoint.Y * cos);
 
-            var nudgeTarget = playerWorld + nudgeDir * 200f;
-            var playerZ = gc.Player.PosNum.Z;
-            var screenPos = gc.IngameState.Camera.WorldToScreen(
-                new Vector3(nudgeTarget.X, nudgeTarget.Y, playerZ));
+            // Nudge ~18 grid units in the randomized direction
+            var nudgeTarget = playerGrid + nudgeDir * 18f;
+            var screenPos = GridToScreen(gc, nudgeTarget);
             var windowRect = gc.Window.GetWindowRectangle();
 
             ExecuteWalk(screenPos, windowRect);
@@ -646,20 +630,15 @@ namespace AutoExile.Systems
         }
 
         /// <summary>
-        /// Check targeting-layer LOS between two grid positions.
-        /// Returns true if skills/projectiles can pass between A and B (targeting > 0 along line).
-        /// Returns false if terrain data unavailable.
-        /// </summary>
-        /// <summary>
-        /// Check walkable LOS between two world positions using the pathfinding grid.
+        /// Check walkable LOS between two grid positions using the pathfinding grid.
         /// Returns true if a straight walk is safe (no walls, no fringe cells).
         /// Returns true on degraded data (graceful fallback — assume open).
         /// </summary>
-        public bool HasWalkableLOS(GameController gc, Vector2 worldA, Vector2 worldB)
+        public bool HasWalkableLOS(GameController gc, Vector2 gridA, Vector2 gridB)
         {
             var pfGrid = gc.IngameState.Data.RawFramePathfindingData;
             if (pfGrid == null) return true;
-            return Pathfinding.HasLineOfSight(pfGrid, worldA, worldB);
+            return Pathfinding.HasLineOfSight(pfGrid, gridA, gridB);
         }
 
         public bool HasTargetingLOS(GameController gc, Vector2 gridA, Vector2 gridB)
@@ -734,8 +713,7 @@ namespace AutoExile.Systems
             if (tileGridPos == null)
                 return false;
 
-            var worldTarget = TileMap.GridToWorld(tileGridPos.Value);
-            return NavigateTo(gc, worldTarget, maxNodes: 500000);
+            return NavigateTo(gc, tileGridPos.Value, maxNodes: 500000);
         }
 
         /// <summary>
@@ -757,8 +735,7 @@ namespace AutoExile.Systems
             {
                 IsPaused = false;
                 // Reset stuck timer — we moved during combat
-                var pos = gc.Player.PosNum;
-                _lastPosition = new Vector2(pos.X, pos.Y);
+                _lastPosition = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
                 _stuckTimer = 0;
                 _stuckRecoveryCount = 0;
             }
@@ -782,12 +759,11 @@ namespace AutoExile.Systems
         }
 
         /// <summary>
-        /// Direct movement toward a world position — no pathfinding, no waypoints.
+        /// Direct movement toward a grid position — no pathfinding, no waypoints.
         /// Use when LOS is clear and the caller is managing movement each tick.
         /// Clears any active navigation. Returns false if BotInput gate is blocked.
-        /// Tries movement skills for speed on long distances before falling back to walk.
         /// </summary>
-        public bool MoveToward(GameController gc, Vector2 worldTarget)
+        public bool MoveToward(GameController gc, Vector2 gridTarget)
         {
             // Clear any active path — caller is driving movement directly
             if (IsNavigating)
@@ -814,17 +790,14 @@ namespace AutoExile.Systems
             if (!BotInput.CanAct)
                 return false;
 
-            var playerPos = gc.Player.PosNum;
-            var playerWorld = new Vector2(playerPos.X, playerPos.Y);
-            var playerZ = playerPos.Z;
+            var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
             var windowRect = gc.Window.GetWindowRectangle();
 
             // Try movement skills for speed if distance is long enough
-            if (TryDirectDash(gc, playerWorld, worldTarget, playerZ, windowRect))
+            if (TryDirectDash(gc, playerGrid, gridTarget, windowRect))
                 return true;
 
-            var screenPos = gc.IngameState.Camera.WorldToScreen(
-                new Vector3(worldTarget.X, worldTarget.Y, playerZ));
+            var screenPos = GridToScreen(gc, gridTarget);
 
             ExecuteWalk(screenPos, windowRect);
             return true;
@@ -832,21 +805,18 @@ namespace AutoExile.Systems
 
         /// <summary>
         /// Try to use a movement skill for direct LOS movement (no path waypoints).
-        /// Similar to TryDashForSpeed but for pathless movement — uses raw distance to target.
-        /// No blink reservation needed since there are no blink waypoints in direct movement.
         /// </summary>
-        private bool TryDirectDash(GameController gc, Vector2 playerWorld, Vector2 worldTarget,
-            float playerZ, SharpDX.RectangleF windowRect)
+        private bool TryDirectDash(GameController gc, Vector2 playerGrid, Vector2 gridTarget,
+            SharpDX.RectangleF windowRect)
         {
             if (DashMinDistance <= 0)
                 return false;
 
-            var dist = Vector2.Distance(playerWorld, worldTarget);
-            var minStraightWorld = DashMinDistance * Pathfinding.GridToWorld;
-            if (dist < minStraightWorld)
+            var dist = Vector2.Distance(playerGrid, gridTarget);
+            if (dist < DashMinDistance)
                 return false;
 
-            // Find any ready movement skill — no blink reservation since there's no path with gaps
+            // Find any ready movement skill
             MovementSkillInfo? dashSkill = null;
             foreach (var ms in MovementSkills)
             {
@@ -856,7 +826,6 @@ namespace AutoExile.Systems
                     (DateTime.Now - ms.LastUsedAt).TotalMilliseconds < ms.MinCastIntervalMs)
                     continue;
 
-                // Prefer non-gap-crossing; take gap-crossing only if nothing better
                 if (dashSkill == null || (dashSkill.CanCrossTerrain && !ms.CanCrossTerrain))
                     dashSkill = ms;
 
@@ -867,10 +836,9 @@ namespace AutoExile.Systems
                 return false;
 
             // Aim toward the target
-            var travelDir = Vector2.Normalize(worldTarget - playerWorld);
-            var aimTarget = playerWorld + travelDir * minStraightWorld;
-            var aimScreen = gc.IngameState.Camera.WorldToScreen(
-                new Vector3(aimTarget.X, aimTarget.Y, playerZ));
+            var travelDir = Vector2.Normalize(gridTarget - playerGrid);
+            var aimTarget = playerGrid + travelDir * DashMinDistance;
+            var aimScreen = GridToScreen(gc, aimTarget);
 
             if (aimScreen.X <= 0 || aimScreen.X >= windowRect.Width ||
                 aimScreen.Y <= 0 || aimScreen.Y >= windowRect.Height)
@@ -888,30 +856,24 @@ namespace AutoExile.Systems
 
         /// <summary>
         /// Update the destination of an active navigation for a moving target.
-        /// If LOS is clear to the new target, grafts a direct waypoint onto the current path.
-        /// If LOS is blocked, computes a new path with forward-trim to avoid backtracking.
-        /// Returns false if not currently navigating or destination hasn't drifted enough.
+        /// All positions in grid coordinates.
         /// </summary>
-        public bool UpdateDestination(GameController gc, Vector2 worldTarget, float driftThreshold = 0f)
+        public bool UpdateDestination(GameController gc, Vector2 gridTarget, float driftThreshold = 14f)
         {
             if (!IsNavigating || CurrentNavPath.Count == 0)
                 return false;
 
-            if (driftThreshold <= 0f)
-                driftThreshold = 14f * Pathfinding.GridToWorld;
-
             var currentDest = Destination ?? Vector2.Zero;
-            if (Vector2.Distance(currentDest, worldTarget) < driftThreshold)
+            if (Vector2.Distance(currentDest, gridTarget) < driftThreshold)
                 return false;
 
-            var playerPos = gc.Player.PosNum;
-            var playerWorld = new Vector2(playerPos.X, playerPos.Y);
+            var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
             var pfGrid = gc.IngameState.Data.RawFramePathfindingData;
 
             if (pfGrid == null || pfGrid.Length == 0)
                 return false;
 
-            if (Pathfinding.HasLineOfSight(pfGrid, playerWorld, worldTarget))
+            if (Pathfinding.HasLineOfSight(pfGrid, playerGrid, gridTarget))
             {
                 // LOS clear — truncate path at current waypoint, append direct waypoint
                 var truncated = new List<NavWaypoint>();
@@ -919,17 +881,17 @@ namespace AutoExile.Systems
                 if (CurrentWaypointIndex < CurrentNavPath.Count)
                     truncated.Add(CurrentNavPath[CurrentWaypointIndex]);
 
-                truncated.Add(new NavWaypoint(worldTarget, WaypointAction.Walk));
+                truncated.Add(new NavWaypoint(gridTarget, WaypointAction.Walk));
 
                 CurrentNavPath = truncated;
                 CurrentWaypointIndex = 0;
-                Destination = worldTarget;
+                Destination = gridTarget;
                 BlinkCount = 0;
                 return true;
             }
 
-            // No LOS — full repath (NavigateTo already does forward-trim)
-            return NavigateTo(gc, worldTarget);
+            // No LOS — full repath
+            return NavigateTo(gc, gridTarget);
         }
     }
 }
