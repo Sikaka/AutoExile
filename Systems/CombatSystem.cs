@@ -186,6 +186,8 @@ namespace AutoExile.Systems
             WantsToMove = false;
             LastAction = "";
             LastSkillAction = "";
+            _walkableMonsterWeighted.Clear();
+            BestTargetHasLOS = false;
             _skillBar.Clear();
             _primaryMovementEntry = null;
             _movementSkillEntries.Clear();
@@ -221,10 +223,20 @@ namespace AutoExile.Systems
         /// <summary>Positions of all nearby monsters within chase radius (reused buffer).</summary>
         private readonly List<Vector2> _nearbyMonsterPositions = new();
 
+        /// <summary>Only monsters reachable via straight-line walk (pf LOS), with rarity weight for density.</summary>
+        private readonly List<(Vector2 pos, float weight)> _walkableMonsterWeighted = new();
+
+        /// <summary>Whether BestTarget can be hit from current position via targeting LOS.</summary>
+        public bool BestTargetHasLOS { get; private set; }
+
         private void ScanThreats(GameController gc, BotSettings.BuildSettings settings)
         {
             var playerGrid = gc.Player.GridPosNum;
             float combatRange = settings.CombatRange.Value;
+
+            var pfGrid = gc.IngameState.Data.RawFramePathfindingData;
+            var tgtGrid = gc.IngameState.Data.RawTerrainTargetingData;
+            int px = (int)playerGrid.X, py = (int)playerGrid.Y;
 
             Entity? bestTarget = null;
             float bestScore = float.MinValue;
@@ -237,6 +249,7 @@ namespace AutoExile.Systems
             Vector2? nearestMonsterPos = null;
 
             _nearbyMonsterPositions.Clear();
+            _walkableMonsterWeighted.Clear();
 
             foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
             {
@@ -273,6 +286,14 @@ namespace AutoExile.Systems
                 // Only count monsters within CombatRange for combat decisions
                 if (dist > combatRange) continue;
 
+                // Reachability classification via terrain LOS
+                bool isWalkable = pfGrid != null && Pathfinding.HasLineOfSight(pfGrid, playerGrid, entity.GridPosNum);
+                bool isTargetable = !isWalkable && tgtGrid != null &&
+                    Pathfinding.HasTargetingLOS(tgtGrid, px, py, (int)entity.GridPosNum.X, (int)entity.GridPosNum.Y);
+
+                // Skip unreachable monsters (can't walk to AND can't shoot)
+                if (pfGrid != null && !isWalkable && !isTargetable) continue;
+
                 combatCount++;
                 combatSum += entity.GridPosNum;
                 _nearbyMonsterPositions.Add(entity.GridPosNum);
@@ -287,6 +308,10 @@ namespace AutoExile.Systems
                 };
                 if (IsPriorityTarget(entity))
                     rarityWeight = 100f;
+
+                // Track walkable monsters separately for positioning (don't walk into gaps)
+                if (isWalkable || pfGrid == null)
+                    _walkableMonsterWeighted.Add((entity.GridPosNum, rarityWeight));
 
                 float score = rarityWeight - dist * 0.1f;
 
@@ -314,11 +339,19 @@ namespace AutoExile.Systems
             NearestCorpse = nearestCorpse;
             NearestMonsterPos = nearestMonsterPos;
 
-            // If best target is a priority target, override positioning
+            // Set BestTargetHasLOS — can we shoot the best target from here?
+            BestTargetHasLOS = false;
+            if (bestTarget != null && tgtGrid != null)
+                BestTargetHasLOS = Pathfinding.HasTargetingLOS(tgtGrid, px, py,
+                    (int)bestTarget.GridPosNum.X, (int)bestTarget.GridPosNum.Y);
+
+            // Dense cluster for positioning — only use walkable monsters to avoid walking into gaps
             if (bestTarget != null && IsPriorityTarget(bestTarget))
                 DenseClusterCenter = bestTarget.GridPosNum;
+            else if (_walkableMonsterWeighted.Count > 0)
+                DenseClusterCenter = FindWeightedDensestPosition(_walkableMonsterWeighted, playerGrid);
             else
-                DenseClusterCenter = FindDensestPosition(_nearbyMonsterPositions, playerGrid);
+                DenseClusterCenter = playerGrid; // all targets across gaps, stay put
         }
 
         /// <summary>
@@ -354,6 +387,50 @@ namespace AutoExile.Systems
                 {
                     bestNeighborCount = neighborCount;
                     bestPos = positions[i];
+                }
+            }
+
+            return bestPos;
+        }
+
+        /// <summary>
+        /// Find the position with highest weighted density — rarity-weighted neighbor contribution.
+        /// A unique (25) near other monsters contributes 25x a white (1) to density score.
+        /// Falls back to weighted centroid for 0-2 monsters.
+        /// </summary>
+        private Vector2 FindWeightedDensestPosition(List<(Vector2 pos, float weight)> monsters, Vector2 fallback)
+        {
+            if (monsters.Count == 0) return fallback;
+            if (monsters.Count <= 2)
+            {
+                var sum = Vector2.Zero;
+                float totalWeight = 0f;
+                foreach (var (pos, weight) in monsters)
+                {
+                    sum += pos * weight;
+                    totalWeight += weight;
+                }
+                return totalWeight > 0f ? sum / totalWeight : fallback;
+            }
+
+            float bestScore = -1f;
+            Vector2 bestPos = monsters[0].pos;
+
+            for (int i = 0; i < monsters.Count; i++)
+            {
+                float score = monsters[i].weight; // self-weight included
+                for (int j = 0; j < monsters.Count; j++)
+                {
+                    if (i == j) continue;
+                    if (Vector2.DistanceSquared(monsters[i].pos, monsters[j].pos) <=
+                        DensityClusterRadius * DensityClusterRadius)
+                        score += monsters[j].weight;
+                }
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestPos = monsters[i].pos;
                 }
             }
 
@@ -804,6 +881,16 @@ namespace AutoExile.Systems
 
             if (BestTarget == null || NearbyMonsterCount == 0) return;
 
+            // If no walkable monsters exist, handle gap-only combat
+            if (_walkableMonsterWeighted.Count == 0)
+            {
+                if (BestTargetHasLOS)
+                    LastAction = "attacking across gap";
+                else
+                    LastAction = "no reachable targets";
+                return; // skills fire via TickSkills, no movement needed
+            }
+
             var playerGrid = gc.Player.GridPosNum;
             float dist = Vector2.Distance(playerGrid, DenseClusterCenter);
             float fightRange = settings.FightRange.Value;
@@ -862,8 +949,22 @@ namespace AutoExile.Systems
             }
 
             // Validate the desired position: must be walkable and have targeting LOS to monsters
-            var validPos = ctx.Navigation.FindWalkableWithLOS(gc, desiredGridPos.Value, DenseClusterCenter);
+            var pfGrid2 = gc.IngameState.Data.RawFramePathfindingData;
+            bool canWalkToDesired = pfGrid2 != null &&
+                Pathfinding.HasLineOfSight(pfGrid2, playerGrid, desiredGridPos.Value);
+
+            Vector2? validPos;
+            if (canWalkToDesired)
+                validPos = ctx.Navigation.FindWalkableWithLOS(gc, desiredGridPos.Value, DenseClusterCenter);
+            else
+                // Can't walk to desired pos — search near player for a position with targeting LOS
+                validPos = ctx.Navigation.FindWalkableWithLOS(gc, playerGrid, DenseClusterCenter, 20);
+
             if (!validPos.HasValue) return;
+
+            // Final safety: verify straight-line walkability from player to valid position
+            if (pfGrid2 != null && !Pathfinding.HasLineOfSight(pfGrid2, playerGrid, validPos.Value))
+                return;
 
             WantsToMove = true;
             MoveTarget = ToWorld(validPos.Value);
