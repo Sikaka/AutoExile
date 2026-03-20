@@ -8,7 +8,7 @@ namespace AutoExile.Systems
     /// <summary>
     /// Tracks looted items and their estimated chaos value over time.
     /// Records each pickup for total/per-hour statistics.
-    /// Uses NinjaPrice bridge for valuations.
+    /// Uses NinjaPriceService for valuations.
     /// </summary>
     public class LootTracker
     {
@@ -19,12 +19,17 @@ namespace AutoExile.Systems
         private double _totalChaosValue;
         private int _totalItemsLooted;
         private int _mapsCompleted;
-        private Func<Entity, double>? _getNinjaValue;
-        private bool _ninjaBridgeResolved;
+
+        /// <summary>Price service for valuing looted items. Set by BotCore.</summary>
+        public NinjaPriceService? PriceService { get; set; }
 
         // Recent loot log (capped to prevent unbounded growth)
         private readonly List<LootRecord> _recentLoot = new();
         private const int MaxRecentLoot = 100;
+
+        // Entity ID dedup — prevents multi-counting when stale scan results
+        // cause the same ground item to be "picked up" multiple times
+        private readonly HashSet<long> _recordedEntityIds = new();
 
         public double TotalChaosValue => _totalChaosValue;
         public int TotalItemsLooted => _totalItemsLooted;
@@ -88,6 +93,16 @@ namespace AutoExile.Systems
             _totalItemsLooted = 0;
             _mapsCompleted = 0;
             _recentLoot.Clear();
+            _recordedEntityIds.Clear();
+        }
+
+        /// <summary>
+        /// Clear entity dedup set. Call on area change so new-zone entities aren't
+        /// blocked by stale IDs from a previous zone (entity IDs can be reused).
+        /// </summary>
+        public void OnAreaChanged()
+        {
+            _recordedEntityIds.Clear();
         }
 
         public bool IsActive => _sessionActive;
@@ -102,15 +117,18 @@ namespace AutoExile.Systems
 
         /// <summary>
         /// Record a looted item. Call when an item is confirmed picked up.
+        /// Deduplicates by entity ID.
         /// </summary>
         public void RecordItem(GameController gc, Entity itemEntity, string itemName)
         {
-            ResolveNinjaBridge(gc);
+            // Deduplicate by entity ID
+            if (itemEntity != null && !_recordedEntityIds.Add(itemEntity.Id))
+                return;
 
             var chaosValue = 0.0;
-            if (_getNinjaValue != null && itemEntity != null)
+            if (PriceService != null && PriceService.IsLoaded && itemEntity != null)
             {
-                try { chaosValue = _getNinjaValue(itemEntity); }
+                try { chaosValue = PriceService.GetPrice(gc, itemEntity).MaxChaosValue; }
                 catch { }
             }
 
@@ -130,10 +148,16 @@ namespace AutoExile.Systems
         }
 
         /// <summary>
-        /// Record a looted item by chaos value directly (when entity isn't available).
+        /// Record a looted item by chaos value directly.
+        /// If entityId is provided (non-zero), deduplicates — same entity can only be recorded once.
         /// </summary>
-        public void RecordItem(string itemName, double chaosValue)
+        public void RecordItem(string itemName, double chaosValue, long entityId = 0)
         {
+            // Deduplicate by entity ID — stale scan results can cause the same
+            // ground item to go through the pickup→succeed→record cycle multiple times
+            if (entityId != 0 && !_recordedEntityIds.Add(entityId))
+                return;
+
             _totalChaosValue += chaosValue;
             _totalItemsLooted++;
 
@@ -146,17 +170,6 @@ namespace AutoExile.Systems
 
             if (_recentLoot.Count > MaxRecentLoot)
                 _recentLoot.RemoveAt(0);
-        }
-
-        private void ResolveNinjaBridge(GameController gc)
-        {
-            if (_ninjaBridgeResolved) return;
-            try
-            {
-                _getNinjaValue = gc.PluginBridge.GetMethod<Func<Entity, double>>("NinjaPrice.GetValue");
-            }
-            catch { }
-            _ninjaBridgeResolved = true;
         }
 
         /// <summary>

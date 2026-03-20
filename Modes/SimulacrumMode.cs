@@ -1057,7 +1057,7 @@ namespace AutoExile.Modes
             if (best != null)
             {
                 _lastEmptyScanAt = DateTime.MinValue;
-                var withinRadius = best.Distance <= ctx.Loot.LootRadius;
+                var withinRadius = best.Distance <= ctx.Interaction.InteractRadius;
                 ctx.Interaction.PickupGroundItem(best.Entity, ctx.Navigation,
                     requireProximity: !withinRadius);
                 _lootTracker.SetPending(best.Entity.Id, best.ItemName, best.ChaosValue);

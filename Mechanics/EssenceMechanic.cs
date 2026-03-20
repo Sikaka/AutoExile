@@ -437,7 +437,9 @@ namespace AutoExile.Mechanics
                 var result = ctx.Interaction.Tick(gc);
                 if (result == InteractionResult.Succeeded && _pendingLootName != null)
                 {
-                    ctx.LootTracker.RecordItem(_pendingLootName, _pendingLootValue);
+                    ctx.LootTracker.RecordItem(_pendingLootName, _pendingLootValue, _pendingLootId);
+                    if (_pendingLootId > 0)
+                        ctx.Loot.MarkFailed(_pendingLootId, "picked up");
                     ctx.Log($"[Essence] Picked up: {_pendingLootName} ({_pendingLootValue:F0}c)");
                     _pendingLootName = null;
                 }

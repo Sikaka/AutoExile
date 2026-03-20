@@ -37,6 +37,7 @@ namespace AutoExile.Mechanics
                                        or UltimatumPhase.Failed;
 
         // ── Phase machine ──
+        private BotContext? _ctx;
         private UltimatumPhase _phase = UltimatumPhase.Idle;
         private DateTime _phaseStartTime = DateTime.Now;
 
@@ -53,7 +54,6 @@ namespace AutoExile.Mechanics
 
         // ── Reward value tracking ──
         private double _accumulatedRewardValue;
-        private Func<Entity, double>? _getNinjaValue;
         private bool _encounterConfirmedStarted; // True once we've seen encounter_started=1
 
         // ── Loot wait ──
@@ -169,6 +169,7 @@ namespace AutoExile.Mechanics
 
         public MechanicResult Tick(BotContext ctx)
         {
+            _ctx = ctx;
             var gc = ctx.Game;
             if (gc?.Player == null || !gc.InGame) return MechanicResult.InProgress;
 
@@ -791,7 +792,7 @@ namespace AutoExile.Mechanics
 
         /// <summary>
         /// Price the reward shown on the UltimatumPanel after completing a wave.
-        /// Uses LastRewardInventory (what we just earned) via NinjaPrice bridge.
+        /// Uses NinjaPriceService via BotContext for valuations.
         /// Called each tick in ChoosingMod — only prices once per round transition.
         /// </summary>
         private int _lastPricedRound;
@@ -800,16 +801,6 @@ namespace AutoExile.Mechanics
         {
             // Only price once per round
             if (_currentRound <= _lastPricedRound) return;
-
-            // Initialize NinjaPrice bridge if needed
-            if (_getNinjaValue == null)
-            {
-                try
-                {
-                    _getNinjaValue = gc.PluginBridge.GetMethod<Func<Entity, double>>("NinjaPrice.GetValue");
-                }
-                catch { }
-            }
 
             try
             {
@@ -820,18 +811,20 @@ namespace AutoExile.Mechanics
                 var lastRewardInv = ultimatumPanel.LastRewardInventory;
                 if (lastRewardInv?.ServerInventory?.InventorySlotItems == null) return;
 
+                var priceService = _ctx?.NinjaPrice;
+
                 foreach (var slotItem in lastRewardInv.ServerInventory.InventorySlotItems)
                 {
                     var item = slotItem.Item;
                     if (item == null) continue;
 
                     double value = 0;
-                    if (_getNinjaValue != null)
+                    if (priceService != null && priceService.IsLoaded)
                     {
-                        try { value = _getNinjaValue(item); } catch { }
+                        try { value = priceService.GetPrice(gc, item).MaxChaosValue; } catch { }
                     }
 
-                    // If NinjaPrice can't value it, estimate stack value at 1c per item
+                    // If price service can't value it, estimate stack value at 1c per item
                     if (value <= 0)
                     {
                         var stack = item.GetComponent<ExileCore.PoEMemory.Components.Stack>();

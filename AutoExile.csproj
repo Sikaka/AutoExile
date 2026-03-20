@@ -12,6 +12,12 @@
   </ItemGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="Resources\uniqueArtMapping.json">
+      <LogicalName>uniqueArtMapping.json</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <ItemGroup>
     <Reference Include="ExileCore">
       <HintPath>Resources\ExileCore.dll</HintPath>
     </Reference>

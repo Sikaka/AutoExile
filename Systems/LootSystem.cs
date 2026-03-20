@@ -13,40 +13,58 @@ namespace AutoExile.Systems
     /// </summary>
     public class LootSystem
     {
-        // Ninja pricer bridge — resolved lazily
-        private Func<Entity, double>? _getNinjaValue;
-        private bool _ninjaBridgeResolved;
+        // Price service — set by BotCore each tick
+        public NinjaPriceService? PriceService { get; set; }
 
         // Configurable thresholds
-        public float MinUniqueChaosValue { get; set; } = 5f;
+        public int MinUniqueChaosValue { get; set; } = 5;
         public bool SkipLowValueUniques { get; set; } = true;
 
         /// <summary>
         /// Minimum chaos-per-inventory-slot to pick up a unique.
         /// Set to 0 to disable size-based filtering (only use flat MinUniqueChaosValue).
         /// </summary>
-        public float MinChaosPerSlot { get; set; } = 0f;
-
-        /// <summary>
-        /// Grid distance threshold for direct pickup vs navigation.
-        /// Items within this radius are clicked directly; items beyond require pathing first.
-        /// </summary>
-        public float LootRadius { get; set; } = 20f;
+        public int MinChaosPerSlot { get; set; } = 0;
 
         /// <summary>
         /// Skip quest items (heist contracts, etc.) during loot scans.
         /// </summary>
         public bool IgnoreQuestItems { get; set; } = true;
 
+        // ── Cluster jewel filtering ──
+        public bool FilterClusterJewels { get; set; }
+        public int MinClusterJewelChaosValue { get; set; }
+
+        // ── Skill gem filtering ──
+        public bool FilterSkillGems { get; set; }
+        public int MinGemChaosValue { get; set; } = 5;
+        public bool AlwaysLoot20QualityGems { get; set; } = true;
+
+        // ── Synthesised item filtering ──
+        public bool FilterSynthesisedItems { get; set; }
+        /// <summary>Parsed whitelist entries (lowercase). Set from settings comma-separated string.</summary>
+        public List<string> SynthesisedWhitelist { get; set; } = new();
+
         // State
         public bool HasLootNearby { get; private set; }
         public int LootableCount { get; private set; }
         public string LastSkipReason { get; private set; } = "";
-        public string NinjaBridgeStatus { get; private set; } = "not resolved";
+        public string NinjaBridgeStatus => PriceService?.Status ?? "no price service";
 
         // Cached loot candidates from last scan — always sorted nearest-first
         private readonly List<LootCandidate> _candidates = new();
         public IReadOnlyList<LootCandidate> Candidates => _candidates;
+
+        // Debug: schedule a delayed dump when specific items are seen on the ground
+        /// <summary>
+        /// When non-null, BotCore should fire both game state + recorder dumps at this time.
+        /// Set by Scan() when a unique Large Cluster Jewel is first spotted.
+        /// BotCore clears this after firing.
+        /// </summary>
+        public DateTime? ScheduledDebugDumpAt { get; set; }
+        private DateTime _lastDebugDumpAt = DateTime.MinValue;
+        private const int DebugDumpCooldownSeconds = 120;
+        private const int DebugDumpDelaySeconds = 5;
 
         // Failed pickup tracking — items that couldn't be picked up are skipped in future scans
         private readonly Dictionary<long, FailedLootEntry> _failedEntities = new();
@@ -87,21 +105,6 @@ namespace AutoExile.Systems
             LootableCount = 0;
             LastSkipReason = "";
 
-            // Resolve Ninja bridge once
-            if (!_ninjaBridgeResolved)
-            {
-                try
-                {
-                    _getNinjaValue = gc.PluginBridge.GetMethod<Func<Entity, double>>("NinjaPrice.GetValue");
-                    NinjaBridgeStatus = _getNinjaValue != null ? "connected" : "method not found";
-                }
-                catch (Exception ex)
-                {
-                    NinjaBridgeStatus = $"error: {ex.Message}";
-                }
-                _ninjaBridgeResolved = true;
-            }
-
             try
             {
                 var labels = gc.IngameState.IngameUi.ItemsOnGroundLabelElement.VisibleGroundItemLabels;
@@ -137,12 +140,38 @@ namespace AutoExile.Systems
                     // Use inner item for pricing/sizing, fall back to outer entity
                     var priceEntity = (itemEntity is { IsValid: true }) ? itemEntity : worldItemEntity;
 
+                    // Debug: schedule delayed dump when a unique Large Cluster Jewel is first seen
+                    if (itemName == "Large Cluster Jewel" &&
+                        priceEntity.TryGetComponent<Mods>(out var debugMods) &&
+                        debugMods.ItemRarity == ItemRarity.Unique &&
+                        !ScheduledDebugDumpAt.HasValue &&
+                        (DateTime.Now - _lastDebugDumpAt).TotalSeconds >= DebugDumpCooldownSeconds)
+                    {
+                        _lastDebugDumpAt = DateTime.Now;
+                        ScheduledDebugDumpAt = DateTime.Now.AddSeconds(DebugDumpDelaySeconds);
+                    }
+
                     // Check if this is a unique we should skip
-                    var chaosValue = GetChaosValue(priceEntity);
+                    var priceResult = GetPriceResult(gc, priceEntity);
+                    var chaosValue = priceResult.MaxChaosValue; // Use max for loot decisions
                     var invSlots = GetInventorySlots(priceEntity);
                     var chaosPerSlot = invSlots > 0 ? chaosValue / invSlots : chaosValue;
 
-                    if (SkipLowValueUniques && ShouldSkipUnique(priceEntity, chaosValue, chaosPerSlot, itemName))
+                    if (SkipLowValueUniques && ShouldSkipUnique(priceEntity, priceResult, chaosPerSlot, itemName))
+                        continue;
+
+                    // Cluster jewel value filter
+                    if (FilterClusterJewels && MinClusterJewelChaosValue > 0 &&
+                        IsNonUniqueClusterJewel(priceEntity, itemName) &&
+                        ShouldSkipClusterJewel(priceResult, itemName))
+                        continue;
+
+                    // Skill gem value filter
+                    if (FilterSkillGems && IsSkillGem(priceEntity) && ShouldSkipGem(priceEntity, priceResult, itemName))
+                        continue;
+
+                    // Synthesised implicit whitelist filter
+                    if (FilterSynthesisedItems && ShouldSkipSynthesised(priceEntity, itemName))
                         continue;
 
                     _candidates.Add(new LootCandidate
@@ -177,7 +206,7 @@ namespace AutoExile.Systems
 
         /// <summary>
         /// Start picking up the nearest candidate using the interaction system.
-        /// Items within LootRadius are clicked directly; items beyond require navigation.
+        /// Items within interactRadius are clicked directly; items beyond require navigation.
         /// Returns (wasInRadius, candidate) if pickup was initiated, or (false, null) if nothing to pick up.
         /// Callers should record to LootTracker only after InteractionResult.Succeeded.
         /// </summary>
@@ -186,11 +215,20 @@ namespace AutoExile.Systems
             if (interaction.IsBusy)
                 return (false, null);
 
-            var best = GetBestCandidate();
+            // Find best candidate that isn't in the failed list (stale scan results
+            // may still contain items that were picked up since the last Scan() call)
+            LootCandidate? best = null;
+            foreach (var c in _candidates)
+            {
+                if (_failedEntities.TryGetValue(c.Entity.Id, out var fail) && !fail.IsExpired)
+                    continue;
+                best = c;
+                break;
+            }
             if (best == null)
                 return (false, null);
 
-            var withinRadius = best.Distance <= LootRadius;
+            var withinRadius = best.Distance <= interaction.InteractRadius;
             interaction.PickupGroundItem(best.Entity, nav,
                 requireProximity: !withinRadius);
 
@@ -198,9 +236,109 @@ namespace AutoExile.Systems
         }
 
         /// <summary>
-        /// Check if a unique item should be skipped based on value and size.
+        /// Check if a non-unique cluster jewel should be skipped based on value.
         /// </summary>
-        private bool ShouldSkipUnique(Entity entity, double chaosValue, double chaosPerSlot, string itemName)
+        private bool ShouldSkipClusterJewel(PriceResult priceResult, string itemName)
+        {
+            var maxValue = priceResult.MaxChaosValue;
+            // Can't price it — don't skip (might be valuable)
+            if (maxValue <= 0) return false;
+
+            if (maxValue < MinClusterJewelChaosValue)
+            {
+                LastSkipReason = $"Skipped cluster '{itemName}' ({maxValue:F0}c < {MinClusterJewelChaosValue}c)";
+                return true;
+            }
+            return false;
+        }
+
+        private static bool IsNonUniqueClusterJewel(Entity entity, string itemName)
+        {
+            if (!itemName.EndsWith("Cluster Jewel")) return false;
+            if (!entity.TryGetComponent<Mods>(out var mods)) return false;
+            return mods.ItemRarity != ItemRarity.Unique;
+        }
+
+        /// <summary>
+        /// Check if a skill gem should be skipped based on value and quality.
+        /// </summary>
+        private bool ShouldSkipGem(Entity entity, PriceResult priceResult, string itemName)
+        {
+            // Check quality — 20q gems always picked up if setting enabled
+            if (AlwaysLoot20QualityGems && entity.TryGetComponent<Quality>(out var quality) && quality.ItemQuality >= 20)
+                return false;
+
+            var maxValue = priceResult.MaxChaosValue;
+            if (maxValue <= 0)
+                return false; // Can't price it, don't skip
+
+            if (maxValue < MinGemChaosValue)
+            {
+                LastSkipReason = $"Skipped gem '{itemName}' ({maxValue:F0}c < {MinGemChaosValue}c)";
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Check if a synthesised item should be skipped based on its implicit mods.
+        /// Returns true if the item is synthesised and none of its implicits match the whitelist.
+        /// </summary>
+        private bool ShouldSkipSynthesised(Entity entity, string itemName)
+        {
+            if (!entity.TryGetComponent<Mods>(out var mods))
+                return false;
+
+            // Check if item has synthesised implicits
+            // Synthesised items have implicit mods with RawName starting with "Synthesis"
+            var implicitMods = mods.ImplicitMods;
+            if (implicitMods == null) return false;
+
+            bool isSynthesised = false;
+            var implicitTexts = new List<string>();
+            foreach (var mod in implicitMods)
+            {
+                if (mod.RawName != null && mod.RawName.StartsWith("Synthesis", StringComparison.Ordinal))
+                {
+                    isSynthesised = true;
+                    if (!string.IsNullOrEmpty(mod.Translation))
+                        implicitTexts.Add(mod.Translation);
+                }
+            }
+
+            if (!isSynthesised) return false;
+
+            // Check whitelist — if any implicit matches any whitelist entry, keep it
+            foreach (var implicitText in implicitTexts)
+            {
+                foreach (var entry in SynthesisedWhitelist)
+                {
+                    if (implicitText.Contains(entry, StringComparison.OrdinalIgnoreCase))
+                        return false; // Matches whitelist, don't skip
+                }
+            }
+
+            var implicitSummary = implicitTexts.Count > 0 ? string.Join("; ", implicitTexts) : "unknown";
+            LastSkipReason = $"Skipped synthesised '{itemName}' (implicits: {implicitSummary})";
+            return true;
+        }
+
+        /// <summary>
+        /// Check if a skill gem entity based on path.
+        /// </summary>
+        private static bool IsSkillGem(Entity entity)
+        {
+            var path = entity.Path;
+            if (path == null) return false;
+            return path.Contains("Metadata/Items/Gems/", StringComparison.Ordinal);
+        }
+
+        /// <summary>
+        /// Check if a unique item should be skipped based on value and size.
+        /// Uses MaxChaosValue — if the item COULD be valuable, don't skip it.
+        /// </summary>
+        private bool ShouldSkipUnique(Entity entity, PriceResult priceResult, double chaosPerSlot, string itemName)
         {
             if (!entity.TryGetComponent<Mods>(out var mods))
                 return false;
@@ -208,14 +346,19 @@ namespace AutoExile.Systems
             if (mods.ItemRarity != ItemRarity.Unique)
                 return false;
 
+            var maxValue = priceResult.MaxChaosValue;
+
             // If we can't price it, don't skip (might be valuable)
-            if (chaosValue <= 0)
+            if (maxValue <= 0)
                 return false;
 
-            // Flat value check
-            if (chaosValue < MinUniqueChaosValue)
+            // Flat value check — use max (optimistic: don't skip if it could be valuable)
+            if (maxValue < MinUniqueChaosValue)
             {
-                LastSkipReason = $"Skipped '{itemName}' ({chaosValue:F0}c < {MinUniqueChaosValue}c threshold)";
+                if (priceResult.MatchCount > 1)
+                    LastSkipReason = $"Skipped '{itemName}' (max {maxValue:F0}c across {priceResult.MatchCount} candidates < {MinUniqueChaosValue}c)";
+                else
+                    LastSkipReason = $"Skipped '{itemName}' ({maxValue:F0}c < {MinUniqueChaosValue}c threshold)";
                 return true;
             }
 
@@ -223,7 +366,7 @@ namespace AutoExile.Systems
             if (MinChaosPerSlot > 0 && chaosPerSlot < MinChaosPerSlot)
             {
                 var slots = GetInventorySlots(entity);
-                LastSkipReason = $"Skipped '{itemName}' ({chaosValue:F0}c / {slots} slots = {chaosPerSlot:F1}c/slot < {MinChaosPerSlot}c/slot)";
+                LastSkipReason = $"Skipped '{itemName}' ({maxValue:F0}c / {slots} slots = {chaosPerSlot:F1}c/slot < {MinChaosPerSlot}c/slot)";
                 return true;
             }
 
@@ -246,18 +389,18 @@ namespace AutoExile.Systems
             return 1;
         }
 
-        private double GetChaosValue(Entity entity)
+        private PriceResult GetPriceResult(GameController gc, Entity entity)
         {
-            if (_getNinjaValue == null)
-                return 0;
+            if (PriceService == null || !PriceService.IsLoaded)
+                return PriceResult.Zero;
 
             try
             {
-                return _getNinjaValue(entity);
+                return PriceService.GetPrice(gc, entity);
             }
             catch
             {
-                return 0;
+                return PriceResult.Zero;
             }
         }
     }
@@ -280,13 +423,16 @@ namespace AutoExile.Systems
         public int FailCount;
 
         /// <summary>
-        /// Cooldown before retry. Flicker (entity gone before click) gets 0.5s.
+        /// Cooldown before retry. Successfully picked up items get 30s (prevent flicker re-pickup).
+        /// Flicker (entity gone before click) gets 0.5s.
         /// Actual click failures escalate: 5s, 15s, 30s.
         /// </summary>
         public TimeSpan Cooldown
         {
             get
             {
+                if (Reason == "picked up")
+                    return TimeSpan.FromSeconds(30);
                 if (Reason == "entity gone before click")
                     return TimeSpan.FromSeconds(0.5);
 

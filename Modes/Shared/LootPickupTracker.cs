@@ -39,8 +39,11 @@ namespace AutoExile.Modes.Shared
 
             if (result == InteractionResult.Succeeded)
             {
-                ctx.LootTracker.RecordItem(_pendingItemName, _pendingValue);
+                ctx.LootTracker.RecordItem(_pendingItemName, _pendingValue, _pendingEntityId);
                 _pickupCount++;
+                // Blacklist the entity to prevent re-pickup from entity flicker
+                // (item may briefly reappear on ground after successful pickup)
+                ctx.Loot.MarkFailed(_pendingEntityId, "picked up");
             }
             else if (result == InteractionResult.Failed)
             {

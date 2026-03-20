@@ -27,7 +27,7 @@ namespace AutoExile.Systems
         private int _clickAttempts;
         private const int MaxClickAttempts = 3;
         /// <summary>
-        /// Minimum distance to click entities/items (grid units). Synced from LootRadius setting.
+        /// Minimum distance to click entities/items (grid units). Synced from InteractRadius setting.
         /// Navigation gets as close as possible; if within this range, clicks directly.
         /// </summary>
         public float InteractRadius { get; set; } = 20f;

@@ -39,6 +39,7 @@ namespace AutoExile
         private LootTracker _lootTracker = new();
         private MapMechanicManager _mechanics = new();
         private ThreatSystem _threat = new();
+        private NinjaPriceService _ninjaPrice = new();
         private BotRecorder _recorder = new();
 
         // Public accessors for external tools (POEMCP /eval)
@@ -50,6 +51,7 @@ namespace AutoExile
         public LootTracker LootTrackerInstance => _lootTracker;
         public MapMechanicManager Mechanics => _mechanics;
         public ThreatSystem Threat => _threat;
+        public NinjaPriceService NinjaPrice => _ninjaPrice;
         public BotRecorder Recorder => _recorder;
         public IBotMode ActiveMode => _mode;
         public BotContext Context => _ctx;
@@ -93,6 +95,7 @@ namespace AutoExile
             Name = "AutoExile";
             Instance = this;
             _recorder.SetOutputDir(Path.Combine(DirectoryFullName, "Recordings"));
+            _ninjaPrice.Initialize(DirectoryFullName, msg => LogMessage($"[AutoExile] NinjaPrice: {msg}"));
 
             _ctx = new BotContext
             {
@@ -108,6 +111,7 @@ namespace AutoExile
                 LootTracker = _lootTracker,
                 Mechanics = _mechanics,
                 Threat = _threat,
+                NinjaPrice = _ninjaPrice,
                 Settings = Settings,
                 Log = msg => LogMessage($"[AutoExile] {msg}")
             };
@@ -226,6 +230,7 @@ namespace AutoExile
                 _tileMap.Clear();
                 _tileMap.Load(GameController);
                 _loot.ClearFailed();
+                _lootTracker.OnAreaChanged();
 
                 // Stop MappingMode if we landed in hideout/town (e.g. death respawn)
                 if (_mode == _mappingMode && _mappingMode != null)
@@ -361,13 +366,40 @@ namespace AutoExile
             _loot.SkipLowValueUniques = Settings.Loot.SkipLowValueUniques.Value;
             _loot.MinUniqueChaosValue = Settings.Loot.MinUniqueChaosValue.Value;
             _loot.MinChaosPerSlot = Settings.Loot.MinChaosPerSlot.Value;
-            _loot.LootRadius = Settings.Loot.LootRadius.Value;
-            _interaction.InteractRadius = Settings.Loot.LootRadius.Value;
             _loot.IgnoreQuestItems = Settings.Loot.IgnoreQuestItems.Value;
+            _loot.FilterClusterJewels = Settings.Loot.FilterClusterJewels.Value;
+            _loot.MinClusterJewelChaosValue = Settings.Loot.MinClusterJewelChaosValue.Value;
+            _loot.FilterSkillGems = Settings.Loot.FilterSkillGems.Value;
+            _loot.MinGemChaosValue = Settings.Loot.MinGemChaosValue.Value;
+            _loot.AlwaysLoot20QualityGems = Settings.Loot.AlwaysLoot20QualityGems.Value;
+            _loot.FilterSynthesisedItems = Settings.Loot.FilterSynthesisedItems.Value;
+            // Parse comma-separated whitelist into trimmed lowercase entries
+            var whitelistRaw = Settings.Loot.SynthesisedWhitelist.Value ?? "";
+            _loot.SynthesisedWhitelist = whitelistRaw
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Where(s => s.Length > 0)
+                .ToList();
+            _loot.PriceService = _ninjaPrice;
+            _lootTracker.PriceService = _ninjaPrice;
+
+            // Sync interact radius (global setting used by all systems)
+            _interaction.InteractRadius = Settings.InteractRadius.Value;
+            _mapDevice.InteractRadius = Settings.InteractRadius.Value;
+            _stash.InteractRadius = Settings.InteractRadius.Value;
+
+            // Tick ninja price service (league detection, refresh timer)
+            _ninjaPrice.Tick(GameController);
+
+            // Debug: delayed dump when unique Large Cluster Jewel was spotted
+            if (_loot.ScheduledDebugDumpAt.HasValue && DateTime.Now >= _loot.ScheduledDebugDumpAt.Value)
+            {
+                _loot.ScheduledDebugDumpAt = null;
+                LogMessage("[AutoExile] Unique Large Cluster Jewel debug dump (5s after sighting)");
+                _recorder.ForceDump("unique_cluster_jewel");
+                TriggerGameStateDump();
+            }
 
             // Sync stash/map device settings
-            _mapDevice.InteractRadius = Settings.Loot.LootRadius.Value;
-            _stash.InteractRadius = Settings.Loot.LootRadius.Value;
             _stash.ActionCooldownMs = Settings.Loot.StashItemCooldownMs.Value;
             _stash.ApplyIncubators = Settings.AutoApplyIncubators.Value;
 
@@ -468,7 +500,7 @@ namespace AutoExile
             CheckRange("Dash Min Distance", b.DashMinDistance.Value);
             CheckRange("Fight Range", b.FightRange.Value);
             CheckRange("Combat Range", b.CombatRange.Value);
-            CheckRange("Loot Radius", l.LootRadius.Value);
+            CheckRange("Interact Radius", Settings.InteractRadius.Value);
 
             var f = Settings.Follower;
             CheckRange("Follow Distance", f.FollowDistance.Value);
@@ -1062,7 +1094,7 @@ namespace AutoExile
                 FailedCount = _loot.FailedCount,
                 LastSkipReason = _loot.LastSkipReason,
                 NinjaBridgeStatus = _loot.NinjaBridgeStatus,
-                LootRadius = _loot.LootRadius,
+                LootRadius = _interaction.InteractRadius,
                 VisibleGroundLabelCount = visibleLabels,
                 Candidates = _loot.Candidates.Select(c => new LootCandidateSnapshot
                 {

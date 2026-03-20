@@ -36,6 +36,9 @@ namespace AutoExile
         [Menu("Auto Apply Incubators", "Apply incubators from stash to equipment during stash phase.")]
         public ToggleNode AutoApplyIncubators { get; set; } = new ToggleNode(true);
 
+        [Menu("Interact Radius", "Grid distance at which the bot can click entities, items, stash, map device, etc.")]
+        public RangeNode<int> InteractRadius { get; set; } = new RangeNode<int>(20, 10, 80);
+
         // --- Build (player setup: movement, skills, combat, flasks) ---
 
         public BuildSettings Build { get; set; } = new BuildSettings();
@@ -261,20 +264,46 @@ namespace AutoExile
         [Submenu(CollapsedByDefault = true)]
         public class LootSettings
         {
-            [Menu("Loot Radius", "Click items within this grid distance without pathing. Items beyond this require navigation first.")]
-            public RangeNode<int> LootRadius { get; set; } = new RangeNode<int>(20, 10, 80);
-
             [Menu("Skip Low-Value Uniques", "Skip unique items below the minimum chaos value.")]
             public ToggleNode SkipLowValueUniques { get; set; } = new ToggleNode(false);
 
             [Menu("Min Unique Chaos Value", "Minimum chaos value for a unique to be picked up.")]
-            public RangeNode<float> MinUniqueChaosValue { get; set; } = new RangeNode<float>(10f, 1f, 100f);
+            public RangeNode<int> MinUniqueChaosValue { get; set; } = new RangeNode<int>(10, 1, 100);
 
             [Menu("Min Chaos Per Slot (0=off)", "Minimum chaos value per inventory slot. 0 to disable.")]
-            public RangeNode<float> MinChaosPerSlot { get; set; } = new RangeNode<float>(0f, 0f, 10f);
+            public RangeNode<int> MinChaosPerSlot { get; set; } = new RangeNode<int>(0, 0, 10);
 
             [Menu("Ignore Quest Items", "Skip quest items (heist contracts, etc.) during loot pickup.")]
             public ToggleNode IgnoreQuestItems { get; set; } = new ToggleNode(true);
+
+            // --- Cluster Jewel Filtering ---
+
+            [Menu("Filter Cluster Jewels", "Enable value-based filtering for non-unique cluster jewels.")]
+            public ToggleNode FilterClusterJewels { get; set; } = new ToggleNode(false);
+
+            [Menu("Min Cluster Jewel Chaos Value", "Skip non-unique cluster jewels below this chaos value. 0 = pick up all.")]
+            public RangeNode<int> MinClusterJewelChaosValue { get; set; } = new RangeNode<int>(0, 0, 500);
+
+            // --- Skill Gem Filtering ---
+
+            [Menu("Filter Skill Gems", "Enable value-based filtering for skill gems on the ground.")]
+            public ToggleNode FilterSkillGems { get; set; } = new ToggleNode(false);
+
+            [Menu("Min Gem Chaos Value", "Skip skill gems below this chaos value.")]
+            public RangeNode<int> MinGemChaosValue { get; set; } = new RangeNode<int>(5, 1, 500);
+
+            [Menu("Always Loot 20% Quality Gems", "Always pick up skill gems with 20% quality regardless of value.")]
+            public ToggleNode AlwaysLoot20QualityGems { get; set; } = new ToggleNode(true);
+
+            // --- Synthesised Item Filtering ---
+
+            [Menu("Filter Synthesised Items", "When enabled, only pick up synthesised items whose implicits match the whitelist.")]
+            public ToggleNode FilterSynthesisedItems { get; set; } = new ToggleNode(false);
+
+            [Menu("Synthesised Implicit Whitelist", "Comma-separated implicit mod substrings to keep (e.g. 'Onslaught,Explode,extra curse'). Case-insensitive. Items matching ANY entry are looted.")]
+            public TextNode SynthesisedWhitelist { get; set; } = new TextNode("Onslaught,Explode,extra curse,Tailwind,Elusive,base Critical");
+
+            // --- Misc ---
 
             [Menu("Stash Cooldown (ms)", "Delay between each Ctrl+click when stashing items.")]
             public RangeNode<int> StashItemCooldownMs { get; set; } = new RangeNode<int>(450, 200, 1000);

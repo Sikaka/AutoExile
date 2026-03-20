@@ -563,7 +563,7 @@ namespace AutoExile.Modes
                         continue;
 
                     // Found a quest item — pick it up
-                    var withinRadius = worldItemEntity.DistancePlayer <= ctx.Loot.LootRadius;
+                    var withinRadius = worldItemEntity.DistancePlayer <= ctx.Interaction.InteractRadius;
                     ctx.Interaction.PickupGroundItem(worldItemEntity, ctx.Navigation,
                         requireProximity: !withinRadius);
 
