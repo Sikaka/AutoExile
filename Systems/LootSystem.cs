@@ -45,6 +45,13 @@ namespace AutoExile.Systems
         /// <summary>Parsed whitelist entries (lowercase). Set from settings comma-separated string.</summary>
         public List<string> SynthesisedWhitelist { get; set; } = new();
 
+        /// <summary>
+        /// Callback fired when an item is skipped during scan (value filter, cooldown block, etc.)
+        /// or when a pickup fails. Args: (itemName, reason, chaosValue).
+        /// Deduped per entity ID — each item only fires once per area.
+        /// </summary>
+        public Action<string, string, double>? OnItemSkipped { get; set; }
+
         // State
         public bool HasLootNearby { get; private set; }
         public int LootableCount { get; private set; }
@@ -61,13 +68,12 @@ namespace AutoExile.Systems
         /// Set by Scan() when a unique Large Cluster Jewel is first spotted.
         /// BotCore clears this after firing.
         /// </summary>
-        public DateTime? ScheduledDebugDumpAt { get; set; }
-        private DateTime _lastDebugDumpAt = DateTime.MinValue;
-        private const int DebugDumpCooldownSeconds = 120;
-        private const int DebugDumpDelaySeconds = 5;
 
         // Failed pickup tracking — items that couldn't be picked up are skipped in future scans
         private readonly Dictionary<long, FailedLootEntry> _failedEntities = new();
+
+        // Dedup for OnItemSkipped — each entity only fires one skip event per area
+        private readonly HashSet<long> _loggedSkipIds = new();
 
         public int FailedCount => _failedEntities.Count;
         public IReadOnlyDictionary<long, FailedLootEntry> FailedEntries => _failedEntities;
@@ -90,7 +96,11 @@ namespace AutoExile.Systems
         /// <summary>
         /// Clear the failed entity list. Call on area change or phase reset.
         /// </summary>
-        public void ClearFailed() => _failedEntities.Clear();
+        public void ClearFailed()
+        {
+            _failedEntities.Clear();
+            _loggedSkipIds.Clear();
+        }
 
         /// <summary>
         /// Scan visible ground items and build a prioritized pickup list.
@@ -119,7 +129,11 @@ namespace AutoExile.Systems
 
                     var worldItemEntity = label.Entity;
                     if (_failedEntities.TryGetValue(worldItemEntity.Id, out var failEntry) && !failEntry.IsExpired)
+                    {
+                        LogSkipEvent(worldItemEntity.Id, label.Label.Text ?? "?",
+                            $"blocked by previous failure: {failEntry.Reason} (attempt {failEntry.FailCount}, cooldown {failEntry.Cooldown.TotalSeconds:F0}s)", 0);
                         continue;
+                    }
 
                     var itemName = label.Label.Text ?? "?";
 
@@ -140,17 +154,6 @@ namespace AutoExile.Systems
                     // Use inner item for pricing/sizing, fall back to outer entity
                     var priceEntity = (itemEntity is { IsValid: true }) ? itemEntity : worldItemEntity;
 
-                    // Debug: schedule delayed dump when a unique Large Cluster Jewel is first seen
-                    if (itemName == "Large Cluster Jewel" &&
-                        priceEntity.TryGetComponent<Mods>(out var debugMods) &&
-                        debugMods.ItemRarity == ItemRarity.Unique &&
-                        !ScheduledDebugDumpAt.HasValue &&
-                        (DateTime.Now - _lastDebugDumpAt).TotalSeconds >= DebugDumpCooldownSeconds)
-                    {
-                        _lastDebugDumpAt = DateTime.Now;
-                        ScheduledDebugDumpAt = DateTime.Now.AddSeconds(DebugDumpDelaySeconds);
-                    }
-
                     // Check if this is a unique we should skip
                     var priceResult = GetPriceResult(gc, priceEntity);
                     var chaosValue = priceResult.MaxChaosValue; // Use max for loot decisions
@@ -158,21 +161,33 @@ namespace AutoExile.Systems
                     var chaosPerSlot = invSlots > 0 ? chaosValue / invSlots : chaosValue;
 
                     if (SkipLowValueUniques && ShouldSkipUnique(priceEntity, priceResult, chaosPerSlot, itemName))
+                    {
+                        LogSkipEvent(worldItemEntity.Id, itemName, LastSkipReason, chaosValue);
                         continue;
+                    }
 
                     // Cluster jewel value filter
                     if (FilterClusterJewels && MinClusterJewelChaosValue > 0 &&
                         IsNonUniqueClusterJewel(priceEntity, itemName) &&
                         ShouldSkipClusterJewel(priceResult, itemName))
+                    {
+                        LogSkipEvent(worldItemEntity.Id, itemName, LastSkipReason, chaosValue);
                         continue;
+                    }
 
                     // Skill gem value filter
                     if (FilterSkillGems && IsSkillGem(priceEntity) && ShouldSkipGem(priceEntity, priceResult, itemName))
+                    {
+                        LogSkipEvent(worldItemEntity.Id, itemName, LastSkipReason, chaosValue);
                         continue;
+                    }
 
                     // Synthesised implicit whitelist filter
                     if (FilterSynthesisedItems && ShouldSkipSynthesised(priceEntity, itemName))
+                    {
+                        LogSkipEvent(worldItemEntity.Id, itemName, LastSkipReason, chaosValue);
                         continue;
+                    }
 
                     _candidates.Add(new LootCandidate
                     {
@@ -387,6 +402,17 @@ namespace AutoExile.Systems
                     return w * h;
             }
             return 1;
+        }
+
+        /// <summary>
+        /// Log an item skip/failure event (deduped by entity ID).
+        /// Called internally from Scan() and externally from LootPickupTracker on failure.
+        /// </summary>
+        public void LogSkipEvent(long entityId, string itemName, string reason, double chaosValue)
+        {
+            if (OnItemSkipped == null) return;
+            if (!_loggedSkipIds.Add(entityId)) return; // Already logged this entity
+            OnItemSkipped(itemName, reason, chaosValue);
         }
 
         private PriceResult GetPriceResult(GameController gc, Entity entity)

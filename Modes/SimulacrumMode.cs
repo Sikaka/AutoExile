@@ -489,8 +489,30 @@ namespace AutoExile.Modes
                             ctx.Exploration.SeenRadiusOverride = 0;
                         }
 
-                        // Combat system handles fighting + positioning automatically via Tick above
-                        Decision = $"Wave {_state.CurrentWave} — fighting ({ctx.Combat.NearbyMonsterCount} nearby, {ctx.Combat.CachedMonsterCount} total)";
+                        // Aggressive positioning: CombatSystem signals WantsToMove with a dense
+                        // cluster target, but defers A* pathfinding to the mode. Without this,
+                        // the bot stands still fighting a few nearby monsters while ignoring
+                        // a much denser pack farther away.
+                        if (ctx.Combat.WantsToMove &&
+                            ctx.Combat.Profile.Positioning == CombatPositioning.Aggressive &&
+                            !ctx.Interaction.IsBusy)
+                        {
+                            var combatTarget = ctx.Combat.MoveTargetGrid;
+                            // Only repath if not navigating or current destination is far from new target
+                            var navPath = ctx.Navigation.CurrentNavPath;
+                            var currentDest = navPath.Count > 0 ? navPath[navPath.Count - 1].Position : playerPos;
+                            if (!ctx.Navigation.IsNavigating ||
+                                Vector2.Distance(currentDest, combatTarget) > 20f)
+                            {
+                                ctx.Navigation.Stop(gc);
+                                ctx.Navigation.NavigateTo(gc, combatTarget);
+                            }
+                            Decision = $"Wave {_state.CurrentWave} — aggressive: pathing to density @ ({combatTarget.X:F0},{combatTarget.Y:F0})";
+                        }
+                        else
+                        {
+                            Decision = $"Wave {_state.CurrentWave} — fighting ({ctx.Combat.NearbyMonsterCount} nearby, {ctx.Combat.CachedMonsterCount} total)";
+                        }
                         StatusText = $"Wave {_state.CurrentWave}/15 — fighting {ctx.Combat.NearbyMonsterCount} monsters";
                     }
                 }

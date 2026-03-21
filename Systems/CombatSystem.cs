@@ -78,6 +78,9 @@ namespace AutoExile.Systems
         /// <summary>Target position the system wants to move toward (world coords).</summary>
         public Vector2 MoveTarget { get; private set; }
 
+        /// <summary>Target position in grid coords (for A* pathfinding by modes).</summary>
+        public Vector2 MoveTargetGrid { get; private set; }
+
         // ── Movement info (exposed for NavigationSystem) ──
 
         /// <summary>Key for the primary movement (Move Only) binding, or null if not configured.</summary>
@@ -187,6 +190,7 @@ namespace AutoExile.Systems
             LastAction = "";
             LastSkillAction = "";
             _walkableMonsterWeighted.Clear();
+            _allMonsterWeighted.Clear();
             BestTargetHasLOS = false;
             _skillBar.Clear();
             _primaryMovementEntry = null;
@@ -226,6 +230,9 @@ namespace AutoExile.Systems
         /// <summary>Only monsters reachable via straight-line walk (pf LOS), with rarity weight for density.</summary>
         private readonly List<(Vector2 pos, float weight)> _walkableMonsterWeighted = new();
 
+        /// <summary>All alive hostile monsters with rarity weight, regardless of range or LOS. Used for Aggressive positioning.</summary>
+        private readonly List<(Vector2 pos, float weight)> _allMonsterWeighted = new();
+
         /// <summary>Whether BestTarget can be hit from current position via targeting LOS.</summary>
         public bool BestTargetHasLOS { get; private set; }
 
@@ -250,6 +257,7 @@ namespace AutoExile.Systems
 
             _nearbyMonsterPositions.Clear();
             _walkableMonsterWeighted.Clear();
+            _allMonsterWeighted.Clear();
 
             foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
             {
@@ -276,6 +284,20 @@ namespace AutoExile.Systems
 
                 cachedCount++;
 
+                // Rarity weight used for both targeting and density
+                float rarityWeight = entity.Rarity switch
+                {
+                    MonsterRarity.Magic => 2f,
+                    MonsterRarity.Rare => 10f,
+                    MonsterRarity.Unique => 25f,
+                    _ => 1f
+                };
+                if (IsPriorityTarget(entity))
+                    rarityWeight = 100f;
+
+                // Track ALL alive hostiles for Aggressive density (no range/LOS filter)
+                _allMonsterWeighted.Add((entity.GridPosNum, rarityWeight));
+
                 // Track nearest monster (for awareness-tier navigation)
                 if (dist < nearestMonsterDist)
                 {
@@ -297,17 +319,6 @@ namespace AutoExile.Systems
                 combatCount++;
                 combatSum += entity.GridPosNum;
                 _nearbyMonsterPositions.Add(entity.GridPosNum);
-
-                // Score: rarity weight - distance penalty
-                float rarityWeight = entity.Rarity switch
-                {
-                    MonsterRarity.Magic => 2f,
-                    MonsterRarity.Rare => 10f,
-                    MonsterRarity.Unique => 25f,
-                    _ => 1f
-                };
-                if (IsPriorityTarget(entity))
-                    rarityWeight = 100f;
 
                 // Track walkable monsters separately for positioning (don't walk into gaps)
                 if (isWalkable || pfGrid == null)
@@ -345,9 +356,12 @@ namespace AutoExile.Systems
                 BestTargetHasLOS = Pathfinding.HasTargetingLOS(tgtGrid, px, py,
                     (int)bestTarget.GridPosNum.X, (int)bestTarget.GridPosNum.Y);
 
-            // Dense cluster for positioning — only use walkable monsters to avoid walking into gaps
+            // Dense cluster for positioning
             if (bestTarget != null && IsPriorityTarget(bestTarget))
                 DenseClusterCenter = bestTarget.GridPosNum;
+            else if (Profile.Positioning == CombatPositioning.Aggressive && _allMonsterWeighted.Count > 0)
+                // Aggressive: consider ALL known monsters regardless of range/LOS — mode will A* pathfind there
+                DenseClusterCenter = FindWeightedDensestPosition(_allMonsterWeighted, playerGrid);
             else if (_walkableMonsterWeighted.Count > 0)
                 DenseClusterCenter = FindWeightedDensestPosition(_walkableMonsterWeighted, playerGrid);
             else
@@ -489,19 +503,51 @@ namespace AutoExile.Systems
                     continue;
                 }
 
-                // Try to find the matching ActorSkill on the skill bar for status reading
+                // Try to find the matching ActorSkill via ServerData.SkillBarIds
+                // SkillBarIds maps bar position (0-7) to skill IDs matching ActorSkill.Id
                 ActorSkill? matchedSkill = null;
                 var actor = gc.Player?.GetComponent<Actor>();
                 if (actor?.ActorSkills != null)
                 {
-                    foreach (var skill in actor.ActorSkills)
+                    var barIds = gc.IngameState?.ServerData?.SkillBarIds;
+                    if (barIds != null)
                     {
-                        if (!skill.IsOnSkillBar) continue;
-                        var slotKey = DefaultKeyForSlot(skill.SkillSlotIndex);
-                        if (slotKey == key)
+                        // Find the bar position for this key
+                        int targetBarPos = -1;
+                        for (int bi = 0; bi < 8 && bi < barIds.Count; bi++)
                         {
-                            matchedSkill = skill;
-                            break;
+                            if (DefaultKeyForSlot(bi) == key) { targetBarPos = bi; break; }
+                        }
+
+                        if (targetBarPos >= 0 && targetBarPos < barIds.Count)
+                        {
+                            var targetId = barIds[targetBarPos];
+                            if (targetId != 0)
+                            {
+                                foreach (var skill in actor.ActorSkills)
+                                {
+                                    if (skill.Id == targetId)
+                                    {
+                                        matchedSkill = skill;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Fallback: match by ActorSkill.SkillSlotIndex (legacy)
+                    if (matchedSkill == null)
+                    {
+                        foreach (var skill in actor.ActorSkills)
+                        {
+                            if (!skill.IsOnSkillBar) continue;
+                            if (skill.InternalName != null && skill.Name != null)
+                            {
+                                // Try direct key name match as last resort
+                                var slotKey = DefaultKeyForSlot(skill.SkillSlotIndex);
+                                if (slotKey == key) { matchedSkill = skill; break; }
+                            }
                         }
                     }
                 }
@@ -590,9 +636,16 @@ namespace AutoExile.Systems
         /// Default key for a POE skill slot index (used to match ActorSkills to user key configs).
         /// Returns Keys.None for unknown/unmapped slots.
         /// </summary>
-        private static Keys DefaultKeyForSlot(int slotIndex) => slotIndex switch
+        /// <summary>
+        /// Default key for a POE skill bar position.
+        /// Bar positions come from ServerData.SkillBarIds array indices:
+        /// 0=LMB, 1=RMB, 2=MMB, 3=Q, 4=W, 5=E, 6=R, 7=T
+        /// Note: ActorSkill.SkillSlotIndex uses a DIFFERENT numbering
+        /// (even indices for keyboard slots). This method maps bar positions.
+        /// </summary>
+        public static Keys DefaultKeyForSlot(int barPosition) => barPosition switch
         {
-            0 => Keys.None,        // LMB — move only, not a combat skill
+            0 => Keys.None,        // LMB — move only
             1 => Keys.RButton,     // RMB
             2 => Keys.MButton,     // Middle mouse
             3 => Keys.Q,
@@ -900,7 +953,17 @@ namespace AutoExile.Systems
             switch (Profile.Positioning)
             {
                 case CombatPositioning.Aggressive:
-                    // Always walk into the densest pack
+                    // Aggressive: expose DenseClusterCenter for mode to A* pathfind to.
+                    // Only use cursor-walk for very short range (already nearly on top of cluster).
+                    if (dist > 15f)
+                    {
+                        // Far away — signal the mode to pathfind there, don't cursor-walk
+                        WantsToMove = true;
+                        MoveTargetGrid = DenseClusterCenter;
+                        MoveTarget = ToWorld(DenseClusterCenter);
+                        LastAction = $"aggressive: pathfind to density @ ({DenseClusterCenter.X:F0},{DenseClusterCenter.Y:F0}) dist={dist:F0}";
+                        return;
+                    }
                     if (dist > 3f)
                         desiredGridPos = DenseClusterCenter;
                     break;

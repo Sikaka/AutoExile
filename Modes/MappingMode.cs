@@ -179,7 +179,9 @@ namespace AutoExile.Modes
             // Pause/resume navigation based on combat state
             // Don't pause nav when interaction is busy (navigating to loot/interactable) —
             // combat positioning is already suppressed, and pausing nav would stall the pickup
-            if (!_mechanicActive && !ctx.Interaction.IsBusy && ctx.Combat.InCombat && ctx.Combat.WantsToMove)
+            // Aggressive mode uses NavigationSystem for combat movement, so don't pause it
+            bool aggressiveMode = ctx.Combat.Profile.Positioning == CombatPositioning.Aggressive;
+            if (!aggressiveMode && !_mechanicActive && !ctx.Interaction.IsBusy && ctx.Combat.InCombat && ctx.Combat.WantsToMove)
             {
                 // Combat wants to reposition — pause nav so combat controls movement
                 if (ctx.Navigation.IsNavigating)
@@ -322,8 +324,30 @@ namespace AutoExile.Modes
             // ── Combat hold — don't explore while fighting ──
             if (ctx.Combat.InCombat && ctx.Combat.WantsToMove)
             {
-                if (_phase != MappingPhase.Fighting)
-                    ctx.Navigation.Stop(gc); // stop stale exploration nav — combat handles movement
+                // Aggressive mode: pathfind to dense cluster via NavigationSystem (A*)
+                // instead of letting CombatSystem cursor-walk (which can't navigate around terrain)
+                if (ctx.Combat.Profile.Positioning == CombatPositioning.Aggressive)
+                {
+                    var combatTarget = ctx.Combat.MoveTargetGrid;
+                    var distToTarget = Vector2.Distance(playerGrid, combatTarget);
+
+                    // Only repath if target moved significantly or we're not already navigating toward it
+                    if (!ctx.Navigation.IsNavigating || _navTarget == null ||
+                        Vector2.Distance(_navTarget.Value, combatTarget) > 20f)
+                    {
+                        ctx.Navigation.Stop(gc);
+                        if (ctx.Navigation.NavigateTo(gc, combatTarget))
+                        {
+                            _navTarget = combatTarget;
+                            Decision = $"Aggressive: pathing to density @ ({combatTarget.X:F0},{combatTarget.Y:F0}) dist={distToTarget:F0}";
+                        }
+                    }
+                }
+                else
+                {
+                    if (_phase != MappingPhase.Fighting)
+                        ctx.Navigation.Stop(gc); // stop stale exploration nav — combat handles movement
+                }
                 _phase = MappingPhase.Fighting;
                 Status = $"Fighting: {ctx.Combat.NearbyMonsterCount} monsters ({ctx.Combat.LastSkillAction})";
                 return;
@@ -363,6 +387,24 @@ namespace AutoExile.Modes
                 ctx.Navigation.Stop(gc);
                 _navTarget = null;
                 Decision = $"Abandoned stuck target ({ctx.Exploration.FailedRegions.Count} failed regions)";
+            }
+
+            // Aggressive: chase known monsters instead of exploring when any are cached
+            if (aggressiveMode && ctx.Combat.CachedMonsterCount > 0 && !ctx.Navigation.IsNavigating)
+            {
+                var combatTarget = ctx.Combat.DenseClusterCenter;
+                var distToTarget = Vector2.Distance(playerGrid, combatTarget);
+                if (distToTarget > 10f)
+                {
+                    if (ctx.Navigation.NavigateTo(gc, combatTarget))
+                    {
+                        _navTarget = combatTarget;
+                        _phase = MappingPhase.Fighting;
+                        Decision = $"Aggressive: chasing density @ ({combatTarget.X:F0},{combatTarget.Y:F0}) dist={distToTarget:F0}, {ctx.Combat.CachedMonsterCount} cached";
+                        Status = $"Chasing: {ctx.Combat.CachedMonsterCount} monsters dist={distToTarget:F0}";
+                        return;
+                    }
+                }
             }
 
             // Pick next target when idle (not navigating, or paused nav just resumed)

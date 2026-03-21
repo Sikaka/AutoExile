@@ -1,0 +1,1205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AutoExile Dashboard</title>
+<style>
+:root {
+  --bg: #0f1117; --surface: #1a1d27; --surface2: #242836; --border: #2e3347;
+  --text: #e1e4ed; --text-dim: #8b90a5; --accent: #6c8cff; --green: #4ade80;
+  --red: #f87171; --orange: #fb923c; --yellow: #fbbf24;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family:'Segoe UI',system-ui,sans-serif; background:var(--bg); color:var(--text); min-height:100vh; }
+
+/* Header + Tabs */
+.header { background:var(--surface); border-bottom:1px solid var(--border); padding:12px 24px; display:flex; align-items:center; justify-content:space-between; }
+.header h1 { font-size:20px; font-weight:600; color:var(--accent); }
+.header-right { display:flex; align-items:center; gap:12px; }
+.connection-badge { font-size:12px; padding:4px 10px; border-radius:12px; background:var(--surface2); border:1px solid var(--border); }
+.connection-badge.ok { border-color:var(--green); color:var(--green); }
+.connection-badge.err { border-color:var(--red); color:var(--red); }
+
+.tabs { display:flex; background:var(--surface); border-bottom:1px solid var(--border); padding:0 24px; }
+.tab { padding:12px 20px; cursor:pointer; color:var(--text-dim); border-bottom:2px solid transparent; transition:all .15s; font-size:14px; }
+.tab:hover { color:var(--text); }
+.tab.active { color:var(--accent); border-bottom-color:var(--accent); }
+
+.tab-content { display:none; }
+.tab-content.active { display:block; }
+
+.main { max-width:1200px; margin:0 auto; padding:24px; }
+
+/* Cards */
+.card { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:20px; margin-bottom:16px; }
+.card h2 { font-size:14px; text-transform:uppercase; letter-spacing:.5px; color:var(--text-dim); margin-bottom:16px; }
+.grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+
+/* Stats */
+.status-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(160px,1fr)); gap:12px; }
+.stat { background:var(--surface2); padding:12px 16px; border-radius:6px; }
+.stat-label { font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--text-dim); margin-bottom:4px; }
+.stat-value { font-size:20px; font-weight:600; }
+.green { color:var(--green); } .red { color:var(--red); } .orange { color:var(--orange); } .yellow { color:var(--yellow); } .accent { color:var(--accent); }
+
+/* Bars */
+.bar-container { margin-bottom:10px; }
+.bar-label { display:flex; justify-content:space-between; font-size:12px; margin-bottom:4px; color:var(--text-dim); }
+.bar { height:8px; background:var(--surface2); border-radius:4px; overflow:hidden; }
+.bar-fill { height:100%; border-radius:4px; transition:width .3s; }
+.bar-fill.hp { background:var(--red); } .bar-fill.es { background:var(--accent); } .bar-fill.mana { background:#818cf8; }
+
+/* Controls */
+.controls { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+.btn { padding:10px 24px; border:1px solid var(--border); border-radius:6px; background:var(--surface2); color:var(--text); font-size:14px; cursor:pointer; transition:all .15s; }
+.btn:hover { border-color:var(--accent); background:#2a2e42; }
+.btn.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+.btn.primary:hover { background:#5a7aee; }
+.btn.danger { border-color:var(--red); color:var(--red); }
+.btn.danger:hover { background:rgba(248,113,113,.1); }
+.mode-select { padding:10px 16px; background:var(--surface2); border:1px solid var(--border); border-radius:6px; color:var(--text); font-size:14px; }
+
+.bot-status { display:flex; align-items:center; gap:12px; font-size:24px; font-weight:700; }
+.status-dot { width:12px; height:12px; border-radius:50%; background:var(--red); }
+.status-dot.running { background:var(--green); animation:pulse 2s infinite; }
+.status-dot.paused { background:var(--yellow); }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
+
+/* Log */
+.log-area { font-family:'Cascadia Code','Fira Code',monospace; font-size:12px; background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:12px; max-height:200px; overflow-y:auto; color:var(--text-dim); line-height:1.6; }
+.log-area .decision { color:var(--yellow); } .log-area .status { color:var(--text); } .log-area .time { color:var(--text-dim); }
+
+/* Settings */
+.settings-group { margin-bottom:24px; }
+.settings-group h3 { font-size:16px; font-weight:600; margin-bottom:12px; padding-bottom:8px; border-bottom:1px solid var(--border); color:var(--text); cursor:pointer; user-select:none; }
+.settings-group h3:hover { color:var(--accent); }
+.settings-group h3::before { content:''; display:inline-block; width:0; height:0; border-left:6px solid var(--text-dim); border-top:4px solid transparent; border-bottom:4px solid transparent; margin-right:8px; transition:transform .2s; }
+.settings-group h3.open::before { transform:rotate(90deg); }
+.settings-body { display:none; }
+.settings-body.open { display:block; }
+
+.setting-row { display:flex; justify-content:space-between; align-items:center; padding:8px 12px; border-radius:6px; transition:background .15s; }
+.setting-row:hover { background:var(--surface2); }
+.setting-info { flex:1; min-width:0; }
+.setting-label { font-size:14px; font-weight:500; }
+.setting-desc { display:block; font-size:11px; color:var(--text-dim); margin-top:2px; }
+.setting-control { flex-shrink:0; margin-left:16px; }
+.setting-control input[type=number] { width:100px; padding:6px 10px; background:var(--surface2); border:1px solid var(--border); border-radius:4px; color:var(--text); font-size:14px; }
+.setting-control input[type=text] { width:200px; padding:6px 10px; background:var(--surface2); border:1px solid var(--border); border-radius:4px; color:var(--text); font-size:14px; }
+.setting-control select { padding:6px 10px; background:var(--surface2); border:1px solid var(--border); border-radius:4px; color:var(--text); font-size:14px; }
+
+/* Toggle switch */
+.switch { position:relative; display:inline-block; width:44px; height:24px; }
+.switch input { opacity:0; width:0; height:0; }
+.slider { position:absolute; cursor:pointer; inset:0; background:var(--surface2); border:1px solid var(--border); border-radius:24px; transition:.2s; }
+.slider::before { content:''; position:absolute; height:18px; width:18px; left:2px; bottom:2px; background:var(--text-dim); border-radius:50%; transition:.2s; }
+input:checked + .slider { background:var(--accent); border-color:var(--accent); }
+input:checked + .slider::before { transform:translateX(20px); background:#fff; }
+
+.hotkey-badge { display:inline-block; padding:4px 10px; background:var(--surface2); border:1px solid var(--border); border-radius:4px; font-size:12px; color:var(--text-dim); font-family:monospace; }
+
+.subgroup { margin-left:20px; border-left:2px solid var(--border); padding-left:16px; margin-bottom:12px; }
+.subgroup h4 { font-size:13px; font-weight:600; color:var(--text-dim); margin-bottom:8px; cursor:pointer; user-select:none; }
+.subgroup h4:hover { color:var(--accent); }
+
+/* Range slider + number combo */
+.range-control { display:flex; align-items:center; gap:10px; }
+.range-slider { -webkit-appearance:none; appearance:none; width:160px; height:6px; background:var(--surface2); border-radius:3px; outline:none; }
+.range-slider::-webkit-slider-thumb { -webkit-appearance:none; width:16px; height:16px; border-radius:50%; background:var(--accent); cursor:pointer; border:2px solid var(--surface); }
+.range-slider::-moz-range-thumb { width:14px; height:14px; border-radius:50%; background:var(--accent); cursor:pointer; border:2px solid var(--surface); }
+.range-number { width:72px; padding:4px 8px; background:var(--surface2); border:1px solid var(--border); border-radius:4px; color:var(--text); font-size:13px; text-align:center; }
+.range-suffix { font-size:11px; color:var(--text-dim); min-width:20px; }
+
+/* Settings sub-tabs */
+.settings-tabs { display:flex; gap:6px; margin-bottom:16px; flex-wrap:wrap; }
+.settings-tab { padding:8px 18px; border-radius:6px; cursor:pointer; font-size:13px; font-weight:500; background:var(--surface2); border:1px solid var(--border); color:var(--text-dim); transition:all .15s; }
+.settings-tab:hover { color:var(--text); border-color:var(--accent); }
+.settings-tab.active { background:var(--accent); border-color:var(--accent); color:#fff; }
+.settings-tab-content { display:none; }
+.settings-tab-content.active { display:block; }
+
+/* Compact checklist grid (heist rewards etc.) */
+.check-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:6px; }
+.check-item { display:flex; align-items:center; gap:8px; padding:6px 10px; border-radius:4px; font-size:13px; background:var(--surface2); }
+.check-item label { cursor:pointer; user-select:none; }
+.check-item input[type=checkbox] { accent-color:var(--accent); width:16px; height:16px; cursor:pointer; }
+
+/* Tower config table */
+.tower-table { width:100%; font-size:13px; }
+.tower-table th { text-align:center; padding:6px 8px; font-size:11px; font-weight:500; }
+.tower-table td { text-align:center; padding:6px 4px; }
+.tower-table td:first-child { text-align:left; font-weight:500; }
+.tower-table input[type=range] { width:80px; }
+.tower-table select { padding:2px 6px; background:var(--surface2); border:1px solid var(--border); border-radius:3px; color:var(--text); font-size:12px; }
+
+/* Section divider within a tab */
+.section-divider { font-size:12px; text-transform:uppercase; letter-spacing:1px; color:var(--text-dim); padding:12px 0 8px; border-bottom:1px solid var(--border); margin:16px 0 8px; }
+
+.save-flash { position:fixed; bottom:24px; right:24px; padding:10px 20px; background:var(--green); color:#000; border-radius:6px; font-weight:600; opacity:0; transition:opacity .3s; pointer-events:none; z-index:100; }
+.save-flash.show { opacity:1; }
+
+/* History tables */
+table { width:100%; border-collapse:collapse; font-size:13px; }
+th { text-align:left; padding:8px 12px; border-bottom:2px solid var(--border); color:var(--text-dim); font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
+td { padding:8px 12px; border-bottom:1px solid var(--border); }
+tr:hover td { background:var(--surface2); }
+.empty-state { padding:40px; text-align:center; color:var(--text-dim); }
+
+.history-tabs { display:flex; gap:8px; margin-bottom:16px; }
+.history-tab { padding:6px 16px; border-radius:4px; cursor:pointer; font-size:13px; background:var(--surface2); border:1px solid var(--border); color:var(--text-dim); }
+.history-tab.active { background:var(--accent); border-color:var(--accent); color:#fff; }
+
+/* Map */
+.map-container { position:relative; background:var(--bg); border:1px solid var(--border); border-radius:8px; overflow:hidden; }
+.map-canvas { display:block; width:100%; cursor:grab; }
+.map-canvas:active { cursor:grabbing; }
+.map-controls { position:absolute; top:12px; right:12px; display:flex; flex-direction:column; gap:4px; z-index:10; }
+.map-controls button { width:32px; height:32px; border:1px solid var(--border); border-radius:4px; background:var(--surface); color:var(--text); font-size:16px; cursor:pointer; }
+.map-controls button:hover { background:var(--surface2); }
+.map-legend { display:flex; flex-wrap:wrap; gap:12px; padding:12px; font-size:12px; color:var(--text-dim); }
+.legend-item { display:flex; align-items:center; gap:4px; }
+.legend-dot { width:10px; height:10px; border-radius:50%; }
+.map-info { position:absolute; bottom:12px; left:12px; font-size:11px; color:var(--text-dim); background:rgba(15,17,23,.8); padding:4px 8px; border-radius:4px; }
+
+@media (max-width:768px) { .grid2{grid-template-columns:1fr} .main{padding:12px} }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>AutoExile</h1>
+  <div class="header-right">
+    <span id="wsStatus" class="connection-badge err">Connecting...</span>
+  </div>
+</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('dashboard')">Dashboard</div>
+  <div class="tab" onclick="switchTab('map')">Map</div>
+  <div class="tab" onclick="switchTab('settings')">Settings</div>
+  <div class="tab" onclick="switchTab('history')">History</div>
+</div>
+
+<!-- ==================== DASHBOARD ==================== -->
+<div id="tab-dashboard" class="tab-content active">
+<div class="main">
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+      <div class="bot-status">
+        <div id="statusDot" class="status-dot"></div>
+        <span id="botStatusText">Stopped</span>
+      </div>
+      <div class="controls">
+        <select id="modeSelect" class="mode-select">
+          <option>Idle</option><option>Mapping</option><option>Simulacrum</option>
+          <option>Blight</option><option>Heist</option><option>Follower</option>
+          <option>DebugPathfinding</option>
+        </select>
+        <button class="btn primary" onclick="sendCmd('start')">Start</button>
+        <button class="btn danger" onclick="sendCmd('stop')">Stop</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Minimap -->
+  <div class="card" style="padding:0;overflow:hidden;position:relative">
+    <canvas id="minimapCanvas" style="width:100%;height:280px;display:block;background:#0a0a0f"></canvas>
+    <div style="position:absolute;top:8px;right:8px;display:flex;gap:4px">
+      <button class="btn" style="padding:4px 10px;font-size:14px" onclick="minimapScale*=1.3;renderMinimap()">+</button>
+      <button class="btn" style="padding:4px 10px;font-size:14px" onclick="minimapScale*=0.77;renderMinimap()">-</button>
+    </div>
+    <div id="minimapInfo" style="position:absolute;bottom:6px;left:8px;font-size:10px;color:var(--text-dim);background:rgba(15,17,23,.7);padding:2px 6px;border-radius:3px">No terrain</div>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <h2>Player</h2>
+      <div id="areaName" style="font-size:13px;color:var(--text-dim);margin-bottom:12px">--</div>
+      <div class="bar-container"><div class="bar-label"><span>HP</span><span id="hpText">0%</span></div><div class="bar"><div id="hpBar" class="bar-fill hp" style="width:0%"></div></div></div>
+      <div class="bar-container"><div class="bar-label"><span>ES</span><span id="esText">0%</span></div><div class="bar"><div id="esBar" class="bar-fill es" style="width:0%"></div></div></div>
+      <div class="bar-container"><div class="bar-label"><span>Mana</span><span id="manaText">0%</span></div><div class="bar"><div id="manaBar" class="bar-fill mana" style="width:0%"></div></div></div>
+    </div>
+    <div class="card">
+      <h2>Combat & Navigation</h2>
+      <div class="status-grid">
+        <div class="stat"><div class="stat-label">In Combat</div><div id="inCombat" class="stat-value">--</div></div>
+        <div class="stat"><div class="stat-label">Monsters</div><div id="monsters" class="stat-value accent">0</div></div>
+        <div class="stat"><div class="stat-label">Target</div><div id="combatTarget" class="stat-value" style="font-size:14px">--</div></div>
+        <div class="stat"><div class="stat-label">Navigation</div><div id="navStatus" class="stat-value" style="font-size:14px">Idle</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Exploration</h2>
+      <div class="status-grid">
+        <div class="stat"><div class="stat-label">Coverage</div><div id="coverage" class="stat-value green">0%</div></div>
+        <div class="stat"><div class="stat-label">Regions</div><div id="regions" class="stat-value accent">0</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Loot Tracker</h2>
+      <div class="status-grid">
+        <div class="stat"><div class="stat-label">Session Chaos</div><div id="sessionChaos" class="stat-value yellow">0</div></div>
+        <div class="stat"><div class="stat-label">Chaos / Hour</div><div id="chaosPerHour" class="stat-value orange">0</div></div>
+        <div class="stat"><div class="stat-label">Items Looted</div><div id="itemsLooted" class="stat-value accent">0</div></div>
+        <div class="stat"><div class="stat-label">Maps Done</div><div id="mapsCompleted" class="stat-value accent">0</div></div>
+        <div class="stat"><div class="stat-label">Session Time</div><div id="sessionTime" class="stat-value" style="font-size:16px">--</div></div>
+        <div class="stat"><div class="stat-label">Loot Nearby</div><div id="lootNearby" class="stat-value accent">0</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Activity</h2>
+    <div id="logArea" class="log-area">Waiting for connection...</div>
+  </div>
+</div>
+</div>
+
+<!-- ==================== MAP ==================== -->
+<div id="tab-map" class="tab-content">
+<div class="main" style="max-width:none;padding:12px">
+  <div class="map-container" style="height:calc(100vh - 120px)">
+    <canvas id="mapCanvas" class="map-canvas"></canvas>
+    <div class="map-controls">
+      <button onclick="mapZoom(1.3)" title="Zoom in">+</button>
+      <button onclick="mapZoom(0.77)" title="Zoom out">-</button>
+      <button onclick="mapRecenter()" title="Center on player">P</button>
+    </div>
+    <div id="mapInfo" class="map-info">No terrain data</div>
+  </div>
+  <div class="map-legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#4ade80"></div> Player</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#f87171"></div> Monster</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#fbbf24"></div> Chest</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#60a5fa"></div> Portal</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#22d3ee"></div> Transition</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#c084fc"></div> Stash</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#fb923c"></div> Nav Path</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#1e3a5f;border:1px solid #3b82f6"></div> Jumpable Gap</div>
+  </div>
+</div>
+</div>
+
+<!-- ==================== SETTINGS ==================== -->
+<div id="tab-settings" class="tab-content">
+<div class="main">
+  <div class="settings-tabs">
+    <div class="settings-tab active" onclick="switchSettingsTab('build')">Build</div>
+    <div class="settings-tab" onclick="switchSettingsTab('loot')">Loot</div>
+    <div class="settings-tab" onclick="switchSettingsTab('modes')">Modes</div>
+    <div class="settings-tab" onclick="switchSettingsTab('mechanics')">Mechanics</div>
+    <div class="settings-tab" onclick="switchSettingsTab('advanced')">Advanced</div>
+  </div>
+  <div id="settingsContainer"><div class="empty-state">Loading settings...</div></div>
+</div>
+</div>
+
+<!-- ==================== HISTORY ==================== -->
+<div id="tab-history" class="tab-content">
+<div class="main">
+  <div class="history-tabs">
+    <div class="history-tab active" onclick="switchHistory('loot',this)">Loot Log</div>
+    <div class="history-tab" onclick="switchHistory('runs',this)">Run Sessions</div>
+    <div class="history-tab" onclick="switchHistory('events',this)">Events</div>
+  </div>
+  <div class="card">
+    <div id="historyContent"><div class="empty-state">Select a tab to view history</div></div>
+  </div>
+</div>
+</div>
+
+<div id="saveFlash" class="save-flash">Saved</div>
+
+<script>
+// ==================== TAB SWITCHING ====================
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach((t,i) => {
+    t.classList.toggle('active', t.textContent.toLowerCase().includes(name));
+  });
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+  document.getElementById('tab-'+name).classList.add('active');
+  if (name === 'settings' && !settingsLoaded) loadSettings();
+  if (name === 'history') loadHistory('loot');
+}
+
+// ==================== WEBSOCKET ====================
+let ws = null;
+let wsRetryTimer = null;
+let lastDecision = '', lastStatus = '';
+let logLines = [];
+const MAX_LOG = 50;
+
+function connectWs() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/api/ws`);
+  ws.onopen = () => {
+    document.getElementById('wsStatus').textContent = 'Live';
+    document.getElementById('wsStatus').className = 'connection-badge ok';
+  };
+  ws.onmessage = (e) => {
+    try { updateDashboard(JSON.parse(e.data)); } catch {}
+  };
+  ws.onclose = () => {
+    document.getElementById('wsStatus').textContent = 'Reconnecting...';
+    document.getElementById('wsStatus').className = 'connection-badge err';
+    wsRetryTimer = setTimeout(connectWs, 2000);
+  };
+  ws.onerror = () => ws.close();
+}
+
+// Fallback to polling if WebSocket fails
+let pollFallback = false;
+setTimeout(() => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    pollFallback = true;
+    setInterval(async () => {
+      try {
+        const r = await fetch('/api/status');
+        if (r.ok) { updateDashboard(await r.json()); setConnected(true); }
+        else setConnected(false);
+      } catch { setConnected(false); }
+    }, 500);
+  }
+}, 3000);
+
+function setConnected(ok) {
+  const b = document.getElementById('wsStatus');
+  b.textContent = ok ? 'Polling' : 'Disconnected';
+  b.className = 'connection-badge ' + (ok ? 'ok' : 'err');
+}
+
+connectWs();
+
+// ==================== DASHBOARD UPDATE ====================
+function updateDashboard(s) {
+  const dot = document.getElementById('statusDot');
+  const txt = document.getElementById('botStatusText');
+  if (!s.inGame) { dot.className='status-dot'; txt.textContent='Not In Game'; }
+  else if (s.running) { dot.className='status-dot running'; txt.textContent=`${s.mode}${s.phase?' - '+s.phase:''}`; }
+  else { dot.className='status-dot paused'; txt.textContent='Paused'; }
+
+  document.getElementById('areaName').textContent = s.area || '--';
+  setBar('hp',s.hpPercent); setBar('es',s.esPercent); setBar('mana',s.manaPercent);
+
+  const ce = document.getElementById('inCombat');
+  ce.textContent = s.inCombat ? 'FIGHTING' : 'Clear';
+  ce.className = 'stat-value ' + (s.inCombat ? 'red' : 'green');
+  document.getElementById('monsters').textContent = s.nearbyMonsters;
+  document.getElementById('combatTarget').textContent = s.combatTarget || '--';
+
+  const ne = document.getElementById('navStatus');
+  if (s.isNavigating) { ne.textContent=`${s.waypointIndex+1}/${s.waypointTotal}`; ne.className='stat-value accent'; }
+  else { ne.textContent='Idle'; ne.className='stat-value'; }
+
+  document.getElementById('coverage').textContent = (s.explorationCoverage*100).toFixed(1)+'%';
+  document.getElementById('regions').textContent = s.explorationRegions;
+  document.getElementById('sessionChaos').textContent = s.sessionChaos.toFixed(1);
+  document.getElementById('chaosPerHour').textContent = s.chaosPerHour.toFixed(1);
+  document.getElementById('itemsLooted').textContent = s.itemsLooted;
+  document.getElementById('mapsCompleted').textContent = s.mapsCompleted;
+  document.getElementById('sessionTime').textContent = s.sessionDuration || '--';
+  document.getElementById('lootNearby').textContent = s.lootCandidates;
+
+  const sel = document.getElementById('modeSelect');
+  if (!sel.matches(':focus')) { for(let o of sel.options) if(o.value===s.mode){sel.value=s.mode;break;} }
+
+  if (s.decision && s.decision !== lastDecision) { addLog('decision',s.decision); lastDecision=s.decision; }
+  if (s.status && s.status !== lastStatus) { addLog('status',s.status); lastStatus=s.status; }
+}
+
+function setBar(id,pct) { const p=Math.round(pct*100); document.getElementById(id+'Bar').style.width=p+'%'; document.getElementById(id+'Text').textContent=p+'%'; }
+
+function addLog(cls,text) {
+  const now = new Date().toLocaleTimeString();
+  logLines.push({cls,text,time:now});
+  if (logLines.length > MAX_LOG) logLines.shift();
+  const area = document.getElementById('logArea');
+  area.innerHTML = logLines.map(l=>`<div><span class="time">${l.time}</span> <span class="${l.cls}">${esc(l.text)}</span></div>`).join('');
+  area.scrollTop = area.scrollHeight;
+}
+
+function esc(t) { return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// ==================== COMMANDS ====================
+async function sendCmd(action, value) {
+  try { await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,value})}); } catch {}
+}
+document.getElementById('modeSelect').addEventListener('change', function(){sendCmd('setMode',this.value);});
+
+// ==================== SETTINGS ====================
+let settingsLoaded = false;
+let S = {}; // flat settings map: key → {value, type, min, max, options, label, description, readOnly}
+let activeSettingsTab = 'build';
+
+// Skill type definitions: what underlying settings each type uses
+const SKILL_TYPES = {
+  disabled: { label:'Disabled', role:'Disabled', fields:[] },
+  move:     { label:'Move Only', role:'PrimaryMovement', fields:[] },
+  attack:   { label:'Attack', role:'Enemy', fields:['priority','targetFilter','maxTargetRange','minCastIntervalMs'], defaults:{priority:8} },
+  blink:    { label:'Blink / Dash', role:'MovementSkill', fields:['canCrossTerrain'], defaults:{canCrossTerrain:true} },
+  curse:    { label:'Curse / Debuff', role:'Enemy', fields:['priority','minCastIntervalMs','buffDebuffName'], defaults:{priority:3, onlyWhenBuffMissing:true, minCastIntervalMs:5000} },
+  buff:     { label:'Buff', role:'Self', fields:['priority','buffDebuffName'], defaults:{priority:5, onlyWhenBuffMissing:true} },
+  guard:    { label:'Guard', role:'Self', fields:['priority'], defaults:{priority:7, onlyOnLowLife:true} },
+  vaal:     { label:'Vaal Skill', role:'Self', fields:['priority','minNearbyEnemies'], defaults:{priority:6, minNearbyEnemies:5} },
+  warcry:   { label:'Warcry', role:'Enemy', fields:['priority','minNearbyEnemies','minCastIntervalMs'], defaults:{priority:4, minNearbyEnemies:3} },
+  summon:   { label:'Summon / Minion', role:'Self', fields:['priority'], defaults:{priority:5, summonRecast:true} },
+  corpse:   { label:'Corpse Skill', role:'Corpse', fields:['priority','buffDebuffName'], defaults:{priority:5, onlyWhenBuffMissing:true} },
+  totem:    { label:'Totem', role:'Enemy', fields:['priority','maxTargetRange'], defaults:{priority:6} },
+  custom:   { label:'Custom', role:null, fields:['role','priority','canCrossTerrain','targetFilter','maxTargetRange','minNearbyEnemies','minCastIntervalMs','onlyWhenBuffMissing','buffDebuffName','onlyOnLowLife','summonRecast'], defaults:{} },
+};
+
+// Curse keywords for auto-detection
+const CURSE_NAMES = ['despair','flammability','conductivity','vulnerability','punishment','enfeeble',
+  'temporal_chains','elemental_weakness','poachers_mark','warlords_mark','assassins_mark',
+  'snipers_mark','projectile_weakness','frostbite'];
+const OFFERING_NAMES = ['flesh_offering','spirit_offering','bone_offering','blood_offering'];
+const GUARD_NAMES = ['molten_shell','steelskin','immortal_call','bone_armour','arcane_cloak','frost_shield'];
+const BLINK_NAMES = ['frostblink','flame_dash','dash','leap_slam','shield_charge','whirling_blades',
+  'lightning_warp','blink_arrow','flicker_strike','smoke_mine','bodyswap','charged_dash'];
+
+function autoClassifySkill(d) {
+  const n = (d.internalName || '').toLowerCase();
+  if (d.skillName === 'Move' || n === '') return 'move';
+  if (BLINK_NAMES.some(b => n.includes(b))) return 'blink';
+  if (d.isVaalSkill) return 'vaal';
+  if (d.isCry) return 'warcry';
+  if (d.isTotem) return 'totem';
+  if (d.isTrap) return 'custom'; // traps are niche
+  if (d.isMine) return 'custom';
+  if (CURSE_NAMES.some(c => n.includes(c))) return 'curse';
+  if (OFFERING_NAMES.some(o => n.includes(o))) return 'corpse';
+  if (GUARD_NAMES.some(g => n.includes(g))) return 'guard';
+  if (d.deployedCount > 0 || n.includes('summon') || n.includes('raise') || n.includes('animate')) return 'summon';
+  if (d.isAttack) return 'attack';
+  if (d.isSpell) return 'attack'; // default spell = attack-type (target enemies)
+  return 'attack';
+}
+
+// Determine type from existing config (reverse-map Role+conditions → type)
+function typeFromConfig(prefix) {
+  const role = S[prefix+'.role']?.value || 'Disabled';
+  if (role === 'Disabled') return null; // no config → auto-detect
+  if (role === 'PrimaryMovement') return 'move';
+  if (role === 'MovementSkill') return 'blink';
+  if (role === 'Corpse') return 'corpse';
+  if (role === 'Enemy') {
+    if (S[prefix+'.onlyWhenBuffMissing']?.value) return 'curse';
+    return 'attack';
+  }
+  if (role === 'Self') {
+    if (S[prefix+'.onlyOnLowLife']?.value) return 'guard';
+    if (S[prefix+'.summonRecast']?.value) return 'summon';
+    if (S[prefix+'.onlyWhenBuffMissing']?.value) return 'buff';
+    // Check if vaal by detected data
+    return 'buff';
+  }
+  return 'custom';
+}
+
+const HEIST_REWARDS = [
+  ['heist.rewardCurrency','Currency'], ['heist.rewardArmour','Armour'],
+  ['heist.rewardWeapons','Weapons'], ['heist.rewardGems','Gems'],
+  ['heist.rewardDivinationCards','Div Cards'], ['heist.rewardUniques','Uniques'],
+  ['heist.rewardJewellery','Jewellery'], ['heist.rewardEssences','Essences'],
+  ['heist.rewardFragments','Fragments'], ['heist.rewardMaps','Maps'],
+  ['heist.rewardJewels','Jewels'], ['heist.rewardCorrupted','Corrupted'],
+];
+
+const TOWER_TYPES = ['chilling','fireball','empowering','seismic','minion','shockNova'];
+
+function switchSettingsTab(name) {
+  activeSettingsTab = name;
+  document.querySelectorAll('.settings-tab').forEach(t => t.classList.toggle('active', t.textContent.toLowerCase() === name));
+  document.querySelectorAll('.settings-tab-content').forEach(c => c.classList.remove('active'));
+  const el = document.getElementById('stab-'+name);
+  if (el) el.classList.add('active');
+}
+
+async function loadSettings() {
+  try {
+    const r = await fetch('/api/settings');
+    S = await r.json();
+    renderAllSettings();
+    settingsLoaded = true;
+  } catch(e) {
+    document.getElementById('settingsContainer').innerHTML = `<div class="empty-state">Failed to load: ${e.message}</div>`;
+  }
+}
+
+function renderAllSettings() {
+  const c = document.getElementById('settingsContainer');
+  c.innerHTML = '';
+
+  // Build tab
+  const build = makeTabContent('build', true);
+  addSection(build, 'Movement', [['build.blinkRange'],['build.dashMinDistance','0 = disable dash-for-speed']]);
+  addSection(build, 'Combat', [['build.defaultPositioning'],['build.fightRange'],['build.combatRange'],
+    ['build.guardHpThreshold'],['build.guardEsThreshold'],['build.vaalMinMonsters'],['build.summonExpectedCount']]);
+  build.appendChild(renderSkillsSection());
+  addSection(build, 'Flasks', [['build.flasksEnabled'],['build.lifeFlaskSlot','0 = disabled'],['build.lifeFlaskHpThreshold'],
+    ['build.manaFlaskSlot','0 = disabled'],['build.manaFlaskManaThreshold'],['build.utilityFlaskIntervalMs']]);
+  c.appendChild(build);
+
+  // Loot tab
+  const loot = makeTabContent('loot');
+  addSection(loot, 'Unique Filtering', [['loot.skipLowValueUniques'],
+    {key:'loot.minUniqueChaosValue', showIf:'loot.skipLowValueUniques'},
+    {key:'loot.minChaosPerSlot', note:'0 = disabled'}]);
+  addSection(loot, 'Cluster Jewels', [['loot.filterClusterJewels'],
+    {key:'loot.minClusterJewelChaosValue', showIf:'loot.filterClusterJewels'}]);
+  addSection(loot, 'Skill Gems', [['loot.filterSkillGems'],
+    {key:'loot.minGemChaosValue', showIf:'loot.filterSkillGems'},
+    {key:'loot.alwaysLoot20QualityGems', showIf:'loot.filterSkillGems'}]);
+  addSection(loot, 'Synthesised Items', [['loot.filterSynthesisedItems'],
+    {key:'loot.synthesisedWhitelist', showIf:'loot.filterSynthesisedItems'}]);
+  addSection(loot, 'Other', [['loot.ignoreQuestItems'],['loot.stashItemCooldownMs']]);
+  c.appendChild(loot);
+
+  // Modes tab
+  const modes = makeTabContent('modes');
+  addSection(modes, 'Simulacrum', [['simulacrum.maxDeaths'],['simulacrum.minWaveDelaySeconds'],
+    ['simulacrum.waveTimeoutMinutes'],['simulacrum.stashItemThreshold']]);
+  addSection(modes, 'Follower', [['follower.leaderName'],['follower.followDistance'],['follower.stopDistance'],
+    ['follower.followThroughTransitions'],['follower.enableCombat'],['follower.enableLoot'],['follower.lootNearLeaderOnly']]);
+
+  // Heist with reward checklist
+  const heistDiv = document.createElement('div');
+  const heistTitle = document.createElement('div'); heistTitle.className='section-divider'; heistTitle.textContent='Heist'; heistDiv.appendChild(heistTitle);
+  addFieldsTo(heistDiv, [['heist.alertThreshold'],['heist.maxChestDetour'],['heist.openRewardChests'],
+    ['heist.companionWaitTimeout'],['heist.companionRetryDelay']]);
+  // Reward checklist
+  const rewardLabel = document.createElement('div'); rewardLabel.className='section-divider'; rewardLabel.textContent='Reward Types'; heistDiv.appendChild(rewardLabel);
+  const grid = document.createElement('div'); grid.className='check-grid';
+  for (const [key, label] of HEIST_REWARDS) {
+    const entry = S[key]; if (!entry) continue;
+    const item = document.createElement('div'); item.className='check-item';
+    item.innerHTML = `<input type="checkbox" ${entry.value?'checked':''} onchange="updateSetting('${key}',this.checked)"><label>${esc(label)}</label>`;
+    grid.appendChild(item);
+  }
+  heistDiv.appendChild(grid);
+  modes.appendChild(heistDiv);
+
+  // Blight with tower table
+  const blightDiv = document.createElement('div');
+  const blightTitle = document.createElement('div'); blightTitle.className='section-divider'; blightTitle.textContent='Blight'; blightDiv.appendChild(blightTitle);
+  addFieldsTo(blightDiv, [['blight.ignoreCurrency'],['blight.towerBuildRadius'],['blight.towerBuildCooldownMs'],
+    ['blight.towerClickCooldownMs'],['blight.towerApproachDistance'],
+    ['blight.sweepDelayAfterTimerSeconds'],['blight.sweepTimeoutSeconds'],
+    ['blight.sweepPumpReturnSeconds'],['blight.sweepPumpRadius']]);
+  // Tower config table
+  const towerLabel = document.createElement('div'); towerLabel.className='section-divider'; towerLabel.textContent='Tower Priorities'; blightDiv.appendChild(towerLabel);
+  blightDiv.appendChild(renderTowerTable());
+  modes.appendChild(blightDiv);
+  c.appendChild(modes);
+
+  // Mechanics tab
+  const mech = makeTabContent('mechanics');
+  addSection(mech, 'Interactables', [
+    ['mechanics.interactables.shrines'],['mechanics.interactables.strongboxes'],
+    ['mechanics.interactables.djinnCaches'],['mechanics.interactables.heistCaches'],
+    ['mechanics.interactables.craftingRecipes']]);
+  addSection(mech, 'Ultimatum', [['mechanics.ultimatum.mode'],
+    ['mechanics.ultimatum.doSurvive'],['mechanics.ultimatum.doKillEnemies'],
+    ['mechanics.ultimatum.doDefendAltar'],['mechanics.ultimatum.doStandInCircles'],
+    ['mechanics.ultimatum.maxWaves'],['mechanics.ultimatum.dangerThreshold'],
+    ['mechanics.ultimatum.minSecureValue'],['mechanics.ultimatum.orbitRadius']]);
+  addSection(mech, 'Harvest', [['mechanics.harvest.mode'],['mechanics.harvest.preferredColour'],
+    ['mechanics.harvest.colourPreferenceBonus'],['mechanics.harvest.normalWeight'],
+    ['mechanics.harvest.magicWeight'],['mechanics.harvest.rareWeight'],
+    ['mechanics.harvest.wildMultiplier'],['mechanics.harvest.vividMultiplier'],
+    ['mechanics.harvest.primalMultiplier'],['mechanics.harvest.lootSweepSeconds']]);
+  addSection(mech, 'Wishes', [['mechanics.wishes.mode'],['mechanics.wishes.preferredWish'],
+    ['mechanics.wishes.lootSweepSeconds']]);
+  addSection(mech, 'Essence', [['mechanics.essence.mode'],['mechanics.essence.minEssenceTier'],
+    ['mechanics.essence.corruptEssences'],['mechanics.essence.lootSweepSeconds']]);
+  c.appendChild(mech);
+
+  // Advanced tab
+  const adv = makeTabContent('advanced');
+  addSection(adv, 'General', [['actionCooldownMs'],['interactRadius'],['autoLevelGems'],['autoApplyIncubators']]);
+  addSection(adv, 'Threat Detection', [['threat.enabled'],['threat.monitorRares'],['threat.autoDodge'],
+    ['threat.threatRadius'],['threat.dodgeTriggerDistance'],['threat.dodgeDistance'],
+    ['threat.dodgeMinProgress'],['threat.dodgeMaxProgress'],['threat.dodgeCooldownMs']]);
+  addSection(adv, 'Web UI', [['webUiEnabled'],['webUiPort']]);
+  addSection(adv, 'Hotkeys', [['toggleRunning'],['testMapExplore'],['dumpGameState'],['dumpRecording']]);
+  c.appendChild(adv);
+
+  switchSettingsTab(activeSettingsTab);
+}
+
+function makeTabContent(id, active) {
+  const d = document.createElement('div');
+  d.id = 'stab-'+id;
+  d.className = 'settings-tab-content' + (active ? ' active' : '');
+  return d;
+}
+
+function addSection(parent, title, fieldDefs) {
+  const div = document.createElement('div');
+  const titleEl = document.createElement('div'); titleEl.className='section-divider'; titleEl.textContent=title;
+  div.appendChild(titleEl);
+  addFieldsTo(div, fieldDefs);
+  parent.appendChild(div);
+}
+
+function addFieldsTo(parent, fieldDefs) {
+  for (const f of fieldDefs) {
+    const fd = Array.isArray(f) ? {key:f[0], note:f[1]} : f;
+    const entry = S[fd.key]; if (!entry) continue;
+    const row = buildField(fd.key, entry, fd.note);
+    if (fd.showIf) {
+      const dep = S[fd.showIf]; row.style.display = dep && dep.value ? '' : 'none';
+      row.dataset.showIf = fd.showIf;
+    }
+    parent.appendChild(row);
+  }
+}
+
+// Game slot display — we show whatever slots the game reports
+// No hardcoded order; we render from detectedSkillBar sorted by slot index
+
+let detectedSkillBar = []; // populated from WebSocket
+
+function findConfigSlotForKey(keyName) {
+  // Find which build.skill{N} has this key
+  for (let i = 1; i <= 6; i++) {
+    const ke = S[`build.skill${i}.key`];
+    if (ke && ke.value === keyName) return i;
+  }
+  return null;
+}
+
+function renderSkillsSection() {
+  const wrap = document.createElement('div');
+  const title = document.createElement('div'); title.className='section-divider'; title.textContent='Skill Bar'; wrap.appendChild(title);
+
+  if (detectedSkillBar.length > 0) {
+    for (const detected of detectedSkillBar) {
+      const configIdx = findConfigSlotForKey(detected.key);
+      const prefix = configIdx ? `build.skill${configIdx}` : null;
+
+      // Determine type: from existing config, or auto-detect
+      let skillType = prefix ? typeFromConfig(prefix) : null;
+      if (!skillType) skillType = autoClassifySkill(detected);
+      // If vaal flag but type wasn't set from config, override
+      if (detected.isVaalSkill && skillType === 'attack') skillType = 'vaal';
+
+      const typeDef = SKILL_TYPES[skillType] || SKILL_TYPES.disabled;
+
+      const slot = document.createElement('div'); slot.className='subgroup';
+      if (configIdx) slot.id = `skill-slot-${configIdx}`;
+
+      // Header: [Q] SkillName — Type badge
+      const header = document.createElement('h4');
+      header.style.cssText = 'display:flex;justify-content:space-between;align-items:center';
+      const typeColor = skillType === 'disabled' ? 'var(--text-dim)' : 'var(--accent)';
+      header.innerHTML = `<span><span class="hotkey-badge" style="margin-right:8px">${esc(detected.key)}</span><span style="color:var(--text)">${esc(detected.skillName)}</span></span><span style="color:${typeColor};font-size:12px">${esc(typeDef.label)}</span>`;
+
+      const body = document.createElement('div');
+      body.style.display = 'none';
+      header.onclick = () => { body.style.display = body.style.display === 'none' ? 'block' : 'none'; };
+
+      if (prefix) {
+        // Type selector
+        const typeRow = document.createElement('div'); typeRow.className = 'setting-row';
+        const typeOpts = Object.entries(SKILL_TYPES).map(([k,v]) => `<option value="${k}" ${k===skillType?'selected':''}>${esc(v.label)}</option>`).join('');
+        typeRow.innerHTML = `<div class="setting-info"><span class="setting-label">Skill Type</span><span class="setting-desc">How the bot should use this skill</span></div><div class="setting-control"><select onchange="changeSkillType('${prefix}',this.value,${configIdx})">${typeOpts}</select></div>`;
+        body.appendChild(typeRow);
+
+        // Type-specific fields
+        const fieldsContainer = document.createElement('div');
+        fieldsContainer.id = `skill-fields-${configIdx}`;
+        renderSkillFields(fieldsContainer, prefix, skillType, configIdx);
+        body.appendChild(fieldsContainer);
+      } else {
+        body.innerHTML = `<div style="padding:8px;color:var(--text-dim);font-size:13px">No config slot has key "${esc(detected.key)}". Assign key "${esc(detected.key)}" to one of the Skill 1-6 slots to configure.</div>`;
+      }
+
+      slot.appendChild(header); slot.appendChild(body); wrap.appendChild(slot);
+    }
+  } else {
+    // Fallback: no game data
+    const desc = document.createElement('div');
+    desc.style.cssText = 'font-size:12px;color:var(--text-dim);margin-bottom:12px';
+    desc.textContent = 'Not in game — skills auto-detect when connected. Configure key bindings below.';
+    wrap.appendChild(desc);
+
+    for (let i = 1; i <= 6; i++) {
+      const prefix = `build.skill${i}`;
+      const roleEntry = S[`${prefix}.role`]; if (!roleEntry) continue;
+      const role = roleEntry.value || 'Disabled';
+      const keyEntry = S[`${prefix}.key`];
+      const keyName = keyEntry ? keyEntry.value : '?';
+
+      const slot = document.createElement('div'); slot.className='subgroup'; slot.id=`skill-slot-${i}`;
+      const header = document.createElement('h4');
+      header.style.cssText = 'display:flex;justify-content:space-between';
+      header.innerHTML = `<span>Slot ${i}</span><span style="font-weight:400;color:var(--text-dim)">${esc(keyName)} — ${esc(role)}</span>`;
+      const body = document.createElement('div');
+      body.style.display = (role === 'Disabled' && keyName === 'None') ? 'none' : 'block';
+      header.onclick = () => { body.style.display = body.style.display === 'none' ? 'block' : 'none'; };
+
+      // Show key + type selector + all fields for offline mode
+      const keyRow = buildField(`${prefix}.key`, S[`${prefix}.key`]);
+      body.appendChild(keyRow);
+      const roleRow = buildField(`${prefix}.role`, S[`${prefix}.role`]);
+      body.appendChild(roleRow);
+      const allFields = ['priority','canCrossTerrain','targetFilter','maxTargetRange','minNearbyEnemies',
+        'minCastIntervalMs','onlyWhenBuffMissing','buffDebuffName','onlyOnLowLife','summonRecast'];
+      for (const f of allFields) {
+        const entry = S[`${prefix}.${f}`]; if (!entry) continue;
+        body.appendChild(buildField(`${prefix}.${f}`, entry));
+      }
+      slot.appendChild(header); slot.appendChild(body); wrap.appendChild(slot);
+    }
+  }
+  return wrap;
+}
+
+function renderSkillFields(container, prefix, skillType, configIdx) {
+  container.innerHTML = '';
+  const typeDef = SKILL_TYPES[skillType];
+  if (!typeDef || typeDef.fields.length === 0) return;
+
+  for (const fieldKey of typeDef.fields) {
+    const fullKey = `${prefix}.${fieldKey}`;
+    const entry = S[fullKey]; if (!entry) continue;
+    const row = buildField(fullKey, entry);
+    container.appendChild(row);
+  }
+}
+
+function changeSkillType(prefix, newType, configIdx) {
+  const typeDef = SKILL_TYPES[newType];
+  if (!typeDef) return;
+
+  // Apply the role mapping
+  if (typeDef.role !== null) {
+    updateSetting(`${prefix}.role`, typeDef.role);
+  }
+
+  // Reset all condition fields to safe defaults, then apply type defaults
+  const resets = {
+    priority: 5, canCrossTerrain: false, onlyWhenBuffMissing: false,
+    onlyOnLowLife: false, summonRecast: false, minNearbyEnemies: 0,
+    minCastIntervalMs: 0, maxTargetRange: 0,
+  };
+  for (const [k, v] of Object.entries(resets)) {
+    if (S[`${prefix}.${k}`]) updateSetting(`${prefix}.${k}`, v);
+  }
+
+  // Apply type-specific defaults
+  if (typeDef.defaults) {
+    for (const [k, v] of Object.entries(typeDef.defaults)) {
+      if (S[`${prefix}.${k}`]) updateSetting(`${prefix}.${k}`, v);
+    }
+  }
+
+  // Re-render the fields for this type
+  const container = document.getElementById(`skill-fields-${configIdx}`);
+  if (container) renderSkillFields(container, prefix, newType, configIdx);
+
+  // Update the header type label
+  const slot = document.getElementById(`skill-slot-${configIdx}`);
+  if (slot) {
+    const typeSpan = slot.querySelector('h4 > span:last-child');
+    if (typeSpan) {
+      typeSpan.textContent = typeDef.label;
+      typeSpan.style.color = newType === 'disabled' ? 'var(--text-dim)' : 'var(--accent)';
+    }
+  }
+}
+
+function renderTowerTable() {
+  const table = document.createElement('table'); table.className='tower-table';
+  table.innerHTML = '<thead><tr><th>Tower</th><th>Priority</th><th>Stack</th><th>Nearby Req</th><th>Tier 3</th></tr></thead>';
+  const tbody = document.createElement('tbody');
+  for (const t of TOWER_TYPES) {
+    const pKey = `blight.${t}.priority`, sKey = `blight.${t}.canStack`, nKey = `blight.${t}.requiresNearbyTower`, bKey = `blight.${t}.tier3Branch`;
+    const p = S[pKey], s = S[sKey], n = S[nKey], b = S[bKey];
+    if (!p) continue;
+    const name = t.charAt(0).toUpperCase() + t.slice(1);
+    const tr = document.createElement('tr');
+    const branchOpts = (b?.options||['None','Left','Right']).map(o => `<option value="${o}" ${o===b?.value?'selected':''}>${o}</option>`).join('');
+    tr.innerHTML = `<td>${name}</td>
+      <td><div class="range-control" style="justify-content:center"><input type="range" class="range-slider" style="width:60px" min="0" max="5" value="${p.value}" oninput="this.nextElementSibling.textContent=this.value;updateSetting('${pKey}',parseInt(this.value))"><span class="range-suffix" style="min-width:12px">${p.value}</span></div></td>
+      <td><input type="checkbox" ${s?.value?'checked':''} onchange="updateSetting('${sKey}',this.checked)" style="accent-color:var(--accent);width:16px;height:16px"></td>
+      <td><input type="checkbox" ${n?.value?'checked':''} onchange="updateSetting('${nKey}',this.checked)" style="accent-color:var(--accent);width:16px;height:16px"></td>
+      <td><select onchange="updateSetting('${bKey}',this.value)">${branchOpts}</select></td>`;
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  return table;
+}
+
+function buildField(key, entry, note) {
+  const row = document.createElement('div'); row.className='setting-row'; row.dataset.key=key;
+  let input = '';
+  switch(entry.type) {
+    case 'toggle':
+      input = `<label class="switch"><input type="checkbox" ${entry.value?'checked':''} onchange="updateSetting('${key}',this.checked)"><span class="slider"></span></label>`;
+      break;
+    case 'range_int': {
+      const v=entry.value, mn=entry.min, mx=entry.max;
+      input = `<div class="range-control"><input type="range" class="range-slider" min="${mn}" max="${mx}" step="1" value="${v}" oninput="this.parentNode.querySelector('.range-number').value=this.value" onchange="updateSetting('${key}',parseInt(this.value))"><input type="number" class="range-number" min="${mn}" max="${mx}" step="1" value="${v}" oninput="this.parentNode.querySelector('.range-slider').value=this.value" onchange="updateSetting('${key}',parseInt(this.value))"></div>`;
+      break;
+    }
+    case 'range_float': {
+      const v=entry.value, mn=entry.min, mx=entry.max;
+      const step = (mx-mn) <= 2 ? '0.01' : '0.1';
+      input = `<div class="range-control"><input type="range" class="range-slider" min="${mn}" max="${mx}" step="${step}" value="${v}" oninput="this.parentNode.querySelector('.range-number').value=parseFloat(this.value).toFixed(2)" onchange="updateSetting('${key}',parseFloat(this.value))"><input type="number" class="range-number" min="${mn}" max="${mx}" step="${step}" value="${v}" oninput="this.parentNode.querySelector('.range-slider').value=this.value" onchange="updateSetting('${key}',parseFloat(this.value))"></div>`;
+      break;
+    }
+    case 'list': {
+      const opts = (entry.options||[]).map(o=>`<option value="${esc(o)}" ${o===entry.value?'selected':''}>${esc(o)}</option>`).join('');
+      input = opts ? `<select onchange="updateSetting('${key}',this.value)">${opts}</select>`
+        : `<input type="text" value="${esc(entry.value||'')}" onchange="updateSetting('${key}',this.value)">`;
+      break;
+    }
+    case 'text':
+      input = `<input type="text" value="${esc(entry.value||'')}" onchange="updateSetting('${key}',this.value)">`;
+      break;
+    case 'hotkey':
+      input = `<span class="hotkey-badge">${esc(entry.value||'')}</span>`;
+      break;
+    default:
+      input = `<span class="hotkey-badge">${esc(String(entry.value||''))}</span>`;
+  }
+  const desc = entry.description ? `<span class="setting-desc">${esc(entry.description)}</span>` : '';
+  const noteHtml = note ? `<span class="setting-desc" style="color:var(--accent)">${esc(note)}</span>` : '';
+  row.innerHTML = `<div class="setting-info"><span class="setting-label">${esc(entry.label)}</span>${desc}${noteHtml}</div><div class="setting-control">${input}</div>`;
+  return row;
+}
+
+async function updateSetting(key, value) {
+  if (S[key]) S[key].value = value;
+  try {
+    const r = await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key,value})});
+    const data = await r.json();
+    if (data.ok) { flashSave(); handleVisibilityUpdate(key, value); }
+    else console.error('Setting error:', data.error);
+  } catch(e) { console.error('Setting failed:', e); }
+}
+
+function handleVisibilityUpdate(key, val) {
+  // Toggle-dependent fields (loot filters etc.)
+  document.querySelectorAll(`[data-show-if="${key}"]`).forEach(el => { el.style.display = val ? '' : 'none'; });
+}
+
+function flashSave() {
+  const el = document.getElementById('saveFlash');
+  el.classList.add('show');
+  setTimeout(()=>el.classList.remove('show'), 1500);
+}
+
+// ==================== HISTORY ====================
+async function switchHistory(type, el) {
+  document.querySelectorAll('.history-tab').forEach(t=>t.classList.remove('active'));
+  if(el) el.classList.add('active');
+  await loadHistory(type);
+}
+
+async function loadHistory(type) {
+  const container = document.getElementById('historyContent');
+  try {
+    const r = await fetch(`/api/history/${type}?limit=100`);
+    const data = await r.json();
+    if (!data || data.length === 0) { container.innerHTML = '<div class="empty-state">No data yet</div>'; return; }
+
+    switch(type) {
+      case 'loot': renderLootTable(data); break;
+      case 'runs': renderRunsTable(data); break;
+      case 'events': renderEventsTable(data); break;
+    }
+  } catch(e) { container.innerHTML = `<div class="empty-state">Error: ${e.message}</div>`; }
+}
+
+function renderLootTable(data) {
+  let html = '<table><thead><tr><th>Time</th><th>Item</th><th>Value</th><th>Area</th><th>Mode</th></tr></thead><tbody>';
+  for (const r of data) {
+    const t = new Date(r.time).toLocaleString();
+    const v = r.chaosValue > 0 ? `${r.chaosValue.toFixed(1)}c` : '-';
+    html += `<tr><td>${esc(t)}</td><td>${esc(r.itemName)}</td><td class="yellow">${v}</td><td>${esc(r.area||'')}</td><td>${esc(r.mode||'')}</td></tr>`;
+  }
+  html += '</tbody></table>';
+  document.getElementById('historyContent').innerHTML = html;
+}
+
+function renderRunsTable(data) {
+  let html = '<table><thead><tr><th>Start</th><th>Mode</th><th>Area</th><th>Duration</th><th>Wave</th><th>Deaths</th><th>Chaos</th><th>Items</th><th>Result</th></tr></thead><tbody>';
+  for (const r of data) {
+    const start = new Date(r.startTime).toLocaleString();
+    let dur = '-';
+    if (r.endTime) {
+      const ms = new Date(r.endTime) - new Date(r.startTime);
+      const mins = Math.floor(ms/60000);
+      const secs = Math.floor((ms%60000)/1000);
+      dur = `${mins}m ${secs}s`;
+    }
+    const result = r.completed ? '<span class="green">Done</span>' : (r.endTime ? '<span class="red">Abandoned</span>' : '<span class="yellow">Active</span>');
+    html += `<tr><td>${esc(start)}</td><td>${esc(r.mode)}</td><td>${esc(r.area||'')}</td><td>${dur}</td><td>${r.highestWave||'-'}</td><td>${r.deaths}</td><td class="yellow">${r.totalChaos.toFixed(1)}c</td><td>${r.itemsLooted}</td><td>${result}</td></tr>`;
+  }
+  html += '</tbody></table>';
+  document.getElementById('historyContent').innerHTML = html;
+}
+
+function renderEventsTable(data) {
+  let html = '<table><thead><tr><th>Time</th><th>Type</th><th>Message</th></tr></thead><tbody>';
+  for (const r of data) {
+    const t = new Date(r.time).toLocaleString();
+    html += `<tr><td>${esc(t)}</td><td>${esc(r.type)}</td><td>${esc(r.message)}</td></tr>`;
+  }
+  html += '</tbody></table>';
+  document.getElementById('historyContent').innerHTML = html;
+}
+
+// ==================== MAP ENGINE ====================
+// Isometric projection matching PoE's camera (from Radar plugin)
+const CAM_ANGLE = 38.7 * Math.PI / 180;
+const CAM_COS = Math.cos(CAM_ANGLE);
+const CAM_SIN = Math.sin(CAM_ANGLE);
+
+let mapTerrain = null;       // {width, height, originX, originY, areaHash}
+let mapTerrainCanvas = null;  // offscreen canvas with rendered terrain
+let mapLastAreaHash = 0;
+let mapLastStatus = null;
+let mapActive = false;
+
+// Full map state
+let mapScale = 2.5;
+let mapPanX = 0, mapPanY = 0; // pan offset in screen pixels from player-center
+let mapDragging = false, mapDragLastX = 0, mapDragLastY = 0;
+
+// Minimap state
+let minimapScale = 1.2;
+
+// Terrain cell colors: bits 0-2 = terrain(0-6), bit 3 = explored
+const TC = {
+  0:[10,10,15],  1:[25,28,35],  2:[30,33,42],  3:[35,38,48],
+  4:[40,44,55],  5:[45,50,62],  6:[15,30,50],
+  8:[10,10,15],  9:[50,55,70], 10:[60,65,80], 11:[70,76,92],
+  12:[82,88,105],13:[95,102,120],14:[30,58,95],
+};
+
+// Grid delta → isometric screen delta (matches PoE minimap)
+function isoX(dx, dy) { return (dx - dy) * CAM_COS; }
+function isoY(dx, dy) { return -(dx + dy) * CAM_SIN; }
+
+async function loadTerrain() {
+  try {
+    const r = await fetch('/api/map/terrain');
+    const d = await r.json();
+    if (d.error) return;
+
+    const raw = atob(d.data);
+    const w = d.width, h = d.height;
+
+    mapTerrainCanvas = document.createElement('canvas');
+    mapTerrainCanvas.width = w;
+    mapTerrainCanvas.height = h;
+    const tctx = mapTerrainCanvas.getContext('2d');
+    const imgData = tctx.createImageData(w, h);
+
+    for (let i = 0; i < raw.length; i++) {
+      const c = TC[raw.charCodeAt(i)] || TC[0];
+      imgData.data[i*4]=c[0]; imgData.data[i*4+1]=c[1]; imgData.data[i*4+2]=c[2]; imgData.data[i*4+3]=255;
+    }
+    tctx.putImageData(imgData, 0, 0);
+
+    mapTerrain = { width: w, height: h, originX: d.originX, originY: d.originY, areaHash: d.areaHash };
+    mapLastAreaHash = d.areaHash;
+    mapPanX = 0; mapPanY = 0;
+  } catch(e) { console.error('Terrain load failed:', e); }
+}
+
+// ---- Shared isometric map renderer ----
+function drawIsoMap(canvas, scale, panX, panY, showBubble, infoEl) {
+  const ctx = canvas.getContext('2d');
+  const cw = canvas.clientWidth, ch = canvas.clientHeight;
+  if (cw === 0 || ch === 0) return;
+  canvas.width = cw; canvas.height = ch;
+
+  ctx.fillStyle = '#0a0a0f';
+  ctx.fillRect(0, 0, cw, ch);
+
+  if (!mapTerrainCanvas || !mapTerrain || !mapLastStatus) return;
+  const s = mapLastStatus;
+  const ox = mapTerrain.originX, oy = mapTerrain.originY;
+  // Player position in terrain-pixel coords
+  const ptx = s.playerGridX - ox, pty = s.playerGridY - oy;
+
+  ctx.save();
+  // 1. Move origin to canvas center + pan offset
+  ctx.translate(cw/2 + panX, ch/2 + panY);
+  // 2. Scale
+  ctx.scale(scale, scale);
+
+  // Draw terrain: for each pixel in the terrain image, project to iso coords
+  // Optimization: draw the terrain image using a 2D affine transform
+  // The iso transform for a point (tx, ty) in terrain-pixel space (relative to player):
+  //   screenX = isoX(tx - ptx, ty - pty)
+  //   screenY = isoY(tx - ptx, ty - pty)
+  // This is a linear transform: we can express it as a canvas setTransform
+  ctx.save();
+  // Affine: for terrain pixel (tx, ty), iso position relative to player is:
+  //   sx = (tx-ptx)*CAM_COS - (ty-pty)*CAM_COS = CAM_COS*(tx-ptx) + (-CAM_COS)*(ty-pty)
+  //   sy = -(tx-ptx)*CAM_SIN - (ty-pty)*CAM_SIN = (-CAM_SIN)*(tx-ptx) + (-CAM_SIN)*(ty-pty)
+  // setTransform(a, b, c, d, e, f) maps (x,y) to (a*x+c*y+e, b*x+d*y+f)
+  // We want to map terrain pixel (tx, ty) → (CAM_COS*(tx-ptx) - CAM_COS*(ty-pty), -CAM_SIN*(tx-ptx) - CAM_SIN*(ty-pty))
+  // = (CAM_COS*tx - CAM_COS*ty - CAM_COS*ptx + CAM_COS*pty, ...)
+  // setTransform(CAM_COS, -CAM_SIN, -CAM_COS, -CAM_SIN, -CAM_COS*(ptx-pty-...), ...)
+  // Simpler: translate to -ptx,-pty first, then apply iso matrix
+  ctx.transform(CAM_COS, -CAM_SIN, -CAM_COS, -CAM_SIN, 0, 0);
+  ctx.translate(-ptx, -pty);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(mapTerrainCanvas, 0, 0);
+  ctx.restore();
+
+  // Helper: grid coords to iso coords (relative to canvas center, pre-scaled)
+  function toIso(gx, gy) {
+    const dx = gx - s.playerGridX, dy = gy - s.playerGridY;
+    return [isoX(dx, dy), isoY(dx, dy)];
+  }
+
+  // Navigation path
+  if (s.navPath && s.navPath.length > 1) {
+    ctx.lineWidth = 2/scale;
+    for (let i = 0; i < s.navPath.length - 1; i++) {
+      const [x1,y1] = toIso(s.navPath[i][0], s.navPath[i][1]);
+      const [x2,y2] = toIso(s.navPath[i+1][0], s.navPath[i+1][1]);
+      const isBlink = s.navPath[i+1][2] > 0;
+      ctx.strokeStyle = isBlink ? '#e879f9' : '#fb923c';
+      ctx.setLineDash(isBlink ? [4/scale,4/scale] : []);
+      ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+    }
+    ctx.setLineDash([]);
+  }
+
+  // Entities
+  if (s.entities) {
+    for (const e of s.entities) {
+      const [ex, ey] = toIso(e.x, e.y);
+      let color, sz;
+      switch(e.t) {
+        case 'm':
+          sz = e.r==='u'?5:e.r==='r'?4:e.r==='m'?3:2;
+          color = e.r==='u'?'#c084fc':e.r==='r'?'#fbbf24':e.r==='m'?'#60a5fa':'#f87171';
+          break;
+        case 'c': color='#fbbf24'; sz=3; break;
+        case 'a': color='#22d3ee'; sz=4; break;
+        case 'o': color='#60a5fa'; sz=4; break;
+        case 's': color='#c084fc'; sz=4; break;
+        case 'n': color='#f472b6'; sz=5; break;
+        case 'p': color='#86efac'; sz=4; break;
+        default: continue;
+      }
+      sz /= scale; // keep dot size constant on screen
+      ctx.fillStyle = color;
+      ctx.beginPath(); ctx.arc(ex, ey, sz, 0, Math.PI*2); ctx.fill();
+      if (e.r==='u'||e.r==='r') {
+        ctx.strokeStyle = color; ctx.lineWidth = 1/scale;
+        ctx.beginPath(); ctx.arc(ex, ey, sz+2/scale, 0, Math.PI*2); ctx.stroke();
+      }
+    }
+  }
+
+  // Network bubble (ellipse in iso projection)
+  if (showBubble) {
+    const bw = 180 * CAM_COS, bh = 180 * CAM_SIN;
+    ctx.strokeStyle = 'rgba(74, 222, 128, 0.15)';
+    ctx.lineWidth = 1/scale;
+    ctx.beginPath(); ctx.ellipse(0, 0, bw, bh, 0, 0, Math.PI*2); ctx.stroke();
+  }
+
+  // Player dot (always at center = 0,0)
+  const ps = 5/scale;
+  ctx.fillStyle = '#4ade80';
+  ctx.beginPath(); ctx.arc(0, 0, ps, 0, Math.PI*2); ctx.fill();
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 2/scale;
+  ctx.beginPath(); ctx.arc(0, 0, ps, 0, Math.PI*2); ctx.stroke();
+
+  ctx.restore();
+
+  // Info text
+  if (infoEl) {
+    const mc = (s.entities||[]).filter(e=>e.t==='m').length;
+    infoEl.textContent = `Zoom: ${scale.toFixed(1)}x | Monsters: ${mc} | (${s.playerGridX.toFixed(0)}, ${s.playerGridY.toFixed(0)})`;
+  }
+}
+
+// ---- Full Map Tab ----
+function renderMap() { drawIsoMap(document.getElementById('mapCanvas'), mapScale, mapPanX, mapPanY, true, document.getElementById('mapInfo')); }
+function mapZoom(factor) { mapScale = Math.max(0.3, Math.min(10, mapScale * factor)); renderMap(); }
+function mapRecenter() { mapPanX = 0; mapPanY = 0; renderMap(); }
+
+(function() {
+  const canvas = document.getElementById('mapCanvas');
+  canvas.addEventListener('mousedown', e => { mapDragging=true; mapDragLastX=e.clientX; mapDragLastY=e.clientY; });
+  canvas.addEventListener('mousemove', e => {
+    if (!mapDragging) return;
+    mapPanX += e.clientX - mapDragLastX;
+    mapPanY += e.clientY - mapDragLastY;
+    mapDragLastX = e.clientX; mapDragLastY = e.clientY;
+    renderMap();
+  });
+  canvas.addEventListener('mouseup', () => mapDragging=false);
+  canvas.addEventListener('mouseleave', () => mapDragging=false);
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    const f = e.deltaY < 0 ? 1.15 : 0.87;
+    // Zoom toward mouse
+    const r = canvas.getBoundingClientRect();
+    const mx = e.clientX-r.left - canvas.width/2 - mapPanX;
+    const my = e.clientY-r.top - canvas.height/2 - mapPanY;
+    mapPanX -= mx * (f-1); mapPanY -= my * (f-1);
+    mapScale = Math.max(0.3, Math.min(10, mapScale * f));
+    renderMap();
+  }, {passive:false});
+})();
+
+// ---- Dashboard Minimap ----
+function renderMinimap() { drawIsoMap(document.getElementById('minimapCanvas'), minimapScale, 0, 0, true, document.getElementById('minimapInfo')); }
+
+(function() {
+  const canvas = document.getElementById('minimapCanvas');
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    minimapScale = Math.max(0.3, Math.min(6, minimapScale * (e.deltaY < 0 ? 1.15 : 0.87)));
+    renderMinimap();
+  }, {passive:false});
+})();
+
+// ---- Hook into update loop ----
+const origUpdateDashboard = updateDashboard;
+updateDashboard = function(s) {
+  origUpdateDashboard(s);
+  mapLastStatus = s;
+  if (s.areaHash && s.areaHash !== mapLastAreaHash) loadTerrain();
+  if (mapActive) renderMap();
+  renderMinimap(); // always render minimap on dashboard
+
+  // Update detected skill bar — re-render skills section if data changes
+  if (s.skillBar && s.skillBar.length > 0) {
+    const newKeys = s.skillBar.map(d => d.slotIndex+':'+d.skillName).join(',');
+    const oldKeys = detectedSkillBar.map(d => d.slotIndex+':'+d.skillName).join(',');
+    if (newKeys !== oldKeys) {
+      detectedSkillBar = s.skillBar;
+      // Re-render skills if settings tab is open
+      if (settingsLoaded && activeSettingsTab === 'build') renderAllSettings();
+    }
+  }
+};
+
+const origSwitchTab = switchTab;
+switchTab = function(name) {
+  origSwitchTab(name);
+  mapActive = (name === 'map');
+  if (mapActive) {
+    if (!mapTerrainCanvas) loadTerrain();
+    else renderMap();
+  }
+};
+</script>
+</body>
+</html>

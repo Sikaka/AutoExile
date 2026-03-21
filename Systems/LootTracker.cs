@@ -23,6 +23,9 @@ namespace AutoExile.Systems
         /// <summary>Price service for valuing looted items. Set by BotCore.</summary>
         public NinjaPriceService? PriceService { get; set; }
 
+        /// <summary>Optional callback fired after each successful loot recording. (itemName, chaosValue, slots)</summary>
+        public Action<string, double, int>? OnItemRecorded { get; set; }
+
         // Recent loot log (capped to prevent unbounded growth)
         private readonly List<LootRecord> _recentLoot = new();
         private const int MaxRecentLoot = 100;
@@ -145,6 +148,8 @@ namespace AutoExile.Systems
             // Cap recent log
             if (_recentLoot.Count > MaxRecentLoot)
                 _recentLoot.RemoveAt(0);
+
+            OnItemRecorded?.Invoke(itemName, chaosValue, 1);
         }
 
         /// <summary>
@@ -170,6 +175,8 @@ namespace AutoExile.Systems
 
             if (_recentLoot.Count > MaxRecentLoot)
                 _recentLoot.RemoveAt(0);
+
+            OnItemRecorded?.Invoke(itemName, chaosValue, 1);
         }
 
         /// <summary>

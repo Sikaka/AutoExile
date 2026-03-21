@@ -15,6 +15,9 @@
     <EmbeddedResource Include="Resources\uniqueArtMapping.json">
       <LogicalName>uniqueArtMapping.json</LogicalName>
     </EmbeddedResource>
+    <EmbeddedResource Include="WebServer\wwwroot\index.html">
+      <LogicalName>webui.index.html</LogicalName>
+    </EmbeddedResource>
   </ItemGroup>
 
   <ItemGroup>

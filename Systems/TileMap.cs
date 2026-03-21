@@ -154,6 +154,14 @@ namespace AutoExile.Systems
         }
 
         /// <summary>
+        /// Get positions for an exact key (no substring search).
+        /// </summary>
+        public List<Vector2>? GetPositions(string key)
+        {
+            return _tiles.TryGetValue(key, out var positions) ? positions : null;
+        }
+
+        /// <summary>
         /// Get all tile keys (for debug browsing).
         /// </summary>
         public IReadOnlyCollection<string> GetAllKeys()

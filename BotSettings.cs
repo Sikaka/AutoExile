@@ -24,11 +24,23 @@ namespace AutoExile
         [Menu("Dump Recording", "Hotkey to dump last ~10 seconds of tick-level state (decisions, threats, navigation, actions).")]
         public HotkeyNode DumpRecording { get; set; } = new HotkeyNode(Keys.F7);
 
+        [Menu("Scan Tile Signatures", "Hotkey to scan nearby tiles for unique/rare map signatures and overlay results.")]
+        public HotkeyNode ScanTileSignatures { get; set; } = new HotkeyNode(Keys.F8);
+
         [Menu("Active Mode", "Bot mode to run. Persists across reloads.")]
         public ListNode ActiveMode { get; set; } = new ListNode() { Value = "Idle" };
 
         [Menu("Action Cooldown (ms)", "Minimum time between mouse actions. Prevents server kicks from input spam.")]
         public RangeNode<int> ActionCooldownMs { get; set; } = new RangeNode<int>(75, 50, 300);
+
+        [Menu("Web UI Enabled", "Enable embedded web dashboard.")]
+        public ToggleNode WebUiEnabled { get; set; } = new ToggleNode(true);
+
+        [Menu("Web UI Port", "Port for the web dashboard (requires restart to change).")]
+        public RangeNode<int> WebUiPort { get; set; } = new RangeNode<int>(9876, 1024, 65535);
+
+        [Menu("Web UI Network Access", "Allow access from other devices on the network (requires admin or URL reservation).")]
+        public ToggleNode WebUiNetworkAccess { get; set; } = new ToggleNode(false);
 
         [Menu("Auto Level Gems", "Automatically level up skill gems when the level-up panel appears.")]
         public ToggleNode AutoLevelGems { get; set; } = new ToggleNode(true);

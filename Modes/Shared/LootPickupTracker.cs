@@ -19,6 +19,7 @@ namespace AutoExile.Modes.Shared
         public string PendingItemName => _pendingItemName;
         public int PickupCount => _pickupCount;
 
+
         /// <summary>
         /// Called after starting a pickup via InteractionSystem.
         /// </summary>
@@ -47,7 +48,10 @@ namespace AutoExile.Modes.Shared
             }
             else if (result == InteractionResult.Failed)
             {
-                ctx.Loot.MarkFailed(_pendingEntityId, ctx.Interaction.LastFailReason);
+                var failReason = ctx.Interaction.LastFailReason;
+                ctx.Loot.MarkFailed(_pendingEntityId, failReason);
+                ctx.Loot.LogSkipEvent(_pendingEntityId, _pendingItemName,
+                    $"pickup failed: {failReason}", _pendingValue);
             }
 
             if (result == InteractionResult.Succeeded || result == InteractionResult.Failed)

@@ -5,6 +5,7 @@ using ImGuiNET;
 using AutoExile.Mechanics;
 using AutoExile.Modes;
 using AutoExile.Systems;
+using AutoExile.WebServer;
 using System.IO;
 using System.Linq;
 using System.Numerics;
@@ -41,6 +42,9 @@ namespace AutoExile
         private ThreatSystem _threat = new();
         private NinjaPriceService _ninjaPrice = new();
         private BotRecorder _recorder = new();
+        private BotWebServer? _webServer;
+        private DataStore? _dataStore;
+        private ConfigManager? _configManager;
 
         // Public accessors for external tools (POEMCP /eval)
         public NavigationSystem Navigation => _navigation;
@@ -79,6 +83,12 @@ namespace AutoExile
         private int _debugCircleRadius;
         private DateTime _debugCircleExpiry = DateTime.MinValue;
         private readonly Dictionary<string, int> _lastRangeValues = new();
+
+        // Tile signature scanner (F8)
+        private List<TileSignature> _tileSignatures = new();
+        private string _tileSignatureArea = "";
+        private Vector2 _tileSignaturePlayerPos;
+        private DateTime _tileSignatureScanTime;
 
         // --- Buff scanner ---
         private bool _buffScanActive;
@@ -151,6 +161,40 @@ namespace AutoExile
                     SetMode(name);
             };
 
+            // Load our own config (overrides ExileCore defaults)
+            _configManager = new ConfigManager(msg => LogMessage($"[AutoExile] {msg}"));
+            _configManager.Initialize(DirectoryFullName);
+            _configManager.LoadAndApply(Settings);
+
+            // Initialize data store
+            _dataStore = new DataStore(msg => LogMessage($"[AutoExile] {msg}"));
+            _dataStore.Initialize(DirectoryFullName);
+
+            // Wire loot recording callback → data store
+            _lootTracker.OnItemRecorded = (name, value, slots) =>
+            {
+                var area = GameController?.Area?.CurrentArea?.Name ?? "";
+                _dataStore.RecordLoot(name, value, slots, area, _mode.Name);
+            };
+
+            // Wire loot skip/fail events → data store (for web UI logs tab)
+            _loot.OnItemSkipped = (itemName, reason, chaosValue) =>
+            {
+                var area = GameController?.Area?.CurrentArea?.Name ?? "";
+                var valueStr = chaosValue > 0 ? $" ({chaosValue:F0}c)" : "";
+                _dataStore.RecordEvent("loot_skip", $"{itemName}{valueStr}: {reason}", area);
+            };
+
+            // Start embedded web server
+            if (Settings.WebUiEnabled.Value)
+            {
+                _webServer = new BotWebServer(Settings.WebUiPort.Value, Settings.WebUiNetworkAccess.Value, msg => LogMessage($"[AutoExile] {msg}"));
+                _webServer.Settings = Settings;
+                _webServer.DataStore = _dataStore;
+                _webServer.ConfigManager = _configManager;
+                _webServer.Start();
+            }
+
             return base.Initialise();
         }
 
@@ -158,6 +202,11 @@ namespace AutoExile
         {
             if (!Settings.Enable || !GameController.InGame)
                 return base.Tick();
+
+            // Web server: push status snapshot + process commands
+            // Runs before all early returns so the dashboard stays live even when
+            // POE is unfocused or an async action is in flight.
+            TickWebServer();
 
             // Don't do anything when POE isn't the active window
             if (!GameController.IsForeGroundCache)
@@ -362,6 +411,24 @@ namespace AutoExile
                 LogMessage($"[AutoExile] {_recorder.LastDumpStatus}");
             }
 
+            // Tile signature scanner hotkey — F8 (toggle on/off, area change clears)
+            if (Settings.ScanTileSignatures.PressedOnce())
+            {
+                if (_tileSignatures.Count > 0)
+                {
+                    _tileSignatures.Clear();
+                    LogMessage("[AutoExile] Tile signatures cleared");
+                }
+                else
+                {
+                    ScanTileSignatures();
+                }
+            }
+
+            // Clear tile signatures on area change
+            if (_tileSignatures.Count > 0 && currentArea != _tileSignatureArea)
+                _tileSignatures.Clear();
+
             // Sync loot settings
             _loot.SkipLowValueUniques = Settings.Loot.SkipLowValueUniques.Value;
             _loot.MinUniqueChaosValue = Settings.Loot.MinUniqueChaosValue.Value;
@@ -389,15 +456,6 @@ namespace AutoExile
 
             // Tick ninja price service (league detection, refresh timer)
             _ninjaPrice.Tick(GameController);
-
-            // Debug: delayed dump when unique Large Cluster Jewel was spotted
-            if (_loot.ScheduledDebugDumpAt.HasValue && DateTime.Now >= _loot.ScheduledDebugDumpAt.Value)
-            {
-                _loot.ScheduledDebugDumpAt = null;
-                LogMessage("[AutoExile] Unique Large Cluster Jewel debug dump (5s after sighting)");
-                _recorder.ForceDump("unique_cluster_jewel");
-                TriggerGameStateDump();
-            }
 
             // Sync stash/map device settings
             _stash.ActionCooldownMs = Settings.Loot.StashItemCooldownMs.Value;
@@ -474,6 +532,9 @@ namespace AutoExile
             _mode.Render(_ctx);
             _ctx.Graphics = null;
 
+            // Tile signature overlay (F8)
+            RenderTileSignatures();
+
             // Debug range circle overlay
             if (DateTime.Now < _debugCircleExpiry && _debugCircleRadius > 0 && GameController.Player != null)
             {
@@ -529,6 +590,15 @@ namespace AutoExile
         public override void DrawSettings()
         {
             base.DrawSettings();
+
+            // Web UI link
+            if (_webServer != null && _webServer.IsRunning)
+            {
+                ImGui.Separator();
+                ImGui.TextColored(new Vector4(0.42f, 0.55f, 1f, 1f), $"Web Dashboard: {_webServer.Url}");
+                if (ImGui.SmallButton("Copy URL"))
+                    ImGui.SetClipboardText(_webServer.Url);
+            }
 
             ImGui.Separator();
             ImGui.Text($"Mode: {_mode.Name}");
@@ -879,6 +949,201 @@ namespace AutoExile
         }
 
         // =================================================================
+        // Web Server
+        // =================================================================
+
+        private long _lastTerrainHash;
+        private DateTime _lastTerrainRefresh = DateTime.MinValue;
+        private const double TerrainRefreshIntervalSec = 3.0;
+
+        private void TickWebServer()
+        {
+            if (_webServer == null || !_webServer.IsRunning) return;
+
+            // Refresh terrain data on area change or periodically (for exploration updates)
+            var currentHash = GameController.IngameState?.Data?.CurrentAreaHash ?? 0;
+            var needsRefresh = currentHash != _lastTerrainHash
+                || (DateTime.Now - _lastTerrainRefresh).TotalSeconds >= TerrainRefreshIntervalSec;
+
+            if (needsRefresh && currentHash != 0)
+            {
+                var pfGrid = GameController.IngameState?.Data?.RawPathfindingData;
+                var tgtGrid = GameController.IngameState?.Data?.RawTerrainTargetingData;
+                var terrain = MapRenderer.BuildTerrainData(pfGrid, tgtGrid, _exploration);
+                if (terrain != null)
+                {
+                    _webServer.UpdateTerrain(terrain, currentHash);
+                    _lastTerrainHash = currentHash;
+                    _lastTerrainRefresh = DateTime.Now;
+                }
+            }
+
+            // Process commands from web UI
+            while (_webServer.TryDequeueCommand(out var cmd))
+            {
+                switch (cmd.Action)
+                {
+                    case "start":
+                        Settings.Running.Value = true;
+                        if (!_lootTracker.IsActive) _lootTracker.StartSession();
+                        break;
+                    case "stop":
+                        Settings.Running.Value = false;
+                        if (_lootTracker.IsActive) _lootTracker.StopSession();
+                        break;
+                    case "setMode":
+                        if (!string.IsNullOrEmpty(cmd.Value) && _modes.ContainsKey(cmd.Value))
+                            SetMode(cmd.Value);
+                        break;
+                }
+            }
+
+            // Build status snapshot for web UI — wrapped in try/catch so a single
+            // bad entity or stale pointer doesn't kill all dashboard updates.
+            try
+            {
+                var phase = "";
+                var decision = "";
+                var status = "";
+
+                if (_mode is MappingMode map)
+                { phase = map.Phase.ToString(); decision = map.Decision; status = map.Status; }
+                else if (_mode is SimulacrumMode sim)
+                { phase = sim.Phase.ToString(); decision = sim.Decision; status = sim.StatusText; }
+                else if (_mode is BlightMode blight)
+                { phase = blight.Phase.ToString(); status = blight.StatusText; }
+                else if (_mode is HeistMode heist)
+                { phase = heist.Phase.ToString(); decision = heist.Decision; }
+                else if (_mode is FollowerMode follower)
+                { phase = follower.State.ToString(); decision = follower.Decision; status = follower.StatusText; }
+
+                // Player position for map overlay
+                var playerGridPos = GameController.Player?.GridPosNum ?? Vector2.Zero;
+                var playerGrid = new Vector2(playerGridPos.X, playerGridPos.Y);
+
+                // Detect skill bar from game
+                List<DetectedSkillSlot>? detectedSkills = null;
+                try
+                {
+                    var barIds = GameController.IngameState?.ServerData?.SkillBarIds;
+                    var actor = GameController.Player?.GetComponent<ExileCore.PoEMemory.Components.Actor>();
+                    if (barIds != null && actor?.ActorSkills != null)
+                    {
+                        var idToSkill = new Dictionary<int, ExileCore.PoEMemory.MemoryObjects.ActorSkill>();
+                        foreach (var skill in actor.ActorSkills)
+                        {
+                            var id = (int)skill.Id;
+                            if (!idToSkill.ContainsKey(id))
+                                idToSkill[id] = skill;
+                        }
+
+                        string[] posKeys = { "LMB", "RMB", "MButton", "Q", "W", "E", "R", "T" };
+                        detectedSkills = new();
+
+                        var limit = Math.Min(barIds.Count, posKeys.Length);
+                        for (int i = 3; i < limit; i++)
+                        {
+                            var skillId = barIds[i];
+                            if (skillId == 0) continue;
+                            if (!idToSkill.TryGetValue(skillId, out var actorSkill)) continue;
+                            var skillName = actorSkill.Name ?? "";
+                            if (string.IsNullOrEmpty(skillName)) continue;
+
+                            detectedSkills.Add(new DetectedSkillSlot
+                            {
+                                SlotIndex = i,
+                                Key = posKeys[i],
+                                SkillName = skillName,
+                                InternalName = actorSkill.InternalName ?? "",
+                                IsSpell = actorSkill?.IsSpell ?? false,
+                                IsAttack = actorSkill?.IsAttack ?? false,
+                                IsVaalSkill = actorSkill?.IsVaalSkill ?? false,
+                                IsInstant = actorSkill?.IsInstant ?? false,
+                                IsCry = actorSkill?.IsCry ?? false,
+                                IsChanneling = actorSkill?.IsChanneling ?? false,
+                                IsTotem = actorSkill?.IsTotem ?? false,
+                                IsTrap = actorSkill?.IsTrap ?? false,
+                                IsMine = actorSkill?.IsMine ?? false,
+                                SoulsPerUse = actorSkill?.SoulsPerUse ?? 0,
+                                DeployedCount = actorSkill?.DeployedObjects?.Count ?? 0,
+                            });
+                        }
+                    }
+                }
+                catch { }
+
+                // Read vitals directly from player — CombatSystem only updates when combat is ticking
+                var life = GameController.Player?.GetComponent<ExileCore.PoEMemory.Components.Life>();
+                var hpPct = Sanitize(life?.HPPercentage ?? 0f);
+                var esPct = Sanitize(life?.ESPercentage ?? 0f);
+                var manaPct = Sanitize(life?.MPPercentage ?? 0f);
+
+                // Collect entities/nav safely — these iterate game state that can go stale
+                List<MapEntity>? entities = null;
+                try { entities = MapRenderer.CollectEntities(GameController, playerGrid); } catch { }
+                List<float[]>? navPath = null;
+                try { navPath = MapRenderer.CollectNavPath(_navigation); } catch { }
+
+                _webServer.UpdateStatus(new BotStatusSnapshot
+                {
+                    Running = Settings.Running.Value,
+                    InGame = GameController.InGame,
+                    Mode = _mode?.Name ?? "Unknown",
+                    Phase = phase,
+                    Decision = decision,
+                    Status = status,
+                    Area = GameController.Area?.CurrentArea?.Name ?? "",
+                    HpPercent = hpPct,
+                    EsPercent = esPct,
+                    ManaPercent = manaPct,
+                    InCombat = _combat.InCombat,
+                    NearbyMonsters = _combat.NearbyMonsterCount,
+                    CombatTarget = _combat.BestTarget?.RenderName,
+                    IsNavigating = _navigation.IsNavigating,
+                    WaypointIndex = _navigation.CurrentWaypointIndex,
+                    WaypointTotal = _navigation.CurrentNavPath?.Count ?? 0,
+                    ExplorationCoverage = Sanitize(_exploration.IsInitialized && _exploration.ActiveBlob != null
+                        ? _exploration.ActiveBlob.Coverage : 0f),
+                    ExplorationRegions = _exploration.IsInitialized && _exploration.ActiveBlob != null
+                        ? _exploration.ActiveBlob.Regions.Count : 0,
+                    LootCandidates = _loot.Candidates.Count,
+                    SessionChaos = Sanitize((float)_lootTracker.TotalChaosValue),
+                    ChaosPerHour = Sanitize((float)_lootTracker.ChaosPerHour),
+                    ItemsLooted = _lootTracker.TotalItemsLooted,
+                    MapsCompleted = _lootTracker.MapsCompleted,
+                    SessionDuration = _lootTracker.SessionDuration.TotalSeconds > 0
+                        ? _lootTracker.SessionDuration.ToString(@"hh\:mm\:ss") : "",
+                    Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+
+                    // Map overlay
+                    PlayerGridX = Sanitize(playerGrid.X),
+                    PlayerGridY = Sanitize(playerGrid.Y),
+                    AreaHash = currentHash,
+                    Entities = entities,
+                    NavPath = navPath,
+                    SkillBar = detectedSkills,
+                });
+            }
+            catch (Exception ex)
+            {
+                // Log the crash so we can diagnose — don't let it kill future updates
+                LogMessage($"[AutoExile] Web snapshot error: {ex.Message}");
+            }
+        }
+
+        /// <summary>Clamp NaN/Infinity to 0 — System.Text.Json can't serialize them.</summary>
+        private static float Sanitize(float v) => float.IsFinite(v) ? v : 0f;
+
+        /// <summary>Called by ExileCore when plugin is being unloaded.</summary>
+        public override void OnClose()
+        {
+            _webServer?.Stop();
+            _webServer = null;
+            Instance = null;
+            base.OnClose();
+        }
+
+        // =================================================================
         // Exploration — area transition scanning
         // =================================================================
 
@@ -1163,27 +1428,22 @@ namespace AutoExile
 
                 var windowRect = GameController.Window.GetWindowRectangle();
 
-                // Try to find a "Level All" button by checking panel children.
-                // It's typically the first child before the individual gem rows.
-                // If it has more children than gems, the extra one is likely "Level All".
-                if (panel.ChildCount > gems.Count)
+                // Use the dedicated "Level Up All Gems" button if visible.
+                // Property exists at runtime but not in bundled ExileCore DLL — use dynamic.
+                try
                 {
-                    for (int i = 0; i < panel.ChildCount; i++)
+                    dynamic dynPanel = panel;
+                    var levelAllBtn = (ExileCore.PoEMemory.Element)dynPanel.LevelUpAllGemsButton;
+                    if (levelAllBtn?.IsVisible == true)
                     {
-                        var child = panel.GetChildAtIndex(i);
-                        if (child?.IsVisible != true) continue;
-                        var text = child.Text;
-                        if (text != null && text.IndexOf("level", StringComparison.OrdinalIgnoreCase) >= 0
-                            && text.IndexOf("all", StringComparison.OrdinalIgnoreCase) >= 0)
-                        {
-                            var rect = child.GetClientRect();
-                            var absPos = new Vector2(windowRect.X + rect.Center.X, windowRect.Y + rect.Center.Y);
-                            BotInput.Click(absPos);
-                            _lastGemLevelAt = DateTime.Now;
-                            return;
-                        }
+                        var rect = levelAllBtn.GetClientRect();
+                        var absPos = new Vector2(windowRect.X + rect.Center.X, windowRect.Y + rect.Center.Y);
+                        BotInput.Click(absPos);
+                        _lastGemLevelAt = DateTime.Now;
+                        return;
                     }
                 }
+                catch { /* Property not available in this ExileCore version — fall through to per-gem */ }
 
                 // Click the level-up "+" button for the first levelable gem.
                 // Layout: [0]=dismiss(X) [1]=level(+) [2]=bar(hidden) [3]=text
@@ -1481,6 +1741,176 @@ namespace AutoExile
                 }
             }
         }
+
+        // =================================================================
+        // Tile Signature Scanner (F8)
+        // =================================================================
+
+        private void ScanTileSignatures()
+        {
+            var gc = GameController;
+            if (gc?.Player == null || !_tileMap.IsLoaded)
+            {
+                LogMessage("[AutoExile] Tile scan failed: no player or tile map not loaded");
+                return;
+            }
+
+            var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
+            var areaName = gc.Area?.CurrentArea?.Name ?? "Unknown";
+            const float scanRadius = 100f;
+
+            var signatures = new List<TileSignature>();
+
+            foreach (var key in _tileMap.GetAllKeys())
+            {
+                var allPositions = _tileMap.GetPositions(key);
+                if (allPositions == null) continue;
+
+                int total = allPositions.Count;
+                if (total >= 20) continue; // Skip common tiles
+
+                var nearPositions = new List<Vector2>();
+                foreach (var pos in allPositions)
+                {
+                    if (Vector2.Distance(playerGrid, pos) <= scanRadius)
+                        nearPositions.Add(pos);
+                }
+
+                if (nearPositions.Count == 0) continue;
+
+                float concentration = (float)nearPositions.Count / total;
+                SignatureTier? tier = null;
+
+                if (total == 1)
+                    tier = SignatureTier.Unique;
+                else if (total <= 3)
+                    tier = SignatureTier.VeryRare;
+                else if (total <= 9 && concentration >= 0.5f)
+                    tier = SignatureTier.Rare;
+                else if (total <= 19 && concentration >= 0.8f)
+                    tier = SignatureTier.Clustered;
+
+                if (tier == null) continue;
+
+                float score = (1f / total) * concentration * nearPositions.Count;
+
+                signatures.Add(new TileSignature
+                {
+                    Key = key,
+                    Tier = tier.Value,
+                    TotalCount = total,
+                    NearCount = nearPositions.Count,
+                    Concentration = concentration,
+                    Score = score,
+                    NearPositions = nearPositions,
+                });
+            }
+
+            // Sort by tier (Unique first) then score descending
+            signatures.Sort((a, b) =>
+            {
+                int tierCmp = a.Tier.CompareTo(b.Tier);
+                return tierCmp != 0 ? tierCmp : b.Score.CompareTo(a.Score);
+            });
+
+            _tileSignatures = signatures;
+            _tileSignatureArea = areaName;
+            _tileSignaturePlayerPos = playerGrid;
+            _tileSignatureScanTime = DateTime.Now;
+
+            LogMessage($"[AutoExile] Tile scan: {signatures.Count} signatures found in {areaName}");
+            WriteTileSignatureLog();
+        }
+
+        private void WriteTileSignatureLog()
+        {
+            if (_tileSignatures.Count == 0) return;
+
+            var outputDir = Path.Combine(DirectoryFullName, "Dumps");
+            Directory.CreateDirectory(outputDir);
+            var logPath = Path.Combine(outputDir, "TileSignatures.log");
+
+            var lines = new List<string>();
+            lines.Add($"=== {_tileSignatureScanTime:yyyy-MM-dd HH:mm:ss} | {_tileSignatureArea} | Player: ({_tileSignaturePlayerPos.X:F0},{_tileSignaturePlayerPos.Y:F0}) | {_tileSignatures.Count} signatures ===");
+
+            foreach (var sig in _tileSignatures)
+            {
+                var positions = string.Join("; ", sig.NearPositions.Select(p => $"({p.X:F0},{p.Y:F0})"));
+                lines.Add($"  [{sig.Tier}] {sig.Key} | total={sig.TotalCount} near={sig.NearCount} conc={sig.Concentration:P0} score={sig.Score:F3} | {positions}");
+            }
+
+            lines.Add("");
+            File.AppendAllLines(logPath, lines);
+            LogMessage($"[AutoExile] Tile signatures written to {logPath}");
+        }
+
+        private void RenderTileSignatures()
+        {
+            if (_tileSignatures.Count == 0) return;
+
+            var gc = GameController;
+            if (gc?.Player == null) return;
+
+            var camera = gc.IngameState.Camera;
+
+            // HUD summary
+            Graphics.DrawText(
+                $"Tile Signatures: {_tileSignatures.Count} in {_tileSignatureArea} (F8 to clear)",
+                new Vector2(100, 110), SharpDX.Color.Gold);
+
+            // World overlay for each signature
+            foreach (var sig in _tileSignatures)
+            {
+                var color = sig.Tier switch
+                {
+                    SignatureTier.Unique => SharpDX.Color.Gold,
+                    SignatureTier.VeryRare => SharpDX.Color.OrangeRed,
+                    SignatureTier.Rare => SharpDX.Color.Cyan,
+                    SignatureTier.Clustered => SharpDX.Color.LimeGreen,
+                    _ => SharpDX.Color.White,
+                };
+
+                foreach (var gridPos in sig.NearPositions)
+                {
+                    // Tile center = gridPos + half tile size (23/2 ≈ 11.5)
+                    var centerGrid = gridPos + new Vector2(11.5f, 11.5f);
+                    var worldPos = new System.Numerics.Vector3(
+                        centerGrid.X * (float)Systems.Pathfinding.GridToWorld,
+                        centerGrid.Y * (float)Systems.Pathfinding.GridToWorld,
+                        gc.Player.PosNum.Z);
+
+                    // Circle
+                    Graphics.DrawCircleInWorld(worldPos, 80f, color, 2f);
+
+                    // Label
+                    var screenPos = camera.WorldToScreen(worldPos);
+                    if (screenPos.X > 0 && screenPos.Y > 0)
+                    {
+                        // Short key: last path segment
+                        var shortKey = sig.Key;
+                        var lastSlash = shortKey.LastIndexOf('/');
+                        if (lastSlash >= 0 && lastSlash < shortKey.Length - 1)
+                            shortKey = shortKey[(lastSlash + 1)..];
+
+                        var label = $"[{sig.Tier}] {shortKey} ({sig.TotalCount})";
+                        Graphics.DrawText(label, new Vector2(screenPos.X - 60, screenPos.Y - 20), color);
+                    }
+                }
+            }
+        }
+    }
+
+    internal enum SignatureTier { Unique, VeryRare, Rare, Clustered }
+
+    internal class TileSignature
+    {
+        public string Key = "";
+        public SignatureTier Tier;
+        public int TotalCount;
+        public int NearCount;
+        public float Concentration;
+        public float Score;
+        public List<Vector2> NearPositions = new();
     }
 
     /// <summary>Cached exploration + mechanics state for a map area, used for round-trip zone support.</summary>
