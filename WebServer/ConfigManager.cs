@@ -50,6 +50,22 @@ namespace AutoExile.WebServer
                 int applied = 0, skipped = 0;
                 foreach (var (key, value) in config)
                 {
+                    // Handle non-node data stored with _ prefix
+                    if (key == "_ultimatumModOverrides")
+                    {
+                        try
+                        {
+                            var overrides = JsonSerializer.Deserialize<Dictionary<string, int>>(value.GetRawText());
+                            if (overrides != null)
+                            {
+                                settings.Mechanics.Ultimatum.ModRanking.DangerOverrides = overrides;
+                                applied++;
+                            }
+                        }
+                        catch { skipped++; }
+                        continue;
+                    }
+
                     var (success, _) = SettingsApi.Apply(settings, key, value);
                     if (success) applied++;
                     else skipped++;
@@ -79,6 +95,12 @@ namespace AutoExile.WebServer
                     if (entry.ReadOnly) continue; // skip hotkeys etc.
                     config[key] = entry.Value;
                 }
+
+                // Save non-node data that reflection can't reach
+                // Ultimatum modifier danger overrides (Dictionary<string, int>)
+                var overrides = settings.Mechanics?.Ultimatum?.ModRanking?.DangerOverrides;
+                if (overrides != null && overrides.Count > 0)
+                    config["_ultimatumModOverrides"] = overrides;
 
                 var json = JsonSerializer.Serialize(config, WriteOpts);
                 File.WriteAllText(_configPath, json);

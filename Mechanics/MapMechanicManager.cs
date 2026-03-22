@@ -200,6 +200,22 @@ namespace AutoExile.Mechanics
         }
 
         /// <summary>
+        /// Mark a mechanic as completed by name, preventing re-detection.
+        /// Used when entering sub-zones to suppress the triggering mechanic.
+        /// </summary>
+        public void SuppressMechanic(string name)
+        {
+            foreach (var m in _mechanics)
+            {
+                if (m.Name == name && !_completed.Contains(m))
+                {
+                    _completed.Add(m);
+                    _completionCounts[name] = _completionCounts.GetValueOrDefault(name) + 1;
+                }
+            }
+        }
+
+        /// <summary>
         /// Capture which mechanics are completed/detected so state survives cross-zone trips.
         /// </summary>
         public MechanicsSnapshot CreateSnapshot()
@@ -254,6 +270,7 @@ namespace AutoExile.Mechanics
                 "Harvest" => ParseMode(settings.Harvest.Mode.Value),
                 "Wishes" => ParseMode(settings.Wishes.Mode.Value),
                 "Essence" => ParseMode(settings.Essence.Mode.Value),
+                "Ritual" => ParseMode(settings.Ritual.Mode.Value),
                 _ => MechanicMode.Skip,
             };
         }

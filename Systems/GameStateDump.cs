@@ -38,6 +38,8 @@ namespace AutoExile.Systems
         public string RenderName { get; set; } = "";
         /// <summary>StateMachine states (name→value), if the entity has a StateMachine component.</summary>
         public Dictionary<string, long>? States { get; set; }
+        /// <summary>MinimapIcon.Name if the entity has a MinimapIcon component.</summary>
+        public string? MinimapIconName { get; set; }
     }
 
     public enum EntityCategory

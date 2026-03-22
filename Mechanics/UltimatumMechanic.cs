@@ -60,6 +60,13 @@ namespace AutoExile.Mechanics
         private DateTime _rewardTakenTime;
         private const float LootWaitSeconds = 3f;
 
+        // ── Circle capture state (Stand in the Circles) ──
+        private const string CaptureRunePath = "Metadata/Terrain/Leagues/Ultimatum/Objects/CaptureRune";
+        private long _activeCircleId;           // Entity ID of the circle we're navigating to
+        private Vector2? _activeCirclePos;      // Grid position of active circle
+        private const float CircleStandRadius = 12f; // Grid distance — must be inside the circle effect
+        private const float DefaultEncounterRadius = 75f; // Base encounter boundary radius (grid units)
+
         // ── Previous combat profile (to restore after encounter) ──
         private CombatProfile? _savedCombatProfile;
 
@@ -424,37 +431,62 @@ namespace AutoExile.Mechanics
                     return MechanicResult.Abandoned;
                 }
 
-                // Click the choice element
+                // Click the choice element — verify the click actually fired
                 var elem = choiceElements[bestChoice];
-                ClickElement(gc, elem);
+                if (!ClickElementChecked(gc, elem))
+                {
+                    Status = "Waiting to click modifier...";
+                    return MechanicResult.InProgress;
+                }
                 _preStartSelectedIndex = bestChoice;
                 _preStartModSelected = true;
+                _lastPreStartClickTime = DateTime.Now; // Reuse as "last mod click time"
                 Status = $"Selected: {modifiers[bestChoice].Name} (danger={settings.GetModDanger(modifiers[bestChoice].Id)})";
                 ctx.Log($"[Ultimatum] Selected mod: {modifiers[bestChoice].Name} (id={modifiers[bestChoice].Id})");
                 return MechanicResult.InProgress;
             }
 
-            // Step 2: Click BEGIN button and verify encounter actually started
+            // Step 2: Click BEGIN button — retry mod click every 600ms if BEGIN not visible yet
             if (!_preStartBeginClicked)
             {
                 var beginBtn = root.GetChildAtIndex(4)?.GetChildAtIndex(0)?.GetChildAtIndex(0);
-                if (beginBtn == null || !beginBtn.IsVisible)
+                if (beginBtn != null && beginBtn.IsVisible)
                 {
-                    Status = "BEGIN button not found";
-                    if ((DateTime.Now - _phaseStartTime).TotalSeconds > 20)
+                    // BEGIN available — click it immediately
+                    if (!ClickElementChecked(gc, beginBtn))
                     {
-                        _phase = UltimatumPhase.Failed;
-                        Status = "Timeout: BEGIN button not found";
-                        return MechanicResult.Failed;
+                        Status = "Waiting to click BEGIN...";
+                        return MechanicResult.InProgress;
                     }
+                    _preStartBeginClicked = true;
+                    _preStartBeginClickTime = DateTime.Now;
+                    ctx.Log("[Ultimatum] Clicked BEGIN");
+                    Status = "Clicked BEGIN, verifying...";
                     return MechanicResult.InProgress;
                 }
 
-                ClickElement(gc, beginBtn);
-                _preStartBeginClicked = true;
-                _preStartBeginClickTime = DateTime.Now;
-                ctx.Log("[Ultimatum] Clicked BEGIN, waiting for encounter_started confirmation");
-                Status = "Clicked BEGIN, verifying...";
+                // BEGIN not visible — retry mod click every 600ms
+                if ((DateTime.Now - _lastPreStartClickTime).TotalMilliseconds > 600)
+                {
+                    var bestChoice = PickBestModifier(modifiers, settings);
+                    if (bestChoice >= 0)
+                    {
+                        ClickElementChecked(gc, choiceElements[bestChoice]);
+                        _lastPreStartClickTime = DateTime.Now;
+                        Status = "Retrying mod click...";
+                    }
+                }
+                else
+                {
+                    Status = "Waiting for BEGIN...";
+                }
+
+                if ((DateTime.Now - _phaseStartTime).TotalSeconds > 20)
+                {
+                    _phase = UltimatumPhase.Failed;
+                    Status = "Timeout: BEGIN button not found";
+                    return MechanicResult.Failed;
+                }
                 return MechanicResult.InProgress;
             }
 
@@ -518,23 +550,77 @@ namespace AutoExile.Mechanics
             return MechanicResult.InProgress;
         }
 
-        // ── Fighting: combat handles skills, we stay near altar ──
+        // ── Fighting: combat handles skills, we stay near altar, chase circles ──
 
         private MechanicResult TickFighting(BotContext ctx, GameController gc)
         {
             var settings = ctx.Settings.Mechanics.Ultimatum;
+            var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
+            var effectiveRadius = GetEffectiveOrbitRadius(settings.OrbitRadius.Value);
 
-            // Suppress combat positioning when leash will pull us back,
-            // otherwise combat movement fights navigation for cursor control
+            // ── Circle capture logic (Stand in the Circles encounter type) ──
+            bool chasingCircle = false;
+            if (_encounterType.Contains("Circle", StringComparison.OrdinalIgnoreCase))
+            {
+                // Find active circle (stage == 2)
+                Entity? activeCircle = null;
+                float nearestActiveDist = float.MaxValue;
+
+                foreach (var entity in gc.EntityListWrapper.ValidEntitiesByType[EntityType.IngameIcon])
+                {
+                    if (entity.Path != CaptureRunePath) continue;
+                    if (!entity.TryGetComponent<StateMachine>(out var runeSm)) continue;
+                    var stage = runeSm.States.FirstOrDefault(s => s.Name == "stage");
+                    if (stage?.Value != 2) continue;
+
+                    var dist = Vector2.Distance(playerGrid, entity.GridPosNum);
+                    if (dist < nearestActiveDist)
+                    {
+                        nearestActiveDist = dist;
+                        activeCircle = entity;
+                    }
+                }
+
+                if (activeCircle != null)
+                {
+                    _activeCircleId = activeCircle.Id;
+                    _activeCirclePos = new Vector2(activeCircle.GridPosNum.X, activeCircle.GridPosNum.Y);
+
+                    if (nearestActiveDist > CircleStandRadius)
+                    {
+                        // Navigate to circle — suppress combat positioning so we don't get pulled away
+                        chasingCircle = true;
+                        if (!ctx.Navigation.IsNavigating ||
+                            (ctx.Navigation.Destination.HasValue && Vector2.Distance(ctx.Navigation.Destination.Value, _activeCirclePos.Value) > 10f))
+                        {
+                            ctx.Navigation.NavigateTo(gc, _activeCirclePos.Value);
+                        }
+                        Status = $"Round {_currentRound} — running to circle (dist={nearestActiveDist:F0})";
+                    }
+                    else
+                    {
+                        // Inside circle — stop moving, let capture happen
+                        if (ctx.Navigation.IsNavigating)
+                            ctx.Navigation.Stop(gc);
+                        Status = $"Round {_currentRound} — standing in circle...";
+                    }
+                }
+                else
+                {
+                    // No active circle — clear tracking, fight normally
+                    _activeCircleId = 0;
+                    _activeCirclePos = null;
+                }
+            }
+
+            // Suppress combat positioning when chasing a circle or leashing
             bool leashing = false;
             if (AnchorGridPos.HasValue)
             {
-                var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
                 var dist = Vector2.Distance(playerGrid, AnchorGridPos.Value);
-                var effectiveRadius = GetEffectiveOrbitRadius(settings.OrbitRadius.Value);
                 leashing = dist > effectiveRadius;
             }
-            ctx.Combat.SuppressPositioning = leashing;
+            ctx.Combat.SuppressPositioning = leashing || chasingCircle;
             ctx.Combat.Tick(ctx);
             ctx.Combat.SuppressPositioning = false;
 
@@ -542,9 +628,12 @@ namespace AutoExile.Mechanics
             var panel = gc.IngameState.IngameUi.UltimatumPanel;
             if (panel != null && panel.IsVisible)
             {
+                _activeCircleId = 0;
+                _activeCirclePos = null;
                 _phase = UltimatumPhase.ChoosingMod;
                 _phaseStartTime = DateTime.Now;
                 Status = "Wave complete, choosing next modifier";
+                ctx.Log($"[Ultimatum] UltimatumPanel visible during Fighting — transitioning to ChoosingMod (fightTime={(DateTime.Now - _phaseStartTime).TotalSeconds:F1}s)");
                 return MechanicResult.InProgress;
             }
 
@@ -565,20 +654,18 @@ namespace AutoExile.Mechanics
                 }
             }
 
-            // Leash to altar
-            if (AnchorGridPos.HasValue)
+            // Leash to altar (only when not chasing a circle — circles are within the arena)
+            if (!chasingCircle && AnchorGridPos.HasValue)
             {
-                var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
                 var dist = Vector2.Distance(playerGrid, AnchorGridPos.Value);
-                var effectiveRadius = GetEffectiveOrbitRadius(settings.OrbitRadius.Value);
                 if (dist > effectiveRadius)
                 {
                     ctx.Navigation.NavigateTo(gc, AnchorGridPos.Value);
-                    Status = $"Fighting round {_currentRound} — leashing back (dist={dist:F0}, radius={effectiveRadius:F0})";
+                    Status = $"Round {_currentRound} — leashing back (dist={dist:F0}, radius={effectiveRadius:F0})";
                 }
-                else
+                else if (!_encounterType.Contains("Circle", StringComparison.OrdinalIgnoreCase))
                 {
-                    Status = $"Fighting round {_currentRound}/{_totalRounds} (dist={dist:F0}, danger={_cumulativeDanger})";
+                    Status = $"Round {_currentRound}/{_totalRounds} (dist={dist:F0}, danger={_cumulativeDanger})";
                 }
             }
 
@@ -899,6 +986,18 @@ namespace AutoExile.Mechanics
             BotInput.Click(absPos);
         }
 
+        /// <summary>
+        /// Click a UI element and return whether the click actually fired (input gate was open).
+        /// </summary>
+        private bool ClickElementChecked(GameController gc, Element element)
+        {
+            var rect = element.GetClientRectCache;
+            var clickPos = new Vector2(rect.Center.X, rect.Center.Y);
+            var windowRect = gc.Window.GetWindowRectangleTimeCache;
+            var absPos = clickPos + new Vector2(windowRect.X, windowRect.Y);
+            return BotInput.Click(absPos);
+        }
+
         private void ParseRoundText(Element? panel)
         {
             // Text format: "Round <ultimatumnumber>{2/10}"
@@ -1081,6 +1180,21 @@ namespace AutoExile.Mechanics
                     g.DrawText("ULTIMATUM", altarScreen + new Vector2(-30, -25), SharpDX.Color.Orange);
                 }
             }
+
+            // Active circle marker (Stand in the Circles)
+            if (_activeCirclePos.HasValue && _phase == UltimatumPhase.Fighting)
+            {
+                var circleWorld = new Vector3(
+                    _activeCirclePos.Value.X * Pathfinding.GridToWorld,
+                    _activeCirclePos.Value.Y * Pathfinding.GridToWorld, playerZ);
+                var circleScreen = cam.WorldToScreen(circleWorld);
+                if (circleScreen.X > -200 && circleScreen.X < 2400)
+                {
+                    g.DrawCircleInWorld(circleWorld, CircleStandRadius * Pathfinding.GridToWorld,
+                        SharpDX.Color.Cyan, 2f);
+                    g.DrawText("STAND HERE", circleScreen + new Vector2(-30, -25), SharpDX.Color.Cyan);
+                }
+            }
         }
 
         // ══════════════════════════════════════════════════════════════
@@ -1111,6 +1225,8 @@ namespace AutoExile.Mechanics
             _takeRewardReason = "";
             _accumulatedRewardValue = 0;
             _lastPricedRound = 0;
+            _activeCircleId = 0;
+            _activeCirclePos = null;
             Status = "";
         }
     }

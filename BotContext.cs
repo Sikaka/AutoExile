@@ -23,7 +23,15 @@ namespace AutoExile
         public required MapMechanicManager Mechanics { get; init; }
         public required ThreatSystem Threat { get; init; }
         public required NinjaPriceService NinjaPrice { get; init; }
+        public required MapDatabase MapDatabase { get; init; }
         public required BotSettings Settings { get; init; }
+
+        /// <summary>
+        /// Minimap icons discovered from TileEntities. Updated periodically by BotCore.
+        /// Covers ~2x network bubble range — mechanics visible before entity list loads them.
+        /// </summary>
+        public IReadOnlyDictionary<long, BotCore.MinimapIconEntry> MinimapIcons { get; set; }
+            = new Dictionary<long, BotCore.MinimapIconEntry>();
 
         /// <summary>
         /// Graphics API for rendering overlays. Set during Render() calls.

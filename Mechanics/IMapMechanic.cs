@@ -69,6 +69,13 @@ namespace AutoExile.Mechanics
         bool IsRepeatable => false;
 
         /// <summary>
+        /// True if completing this mechanic transitions the player to a sub-zone
+        /// (e.g., wish zone mirage map). MappingMode uses this to snapshot parent
+        /// map state before the zone transition occurs.
+        /// </summary>
+        bool TriggersSubZone => false;
+
+        /// <summary>
         /// Run one tick of the mechanic's logic. MappingMode delegates entirely when active.
         /// Handles navigation to anchor, starting encounter, wave management, reward collection.
         /// </summary>

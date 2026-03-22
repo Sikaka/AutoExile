@@ -45,6 +45,10 @@ namespace AutoExile.Systems
         /// <summary>Parsed whitelist entries (lowercase). Set from settings comma-separated string.</summary>
         public List<string> SynthesisedWhitelist { get; set; } = new();
 
+        // ── Must-loot uniques (always pick up regardless of value) ──
+        /// <summary>Unique item names that bypass value filtering. Case-insensitive matching.</summary>
+        public HashSet<string> MustLootUniques { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
         /// <summary>
         /// Callback fired when an item is skipped during scan (value filter, cooldown block, etc.)
         /// or when a pickup fails. Args: (itemName, reason, chaosValue).
@@ -360,6 +364,29 @@ namespace AutoExile.Systems
 
             if (mods.ItemRarity != ItemRarity.Unique)
                 return false;
+
+            // Must-loot override — check unique name, art candidates, and display name
+            if (MustLootUniques.Count > 0)
+            {
+                var uniqueName = mods.UniqueName;
+                if (!string.IsNullOrEmpty(uniqueName) && MustLootUniques.Contains(uniqueName))
+                    return false;
+
+                // For unidentified uniques, resolve art → candidate names
+                if (!mods.Identified && PriceService != null)
+                {
+                    var candidates = PriceService.GetCandidateNames(entity);
+                    foreach (var candidate in candidates)
+                    {
+                        if (MustLootUniques.Contains(candidate))
+                            return false;
+                    }
+                }
+
+                // Also check the label text (visible name)
+                if (MustLootUniques.Contains(itemName))
+                    return false;
+            }
 
             var maxValue = priceResult.MaxChaosValue;
 

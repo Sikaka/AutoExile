@@ -30,6 +30,7 @@ namespace AutoExile.Mechanics
         public Vector2? AnchorGridPos { get; private set; }
         public bool IsEncounterActive => _phase is WishesPhase.WaitForCombatClear;
         public bool IsComplete => _phase == WishesPhase.Complete;
+        public bool TriggersSubZone => true;
 
         private WishesPhase _phase = WishesPhase.Idle;
         private DateTime _phaseStartTime = DateTime.Now;
@@ -48,6 +49,9 @@ namespace AutoExile.Mechanics
         private Vector2 _portalGridPos;
 
 
+        // Completed initiator IDs — never re-detect these (survives Reset)
+        private readonly HashSet<uint> _completedInitiatorIds = new();
+
         // UI interaction state
         private int _wishClickAttempts;
         private int _confirmClickAttempts;
@@ -59,6 +63,7 @@ namespace AutoExile.Mechanics
         private const float PhaseTimeoutSeconds = 60;
         private const int MaxClickAttempts = 8;
         private const int MaxNavFails = 10;
+        private uint _areaHashOnPortalClick;                  // area hash when portal was clicked — detects zone transition
 
         // Wishes panel — discovered dynamically, cached until reset
         private int _wishesPanelIndex = -1;
@@ -79,15 +84,37 @@ namespace AutoExile.Mechanics
             }
 
             // Look for original map encounter anchor
+            // Skip initiators we've already completed (survives Reset — prevents re-entry loop)
+            // Also skip non-targetable ones (encounter already triggered)
+            var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
+            Entity? foundNpc = null;
+            Entity? foundPortal = null;
+
             foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
             {
                 if (entity.Path == null) continue;
+
+                // Track NPC in case initiator is already non-targetable
+                if (entity.Path.Contains("Kubera/Varashta") && entity.IsTargetable)
+                {
+                    var npcDist = Vector2.Distance(playerGrid, entity.GridPosNum);
+                    if (npcDist <= Pathfinding.NetworkBubbleRadius)
+                        foundNpc = entity;
+                }
+
+                // Track DjinnPortal in case both initiator and NPC are done
+                if (entity.Path.Contains("Faridun/DjinnPortal") && entity.IsTargetable)
+                {
+                    var portalDist = Vector2.Distance(playerGrid, entity.GridPosNum);
+                    if (portalDist <= Pathfinding.NetworkBubbleRadius)
+                        foundPortal = entity;
+                }
+
                 if (!entity.Path.Contains("Faridun/FaridunInitiator")) continue;
+                if (!entity.IsTargetable) continue;
+                if (_completedInitiatorIds.Contains(entity.Id)) continue;
 
-                var dist = Vector2.Distance(
-                    new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y),
-                    new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y));
-
+                var dist = Vector2.Distance(playerGrid, entity.GridPosNum);
                 if (dist > Pathfinding.NetworkBubbleRadius) continue;
 
                 _initiator = entity;
@@ -96,6 +123,31 @@ namespace AutoExile.Mechanics
                 AnchorGridPos = _initiatorGridPos;
 
                 ScanFaridunEntities(ctx);
+                ctx.Log($"[Wishes] Detected via initiator at ({AnchorGridPos.Value.X:F0}, {AnchorGridPos.Value.Y:F0})");
+                return true;
+            }
+
+            // Fallback: if the NPC is targetable but the initiator isn't (encounter already
+            // triggered, combat cleared, NPC waiting), detect via NPC directly
+            if (foundNpc != null)
+            {
+                _npc = foundNpc;
+                _npcId = foundNpc.Id;
+                _npcGridPos = new Vector2(foundNpc.GridPosNum.X, foundNpc.GridPosNum.Y);
+                AnchorGridPos = _npcGridPos;
+                ScanFaridunEntities(ctx);
+                ctx.Log($"[Wishes] Detected via NPC at ({AnchorGridPos.Value.X:F0}, {AnchorGridPos.Value.Y:F0})");
+                return true;
+            }
+
+            // Fallback: DjinnPortal is open (wish confirmed, NPC done, portal waiting)
+            if (foundPortal != null)
+            {
+                _portal = foundPortal;
+                _portalId = foundPortal.Id;
+                _portalGridPos = new Vector2(foundPortal.GridPosNum.X, foundPortal.GridPosNum.Y);
+                AnchorGridPos = _portalGridPos;
+                ctx.Log($"[Wishes] Detected via DjinnPortal at ({AnchorGridPos.Value.X:F0}, {AnchorGridPos.Value.Y:F0})");
                 return true;
             }
 
@@ -112,6 +164,7 @@ namespace AutoExile.Mechanics
                 {
                     ctx.Log($"[Wishes] Phase {_phase} timed out after {PhaseTimeoutSeconds}s");
                     Status = $"Timed out in {_phase}";
+                    MarkInitiatorCompleted();
                     _phase = WishesPhase.Complete;
                     return MechanicResult.Failed;
                 }
@@ -134,8 +187,19 @@ namespace AutoExile.Mechanics
             };
         }
 
+        /// <summary>Mark current initiator as done so it's never re-detected (survives Reset).</summary>
+        private void MarkInitiatorCompleted()
+        {
+            if (_initiatorId != 0)
+                _completedInitiatorIds.Add(_initiatorId);
+        }
+
         public void Reset()
         {
+            // Mark initiator done BEFORE clearing state — if we were mid-flow,
+            // we don't want to re-detect this same encounter after reset
+            MarkInitiatorCompleted();
+
             _phase = WishesPhase.Idle;
             _initiator = null;
             _npc = null;
@@ -149,6 +213,7 @@ namespace AutoExile.Mechanics
             _confirmClickAttempts = 0;
             _npcClickAttempts = 0;
             _portalClickAttempts = 0;
+            _areaHashOnPortalClick = 0;
             _navFailCount = 0;
             _wishesPanelIndex = -1;
         }
@@ -159,19 +224,22 @@ namespace AutoExile.Mechanics
 
         private MechanicResult TickIdle(BotContext ctx)
         {
-            if (_initiator == null) return MechanicResult.Idle;
+            // Portal ready — skip straight to entering it
+            if (_portal != null && _portal.IsTargetable)
+            {
+                SetPhase(WishesPhase.NavigateToPortal, "Portal ready");
+                return MechanicResult.InProgress;
+            }
 
+            // NPC ready — go talk
             if (_npc != null && _npc.IsTargetable)
             {
                 SetPhase(WishesPhase.NavigateToNPC, "NPC available, going to talk");
                 return MechanicResult.InProgress;
             }
 
-            if (_portal != null && _portal.IsTargetable)
-            {
-                SetPhase(WishesPhase.NavigateToPortal, "Portal ready");
-                return MechanicResult.InProgress;
-            }
+            // Need initiator for the navigate-to-encounter path
+            if (_initiator == null) return MechanicResult.Idle;
 
             SetPhase(WishesPhase.NavigateToEncounter, "Navigating to encounter area");
             return MechanicResult.InProgress;
@@ -527,6 +595,19 @@ namespace AutoExile.Mechanics
         {
             var gc = ctx.Game;
 
+            // Detect completed transition via area hash change.
+            // Grid positions are zone-relative, so position-based checks are unreliable across zones.
+            if (_portalClickAttempts > 0 && _areaHashOnPortalClick != 0)
+            {
+                var currentHash = gc.IngameState?.Data?.CurrentAreaHash ?? 0;
+                if (currentHash != 0 && currentHash != _areaHashOnPortalClick)
+                {
+                    ctx.Log($"[Wishes] Area hash changed ({_areaHashOnPortalClick} -> {currentHash}) — portal transition complete");
+                    _phase = WishesPhase.Complete;
+                    return MechanicResult.Complete;
+                }
+            }
+
             var stash = gc.IngameState.IngameUi.StashElement;
             var inv = gc.IngameState.IngameUi.InventoryPanel;
             if ((stash != null && stash.IsVisible) || (inv != null && inv.IsVisible))
@@ -538,16 +619,17 @@ namespace AutoExile.Mechanics
 
             if (_portal == null || !_portal.IsTargetable)
             {
-                // Portal gone — area change triggers loading screen.
-                // BotCore will ForceCompleteActive() this mechanic and cache it.
-                // MappingMode handles the wish zone (fight, loot, exit via SekhemaPortal)
-                // with a minimum zone time before allowing exit.
-                var elapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
-                Status = $"[Enter] Portal gone, waiting for area change ({elapsed:F0}s)";
+                // Portal gone but area hash hasn't changed yet — wait a few ticks for the transition.
+                // The area hash check above will complete us once the zone loads.
+                Status = $"[Enter] Portal gone, waiting for transition";
                 return MechanicResult.InProgress;
             }
 
             if (!CanClick()) return MechanicResult.InProgress;
+
+            // Record area hash before first click so we can detect zone transition
+            if (_portalClickAttempts == 0)
+                _areaHashOnPortalClick = gc.IngameState?.Data?.CurrentAreaHash ?? 0;
 
             var screenPos = gc.IngameState.Camera.WorldToScreen(_portal.BoundsCenterPosNum);
             var windowRect = gc.Window.GetWindowRectangleTimeCache;
@@ -728,13 +810,16 @@ namespace AutoExile.Mechanics
             if (string.IsNullOrEmpty(preferred) || preferred == "Any")
                 return 3;
 
+            // Match on reward tooltip text (e.g. "Coin of Power", "Coin of Skill", "Coin of Knowledge")
+            // Tooltip is on option[4] (the reward icon element at bottom of each wish card)
             for (int i = 3; i <= 5; i++)
             {
                 var option = container.GetChildAtIndex(i);
                 if (option == null || !option.IsVisible) continue;
 
-                var name = GetWishName(option);
-                if (name.Contains(preferred, StringComparison.OrdinalIgnoreCase))
+                var rewardElement = option.GetChildAtIndex(4);
+                var tooltipText = rewardElement?.Tooltip?.Text;
+                if (tooltipText != null && tooltipText.Contains(preferred, StringComparison.OrdinalIgnoreCase))
                     return i;
             }
 

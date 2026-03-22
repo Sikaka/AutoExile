@@ -33,7 +33,9 @@ namespace AutoExile.WebServer
         // Settings + data store — set by BotCore after construction
         public BotSettings? Settings { get; set; }
         public DataStore? DataStore { get; set; }
+        public Systems.MapDatabase? MapDatabase { get; set; }
         public ConfigManager? ConfigManager { get; set; }
+        public Systems.NinjaPriceService? NinjaPrice { get; set; }
 
         // Cached terrain data — pushed from BotCore on area change
         private volatile MapTerrainData? _cachedTerrain;
@@ -220,6 +222,18 @@ namespace AutoExile.WebServer
                         break;
                     case "/api/history/events" when method == "GET":
                         await HandleHistoryEvents(req, resp);
+                        break;
+                    case "/api/maps" when method == "GET":
+                        await HandleGetMaps(resp);
+                        break;
+                    case "/api/ultimatum-mods" when method == "GET":
+                        await HandleGetUltimatumMods(resp);
+                        break;
+                    case "/api/ultimatum-mods" when method == "POST":
+                        await HandleSetUltimatumMod(req, resp);
+                        break;
+                    case "/api/ninja/uniques" when method == "GET":
+                        await HandleSearchUniques(req, resp);
                         break;
 
                     default:
@@ -424,6 +438,127 @@ namespace AutoExile.WebServer
             var limit = GetQueryInt(req, "limit", 100);
             var data = DataStore?.GetRecentEvents(limit) ?? new();
             await ServeJson(resp, data, pretty: true);
+        }
+
+        private async Task HandleGetUltimatumMods(HttpListenerResponse resp)
+        {
+            if (Settings == null) { resp.StatusCode = 503; await ServeJson(resp, new { error = "not ready" }); return; }
+
+            var overrides = Settings.Mechanics.Ultimatum.ModRanking.DangerOverrides;
+
+            // Build mod list from game files (authoritative), falling back to defaults + overrides
+            var modEntries = new Dictionary<string, string>(); // id → display name
+            try
+            {
+                var fileMods = ExileCore.PoEMemory.RemoteMemoryObject.pTheGame?.Files?.UltimatumModifiers?.EntriesList;
+                if (fileMods != null)
+                {
+                    foreach (var m in fileMods)
+                    {
+                        if (string.IsNullOrEmpty(m.Id)) continue;
+                        // Skip internal mods: wave scaling, spawners, empty names with no defaults
+                        if (m.Id.StartsWith("UltimatumWave")) continue;
+                        if (m.Id == "EnableFaridunModifiers") continue;
+                        if (string.IsNullOrWhiteSpace(m.Name) && m.Id.EndsWith("Spawner")) continue;
+                        var display = string.IsNullOrWhiteSpace(m.Name) ? m.Id : m.Name;
+                        modEntries[m.Id] = display;
+                    }
+                }
+            }
+            catch { }
+
+            // Fallback if game files unavailable: use defaults + overrides
+            if (modEntries.Count == 0)
+            {
+                foreach (var k in Mechanics.UltimatumModDanger.Defaults.Keys)
+                    modEntries[k] = k;
+                foreach (var k in overrides.Keys)
+                    if (!modEntries.ContainsKey(k)) modEntries[k] = k;
+            }
+
+            var result = modEntries.OrderBy(kv => kv.Value).Select(kv =>
+            {
+                var id = kv.Key;
+                var defaultDanger = Mechanics.UltimatumModDanger.Defaults.TryGetValue(id, out var d) ? d : Mechanics.UltimatumModDanger.DefaultDanger;
+                var currentDanger = Mechanics.UltimatumModDanger.GetDanger(id, overrides);
+                var isOverridden = overrides.ContainsKey(id);
+
+                return new
+                {
+                    id,
+                    name = kv.Value,
+                    defaultDanger,
+                    currentDanger,
+                    isOverridden,
+                };
+            }).ToList();
+
+            await ServeJson(resp, result, pretty: true);
+        }
+
+        private async Task HandleSetUltimatumMod(HttpListenerRequest req, HttpListenerResponse resp)
+        {
+            if (Settings == null) { resp.StatusCode = 503; await ServeJson(resp, new { error = "not ready" }); return; }
+
+            var body = await ReadBody(req);
+            var doc = System.Text.Json.JsonDocument.Parse(body);
+            var root = doc.RootElement;
+
+            if (!root.TryGetProperty("id", out var idEl) || !root.TryGetProperty("danger", out var dangerEl))
+            {
+                resp.StatusCode = 400;
+                await ServeJson(resp, new { error = "requires 'id' and 'danger'" });
+                return;
+            }
+
+            var modId = idEl.GetString() ?? "";
+            var danger = dangerEl.GetInt32();
+            var overrides = Settings.Mechanics.Ultimatum.ModRanking.DangerOverrides;
+
+            // If setting back to default, remove the override
+            if (Mechanics.UltimatumModDanger.Defaults.TryGetValue(modId, out var def) && danger == def)
+                overrides.Remove(modId);
+            else
+                overrides[modId] = danger;
+
+            // Persist
+            ConfigManager?.Save(Settings);
+            await ServeJson(resp, new { ok = true, id = modId, danger });
+        }
+
+        private async Task HandleSearchUniques(HttpListenerRequest req, HttpListenerResponse resp)
+        {
+            var ninja = NinjaPrice;
+            if (ninja == null || !ninja.IsLoaded)
+            {
+                resp.StatusCode = 503;
+                await ServeJson(resp, new { error = "Price data not loaded" });
+                return;
+            }
+
+            var query = req.QueryString["q"] ?? "";
+            if (query.Length < 2)
+            {
+                await ServeJson(resp, Array.Empty<object>());
+                return;
+            }
+
+            var results = ninja.SearchUniques(query, 30);
+            var response = results.Select(r => new { name = r.Name, chaos = r.ChaosValue, category = r.Category }).ToList();
+            await ServeJson(resp, response);
+        }
+
+        private async Task HandleGetMaps(HttpListenerResponse resp)
+        {
+            var db = MapDatabase;
+            var supported = db?.SupportedMaps.ToList() ?? new();
+            var result = supported.Select(name => new
+            {
+                name,
+                bossTiles = db?.GetBossTiles(name),
+                lastScanned = db?.GetEntry(name)?.LastScanned,
+            }).ToList();
+            await ServeJson(resp, result, pretty: true);
         }
 
         // ====================================================================

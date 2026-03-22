@@ -59,6 +59,10 @@ namespace AutoExile
 
         public LootSettings Loot { get; set; } = new LootSettings();
 
+        // --- Mapping (mode-specific) ---
+
+        public MappingSettings Mapping { get; set; } = new MappingSettings();
+
         // --- Follower (mode-specific) ---
 
         public FollowerSettings Follower { get; set; } = new FollowerSettings();
@@ -249,6 +253,34 @@ namespace AutoExile
         }
 
         [Submenu(CollapsedByDefault = true)]
+        public class MappingSettings
+        {
+            [Menu("Map Name", "Which map to farm. Supported maps (marked with ★) have boss location data for faster clears.")]
+            public ListNode MapName { get; set; } = new ListNode();
+
+            [Menu("Min Map Tier", "Minimum map tier to pick from stash when inserting. 0 = any tier.")]
+            public RangeNode<int> MinMapTier { get; set; } = new RangeNode<int>(0, 0, 16);
+
+            [Menu("Rush Boss", "Rush to boss room first using tile data (requires ★ supported map). Kills boss before exploring/clearing the rest of the map.")]
+            public ToggleNode RushBoss { get; set; } = new ToggleNode(false);
+
+            [Menu("Kill Boss", "Map not complete until boss is killed. Bot navigates to boss tiles and verifies kill. Requires ★ supported map with boss data.")]
+            public ToggleNode KillBoss { get; set; } = new ToggleNode(false);
+
+            [Menu("Boss Kill Radius", "Grid distance around boss tiles to check for unique monster kills.")]
+            public RangeNode<int> BossKillRadius { get; set; } = new RangeNode<int>(70, 30, 150);
+
+            [Menu("Min Pack Density", "Minimum nearby monsters to interrupt exploration. Below this, skills fire while walking.")]
+            public RangeNode<int> MinPackDensity { get; set; } = new RangeNode<int>(8, 1, 30);
+
+            [Menu("Detour For Rares", "Always interrupt exploration to fight rare/unique monsters within detour range.")]
+            public ToggleNode DetourForRares { get; set; } = new ToggleNode(true);
+
+            [Menu("Max Detour Distance", "Max grid distance to chase a rare/unique from current path. Beyond this, keep exploring.")]
+            public RangeNode<int> MaxDetourDistance { get; set; } = new RangeNode<int>(60, 10, 150);
+        }
+
+        [Submenu(CollapsedByDefault = true)]
         public class FollowerSettings
         {
             [Menu("Leader Name", "Character name to follow.")]
@@ -312,8 +344,13 @@ namespace AutoExile
             [Menu("Filter Synthesised Items", "When enabled, only pick up synthesised items whose implicits match the whitelist.")]
             public ToggleNode FilterSynthesisedItems { get; set; } = new ToggleNode(false);
 
-            [Menu("Synthesised Implicit Whitelist", "Comma-separated implicit mod substrings to keep (e.g. 'Onslaught,Explode,extra curse'). Case-insensitive. Items matching ANY entry are looted.")]
-            public TextNode SynthesisedWhitelist { get; set; } = new TextNode("Onslaught,Explode,extra curse,Tailwind,Elusive,base Critical");
+            [Menu("Synthesised Implicit Whitelist", "Comma-separated implicit mod substrings to keep. Case-insensitive. Items matching ANY entry are looted.")]
+            public TextNode SynthesisedWhitelist { get; set; } = new TextNode("Onslaught,Explode,extra curse,Tailwind,Elusive,base Critical,maximum Power Charge,maximum Frenzy Charge,maximum Endurance Charge,Cooldown Recovery,additional Arrow,additional Projectile");
+
+            // --- Must-Loot Uniques ---
+
+            [Menu("Must-Loot Uniques", "Comma-separated unique item names to always pick up regardless of value filtering. Use the web UI to search and add from poe.ninja data.")]
+            public TextNode MustLootUniques { get; set; } = new TextNode("");
 
             // --- Misc ---
 
@@ -519,26 +556,41 @@ namespace AutoExile
             public HarvestMechanicSettings Harvest { get; set; } = new HarvestMechanicSettings();
             public WishesMechanicSettings Wishes { get; set; } = new WishesMechanicSettings();
             public EssenceMechanicSettings Essence { get; set; } = new EssenceMechanicSettings();
+            public RitualMechanicSettings Ritual { get; set; } = new RitualMechanicSettings();
             public InteractableSettings Interactables { get; set; } = new InteractableSettings();
         }
 
         [Submenu(CollapsedByDefault = false)]
         public class InteractableSettings
         {
-            [Menu("Click Shrines", "Activate shrines encountered while mapping.")]
-            public ToggleNode Shrines { get; set; } = new ToggleNode(true);
+            private static ListNode MakeInteractableMode(string defaultValue = "Optional")
+            {
+                var node = new ListNode();
+                node.SetListValues(new List<string> { "Ignore", "Optional", "Required" });
+                node.Value = defaultValue;
+                return node;
+            }
 
-            [Menu("Click Strongboxes", "Open strongboxes (spawns monsters, drops loot after kill).")]
-            public ToggleNode Strongboxes { get; set; } = new ToggleNode(true);
+            [Menu("Shrines", "Ignore=skip, Optional=click when passing, Required=route toward.")]
+            public ListNode Shrines { get; set; } = MakeInteractableMode();
 
-            [Menu("Click Djinn Caches", "Open Faridun league caches (Djinn's Cache).")]
-            public ToggleNode DjinnCaches { get; set; } = new ToggleNode(true);
+            [Menu("Strongboxes", "Ignore=skip, Optional=click when passing, Required=route toward.")]
+            public ListNode Strongboxes { get; set; } = MakeInteractableMode();
 
-            [Menu("Click Heist Caches", "Open Smuggler's Caches (Heist league).")]
-            public ToggleNode HeistCaches { get; set; } = new ToggleNode(true);
+            [Menu("Djinn Caches", "Ignore=skip, Optional=click when passing, Required=route toward.")]
+            public ListNode DjinnCaches { get; set; } = MakeInteractableMode();
 
-            [Menu("Click Crafting Recipes", "Unlock crafting recipe tablets.")]
-            public ToggleNode CraftingRecipes { get; set; } = new ToggleNode(true);
+            [Menu("Heist Caches", "Ignore=skip, Optional=click when passing, Required=route toward.")]
+            public ListNode HeistCaches { get; set; } = MakeInteractableMode();
+
+            [Menu("Crafting Recipes", "Ignore=skip, Optional=click when passing, Required=route toward.")]
+            public ListNode CraftingRecipes { get; set; } = MakeInteractableMode();
+
+            /// <summary>Check if a setting is not Ignore (i.e., Optional or Required).</summary>
+            public bool IsEnabled(ListNode setting) => setting.Value != "Ignore";
+
+            /// <summary>Check if a setting is Required (actively route toward).</summary>
+            public bool IsRequired(ListNode setting) => setting.Value == "Required";
         }
 
         [Submenu(CollapsedByDefault = false)]
@@ -592,14 +644,14 @@ namespace AutoExile
                 Mode.SetListValues(Enum.GetNames<MechanicMode>().ToList());
                 Mode.Value = MechanicMode.Optional.ToString();
 
-                PreferredWish.SetListValues(new List<string> { "Any", "Foes", "Horizons", "Meddling" });
+                PreferredWish.SetListValues(new List<string> { "Any", "Coin of Power", "Coin of Skill", "Coin of Knowledge" });
                 PreferredWish.Value = "Any";
             }
 
             [Menu("Mode", "Skip=ignore, Optional=do if found, Required=must complete for map done.")]
             public ListNode Mode { get; set; } = new ListNode();
 
-            [Menu("Preferred Wish", "Which wish to select. Any = pick the first available.")]
+            [Menu("Preferred Wish", "Select by reward coin type. Any = pick the first available.")]
             public ListNode PreferredWish { get; set; } = new ListNode();
 
             [Menu("Loot Sweep Seconds", "How long to loot in the wish zone before returning.")]
@@ -630,6 +682,22 @@ namespace AutoExile
             public ToggleNode CorruptEssences { get; set; } = new ToggleNode(true);
 
             [Menu("Loot Sweep Seconds", "How long to loot after killing the essence monster.")]
+            public RangeNode<float> LootSweepSeconds { get; set; } = new RangeNode<float>(3f, 1f, 10f);
+        }
+
+        [Submenu(CollapsedByDefault = false)]
+        public class RitualMechanicSettings
+        {
+            public RitualMechanicSettings()
+            {
+                Mode.SetListValues(Enum.GetNames<MechanicMode>().ToList());
+                Mode.Value = MechanicMode.Skip.ToString();
+            }
+
+            [Menu("Mode", "BETA — Skip=ignore, Optional=do if found, Required=must complete for map done.")]
+            public ListNode Mode { get; set; } = new ListNode();
+
+            [Menu("Loot Sweep Seconds", "How long to loot after each ritual encounter.")]
             public RangeNode<float> LootSweepSeconds { get; set; } = new RangeNode<float>(3f, 1f, 10f);
         }
 

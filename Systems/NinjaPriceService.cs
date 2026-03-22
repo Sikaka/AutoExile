@@ -176,6 +176,60 @@ namespace AutoExile.Systems
             return LookupItem(name, category);
         }
 
+        /// <summary>
+        /// Resolve an entity's art path to candidate unique item names via the art mapping.
+        /// Returns empty list if art mapping not built or no match found.
+        /// Used by LootSystem to check must-loot names for unidentified uniques.
+        /// </summary>
+        public List<string> GetCandidateNames(Entity entity)
+        {
+            entity.TryGetComponent<RenderItem>(out var renderItem);
+            var artPath = renderItem?.ResourcePath;
+            if (string.IsNullOrEmpty(artPath)) return new List<string>();
+
+            var mapping = _uniqueArtMapping;
+            if (mapping.TryGetValue(artPath, out var names))
+                return names;
+            return new List<string>();
+        }
+
+        /// <summary>
+        /// Search cached unique item names across all unique categories.
+        /// Returns up to maxResults matches with name and chaos value.
+        /// Used by the web UI for must-loot unique selection.
+        /// </summary>
+        public List<(string Name, double ChaosValue, string Category)> SearchUniques(string query, int maxResults = 20)
+        {
+            var results = new List<(string Name, double ChaosValue, string Category)>();
+            if (string.IsNullOrWhiteSpace(query) || !IsLoaded) return results;
+
+            var prices = _prices;
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var cat in UniqueCategories)
+            {
+                if (!prices.TryGetValue(cat, out var byName)) continue;
+                var catName = cat.ToString().Replace("Unique", "");
+
+                foreach (var (name, entries) in byName)
+                {
+                    if (!name.Contains(query, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!seen.Add(name)) continue;
+
+                    var maxVal = 0.0;
+                    foreach (var e in entries)
+                        if ((e.ChaosValue ?? 0) > maxVal) maxVal = e.ChaosValue ?? 0;
+
+                    results.Add((name, maxVal, catName));
+                }
+            }
+
+            results.Sort((a, b) => b.ChaosValue.CompareTo(a.ChaosValue));
+            if (results.Count > maxResults)
+                results.RemoveRange(maxResults, results.Count - maxResults);
+            return results;
+        }
+
         // ═══════════════════════════════════════════════════
         // Item classification + pricing
         // ═══════════════════════════════════════════════════

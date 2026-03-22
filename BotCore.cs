@@ -45,6 +45,7 @@ namespace AutoExile
         private BotWebServer? _webServer;
         private DataStore? _dataStore;
         private ConfigManager? _configManager;
+        private MapDatabase _mapDatabase = null!;
 
         // Public accessors for external tools (POEMCP /eval)
         public NavigationSystem Navigation => _navigation;
@@ -72,6 +73,8 @@ namespace AutoExile
         // Area change tracking for tile map reload
         private string _lastAreaName = "";
         private long _lastAreaHash;
+        private DateTime _areaChangedAt = DateTime.MinValue;
+        private const float AreaSettleSeconds = 3f;
 
         // Cross-zone state cache (e.g., Wishes portal round-trip)
         // Keyed by area name — when returning to same-named area, restore cached state
@@ -90,6 +93,9 @@ namespace AutoExile
         private Vector2 _tileSignaturePlayerPos;
         private DateTime _tileSignatureScanTime;
 
+        // Map list population (deferred to first tick when Files are available)
+        private bool _mapListPopulated;
+
         // --- Buff scanner ---
         private bool _buffScanActive;
         private int _buffScanSlotIndex = -1; // which skill slot (0-based) we're scanning for
@@ -106,6 +112,8 @@ namespace AutoExile
             Instance = this;
             _recorder.SetOutputDir(Path.Combine(DirectoryFullName, "Recordings"));
             _ninjaPrice.Initialize(DirectoryFullName, msg => LogMessage($"[AutoExile] NinjaPrice: {msg}"));
+            _mapDatabase = new MapDatabase(msg => LogMessage($"[AutoExile] {msg}"));
+            _mapDatabase.Initialize(DirectoryFullName);
 
             _ctx = new BotContext
             {
@@ -122,6 +130,7 @@ namespace AutoExile
                 Mechanics = _mechanics,
                 Threat = _threat,
                 NinjaPrice = _ninjaPrice,
+                MapDatabase = _mapDatabase,
                 Settings = Settings,
                 Log = msg => LogMessage($"[AutoExile] {msg}")
             };
@@ -145,6 +154,7 @@ namespace AutoExile
             _mechanics.Register(new HarvestMechanic());
             _mechanics.Register(new WishesMechanic());
             _mechanics.Register(new EssenceMechanic());
+            _mechanics.Register(new RitualMechanic());
 
             // Populate mode dropdown and restore saved selection
             Settings.ActiveMode.SetListValues(_modes.Keys.ToList());
@@ -185,6 +195,10 @@ namespace AutoExile
                 _dataStore.RecordEvent("loot_skip", $"{itemName}{valueStr}: {reason}", area);
             };
 
+            // Populate map name list from atlas nodes (when in-game)
+            // Deferred to first tick since Files may not be ready at init time
+            _mapListPopulated = false;
+
             // Start embedded web server
             if (Settings.WebUiEnabled.Value)
             {
@@ -192,6 +206,8 @@ namespace AutoExile
                 _webServer.Settings = Settings;
                 _webServer.DataStore = _dataStore;
                 _webServer.ConfigManager = _configManager;
+                _webServer.MapDatabase = _mapDatabase;
+                _webServer.NinjaPrice = _ninjaPrice;
                 _webServer.Start();
             }
 
@@ -213,6 +229,11 @@ namespace AutoExile
                 return base.Tick();
 
             _ctx.DeltaTime = (float)GameController.DeltaTime;
+            _ctx.MinimapIcons = _knownMinimapIcons;
+
+            // Populate map name list from atlas data (once, when Files are ready)
+            if (!_mapListPopulated)
+                PopulateMapList();
 
             // Toggle running with hotkey — always check, even during async actions
             if (Settings.ToggleRunning.PressedOnce())
@@ -229,9 +250,10 @@ namespace AutoExile
                     _lootTracker.StopSession();
             }
 
-            // An async action is in flight (cursor settle, key hold) — don't interfere
-            if (!Systems.BotInput.CanAct)
-                return base.Tick();
+            // An async action is in flight (cursor settle, key hold).
+            // Still tick combat for self-cast skills (RF, guards, etc.) and mode for state updates,
+            // but skip navigation which would queue conflicting cursor movements.
+            var canAct = Systems.BotInput.CanAct;
 
             // Reload tile map + exploration on area change
             // Use area hash (unique per instance) to detect changes — area name alone
@@ -276,10 +298,13 @@ namespace AutoExile
 
                 _lastAreaName = currentArea;
                 _lastAreaHash = currentHash;
+                _areaChangedAt = DateTime.Now;
                 _tileMap.Clear();
                 _tileMap.Load(GameController);
                 _loot.ClearFailed();
                 _lootTracker.OnAreaChanged();
+                ClearMinimapIcons();
+                ScanMinimapIcons(forceFullLog: true);
 
                 // Stop MappingMode if we landed in hideout/town (e.g. death respawn)
                 if (_mode == _mappingMode && _mappingMode != null)
@@ -346,12 +371,16 @@ namespace AutoExile
 
                 // Scan for area transition entities and record them
                 ScanAreaTransitions();
+
+                // Periodic minimap icon scan — tiles load at ~2x network bubble as player moves
+                ScanMinimapIcons();
             }
 
             // Sync settings → systems
             _navigation.BlinkRange = Settings.Build.BlinkRange.Value;
             _navigation.DashMinDistance = Settings.Build.DashMinDistance.Value;
             BotInput.ActionCooldownMs = Settings.ActionCooldownMs.Value;
+            BotInput.WindowRect = GameController.Window.GetWindowRectangleTimeCache;
 
             // Sync primary movement key from skill config → NavigationSystem + CombatSystem
             var primaryMove = Settings.Build.GetPrimaryMovement();
@@ -440,12 +469,18 @@ namespace AutoExile
             _loot.MinGemChaosValue = Settings.Loot.MinGemChaosValue.Value;
             _loot.AlwaysLoot20QualityGems = Settings.Loot.AlwaysLoot20QualityGems.Value;
             _loot.FilterSynthesisedItems = Settings.Loot.FilterSynthesisedItems.Value;
-            // Parse comma-separated whitelist into trimmed lowercase entries
+            // Parse comma-separated whitelist into trimmed entries
             var whitelistRaw = Settings.Loot.SynthesisedWhitelist.Value ?? "";
             _loot.SynthesisedWhitelist = whitelistRaw
                 .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                 .Where(s => s.Length > 0)
                 .ToList();
+            // Parse must-loot uniques list
+            var mustLootRaw = Settings.Loot.MustLootUniques.Value ?? "";
+            _loot.MustLootUniques = new HashSet<string>(
+                mustLootRaw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .Where(s => s.Length > 0),
+                StringComparer.OrdinalIgnoreCase);
             _loot.PriceService = _ninjaPrice;
             _lootTracker.PriceService = _ninjaPrice;
 
@@ -461,12 +496,33 @@ namespace AutoExile
             _stash.ActionCooldownMs = Settings.Loot.StashItemCooldownMs.Value;
             _stash.ApplyIncubators = Settings.AutoApplyIncubators.Value;
 
+            // Record tick state BEFORE early returns so recordings capture paused/loading/settle state
+            _recorder.RecordTick(GameController, _mode.Name,
+                (_mode as MappingMode)?.Phase.ToString()
+                ?? (_mode as BlightMode)?.Phase.ToString()
+                ?? (_mode as SimulacrumMode)?.Phase.ToString()
+                ?? (_mode as HeistMode)?.Phase.ToString()
+                ?? (_mode as FollowerMode)?.State.ToString()
+                ?? "",
+                (_mode as MappingMode)?.Decision
+                ?? (_mode as SimulacrumMode)?.Decision
+                ?? (_mode as HeistMode)?.Decision
+                ?? (_mode as FollowerMode)?.Decision
+                ?? "",
+                _navigation, _interaction, _loot);
+
             // Only run full mode logic when running
             if (!Settings.Running)
                 return base.Tick();
 
             // Global interrupts — handle before mode gets control
             if (!HandleInterrupts())
+                return base.Tick();
+
+            // Area change settle — entity list and game state aren't reliable for
+            // a few seconds after zone transition. Skip mode logic to prevent
+            // stale entity reads (e.g., mechanic re-detection from old zone data).
+            if ((DateTime.Now - _areaChangedAt).TotalSeconds < AreaSettleSeconds)
                 return base.Tick();
 
             // Sync follower settings
@@ -487,22 +543,9 @@ namespace AutoExile
             // Navigation ticks AFTER mode — mode sets up/updates paths, then nav executes movement.
             // This prevents stale walk commands: the walk command always targets the current path,
             // not a path that's about to be replaced.
-            _navigation.Tick(GameController);
-
-            // Record tick state for post-hoc analysis (combat, navigation, decisions)
-            _recorder.RecordTick(GameController, _mode.Name,
-                (_mode as MappingMode)?.Phase.ToString()
-                ?? (_mode as BlightMode)?.Phase.ToString()
-                ?? (_mode as SimulacrumMode)?.Phase.ToString()
-                ?? (_mode as HeistMode)?.Phase.ToString()
-                ?? (_mode as FollowerMode)?.State.ToString()
-                ?? "",
-                (_mode as MappingMode)?.Decision
-                ?? (_mode as SimulacrumMode)?.Decision
-                ?? (_mode as HeistMode)?.Decision
-                ?? (_mode as FollowerMode)?.Decision
-                ?? "",
-                _navigation, _interaction, _loot);
+            // Only tick nav when no async action is in flight (cursor settle / key hold).
+            if (canAct)
+                _navigation.Tick(GameController);
 
             // Auto level gems (global, runs across all modes)
             TickGemLevelUp();
@@ -530,10 +573,17 @@ namespace AutoExile
             // Pass graphics to context for mode rendering
             _ctx.Graphics = Graphics;
             _mode.Render(_ctx);
+
+            // Ritual shop overlay — always render when shop is open, regardless of mode
+            RitualMechanic.RenderShopOverlay(_ctx, Graphics, GameController);
+
             _ctx.Graphics = null;
 
             // Tile signature overlay (F8)
             RenderTileSignatures();
+
+            // Boss position overlay (always visible when data exists for current map)
+            RenderBossMarker();
 
             // Debug range circle overlay
             if (DateTime.Now < _debugCircleExpiry && _debugCircleRadius > 0 && GameController.Player != null)
@@ -1160,6 +1210,125 @@ namespace AutoExile
         }
 
         // =================================================================
+        // Minimap Icon Scanner
+        // =================================================================
+
+        // Known minimap icon entities — keyed by entity ID to avoid re-logging
+        private readonly Dictionary<long, MinimapIconEntry> _knownMinimapIcons = new();
+        private DateTime _lastMinimapIconScan = DateTime.MinValue;
+        private const int MinimapIconScanIntervalMs = 2000;
+
+        /// <summary>Discovered minimap icon positions, accessible by modes for navigation.</summary>
+        public IReadOnlyDictionary<long, MinimapIconEntry> KnownMinimapIcons => _knownMinimapIcons;
+
+        /// <summary>
+        /// Periodic scan of TileEntities for minimap icons. Runs every 2s during mapping.
+        /// Tiles load at ~2x network bubble range (~360-400 grid units) as the player moves,
+        /// so periodic scanning discovers mechanics well before the entity list does.
+        /// New discoveries are logged to console and appended to the persistent dump file.
+        /// </summary>
+        private void ScanMinimapIcons(bool forceFullLog = false)
+        {
+            var gc = GameController;
+            if (gc?.Player == null) return;
+
+            if (!forceFullLog && (DateTime.Now - _lastMinimapIconScan).TotalMilliseconds < MinimapIconScanIntervalMs)
+                return;
+            _lastMinimapIconScan = DateTime.Now;
+
+            var tileEntities = gc.IngameState?.Data?.TileEntities;
+            if (tileEntities == null) return;
+
+            int newCount = 0;
+            foreach (var entity in tileEntities)
+            {
+                if (entity?.Path == null) continue;
+                if (_knownMinimapIcons.ContainsKey(entity.Id)) continue;
+                try
+                {
+                    var mic = entity.GetComponent<ExileCore.PoEMemory.Components.MinimapIcon>();
+                    if (mic?.Name == null) continue;
+
+                    var entry = new MinimapIconEntry
+                    {
+                        EntityId = entity.Id,
+                        IconName = mic.Name,
+                        Path = entity.Path,
+                        GridPos = entity.GridPosNum,
+                        EntityType = entity.Type.ToString(),
+                    };
+                    _knownMinimapIcons[entity.Id] = entry;
+                    newCount++;
+
+                    if (!forceFullLog)
+                        LogMessage($"[MinimapIcons] New: {mic.Name} — {entity.Path} @ ({entry.GridPos.X:F0},{entry.GridPos.Y:F0})");
+                }
+                catch { }
+            }
+
+            if (forceFullLog || newCount > 0)
+                DumpMinimapIconsToFile(gc, forceFullLog);
+        }
+
+        /// <summary>
+        /// Clear known icons on area change so the next scan starts fresh.
+        /// </summary>
+        private void ClearMinimapIcons()
+        {
+            _knownMinimapIcons.Clear();
+            _lastMinimapIconScan = DateTime.MinValue;
+        }
+
+        private void DumpMinimapIconsToFile(GameController gc, bool logSummary)
+        {
+            var areaName = gc.Area?.CurrentArea?.Name ?? "Unknown";
+
+            if (logSummary)
+            {
+                var iconCounts = _knownMinimapIcons.Values
+                    .GroupBy(e => e.IconName)
+                    .OrderByDescending(g => g.Count());
+                LogMessage($"[MinimapIcons] {areaName}: {_knownMinimapIcons.Count} icons, {iconCounts.Count()} types");
+                foreach (var g in iconCounts)
+                    LogMessage($"  {g.Key} x{g.Count()} — {g.First().Path}");
+            }
+
+            try
+            {
+                var outputDir = Path.Combine(DirectoryFullName, "Dumps");
+                Directory.CreateDirectory(outputDir);
+                var outputPath = Path.Combine(outputDir, "MinimapIcons.jsonl");
+                var entry = new
+                {
+                    timestamp = DateTime.Now.ToString("o"),
+                    area = areaName,
+                    totalIcons = _knownMinimapIcons.Count,
+                    icons = _knownMinimapIcons.Values.Select(i => new
+                    {
+                        icon = i.IconName,
+                        path = i.Path,
+                        gridX = (int)i.GridPos.X,
+                        gridY = (int)i.GridPos.Y,
+                        type = i.EntityType,
+                    }).ToList(),
+                };
+                var json = System.Text.Json.JsonSerializer.Serialize(entry,
+                    new System.Text.Json.JsonSerializerOptions { WriteIndented = false });
+                File.AppendAllText(outputPath, json + "\n");
+            }
+            catch { }
+        }
+
+        public class MinimapIconEntry
+        {
+            public long EntityId;
+            public string IconName = "";
+            public string Path = "";
+            public Vector2 GridPos;
+            public string EntityType = "";
+        }
+
+        // =================================================================
         // Game State Dump
         // =================================================================
 
@@ -1236,6 +1405,15 @@ namespace AutoExile
                         : (entity.RenderName ?? ""),
                 };
 
+                // Capture MinimapIcon name
+                try
+                {
+                    var mic = entity.GetComponent<ExileCore.PoEMemory.Components.MinimapIcon>();
+                    if (mic?.Name != null)
+                        ent.MinimapIconName = mic.Name;
+                }
+                catch { }
+
                 // Capture StateMachine states for entities that have them (pump, monolith, etc.)
                 if (entity.TryGetComponent<ExileCore.PoEMemory.Components.StateMachine>(out var sm) && sm.States != null)
                 {
@@ -1254,6 +1432,36 @@ namespace AutoExile
                 }
 
                 snapshot.Entities.Add(ent);
+            }
+
+            // Scan TileEntities for map-wide minimap icons (beyond network bubble)
+            var existingIds = new HashSet<long>(snapshot.Entities.Select(e => e.Id));
+            var tileEntities = gc.IngameState?.Data?.TileEntities;
+            if (tileEntities != null)
+            {
+                foreach (var entity in tileEntities)
+                {
+                    if (entity?.Path == null) continue;
+                    if (existingIds.Contains(entity.Id)) continue; // already captured above
+                    try
+                    {
+                        var mic = entity.GetComponent<ExileCore.PoEMemory.Components.MinimapIcon>();
+                        if (mic?.Name == null) continue;
+
+                        snapshot.Entities.Add(new EntitySnapshot
+                        {
+                            Id = entity.Id,
+                            Path = entity.Path,
+                            EntityType = entity.Type.ToString(),
+                            GridPos = entity.GridPosNum,
+                            DistanceToPlayer = Vector2.Distance(entity.GridPosNum, playerGrid),
+                            Category = CategorizeEntity(entity),
+                            ShortName = ExtractShortName(entity.Path),
+                            MinimapIconName = mic.Name,
+                        });
+                    }
+                    catch { }
+                }
             }
 
             // Combat state
@@ -1585,6 +1793,7 @@ namespace AutoExile
             // Persist to settings so it survives reloads
             if (Settings.ActiveMode != null)
                 Settings.ActiveMode.Value = name;
+            _configManager?.Save(Settings);
         }
 
         // =================================================================
@@ -1743,6 +1952,53 @@ namespace AutoExile
         }
 
         // =================================================================
+        // Map List Population
+        // =================================================================
+
+        private void PopulateMapList()
+        {
+            try
+            {
+                var nodes = GameController.Files?.AtlasNodes?.EntriesList;
+                if (nodes == null || nodes.Count == 0) return;
+
+                // Build map name list from normal atlas nodes (0-109)
+                // Mark supported maps (have boss tile data) with ★ prefix
+                var mapNames = new List<string>();
+                var limit = Math.Min(nodes.Count, 110);
+                for (int i = 0; i < limit; i++)
+                {
+                    var name = nodes[i].Area?.Name;
+                    if (string.IsNullOrEmpty(name)) continue;
+                    var prefix = _mapDatabase.IsSupported(name) ? "\u2605 " : "";
+                    mapNames.Add($"{prefix}{name}");
+                }
+                mapNames.Sort((a, b) =>
+                    a.TrimStart('\u2605', ' ').CompareTo(b.TrimStart('\u2605', ' ')));
+
+                Settings.Mapping.MapName.SetListValues(mapNames);
+
+                // Preserve existing selection if valid
+                var current = Settings.Mapping.MapName.Value;
+                if (string.IsNullOrEmpty(current) || !mapNames.Contains(current))
+                {
+                    // Try to match without the ★ prefix
+                    var plain = current?.TrimStart('\u2605', ' ') ?? "";
+                    var match = mapNames.FirstOrDefault(m => m.TrimStart('\u2605', ' ') == plain);
+                    if (match != null)
+                        Settings.Mapping.MapName.Value = match;
+                }
+
+                _mapListPopulated = true;
+                LogMessage($"[AutoExile] Map list populated: {mapNames.Count} maps ({_mapDatabase.SupportedMaps.Count()} supported)");
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"[AutoExile] Map list population failed: {ex.Message}");
+            }
+        }
+
+        // =================================================================
         // Tile Signature Scanner (F8)
         // =================================================================
 
@@ -1820,6 +2076,18 @@ namespace AutoExile
 
             LogMessage($"[AutoExile] Tile scan: {signatures.Count} signatures found in {areaName}");
             WriteTileSignatureLog();
+
+            // Save Unique + VeryRare signatures as boss tiles in the map database
+            var bossTiles = signatures
+                .Where(s => s.Tier == SignatureTier.Unique || s.Tier == SignatureTier.VeryRare)
+                .Select(s => s.Key)
+                .ToList();
+            if (bossTiles.Count > 0)
+            {
+                _mapDatabase.SaveBossTiles(areaName, bossTiles);
+                // Refresh the map list so ★ markers update
+                _mapListPopulated = false;
+            }
         }
 
         private void WriteTileSignatureLog()
@@ -1842,6 +2110,94 @@ namespace AutoExile
             lines.Add("");
             File.AppendAllLines(logPath, lines);
             LogMessage($"[AutoExile] Tile signatures written to {logPath}");
+        }
+
+        private void RenderBossMarker()
+        {
+            var gc = GameController;
+            if (gc?.Player == null) return;
+
+            var areaName = gc.Area?.CurrentArea?.Name ?? "";
+            if (string.IsNullOrEmpty(areaName)) return;
+
+            var bossTiles = _mapDatabase.GetBossTiles(areaName);
+            var rushEnabled = Settings.Mapping.RushBoss.Value;
+
+            // Show status text regardless
+            var statusY = 130f;
+            if (rushEnabled)
+            {
+                if (bossTiles == null || bossTiles.Count == 0)
+                {
+                    Graphics.DrawText($"Boss Rush: ON — no tile data for '{areaName}'",
+                        new Vector2(100, statusY), SharpDX.Color.OrangeRed);
+                    return;
+                }
+
+                // Try to find boss position from tile map
+                if (!_tileMap.IsLoaded)
+                {
+                    Graphics.DrawText("Boss Rush: ON — tile map not loaded",
+                        new Vector2(100, statusY), SharpDX.Color.Yellow);
+                    return;
+                }
+
+                Vector2? bossPos = null;
+                string matchedKey = "";
+                var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
+
+                foreach (var key in bossTiles)
+                {
+                    var positions = _tileMap.GetPositions(key);
+                    if (positions != null && positions.Count > 0)
+                    {
+                        // Tile center offset
+                        bossPos = positions
+                            .OrderBy(p => Vector2.Distance(playerGrid, p))
+                            .First() + new Vector2(11.5f, 11.5f);
+                        matchedKey = key;
+                        break;
+                    }
+                }
+
+                if (bossPos == null)
+                {
+                    var keyList = string.Join(", ", bossTiles.Select(k =>
+                    {
+                        var slash = k.LastIndexOf('/');
+                        return slash >= 0 ? k[(slash + 1)..] : k;
+                    }));
+                    Graphics.DrawText($"Boss Rush: ON — tile keys not found in this instance [{keyList}]",
+                        new Vector2(100, statusY), SharpDX.Color.OrangeRed);
+                    return;
+                }
+
+                // Draw status text
+                var dist = Vector2.Distance(playerGrid, bossPos.Value);
+                Graphics.DrawText($"Boss Rush: ON — ({bossPos.Value.X:F0}, {bossPos.Value.Y:F0}) dist={dist:F0}",
+                    new Vector2(100, statusY), SharpDX.Color.Gold);
+
+                // Draw world marker
+                var camera = gc.IngameState.Camera;
+                var playerZ = gc.Player.PosNum.Z;
+                var bossWorld = new System.Numerics.Vector3(
+                    bossPos.Value.X * (float)Systems.Pathfinding.GridToWorld,
+                    bossPos.Value.Y * (float)Systems.Pathfinding.GridToWorld,
+                    playerZ);
+                Graphics.DrawCircleInWorld(bossWorld, 60f, SharpDX.Color.Gold, 3f);
+                Graphics.DrawCircleInWorld(bossWorld, 30f, SharpDX.Color.Gold, 2f);
+                var bossScreen = camera.WorldToScreen(bossWorld);
+                if (bossScreen.X > -200 && bossScreen.X < 2400)
+                {
+                    Graphics.DrawText($"BOSS ({dist:F0})", bossScreen + new Vector2(-25, -30), SharpDX.Color.Gold);
+                }
+            }
+            else if (bossTiles != null && bossTiles.Count > 0)
+            {
+                // Not rushing but data exists — show subtle indicator
+                Graphics.DrawText($"Boss data available for {areaName} (rush disabled)",
+                    new Vector2(100, statusY), SharpDX.Color.DarkGray);
+            }
         }
 
         private void RenderTileSignatures()

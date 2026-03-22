@@ -158,14 +158,19 @@ namespace AutoExile.Systems
             // Flasks (always check, even out of combat)
             TickFlasks(gc, settings);
 
+            // Self-cast skills (buffs, guards, summons) fire regardless of InCombat.
+            // They don't move the cursor, so they're safe during navigation/interaction.
+            // Targeted skills still require InCombat (monsters in range + reachable).
+            bool usedSkill = TickSelfSkills(gc, settings);
+
             if (!InCombat)
             {
-                LastAction = "no threats";
-                return false;
+                LastAction = usedSkill ? LastAction : "no threats";
+                return usedSkill;
             }
 
-            // Execute skills by priority
-            bool usedSkill = TickSkills(gc, settings);
+            // Execute targeted skills (Enemy/Corpse roles need combat context)
+            usedSkill |= TickSkills(gc, settings);
 
             // Positioning — uses cursor + move key (same as NavigationSystem)
             // Suppressed when another system is navigating (e.g. loot pickup)
@@ -660,13 +665,37 @@ namespace AutoExile.Systems
         // Skill execution
         // ═══════════════════════════════════════════════════
 
-        private bool TickSkills(GameController gc, BotSettings.BuildSettings settings)
+        /// <summary>
+        /// Fire Self-role skills (buffs, guards, summons) independently of InCombat.
+        /// These don't need a target or cursor movement — just a key press.
+        /// </summary>
+        private bool TickSelfSkills(GameController gc, BotSettings.BuildSettings settings)
         {
             if (!BotInput.CanAct) return false;
             if ((DateTime.Now - _lastSkillUseAt).TotalMilliseconds < MinSkillIntervalMs) return false;
 
             foreach (var entry in _skillBar)
             {
+                if (entry.Role != SkillRole.Self) continue;
+                if (entry.Skill != null && !entry.Skill.CanBeUsed) continue;
+                if (!CheckSkillConditions(gc, entry, settings)) continue;
+
+                UseSkill(gc, entry, null);
+                return true;
+            }
+            return false;
+        }
+
+        internal bool TickSkills(GameController gc, BotSettings.BuildSettings settings)
+        {
+            if (!BotInput.CanAct) return false;
+            if ((DateTime.Now - _lastSkillUseAt).TotalMilliseconds < MinSkillIntervalMs) return false;
+
+            foreach (var entry in _skillBar)
+            {
+                // Self-role already handled by TickSelfSkills
+                if (entry.Role == SkillRole.Self) continue;
+
                 // Universal gate: game says skill can't be used (cooldown/mana/souls)
                 if (entry.Skill != null && !entry.Skill.CanBeUsed) continue;
 
@@ -876,7 +905,7 @@ namespace AutoExile.Systems
         // Flask management
         // ═══════════════════════════════════════════════════
 
-        private void TickFlasks(GameController gc, BotSettings.BuildSettings settings)
+        internal void TickFlasks(GameController gc, BotSettings.BuildSettings settings)
         {
             if (!settings.FlasksEnabled.Value) return;
             if (!BotInput.CanAct) return;

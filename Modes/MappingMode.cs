@@ -2,6 +2,7 @@ using ExileCore;
 using ExileCore.PoEMemory.Components;
 using ExileCore.PoEMemory.MemoryObjects;
 using ExileCore.Shared.Enums;
+using ExileCore.Shared.Nodes;
 using AutoExile.Mechanics;
 using AutoExile.Modes.Shared;
 using AutoExile.Systems;
@@ -39,7 +40,9 @@ namespace AutoExile.Modes
         private long _pendingInteractableId;
         private int _interactableClickAttempts;
         private const int MaxInteractableAttempts = 3;
-        private const float InteractableDetectRadius = 120f;  // grid units — shrines visible within network bubble
+        private const float InteractableDetectRadius = 120f;  // grid units — Required interactables route toward
+        private const float InteractableOptionalRadius = 25f; // grid units — Optional interactables only when passing by
+        private string _pendingInteractableName = "";
         private readonly HashSet<long> _failedInteractables = new();
 
         // ── Mechanic state ──
@@ -53,6 +56,12 @@ namespace AutoExile.Modes
         private long _lastZoneHash;
         private const float MinZoneSecondsBeforeExit = 20f; // don't exit sub-zones before clearing them
 
+        // ── Sub-zone state (wish zones, harvest groves, etc.) ──
+        private bool _isInSubZone;
+        private bool _expectingSubZone;       // set when TriggersSubZone mechanic activates
+        private long _parentZoneHash;
+        private MechanicsSnapshot? _parentMechanicsSnapshot;
+
         // ── Stats ──
         private DateTime _startTime;
 
@@ -65,9 +74,27 @@ namespace AutoExile.Modes
         public Vector2? NavTarget => _navTarget;
         public bool IsPaused => _phase == MappingPhase.Paused;
 
+        // ── Boss rush state ──
+        private Vector2? _bossTarget;          // grid position of boss room tile
+        private bool _bossRushComplete;        // boss rush done, switch to normal explore
+        private bool _bossTargetResolved;      // true after we've attempted to look up boss tiles
+        private string _bossRushDebug = "";    // debug info for overlay
+
+        // ── Boss kill verification ──
+        private bool _bossKillVerified;              // boss confirmed dead
+        private List<Vector2>? _bossKillCheckPositions; // boss tile grid positions to check
+        private DateTime? _bossAreaArrivalTime;      // when player entered boss radius
+        private const float BossAreaDwellSeconds = 3f; // wait for entities to load
+
+        // ── Priority targets (minimap icon routing) ──
+        private Vector2? _priorityTarget;            // current priority nav target (grid)
+        private string _priorityTargetReason = "";   // why we're going there
+        private readonly HashSet<long> _visitedIconIds = new(); // minimap icon entity IDs already handled
+
         public enum MappingPhase
         {
             Idle,
+            RushingBoss, // navigating to boss room, fighting on the way but not stopping
             Exploring,
             Fighting,
             Looting,
@@ -104,9 +131,28 @@ namespace AutoExile.Modes
             // Enable combat with configured positioning
             ModeHelpers.EnableDefaultCombat(ctx);
 
-            _phase = MappingPhase.Exploring;
-            Status = "Started";
-            ctx.Log($"Mapping started — {ctx.Exploration.TotalWalkableCells} cells, " +
+            // Boss rush — deferred to first Tick since TileMap may not be loaded yet at OnEnter time
+            _bossTarget = null;
+            _bossRushComplete = false;
+            _bossTargetResolved = false;
+            _bossRushDebug = "";
+
+            var rushBossEnabled = ctx.Settings.Mapping.RushBoss.Value;
+            ctx.Log($"[Mapping] OnEnter: rushBoss={rushBossEnabled} tileMapLoaded={ctx.TileMap.IsLoaded} area={gc.Area?.CurrentArea?.Name}");
+
+            if (rushBossEnabled)
+            {
+                _phase = MappingPhase.RushingBoss;
+                Status = "Waiting for tile data to resolve boss position...";
+                _bossRushDebug = "Pending tile map load";
+            }
+            else
+            {
+                _phase = MappingPhase.Exploring;
+                Status = "Started";
+            }
+
+            ctx.Log($"Mapping — {ctx.Exploration.TotalWalkableCells} cells, " +
                     $"{ctx.Exploration.ActiveBlob?.Regions.Count ?? 0} regions");
         }
 
@@ -114,13 +160,28 @@ namespace AutoExile.Modes
         {
             _phase = MappingPhase.Idle;
             _navTarget = null;
+            _bossTarget = null;
+            _bossRushComplete = false;
+            _bossTargetResolved = false;
+            _bossRushDebug = "";
+            _bossKillVerified = false;
+            _bossKillCheckPositions = null;
+            _bossAreaArrivalTime = null;
+            _priorityTarget = null;
+            _priorityTargetReason = "";
+            _visitedIconIds.Clear();
             _pendingMechanic = null;
             _mechanicActive = false;
             _pendingInteractableId = 0;
+            _pendingInteractableName = "";
             _interactableClickAttempts = 0;
             _failedInteractables.Clear();
             _exitPortal = null;
             _lastZoneHash = 0;
+            _isInSubZone = false;
+            _expectingSubZone = false;
+            _parentZoneHash = 0;
+            _parentMechanicsSnapshot = null;
             Status = "Stopped";
             Decision = "";
         }
@@ -155,10 +216,78 @@ namespace AutoExile.Modes
             {
                 if (_lastZoneHash != 0)
                 {
+                    ctx.Log($"[Mapping] Zone changed: hash {_lastZoneHash} -> {currentHash}, phase={_phase}, subZone={_isInSubZone}");
+
+                    if (_isInSubZone && currentHash == _parentZoneHash)
+                    {
+                        // ── Returning to parent map from sub-zone ──
+                        ctx.Log("[Mapping] Returning to parent map from sub-zone");
+                        _isInSubZone = false;
+                        _expectingSubZone = false;
+                        _parentZoneHash = 0;
+
+                        if (_parentMechanicsSnapshot != null)
+                        {
+                            ctx.Mechanics.RestoreSnapshot(_parentMechanicsSnapshot);
+                            _parentMechanicsSnapshot = null;
+                            ctx.Log("[Mapping] Restored parent map mechanics state");
+                        }
+
+                        _mechanicActive = false;
+                        _pendingMechanic = null;
+                    }
+                    else if (_expectingSubZone)
+                    {
+                        // ── Entering sub-zone (mechanic flagged TriggersSubZone) ──
+                        // The flag was set when the mechanic activated. The mechanic may have
+                        // already timed out or completed by now — that's fine, we still need
+                        // to treat this zone as a sub-zone.
+                        var triggerMechName = ctx.Mechanics.ActiveMechanic?.Name
+                            ?? _pendingMechanic?.Name ?? "Unknown";
+                        ctx.Log($"[Mapping] Entering sub-zone (from {triggerMechName}), snapshotting mechanics");
+
+                        // Snapshot parent mechanics state before resetting
+                        _parentMechanicsSnapshot = ctx.Mechanics.CreateSnapshot();
+                        _parentZoneHash = _lastZoneHash;
+                        _isInSubZone = true;
+                        _expectingSubZone = false;
+
+                        // Force-complete any still-active mechanic, then reset for fresh sub-zone detection
+                        if (_mechanicActive && ctx.Mechanics.ActiveMechanic != null)
+                            ctx.Mechanics.ForceCompleteActive();
+                        ctx.Mechanics.Reset();
+
+                        // Suppress the triggering mechanic in the sub-zone — the wish zone
+                        // has its own Faridun entities that would re-trigger detection
+                        ctx.Mechanics.SuppressMechanic(triggerMechName);
+
+                        _mechanicActive = false;
+                        _pendingMechanic = null;
+                    }
+
+                    // Reset zone-local state for the new zone
                     _zoneEnteredAt = DateTime.Now;
                     _exitPortal = null;
-                    if (_phase == MappingPhase.Exiting)
+                    _navTarget = null;
+                    _exploreTargetsVisited = 0;
+                    _navFailures = 0;
+                    _bossKillCheckPositions = null;
+                    _bossAreaArrivalTime = null;
+                    _visitedIconIds.Clear();
+
+                    // Boss rush only in parent map, not sub-zones
+                    if (!_isInSubZone && ctx.Settings.Mapping.RushBoss.Value && !_bossRushComplete)
+                    {
+                        _bossTarget = null;
+                        _bossTargetResolved = false;
+                        _bossRushDebug = "New zone — re-resolving boss target";
+                        _phase = MappingPhase.RushingBoss;
+                        ctx.Log("[Mapping] Area changed — re-triggering boss rush");
+                    }
+                    else if (_phase == MappingPhase.Exiting || _phase == MappingPhase.RushingBoss)
+                    {
                         _phase = MappingPhase.Exploring;
+                    }
                 }
                 _lastZoneHash = currentHash;
             }
@@ -166,33 +295,130 @@ namespace AutoExile.Modes
             var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
 
             // ── Combat (always runs — fires skills while exploring) ──
-            // When enough monsters are nearby, pause navigation so combat positioning
-            // controls movement (orbit, kite, etc). Resume when monsters are dead.
-            // Suppress cursor-moving combat during loot pickup to avoid click interference.
+            // Navigation always owns movement. CombatSystem scans threats, fires skills,
+            // manages flasks, but never repositions. Dense packs and rares trigger detours below.
             if (!_mechanicActive)
             {
-                ctx.Combat.SuppressPositioning = ctx.Interaction.IsBusy;
+                ctx.Combat.SuppressPositioning = true;  // Always — we own movement
                 ctx.Combat.SuppressTargetedSkills = ctx.Interaction.IsBusy;
                 ctx.Combat.Tick(ctx);
             }
 
-            // Pause/resume navigation based on combat state
-            // Don't pause nav when interaction is busy (navigating to loot/interactable) —
-            // combat positioning is already suppressed, and pausing nav would stall the pickup
-            // Aggressive mode uses NavigationSystem for combat movement, so don't pause it
-            bool aggressiveMode = ctx.Combat.Profile.Positioning == CombatPositioning.Aggressive;
-            if (!aggressiveMode && !_mechanicActive && !ctx.Interaction.IsBusy && ctx.Combat.InCombat && ctx.Combat.WantsToMove)
+            // ── Boss Rush (navigate to boss, fight on the way, don't stop) ──
+            if (_phase == MappingPhase.RushingBoss)
             {
-                // Combat wants to reposition — pause nav so combat controls movement
-                if (ctx.Navigation.IsNavigating)
-                    ctx.Navigation.Pause();
+                // Lazy resolve: TileMap may not have been loaded when OnEnter ran
+                if (!_bossTargetResolved)
+                {
+                    if (!ctx.TileMap.IsLoaded)
+                    {
+                        Status = "Rush boss — waiting for tile map...";
+                        _bossRushDebug = "TileMap not loaded yet";
+                        return;
+                    }
+
+                    _bossTargetResolved = true;
+                    var areaName = gc.Area?.CurrentArea?.Name ?? "";
+                    var bossTiles = ctx.MapDatabase.GetBossTiles(areaName);
+
+                    if (bossTiles == null || bossTiles.Count == 0)
+                    {
+                        _bossRushDebug = $"No boss tiles in database for '{areaName}'";
+                        ctx.Log($"[Mapping] Boss rush: {_bossRushDebug}");
+                        _phase = MappingPhase.Exploring;
+                        ModeHelpers.EnableDefaultCombat(ctx);
+                        Decision = _bossRushDebug;
+                    }
+                    else
+                    {
+                        // Find the first boss tile key that has positions in the tile map
+                        foreach (var tileKey in bossTiles)
+                        {
+                            var positions = ctx.TileMap.GetPositions(tileKey);
+                            if (positions != null && positions.Count > 0)
+                            {
+                                // Tile center = gridPos + half tile (23/2 ≈ 11.5)
+                                _bossTarget = positions
+                                    .OrderBy(p => Vector2.Distance(playerGrid, p))
+                                    .First() + new Vector2(11.5f, 11.5f);
+                                _bossRushDebug = $"Found '{tileKey}' at ({_bossTarget.Value.X:F0}, {_bossTarget.Value.Y:F0})";
+                                break;
+                            }
+                            else
+                            {
+                                _bossRushDebug = $"Tile key '{tileKey}' not found in TileMap ({ctx.TileMap.TileCount} tiles)";
+                            }
+                        }
+
+                        if (_bossTarget.HasValue)
+                        {
+                            ctx.Combat.SetProfile(new CombatProfile { Enabled = true, Positioning = CombatPositioning.Aggressive });
+                            ctx.Log($"[Mapping] Boss rush: {_bossRushDebug}");
+                        }
+                        else
+                        {
+                            ctx.Log($"[Mapping] Boss rush failed: {_bossRushDebug}");
+                            _phase = MappingPhase.Exploring;
+                            ModeHelpers.EnableDefaultCombat(ctx);
+                            Decision = $"Boss rush failed: {_bossRushDebug}";
+                        }
+                    }
+
+                    if (_phase != MappingPhase.RushingBoss) return;
+                }
+
+                if (_bossTarget.HasValue)
+                {
+                    var distToBoss = Vector2.Distance(playerGrid, _bossTarget.Value);
+
+                    // Arrived at boss area (within 2 tiles = 46 grid units)
+                    if (distToBoss < 46)
+                    {
+                        _bossRushComplete = true;
+                        _bossTarget = null;
+                        _phase = MappingPhase.Exploring;
+                        ModeHelpers.EnableDefaultCombat(ctx);
+                        Decision = "Boss area reached — switching to explore+clear";
+                        _bossRushDebug = "Complete — arrived at boss area";
+                        ctx.Log("Boss rush complete — switching to normal exploration");
+                    }
+                    else
+                    {
+                        if (!ctx.Navigation.IsNavigating)
+                        {
+                            ctx.Log($"[BossRush] Starting nav to ({_bossTarget.Value.X:F0}, {_bossTarget.Value.Y:F0}) dist={distToBoss:F0}");
+                            var success = ctx.Navigation.NavigateTo(ctx.Game, _bossTarget.Value);
+                            if (!success)
+                            {
+                                ctx.Log($"[BossRush] NavigateTo failed — no path");
+                                _bossRushComplete = true;
+                                _bossTarget = null;
+                                _phase = MappingPhase.Exploring;
+                                ModeHelpers.EnableDefaultCombat(ctx);
+                                Decision = "Can't path to boss — exploring normally";
+                                _bossRushDebug = "Failed — no path to boss";
+                            }
+                            else
+                            {
+                                ctx.Log($"[BossRush] Nav started, waypoints={ctx.Navigation.CurrentNavPath?.Count ?? 0}");
+                            }
+                        }
+                        Status = $"Rushing boss — dist: {distToBoss:F0} nav={ctx.Navigation.IsNavigating}";
+                        Decision = $"Rush boss ({distToBoss:F0} away, nav={ctx.Navigation.IsNavigating})";
+                        return; // Skip loot, mechanics, explore — just rush
+                    }
+                }
             }
-            else if (!_mechanicActive && ctx.Navigation.IsPaused &&
-                     (!ctx.Combat.InCombat || ctx.Interaction.IsBusy))
+
+            // Resume navigation when density drops below threshold (detour over)
+            if (!_mechanicActive && ctx.Navigation.IsPaused)
             {
-                // Resume navigation when combat ends, OR when interaction needs nav
-                // (e.g. loot pickup started while combat had nav paused)
-                ctx.Navigation.Resume(gc);
+                if (!ctx.Combat.InCombat ||
+                    ctx.Combat.NearbyMonsterCount < ctx.Settings.Mapping.MinPackDensity.Value ||
+                    ctx.Interaction.IsBusy)
+                {
+                    ctx.Navigation.Resume(gc);
+                }
             }
 
             // ── Mechanics (in-map encounters like Ultimatum) ──
@@ -207,6 +433,10 @@ namespace AutoExile.Modes
                 }
 
                 // Mechanic finished (complete/abandoned/failed)
+                // If it was a sub-zone mechanic that didn't trigger a zone change
+                // (abandoned/failed before entering portal), clear the expectation
+                if (result != MechanicResult.Complete)
+                    _expectingSubZone = false;
                 _mechanicActive = false;
                 _pendingMechanic = null;
                 Decision = $"Mechanic result: {result}";
@@ -219,6 +449,8 @@ namespace AutoExile.Modes
                 // Let the mechanic handle its own navigation
                 ctx.Mechanics.SetActive(_pendingMechanic);
                 _mechanicActive = true;
+                if (_pendingMechanic.TriggersSubZone)
+                    _expectingSubZone = true;
                 Status = $"Starting mechanic: {_pendingMechanic.Name}";
                 return;
             }
@@ -285,7 +517,7 @@ namespace AutoExile.Modes
                     }
                     else if (_pendingInteractableId != 0)
                     {
-                        Status = $"Clicking interactable";
+                        Status = $"Clicking: {_pendingInteractableName} ({ctx.Interaction.Status})";
                     }
                     return;
                 }
@@ -313,44 +545,63 @@ namespace AutoExile.Modes
                     if (ctx.Interaction.InteractWithEntity(target, ctx.Navigation))
                     {
                         _pendingInteractableId = target.Id;
+                        _pendingInteractableName = target.RenderName ?? target.Path;
                         _interactableClickAttempts = 0;
-                        Status = $"Clicking: {target.RenderName ?? target.Path}";
+                        Status = $"Clicking: {_pendingInteractableName}";
                         ctx.Log($"[Interactable] Clicking {target.Path} dist={target.DistancePlayer:F0}");
                         return;
                     }
                 }
             }
 
-            // ── Combat hold — don't explore while fighting ──
-            if (ctx.Combat.InCombat && ctx.Combat.WantsToMove)
+            // ── Density-gated combat detour ──
+            // Only pause exploration for dense packs or rare/unique targets.
+            // Otherwise skills fire passively while walking.
+            if (ctx.Combat.InCombat)
             {
-                // Aggressive mode: pathfind to dense cluster via NavigationSystem (A*)
-                // instead of letting CombatSystem cursor-walk (which can't navigate around terrain)
-                if (ctx.Combat.Profile.Positioning == CombatPositioning.Aggressive)
-                {
-                    var combatTarget = ctx.Combat.MoveTargetGrid;
-                    var distToTarget = Vector2.Distance(playerGrid, combatTarget);
+                int minDensity = ctx.Settings.Mapping.MinPackDensity.Value;
+                bool denseEnough = ctx.Combat.NearbyMonsterCount >= minDensity;
 
-                    // Only repath if target moved significantly or we're not already navigating toward it
-                    if (!ctx.Navigation.IsNavigating || _navTarget == null ||
-                        Vector2.Distance(_navTarget.Value, combatTarget) > 20f)
+                // Check for rare/unique detour
+                bool rareDetour = false;
+                if (!denseEnough && ctx.Settings.Mapping.DetourForRares.Value && ctx.Combat.BestTarget != null)
+                {
+                    var rarity = ctx.Combat.BestTarget.Rarity;
+                    if (rarity == MonsterRarity.Rare || rarity == MonsterRarity.Unique)
+                    {
+                        var distToTarget = Vector2.Distance(playerGrid, ctx.Combat.BestTarget.GridPosNum);
+                        if (distToTarget <= ctx.Settings.Mapping.MaxDetourDistance.Value)
+                            rareDetour = true;
+                    }
+                }
+
+                if (denseEnough || rareDetour)
+                {
+                    // Pause nav, pathfind to density cluster
+                    if (ctx.Navigation.IsNavigating)
+                        ctx.Navigation.Pause();
+
+                    var combatTarget = ctx.Combat.DenseClusterCenter;
+                    var distToCluster = Vector2.Distance(playerGrid, combatTarget);
+
+                    if (distToCluster > 10f &&
+                        (!ctx.Navigation.IsNavigating || _navTarget == null ||
+                         Vector2.Distance(_navTarget.Value, combatTarget) > 20f))
                     {
                         ctx.Navigation.Stop(gc);
                         if (ctx.Navigation.NavigateTo(gc, combatTarget))
                         {
                             _navTarget = combatTarget;
-                            Decision = $"Aggressive: pathing to density @ ({combatTarget.X:F0},{combatTarget.Y:F0}) dist={distToTarget:F0}";
                         }
                     }
+
+                    _phase = MappingPhase.Fighting;
+                    var reason = rareDetour ? "rare/unique detour" : $"dense pack ({ctx.Combat.NearbyMonsterCount})";
+                    Decision = $"Fighting: {reason} @ ({combatTarget.X:F0},{combatTarget.Y:F0})";
+                    Status = $"Fighting: {ctx.Combat.NearbyMonsterCount} monsters ({ctx.Combat.LastSkillAction})";
+                    return;
                 }
-                else
-                {
-                    if (_phase != MappingPhase.Fighting)
-                        ctx.Navigation.Stop(gc); // stop stale exploration nav — combat handles movement
-                }
-                _phase = MappingPhase.Fighting;
-                Status = $"Fighting: {ctx.Combat.NearbyMonsterCount} monsters ({ctx.Combat.LastSkillAction})";
-                return;
+                // else: below density threshold, no rare target — skills fire passively while walking
             }
 
             // ── Exit portal handling (wish zones / sub-zones) ──
@@ -389,40 +640,55 @@ namespace AutoExile.Modes
                 Decision = $"Abandoned stuck target ({ctx.Exploration.FailedRegions.Count} failed regions)";
             }
 
-            // Aggressive: chase known monsters instead of exploring when any are cached
-            if (aggressiveMode && ctx.Combat.CachedMonsterCount > 0 && !ctx.Navigation.IsNavigating)
-            {
-                var combatTarget = ctx.Combat.DenseClusterCenter;
-                var distToTarget = Vector2.Distance(playerGrid, combatTarget);
-                if (distToTarget > 10f)
-                {
-                    if (ctx.Navigation.NavigateTo(gc, combatTarget))
-                    {
-                        _navTarget = combatTarget;
-                        _phase = MappingPhase.Fighting;
-                        Decision = $"Aggressive: chasing density @ ({combatTarget.X:F0},{combatTarget.Y:F0}) dist={distToTarget:F0}, {ctx.Combat.CachedMonsterCount} cached";
-                        Status = $"Chasing: {ctx.Combat.CachedMonsterCount} monsters dist={distToTarget:F0}";
-                        return;
-                    }
-                }
-            }
+            // ── Boss kill verification (runs every tick when in boss area) ──
+            if (ctx.Settings.Mapping.KillBoss.Value && !_bossKillVerified)
+                TickBossKillCheck(ctx, gc, playerGrid);
 
             // Pick next target when idle (not navigating, or paused nav just resumed)
             if (!ctx.Navigation.IsNavigating)
             {
-                if (coverage >= _minCoverage)
+                // Priority 1: Required mechanics/interactables from minimap icons
+                var priority = GetPriorityTarget(ctx, playerGrid);
+                if (priority.HasValue)
                 {
-                    // Check if there are still meaningful unexplored regions
+                    NavigateToTarget(ctx, gc, playerGrid, priority.Value);
+                    Decision = $"Priority: {_priorityTargetReason}";
+                }
+                // Priority 2: Boss kill — navigate to boss area if not yet verified
+                else if (ctx.Settings.Mapping.KillBoss.Value && !_bossKillVerified && _bossKillCheckPositions != null)
+                {
+                    var nearest = _bossKillCheckPositions
+                        .OrderBy(p => Vector2.Distance(playerGrid, p))
+                        .First();
+                    var dist = Vector2.Distance(playerGrid, nearest);
+                    if (dist > ctx.Settings.Mapping.BossKillRadius.Value)
+                    {
+                        NavigateToTarget(ctx, gc, playerGrid, nearest);
+                        Decision = $"Boss kill: navigating to boss area ({dist:F0}g away)";
+                    }
+                }
+                // Priority 3: Normal exploration
+                else if (coverage >= _minCoverage)
+                {
+                    // Check if outstanding requirements prevent completion
+                    bool needsBossKill = ctx.Settings.Mapping.KillBoss.Value && !_bossKillVerified;
+
                     var nextTarget = ctx.Exploration.GetNextExplorationTarget(playerGrid);
                     if (nextTarget.HasValue)
                     {
-                        // Keep exploring even past threshold if targets remain
                         NavigateToTarget(ctx, gc, playerGrid, nextTarget.Value);
+                    }
+                    else if (needsBossKill)
+                    {
+                        // Exploration exhausted but boss not killed — keep waiting near boss area
+                        Status = $"Waiting for boss kill — coverage {coverage:P1}";
                     }
                     else
                     {
-                        // Exploration done — check for exit portal (wish zones / sub-zones)
-                        var exitPortal = FindExitPortal(gc, ctx.Combat);
+                        // Truly complete — check for exit portal or mark done
+                        var zoneTime = (DateTime.Now - _zoneEnteredAt).TotalSeconds;
+                        ctx.Log($"[Mapping] Explore complete path: coverage={coverage:P1} zoneTime={zoneTime:F1}s noTarget=true noBoss=true");
+                        var exitPortal = FindExitPortal(ctx, gc, ctx.Combat, "explore-complete");
                         if (exitPortal != null)
                         {
                             _exitPortal = exitPortal;
@@ -443,6 +709,7 @@ namespace AutoExile.Modes
                 }
                 else
                 {
+                    // Under coverage threshold — check for priority targets mixed with exploration
                     NavigateToNextExploreTarget(ctx, gc, playerGrid);
                 }
             }
@@ -474,11 +741,18 @@ namespace AutoExile.Modes
                 {
                     var coverage = ctx.Exploration.ActiveBlobCoverage;
                     var elapsed = (DateTime.Now - _startTime).TotalSeconds;
+                    var zoneTime = (DateTime.Now - _zoneEnteredAt).TotalSeconds;
+                    var blob = ctx.Exploration.ActiveBlob;
+                    var regionCount = blob?.Regions.Count ?? 0;
+                    var failedCount = ctx.Exploration.FailedRegions.Count;
+                    var totalCells = blob?.WalkableCells.Count ?? 0;
+                    var seenCells = blob?.SeenCells.Count ?? 0;
+                    ctx.Log($"[Mapping] No explore target: coverage={coverage:P1} zoneTime={zoneTime:F1}s regions={regionCount} failed={failedCount} cells={seenCells}/{totalCells} attempt={attempt}");
 
                     // Only consider exit portals after meaningful exploration (>10% coverage).
                     // Prevents immediately exiting wish zones / sub-zones before exploring them
                     // (exploration can return null briefly on fresh zone init).
-                    var exitPortal = coverage > 0.10f ? FindExitPortal(gc, ctx.Combat) : null;
+                    var exitPortal = coverage > 0.10f ? FindExitPortal(ctx, gc, ctx.Combat, "no-targets") : null;
                     if (exitPortal != null)
                     {
                         _exitPortal = exitPortal;
@@ -514,8 +788,252 @@ namespace AutoExile.Modes
             Decision = $"5 consecutive pathfind failures ({ctx.Exploration.FailedRegions.Count} total unreachable)";
         }
 
+        // =================================================================
+        // Priority Target Selection (minimap icon routing)
+        // =================================================================
+
+        /// <summary>
+        /// Known minimap icon names → interactable setting mapping.
+        /// Icons not listed here are ignored (unknown/unmapped).
+        /// </summary>
+        private static ListNode? GetInteractableSetting(string iconName, BotSettings.InteractableSettings settings)
+        {
+            return iconName switch
+            {
+                "Shrine" => settings.Shrines,
+                "Strongbox" => settings.Strongboxes,
+                "HeistSumgglersCache" => settings.HeistCaches,  // GGG typo in icon name
+                "CraftingUnlockObject" => settings.CraftingRecipes,
+                _ => null,
+            };
+        }
+
+        /// <summary>
+        /// Known minimap icon names → mechanic mode setting mapping.
+        /// Returns the MechanicMode ListNode for mechanics that have one.
+        /// </summary>
+        private static ListNode? GetMechanicSetting(string iconName, BotSettings settings)
+        {
+            return iconName switch
+            {
+                "UltimatumAltar" => settings.Mechanics.Ultimatum.Mode,
+                "RitualRune" or "RitualRuneFinished" => settings.Mechanics.Ritual.Mode,
+                "HarvestPortal" => settings.Mechanics.Harvest.Mode,
+                "Mirage" => settings.Mechanics.Wishes.Mode,
+                "BlightCore" => null, // Blight has its own mode (BlightMode), not a map mechanic
+                _ => null,
+            };
+        }
+
+        /// <summary>
+        /// Find the highest-priority unvisited minimap icon target.
+        /// Required targets first, then optional. Skips icons in already-explored areas.
+        /// </summary>
+        private Vector2? GetPriorityTarget(BotContext ctx, Vector2 playerGrid)
+        {
+            _priorityTarget = null;
+            _priorityTargetReason = "";
+
+            if (ctx.MinimapIcons.Count == 0) return null;
+
+            var seen = ctx.Exploration.ActiveBlob?.SeenCells;
+            Vector2? bestRequired = null;
+            float bestRequiredDist = float.MaxValue;
+            string bestRequiredReason = "";
+
+            Vector2? bestOptional = null;
+            float bestOptionalDist = float.MaxValue;
+            string bestOptionalReason = "";
+
+            foreach (var (id, icon) in ctx.MinimapIcons)
+            {
+                if (_visitedIconIds.Contains(id)) continue;
+
+                // Check if we've already explored this area (within ~10 grid cells)
+                if (seen != null && seen.Contains(new Vector2i((int)icon.GridPos.X, (int)icon.GridPos.Y)))
+                {
+                    _visitedIconIds.Add(id);
+                    continue;
+                }
+
+                var dist = Vector2.Distance(playerGrid, icon.GridPos);
+
+                // Check interactable settings
+                var interactSetting = GetInteractableSetting(icon.IconName, ctx.Settings.Mechanics.Interactables);
+                if (interactSetting != null)
+                {
+                    if (interactSetting.Value == "Ignore") continue;
+                    if (interactSetting.Value == "Required" && dist < bestRequiredDist)
+                    {
+                        bestRequired = icon.GridPos;
+                        bestRequiredDist = dist;
+                        bestRequiredReason = $"{icon.IconName} (Required) @ d={dist:F0}";
+                    }
+                    else if (interactSetting.Value == "Optional" && dist < bestOptionalDist)
+                    {
+                        bestOptional = icon.GridPos;
+                        bestOptionalDist = dist;
+                        bestOptionalReason = $"{icon.IconName} (Optional) @ d={dist:F0}";
+                    }
+                    continue;
+                }
+
+                // Check mechanic settings
+                var mechSetting = GetMechanicSetting(icon.IconName, ctx.Settings);
+                if (mechSetting != null)
+                {
+                    var mode = mechSetting.Value;
+                    if (mode == "Skip") continue;
+                    if (mode == "Required" && dist < bestRequiredDist)
+                    {
+                        bestRequired = icon.GridPos;
+                        bestRequiredDist = dist;
+                        bestRequiredReason = $"{icon.IconName} (Required) @ d={dist:F0}";
+                    }
+                    else if (mode == "Optional" && dist < bestOptionalDist)
+                    {
+                        bestOptional = icon.GridPos;
+                        bestOptionalDist = dist;
+                        bestOptionalReason = $"{icon.IconName} (Optional) @ d={dist:F0}";
+                    }
+                }
+            }
+
+            // Required first, then optional
+            if (bestRequired.HasValue)
+            {
+                _priorityTarget = bestRequired;
+                _priorityTargetReason = bestRequiredReason;
+                return bestRequired;
+            }
+            if (bestOptional.HasValue)
+            {
+                _priorityTarget = bestOptional;
+                _priorityTargetReason = bestOptionalReason;
+                return bestOptional;
+            }
+            return null;
+        }
+
+        // =================================================================
+        // Boss Kill Verification
+        // =================================================================
+
+        /// <summary>
+        /// Resolve boss tile positions from MapDatabase. Called lazily on first check.
+        /// </summary>
+        private void ResolveBossKillPositions(BotContext ctx, GameController gc)
+        {
+            if (_bossKillCheckPositions != null) return;
+            _bossKillCheckPositions = new List<Vector2>();
+
+            var areaName = gc.Area?.CurrentArea?.Name ?? "";
+            var bossTiles = ctx.MapDatabase.GetBossTiles(areaName);
+            if (bossTiles == null || bossTiles.Count == 0) return;
+
+            foreach (var tileKey in bossTiles)
+            {
+                var positions = ctx.TileMap.GetPositions(tileKey);
+                if (positions != null)
+                {
+                    foreach (var p in positions)
+                        _bossKillCheckPositions.Add(p + new Vector2(11.5f, 11.5f)); // tile center
+                }
+            }
+
+            if (_bossKillCheckPositions.Count > 0)
+                ctx.Log($"[BossKill] Resolved {_bossKillCheckPositions.Count} boss check positions");
+        }
+
+        /// <summary>
+        /// Check if the boss has been killed. Runs each tick when KillBoss is enabled.
+        /// Logic: player is within boss radius + dwell time elapsed + no alive unique monsters in radius.
+        /// </summary>
+        private void TickBossKillCheck(BotContext ctx, GameController gc, Vector2 playerGrid)
+        {
+            if (_bossKillVerified) return;
+
+            // Lazy resolve boss positions
+            if (!ctx.TileMap.IsLoaded) return;
+            ResolveBossKillPositions(ctx, gc);
+            if (_bossKillCheckPositions == null || _bossKillCheckPositions.Count == 0)
+            {
+                // No boss data — can't verify, treat as verified to not block completion
+                _bossKillVerified = true;
+                ctx.Log("[BossKill] No boss tile data — skipping verification");
+                return;
+            }
+
+            float bossRadius = ctx.Settings.Mapping.BossKillRadius.Value;
+
+            // Check if player is within radius of any boss tile
+            bool inBossArea = false;
+            foreach (var pos in _bossKillCheckPositions)
+            {
+                if (Vector2.Distance(playerGrid, pos) <= bossRadius)
+                {
+                    inBossArea = true;
+                    break;
+                }
+            }
+
+            if (!inBossArea)
+            {
+                _bossAreaArrivalTime = null;
+                return;
+            }
+
+            // Start dwell timer
+            if (!_bossAreaArrivalTime.HasValue)
+            {
+                _bossAreaArrivalTime = DateTime.Now;
+                return;
+            }
+
+            // Wait for entities to load
+            if ((DateTime.Now - _bossAreaArrivalTime.Value).TotalSeconds < BossAreaDwellSeconds)
+                return;
+
+            // Check for alive unique monsters in boss radius
+            var bossEntry = ctx.MapDatabase.GetEntry(gc.Area?.CurrentArea?.Name ?? "");
+            var bossPath = bossEntry?.BossEntityPath;
+
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (entity.Type != EntityType.Monster) continue;
+                if (!entity.IsAlive || !entity.IsHostile) continue;
+                if (entity.Rarity != MonsterRarity.Unique) continue;
+
+                // Check if within boss radius
+                bool nearBoss = false;
+                foreach (var pos in _bossKillCheckPositions)
+                {
+                    if (Vector2.Distance(entity.GridPosNum, pos) <= bossRadius)
+                    {
+                        nearBoss = true;
+                        break;
+                    }
+                }
+                if (!nearBoss) continue;
+
+                // If we have a specific boss path, only match that
+                if (bossPath != null && !entity.Path.Contains(bossPath, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                // Found alive unique in boss area — not killed yet
+                return;
+            }
+
+            // No alive uniques in boss area — boss killed
+            _bossKillVerified = true;
+            ctx.Log("[BossKill] Boss kill verified — no alive uniques in boss area");
+            Decision = "Boss killed!";
+        }
+
         /// <summary>
         /// Find the nearest clickable interactable within detection radius, filtered by settings.
+        /// Optional interactables use a short radius (click when passing by).
+        /// Required interactables use the full detect radius (route toward).
         /// </summary>
         private ExileCore.PoEMemory.MemoryObjects.Entity? FindNearbyInteractable(
             GameController gc, Vector2 playerGrid, BotSettings.InteractableSettings settings)
@@ -523,9 +1041,13 @@ namespace AutoExile.Modes
             ExileCore.PoEMemory.MemoryObjects.Entity? best = null;
             float bestDist = float.MaxValue;
 
+            float RadiusFor(ListNode setting) =>
+                settings.IsRequired(setting) ? InteractableDetectRadius : InteractableOptionalRadius;
+
             // Shrines
-            if (settings.Shrines)
+            if (settings.IsEnabled(settings.Shrines))
             {
+                var radius = RadiusFor(settings.Shrines);
                 foreach (var entity in gc.EntityListWrapper.ValidEntitiesByType[EntityType.Shrine])
                 {
                     if (!entity.IsTargetable) continue;
@@ -533,7 +1055,7 @@ namespace AutoExile.Modes
                     if (!entity.TryGetComponent<Shrine>(out var shrine) || !shrine.IsAvailable) continue;
 
                     var dist = Vector2.Distance(playerGrid, new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y));
-                    if (dist < bestDist && dist <= InteractableDetectRadius)
+                    if (dist < bestDist && dist <= radius)
                     {
                         bestDist = dist;
                         best = entity;
@@ -548,21 +1070,22 @@ namespace AutoExile.Modes
                 if (_failedInteractables.Contains(entity.Id)) continue;
                 if (!entity.TryGetComponent<Chest>(out var chest) || chest.IsOpened) continue;
 
-                // Strongboxes
-                if (chest.IsStrongbox && !settings.Strongboxes) continue;
-                // Heist caches
-                if (entity.Path.Contains("LeagueHeist/HeistSmuggler") && !settings.HeistCaches) continue;
-                // Djinn caches (Faridun league)
-                if (entity.Path.Contains("Chests/Faridun/") && !settings.DjinnCaches) continue;
+                // Determine which setting applies and check enabled
+                ListNode? chestSetting = null;
+                if (chest.IsStrongbox)
+                    chestSetting = settings.Strongboxes;
+                else if (entity.Path.Contains("LeagueHeist/HeistSmuggler"))
+                    chestSetting = settings.HeistCaches;
+                else if (entity.Path.Contains("Chests/Faridun/"))
+                    chestSetting = settings.DjinnCaches;
 
-                // Must be one of the known types
-                if (!chest.IsStrongbox
-                    && !entity.Path.Contains("LeagueHeist/HeistSmuggler")
-                    && !entity.Path.Contains("Chests/Faridun/"))
+                // Must be a known type and enabled
+                if (chestSetting == null || !settings.IsEnabled(chestSetting))
                     continue;
 
+                var radius = RadiusFor(chestSetting);
                 var dist = Vector2.Distance(playerGrid, new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y));
-                if (dist < bestDist && dist <= InteractableDetectRadius)
+                if (dist < bestDist && dist <= radius)
                 {
                     bestDist = dist;
                     best = entity;
@@ -570,8 +1093,9 @@ namespace AutoExile.Modes
             }
 
             // Crafting recipes (click to unlock)
-            if (settings.CraftingRecipes)
+            if (settings.IsEnabled(settings.CraftingRecipes))
             {
+                var radius = RadiusFor(settings.CraftingRecipes);
                 foreach (var entity in gc.EntityListWrapper.ValidEntitiesByType[EntityType.IngameIcon])
                 {
                     if (!entity.IsTargetable) continue;
@@ -579,7 +1103,7 @@ namespace AutoExile.Modes
                     if (!entity.Path.Contains("CraftingUnlocks/RecipeUnlock")) continue;
 
                     var dist = Vector2.Distance(playerGrid, new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y));
-                    if (dist < bestDist && dist <= InteractableDetectRadius)
+                    if (dist < bestDist && dist <= radius)
                     {
                         bestDist = dist;
                         best = entity;
@@ -618,22 +1142,34 @@ namespace AutoExile.Modes
         /// Find a return/exit portal in the current zone (e.g., SekhemaPortal in wish zones).
         /// Requires minimum time in zone AND no nearby combat before allowing exit.
         /// </summary>
-        private Entity? FindExitPortal(GameController gc, CombatSystem combat)
+        private Entity? FindExitPortal(BotContext ctx, GameController gc, CombatSystem combat, string caller = "unknown")
         {
+            var elapsed = (DateTime.Now - _zoneEnteredAt).TotalSeconds;
+            var coverage = ctx.Exploration.ActiveBlobCoverage;
+
             // Don't exit sub-zones too quickly — need time to fight and loot
-            if ((DateTime.Now - _zoneEnteredAt).TotalSeconds < MinZoneSecondsBeforeExit)
+            if (elapsed < MinZoneSecondsBeforeExit)
+            {
+                ctx.Log($"[ExitPortal] ({caller}) Blocked: zone time {elapsed:F1}s < {MinZoneSecondsBeforeExit}s, coverage={coverage:P1}");
                 return null;
+            }
 
             // Don't exit while monsters are still nearby
             if (combat.NearbyMonsterCount > 0)
+            {
+                ctx.Log($"[ExitPortal] ({caller}) Blocked: {combat.NearbyMonsterCount} monsters nearby, zoneTime={elapsed:F1}s");
                 return null;
+            }
 
             foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
             {
                 if (entity.Path == null) continue;
                 if (!entity.IsTargetable) continue;
                 if (entity.Path.Contains("SekhemaPortal"))
+                {
+                    ctx.Log($"[ExitPortal] ({caller}) FOUND SekhemaPortal id={entity.Id} dist={entity.DistancePlayer:F0} zoneTime={elapsed:F1}s coverage={coverage:P1}");
                     return entity;
+                }
             }
             return null;
         }
@@ -702,27 +1238,22 @@ namespace AutoExile.Modes
             var hudY = 200f;
             var lineH = 18f;
 
-            var titleColor = _phase == MappingPhase.Complete ? SharpDX.Color.LimeGreen
-                : _phase == MappingPhase.Paused ? SharpDX.Color.Yellow
-                : SharpDX.Color.Cyan;
-            g.DrawText("=== MAPPING ===", new Vector2(hudX, hudY), titleColor);
-            hudY += lineH;
-
             var phaseColor = _phase switch
             {
+                MappingPhase.RushingBoss => SharpDX.Color.Gold,
                 MappingPhase.Fighting => SharpDX.Color.Red,
                 MappingPhase.Looting => SharpDX.Color.LimeGreen,
-                MappingPhase.Exploring => SharpDX.Color.Yellow,
+                MappingPhase.Exploring => SharpDX.Color.Cyan,
                 MappingPhase.Complete => SharpDX.Color.LimeGreen,
                 MappingPhase.Exiting => SharpDX.Color.Magenta,
                 MappingPhase.Paused => SharpDX.Color.Yellow,
                 _ => SharpDX.Color.White,
             };
-            g.DrawText($"Phase: {_phase}", new Vector2(hudX, hudY), phaseColor);
-            hudY += lineH;
-            g.DrawText(Status, new Vector2(hudX, hudY), SharpDX.Color.White);
-            hudY += lineH;
-            g.DrawText($"Decision: {Decision}", new Vector2(hudX, hudY), SharpDX.Color.Gray);
+
+            var elapsed = (DateTime.Now - _startTime).TotalSeconds;
+            var mins = (int)(elapsed / 60);
+            var secs = (int)(elapsed % 60);
+            g.DrawText($"MAPPING  {_phase}  {mins}:{secs:D2}", new Vector2(hudX, hudY), phaseColor);
             hudY += lineH;
 
             // Coverage bar
@@ -730,147 +1261,84 @@ namespace AutoExile.Modes
             {
                 var coverage = blob.Coverage;
                 var barWidth = 200f;
-                var barHeight = 14f;
-                var barX = hudX;
-                var barY = hudY;
+                var barHeight = 12f;
 
-                g.DrawBox(new SharpDX.RectangleF(barX, barY, barWidth, barHeight),
+                g.DrawBox(new SharpDX.RectangleF(hudX, hudY, barWidth, barHeight),
                     new SharpDX.Color(40, 40, 40, 200));
                 var fillWidth = barWidth * Math.Min(coverage, 1f);
                 var fillColor = coverage >= _minCoverage
                     ? new SharpDX.Color(0, 200, 0, 200)
                     : new SharpDX.Color(200, 200, 0, 200);
-                g.DrawBox(new SharpDX.RectangleF(barX, barY, fillWidth, barHeight), fillColor);
-                var targetX = barX + barWidth * _minCoverage;
-                g.DrawLine(new Vector2(targetX, barY), new Vector2(targetX, barY + barHeight), 2f, SharpDX.Color.White);
-                g.DrawText($"{coverage:P1} / {_minCoverage:P0}",
-                    new Vector2(barX + barWidth + 8, barY - 1), SharpDX.Color.White);
+                g.DrawBox(new SharpDX.RectangleF(hudX, hudY, fillWidth, barHeight), fillColor);
+                var targetX = hudX + barWidth * _minCoverage;
+                g.DrawLine(new Vector2(targetX, hudY), new Vector2(targetX, hudY + barHeight), 2f, SharpDX.Color.White);
+                g.DrawText($"{coverage:P0}",
+                    new Vector2(hudX + barWidth + 8, hudY - 1), SharpDX.Color.White);
                 hudY += barHeight + 4;
-
-                g.DrawText($"Cells: {blob.SeenCells.Count}/{blob.WalkableCells.Count} | Regions: {blob.Regions.Count}",
-                    new Vector2(hudX, hudY), SharpDX.Color.Gray);
-                hudY += lineH;
             }
 
-            g.DrawText($"Targets visited: {_exploreTargetsVisited} | Failed regions: {ctx.Exploration.FailedRegions.Count}",
-                new Vector2(hudX, hudY), SharpDX.Color.Gray);
-            hudY += lineH;
-
-            // Loot info
-            if (ctx.Loot.LootableCount > 0)
+            // Status + decision (one line each, only when meaningful)
+            if (!string.IsNullOrEmpty(Status))
             {
-                g.DrawText($"Loot: {ctx.Loot.LootableCount} items nearby",
-                    new Vector2(hudX, hudY), SharpDX.Color.LimeGreen);
+                g.DrawText(Status, new Vector2(hudX, hudY), SharpDX.Color.White);
                 hudY += lineH;
             }
 
-            // Navigation
-            if (ctx.Navigation.IsNavigating)
-            {
-                g.DrawText($"Nav: wp {ctx.Navigation.CurrentWaypointIndex + 1}/{ctx.Navigation.CurrentNavPath.Count} " +
-                           $"stuck={ctx.Navigation.StuckRecoveries} pathfind={ctx.Navigation.LastPathfindMs}ms",
-                    new Vector2(hudX, hudY), SharpDX.Color.Gray);
-                hudY += lineH;
-            }
-
-            // Combat
+            // Combat (inline)
             if (ctx.Combat.InCombat)
             {
-                g.DrawText($"Combat: {ctx.Combat.NearbyMonsterCount} monsters | {ctx.Combat.LastSkillAction}",
+                g.DrawText($"Combat: {ctx.Combat.NearbyMonsterCount} nearby  {ctx.Combat.LastSkillAction}",
                     new Vector2(hudX, hudY), SharpDX.Color.Red);
                 hudY += lineH;
             }
 
-            var elapsed = (DateTime.Now - _startTime).TotalSeconds;
-            g.DrawText($"Time: {elapsed:F0}s", new Vector2(hudX, hudY), SharpDX.Color.DarkGray);
-            hudY += lineH;
-
-            // Top unexplored regions
-            if (blob != null)
+            // Loot
+            if (ctx.Loot.LootableCount > 0)
             {
-                hudY += 4f;
-                g.DrawText("Unexplored Regions:", new Vector2(hudX, hudY), SharpDX.Color.White);
+                g.DrawText($"Loot: {ctx.Loot.LootableCount} items", new Vector2(hudX, hudY), SharpDX.Color.LimeGreen);
                 hudY += lineH;
-
-                int regionShown = 0;
-                foreach (var region in blob.Regions.OrderBy(r => r.ExploredRatio))
-                {
-                    if (regionShown >= 5) break;
-                    if (region.ExploredRatio >= 0.8f) continue;
-
-                    var isNavTarget = _navTarget.HasValue &&
-                        Vector2.Distance(region.Center, _navTarget.Value) < 40f;
-                    var color = isNavTarget ? SharpDX.Color.Cyan
-                        : new SharpDX.Color((byte)255, (byte)(255 * region.ExploredRatio), (byte)0, (byte)255);
-                    var marker = isNavTarget ? ">>>" : "   ";
-                    var dist = Vector2.Distance(playerGrid, region.Center);
-                    g.DrawText($"{marker} R{region.Index}: {region.ExploredRatio:P0} ({region.CellCount} cells) d={dist:F0}",
-                        new Vector2(hudX, hudY), color);
-                    hudY += lineH - 2;
-                    regionShown++;
-                }
             }
 
-            // Transitions
-            if (ctx.Exploration.KnownTransitions.Count > 0)
+            // Boss status (only when kill boss is enabled or rushing)
+            if (_bossTarget.HasValue)
             {
-                hudY += 4f;
-                g.DrawText($"Transitions: {ctx.Exploration.KnownTransitions.Count}", new Vector2(hudX, hudY), SharpDX.Color.White);
+                var dist = Vector2.Distance(playerGrid, _bossTarget.Value);
+                g.DrawText($"Boss: {dist:F0}g away", new Vector2(hudX, hudY), SharpDX.Color.Gold);
                 hudY += lineH;
-                foreach (var t in ctx.Exploration.KnownTransitions)
-                {
-                    g.DrawText($"  {t.Name} ({t.GridPos.X:F0},{t.GridPos.Y:F0})",
-                        new Vector2(hudX, hudY), SharpDX.Color.LightGray);
-                    hudY += lineH - 2;
-                }
+            }
+            else if (ctx.Settings.Mapping.KillBoss.Value)
+            {
+                var bossColor = _bossKillVerified ? SharpDX.Color.LimeGreen : SharpDX.Color.OrangeRed;
+                g.DrawText(_bossKillVerified ? "Boss: KILLED" : "Boss: ALIVE", new Vector2(hudX, hudY), bossColor);
+                hudY += lineH;
             }
 
-            // Mechanics info
-            if (ctx.Mechanics.ActiveMechanic != null || ctx.Mechanics.DetectedMechanics.Count > 0
-                || ctx.Mechanics.CompletedMechanics.Count > 0)
+            // Priority target
+            if (_priorityTarget.HasValue)
             {
-                hudY += 4f;
-                g.DrawText("Mechanics:", new Vector2(hudX, hudY), SharpDX.Color.White);
+                g.DrawText($"Priority: {_priorityTargetReason}", new Vector2(hudX, hudY), SharpDX.Color.Yellow);
                 hudY += lineH;
-
-                if (ctx.Mechanics.ActiveMechanic != null)
-                {
-                    g.DrawText($"  Active: {ctx.Mechanics.ActiveMechanic.Name} — {ctx.Mechanics.ActiveMechanic.Status}",
-                        new Vector2(hudX, hudY), SharpDX.Color.Orange);
-                    hudY += lineH;
-                }
-
-                foreach (var m in ctx.Mechanics.DetectedMechanics)
-                {
-                    g.DrawText($"  Pending: {m.Name}", new Vector2(hudX, hudY), SharpDX.Color.Yellow);
-                    hudY += lineH - 2;
-                }
-
-                foreach (var m in ctx.Mechanics.CompletedMechanics)
-                {
-                    var count = ctx.Mechanics.GetCompletionCount(m.Name);
-                    var countStr = count > 1 ? $" (x{count})" : "";
-                    g.DrawText($"  Done: {m.Name}{countStr}", new Vector2(hudX, hudY), SharpDX.Color.LimeGreen);
-                    hudY += lineH - 2;
-                }
-
-                // Show repeatable mechanics that aren't in _completed but have completions
-                foreach (var kvp in ctx.Mechanics.CompletionCounts)
-                {
-                    if (ctx.Mechanics.CompletedMechanics.Any(m => m.Name == kvp.Key)) continue;
-                    if (ctx.Mechanics.ActiveMechanic?.Name == kvp.Key) continue;
-                    var countStr = kvp.Value > 1 ? $" (x{kvp.Value})" : "";
-                    g.DrawText($"  Done: {kvp.Key}{countStr}", new Vector2(hudX, hudY), SharpDX.Color.LimeGreen);
-                    hudY += lineH - 2;
-                }
             }
 
-            hudY += 6f;
-            g.DrawText("[F5] pause/resume | Running=ON for movement", new Vector2(hudX, hudY), SharpDX.Color.DarkGray);
+            // Mechanics (compact: active + completed counts)
+            if (ctx.Mechanics.ActiveMechanic != null)
+            {
+                g.DrawText($"Mechanic: {ctx.Mechanics.ActiveMechanic.Name} — {ctx.Mechanics.ActiveMechanic.Status}",
+                    new Vector2(hudX, hudY), SharpDX.Color.Orange);
+                hudY += lineH;
+            }
+            var completedCount = ctx.Mechanics.CompletionCounts.Values.Sum();
+            if (completedCount > 0)
+            {
+                var mechList = string.Join(", ", ctx.Mechanics.CompletionCounts
+                    .Select(kv => kv.Value > 1 ? $"{kv.Key} x{kv.Value}" : kv.Key));
+                g.DrawText($"Done: {mechList}", new Vector2(hudX, hudY), SharpDX.Color.DarkGreen);
+                hudY += lineH;
+            }
 
             // ═══ World Overlays ═══
 
-            // Current nav target
+            // Nav target marker
             if (_navTarget.HasValue && ctx.Navigation.IsNavigating)
             {
                 var targetWorld = new Vector3(
@@ -879,8 +1347,10 @@ namespace AutoExile.Modes
                 var targetScreen = cam.WorldToScreen(targetWorld);
                 if (targetScreen.X > -200 && targetScreen.X < 2400)
                 {
-                    g.DrawCircleInWorld(targetWorld, 30f, SharpDX.Color.Cyan, 2f);
-                    g.DrawText("EXPLORE", targetScreen + new Vector2(-20, -25), SharpDX.Color.Cyan);
+                    var markerColor = _priorityTarget.HasValue ? SharpDX.Color.Yellow : SharpDX.Color.Cyan;
+                    var markerLabel = _priorityTarget.HasValue ? "PRIORITY" : "NAV";
+                    g.DrawCircleInWorld(targetWorld, 30f, markerColor, 2f);
+                    g.DrawText(markerLabel, targetScreen + new Vector2(-20, -25), markerColor);
                 }
             }
 
@@ -900,52 +1370,21 @@ namespace AutoExile.Modes
                 }
             }
 
-            // Network bubble
-            var playerWorld = gc.Player.PosNum;
-            var bubbleRadius = Pathfinding.NetworkBubbleRadius * Pathfinding.GridToWorld;
-            g.DrawCircleInWorld(new Vector3(playerWorld.X, playerWorld.Y, playerZ),
-                bubbleRadius, new SharpDX.Color(100, 100, 255, 30), 1f);
-
-            // Region centers (unexplored)
-            if (blob != null)
+            // Boss target world marker
+            if (_bossTarget.HasValue)
             {
-                foreach (var region in blob.Regions)
-                {
-                    if (region.ExploredRatio >= 0.8f) continue;
-
-                    var regionWorld = new Vector3(
-                        region.Center.X * Pathfinding.GridToWorld,
-                        region.Center.Y * Pathfinding.GridToWorld, playerZ);
-                    var regionScreen = cam.WorldToScreen(regionWorld);
-                    if (regionScreen.X < -200 || regionScreen.X > 2400 || regionScreen.Y < -200 || regionScreen.Y > 1500)
-                        continue;
-
-                    var alpha = (byte)(255 * (1f - region.ExploredRatio));
-                    var regionColor = new SharpDX.Color((byte)255, alpha, (byte)0, (byte)(alpha * 0.6f));
-                    g.DrawCircleInWorld(regionWorld, 20f, regionColor, 1f);
-                    g.DrawText($"{region.ExploredRatio:P0}", regionScreen + new Vector2(-12, -8),
-                        new SharpDX.Color((byte)255, alpha, (byte)0, alpha));
-                }
-            }
-
-            // Transition markers
-            foreach (var t in ctx.Exploration.KnownTransitions)
-            {
-                var tWorld = new Vector3(
-                    t.GridPos.X * Pathfinding.GridToWorld,
-                    t.GridPos.Y * Pathfinding.GridToWorld, playerZ);
-                var tScreen = cam.WorldToScreen(tWorld);
-                if (tScreen.X < -200 || tScreen.X > 2400) continue;
-
-                g.DrawCircleInWorld(tWorld, 25f, SharpDX.Color.Purple, 2f);
-                g.DrawText(t.Name, tScreen + new Vector2(-20, -20), SharpDX.Color.Purple);
+                var bossWorld = new Vector3(
+                    _bossTarget.Value.X * (float)Pathfinding.GridToWorld,
+                    _bossTarget.Value.Y * (float)Pathfinding.GridToWorld, playerZ);
+                g.DrawCircleInWorld(bossWorld, 60f, SharpDX.Color.Gold, 3f);
+                var bossScreen = cam.WorldToScreen(bossWorld);
+                if (bossScreen.X > -200 && bossScreen.X < 2400)
+                    g.DrawText("BOSS", bossScreen + new Vector2(-15, -20), SharpDX.Color.Gold);
             }
 
             // Active mechanic overlay
             if (ctx.Mechanics.ActiveMechanic != null)
-            {
                 ctx.Mechanics.ActiveMechanic.Render(ctx);
-            }
         }
     }
 }

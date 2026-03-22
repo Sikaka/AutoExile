@@ -21,9 +21,7 @@ namespace AutoExile.Systems
         private int _count;
         private long _tickNumber;
 
-        // HP drop detection
         private float _lastHpPercent = 1f;
-        private const float HpDropThreshold = 0.4f; // 40% drop in one tick triggers dump
 
         // Dump output
         private string _outputDir = "";
@@ -163,20 +161,6 @@ namespace AutoExile.Systems
         {
             if ((DateTime.Now - _lastDumpTime).TotalMilliseconds < DumpCooldownMs)
                 return;
-
-            // Death
-            if (!isAlive && _lastHpPercent > 0)
-            {
-                DumpToFile("death");
-                return;
-            }
-
-            // Large HP drop
-            if (_lastHpPercent - hpPercent > HpDropThreshold)
-            {
-                DumpToFile($"hp_drop_{_lastHpPercent:F2}_to_{hpPercent:F2}");
-                return;
-            }
 
             // Navigation stuck recovery
             if (nav.StuckRecoveries > 0 && nav.LastRecoveryAction == "Repath")

@@ -24,9 +24,34 @@ namespace AutoExile.Systems
     /// - Sequence: move cursor → random delay (30-50ms) → button/key down → random delay (30-50ms) → up.
     /// - No bot logic runs during the async sequence because NextActionAt is already in the future.
     /// - All actions are logged to a ring buffer for post-hoc analysis.
+    /// - Window bounds are enforced: positions outside the game window are clamped inward.
     /// </summary>
     public static class BotInput
     {
+        // ── Window bounds (set by BotCore each tick) ──
+        /// <summary>Game window rect in absolute screen coordinates. Set by BotCore each tick.</summary>
+        public static SharpDX.RectangleF WindowRect;
+
+        /// <summary>
+        /// Clamp a position to stay within the game window (with padding to avoid edge pixels).
+        /// Returns false if WindowRect is unset (zero-size).
+        /// </summary>
+        private static bool ClampToWindow(ref Vector2 pos)
+        {
+            if (WindowRect.Width < 10 || WindowRect.Height < 10)
+                return false; // window rect not set or too small
+
+            const float pad = 5f;
+            var minX = WindowRect.X + pad;
+            var maxX = WindowRect.X + WindowRect.Width - pad;
+            var minY = WindowRect.Y + pad;
+            var maxY = WindowRect.Y + WindowRect.Height - pad;
+
+            pos.X = Math.Clamp(pos.X, minX, maxX);
+            pos.Y = Math.Clamp(pos.Y, minY, maxY);
+            return true;
+        }
+
         // ── Action Log ──
         private static readonly ActionRecord[] _actionLog = new ActionRecord[500];
         private static int _actionLogIndex;
@@ -86,6 +111,7 @@ namespace AutoExile.Systems
         public static bool CursorPressKey(Vector2 absPos, Keys key)
         {
             if (!CanAct) { LogAction("CursorPressKey", absPos, key, false); return false; }
+            if (!ClampToWindow(ref absPos)) { LogAction("CursorPressKey", absPos, key, false); return false; }
             var settle = RandSettle();
             var hold = RandHold();
             NextActionAt = DateTime.Now.AddMilliseconds(settle + hold + ActionCooldownMs);
@@ -130,6 +156,7 @@ namespace AutoExile.Systems
         public static bool Click(Vector2 absPos)
         {
             if (!CanAct) { LogAction("Click", absPos, null, false); return false; }
+            if (!ClampToWindow(ref absPos)) { LogAction("Click", absPos, null, false); return false; }
             var settle = RandSettle();
             var hold = RandHold();
             NextActionAt = DateTime.Now.AddMilliseconds(settle + hold + ActionCooldownMs);
@@ -142,6 +169,7 @@ namespace AutoExile.Systems
         public static bool RightClick(Vector2 absPos)
         {
             if (!CanAct) { LogAction("RightClick", absPos, null, false); return false; }
+            if (!ClampToWindow(ref absPos)) { LogAction("RightClick", absPos, null, false); return false; }
             var settle = RandSettle();
             var hold = RandHold();
             NextActionAt = DateTime.Now.AddMilliseconds(settle + hold + ActionCooldownMs);
@@ -173,6 +201,7 @@ namespace AutoExile.Systems
         public static bool CtrlClick(Vector2 absPos)
         {
             if (!CanAct) { LogAction("CtrlClick", absPos, null, false); return false; }
+            if (!ClampToWindow(ref absPos)) { LogAction("CtrlClick", absPos, null, false); return false; }
             var settle = RandSettle();
             var hold = RandHold();
             // Ctrl down + settle + cursor + settle + click hold + release + ctrl up
