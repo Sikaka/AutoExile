@@ -286,45 +286,42 @@ namespace AutoExile.Systems
                 return MapDeviceResult.InProgress;
             }
 
-            // Device panel must be visible before we can insert maps
-            var devicePanel = atlas.GetChildAtIndex(7);
-            bool devicePanelVisible = devicePanel?.IsVisible == true;
+            // Two distinct flows:
+            // A) Named map (mapping mode): must select atlas node first → device panel opens → Ctrl+click map
+            // B) Auto-match (blight/simulacrum): right-click map in stash → game handles node selection + insertion
+            bool namedMapFlow = !string.IsNullOrEmpty(TargetMapName);
 
-            // Step 1: Select atlas node — required when TargetMapName is set,
-            // and also required whenever the device panel isn't open yet
-            if (!devicePanelVisible)
+            if (namedMapFlow)
             {
-                if (!string.IsNullOrEmpty(TargetMapName))
+                // Device panel must be visible before we can Ctrl+click insert
+                var devicePanel = atlas.GetChildAtIndex(7);
+                bool devicePanelVisible = devicePanel?.IsVisible == true;
+
+                if (!devicePanelVisible)
                 {
+                    // Click the atlas node to open the device panel for this map
                     return TickSelectAtlasNode(gc, atlas);
                 }
-                else
+
+                // Device panel is open — verify correct map is selected
+                if (!_nodeSelected)
                 {
-                    // No target map name and device panel not open — can't proceed
-                    Status = "[Select] No map selected and no TargetMapName configured";
-                    _phase = MapDevicePhase.Idle;
-                    return MapDeviceResult.Failed;
+                    var nameEl = atlas.GetChildFromIndices(MapNameTextPath);
+                    if (nameEl?.Text != null &&
+                        nameEl.Text.Equals(TargetMapName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _nodeSelected = true;
+                        Status = $"[Select] {TargetMapName} confirmed selected";
+                    }
+                    else
+                    {
+                        // Wrong map selected — click the correct node
+                        return TickSelectAtlasNode(gc, atlas);
+                    }
                 }
             }
 
-            // Device panel is open — verify correct map is selected (if we have a target)
-            if (!string.IsNullOrEmpty(TargetMapName) && !_nodeSelected)
-            {
-                var nameEl = atlas.GetChildFromIndices(MapNameTextPath);
-                if (nameEl?.Text != null &&
-                    nameEl.Text.Equals(TargetMapName, StringComparison.OrdinalIgnoreCase))
-                {
-                    _nodeSelected = true;
-                    Status = $"[Select] {TargetMapName} confirmed selected";
-                }
-                else
-                {
-                    // Wrong map selected — click the correct node
-                    return TickSelectAtlasNode(gc, atlas);
-                }
-            }
-
-            // Step 2: Find and Ctrl+click a map from the stash to insert it
+            // Find a matching map from the stash and insert it
             var mapStash = atlas.GetChildFromIndices(MapStashPath);
             if (mapStash == null)
             {
@@ -333,7 +330,6 @@ namespace AutoExile.Systems
                 return MapDeviceResult.Failed;
             }
 
-            // Find a matching map from the stash
             Element? targetMap = null;
             int checkedCount = 0;
             for (int i = 0; i < mapStash.ChildCount; i++)
@@ -343,7 +339,6 @@ namespace AutoExile.Systems
                     continue;
                 checkedCount++;
 
-                // Apply mode-specific filter (IsStandardMap, IsBlightMap, etc.)
                 if (_mapFilter != null && !_mapFilter(item))
                     continue;
 
@@ -358,20 +353,23 @@ namespace AutoExile.Systems
                 return MapDeviceResult.Failed;
             }
 
-            // Ctrl+click the map to transfer it into the device
+            // Named map: Ctrl+click inserts into the already-selected node's device slot.
+            // Auto-match: Right-click auto-selects the correct atlas node AND inserts.
             var rect = targetMap.GetClientRect();
-            var center = new Vector2(rect.Center.X, rect.Center.Y);
             var windowRect = gc.Window.GetWindowRectangle();
-            var absPos = new Vector2(windowRect.X + center.X, windowRect.Y + center.Y);
+            var clickPos = BotInput.RandomizeWithinRect(rect);
+            var absPos = new Vector2(windowRect.X + clickPos.X, windowRect.Y + clickPos.Y);
 
-            // Ctrl+click when atlas node was manually selected (mapping flow),
-            // right-click when map type auto-matches (blight/simulacrum flow)
-            if (!string.IsNullOrEmpty(TargetMapName))
-                BotInput.CtrlClick(absPos);
-            else
-                BotInput.RightClick(absPos);
+            bool clicked = namedMapFlow
+                ? BotInput.CtrlClick(absPos)
+                : BotInput.RightClick(absPos);
+            if (!clicked)
+                return MapDeviceResult.InProgress; // gate blocked, retry next tick
+
             _lastActionTime = DateTime.Now;
-            Status = "[Select] Inserting map into device";
+            Status = namedMapFlow
+                ? $"[Select] Ctrl+clicking {TargetMapName} map into device"
+                : "[Select] Right-clicking map into device";
 
             // Re-enter this phase — IsMapInDevice check will advance us
             return MapDeviceResult.InProgress;

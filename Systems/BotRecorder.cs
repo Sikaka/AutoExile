@@ -211,8 +211,9 @@ namespace AutoExile.Systems
                     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingDefault
                 });
 
-                File.WriteAllText(path, json);
-                _lastDumpStatus = $"Dumped {snapshots.Count} ticks to {filename} ({reason})";
+                var count = snapshots.Count;
+                Task.Run(() => { try { File.WriteAllText(path, json); } catch { } });
+                _lastDumpStatus = $"Dumped {count} ticks to {filename} ({reason})";
             }
             catch (Exception ex)
             {

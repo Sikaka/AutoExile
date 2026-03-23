@@ -305,8 +305,18 @@ namespace AutoExile
                         // Evict oldest if cache is full
                         while (_areaStateCache.Count > MaxCachedAreas)
                         {
-                            var oldest = _areaStateCache.OrderBy(kv => kv.Value.CachedAt).First().Key;
-                            _areaStateCache.Remove(oldest);
+                            string? oldest = null;
+                            var oldestTime = DateTime.MaxValue;
+                            foreach (var kv in _areaStateCache)
+                            {
+                                if (kv.Value.CachedAt < oldestTime)
+                                {
+                                    oldestTime = kv.Value.CachedAt;
+                                    oldest = kv.Key;
+                                }
+                            }
+                            if (oldest != null) _areaStateCache.Remove(oldest);
+                            else break;
                         }
 
                         _ctx.Log($"[Cache] Saved area state for '{previousAreaName}' hash={_lastAreaHash} ({_areaStateCache.Count} cached)");
@@ -1326,7 +1336,8 @@ namespace AutoExile
                 };
                 var json = System.Text.Json.JsonSerializer.Serialize(entry,
                     new System.Text.Json.JsonSerializerOptions { WriteIndented = false });
-                File.AppendAllText(outputPath, json + "\n");
+                var path = outputPath;
+                Task.Run(() => { try { File.AppendAllText(path, json + "\n"); } catch { } });
             }
             catch { }
         }

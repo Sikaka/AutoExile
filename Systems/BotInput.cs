@@ -121,45 +121,77 @@ namespace AutoExile.Systems
         // ── High-level click helpers (entity / label → randomized screen click) ──
 
         /// <summary>
-        /// Click a world entity with center-biased randomization derived from its actual bounds.
-        /// Projects the entity's Render.BoundsNum to screen space for proper scaling with
-        /// camera zoom and distance. Falls back to a small fixed offset if Render is unavailable.
+        /// Click a world entity with hover verification via Targetable.isTargeted.
+        /// Moves cursor to a random position within the entity's screen bounds, waits for settle,
+        /// checks if the game reports the entity as targeted (highlighted). If not, retries at
+        /// a different position. Once confirmed targeted, clicks.
+        /// This handles overlapping entities (players on top of stash/monolith) — the bot
+        /// keeps sampling positions until it finds one that targets the correct entity.
         /// </summary>
-        /// <returns>True if the click was sent, false if gate blocked or entity off-screen.</returns>
+        /// <returns>True if the click sequence was initiated, false if gate blocked or entity off-screen.</returns>
         public static bool ClickEntity(GameController gc, Entity entity)
         {
-            var center = entity.BoundsCenterPosNum;
-            var camera = gc.IngameState.Camera;
-            var screenCenter = camera.WorldToScreen(center);
-            var windowRect = gc.Window.GetWindowRectangle();
-
-            // Off-screen check
-            if (screenCenter.X < 5 || screenCenter.X > windowRect.Width - 5 ||
-                screenCenter.Y < 5 || screenCenter.Y > windowRect.Height - 5)
+            if (!CanAct) return false;
+            if (!GetEntityScreenBounds(gc, entity, out var screenCenter, out var halfW, out var halfH))
                 return false;
 
-            // Derive screen-space extents from world-space bounds
-            float halfW = 12f, halfH = 8f; // fallback pixels if no Render component
-            var render = entity.GetComponent<Render>();
-            if (render != null)
-            {
-                var bounds = render.BoundsNum;
-                // Project center + X offset to screen, measure pixel delta for scale
-                var offsetWorld = new Vector3(center.X + bounds.X * 0.4f, center.Y, center.Z);
-                var screenOffset = camera.WorldToScreen(offsetWorld);
-                var dx = Math.Abs(screenOffset.X - screenCenter.X);
-                // Project center + Y offset (world Y maps to screen diagonal in isometric view)
-                var offsetWorldY = new Vector3(center.X, center.Y + bounds.Y * 0.4f, center.Z);
-                var screenOffsetY = camera.WorldToScreen(offsetWorldY);
-                var dy = Math.Abs(screenOffsetY.Y - screenCenter.Y);
+            var windowRect = gc.Window.GetWindowRectangle();
+            var settle = RandSettle();
+            var hold = RandHold();
 
-                if (dx > 3f) halfW = dx;
-                if (dy > 3f) halfH = dy;
+            // Reserve gate for worst case: MaxHoverAttempts * (move + settle) + click hold + cooldown
+            var moveMs = EstimateMoveMs(new Vector2(windowRect.X + screenCenter.X, windowRect.Y + screenCenter.Y));
+            NextActionAt = DateTime.Now.AddMilliseconds(
+                MaxHoverAttempts * (moveMs + settle) + hold + ActionCooldownMs);
+
+            _ = DoClickEntityWithVerify(entity, screenCenter, halfW, halfH, windowRect, settle, hold);
+            LogAction("ClickEntity", screenCenter, null, true);
+            return true;
+        }
+
+        private const int MaxHoverAttempts = 5;
+        private const int HoverVerifyDelayMs = 35; // time after cursor settle to let game update isTargeted
+
+        private static async Task DoClickEntityWithVerify(
+            Entity entity, Vector2 screenCenter, float halfW, float halfH,
+            SharpDX.RectangleF windowRect, int settleMs, int holdMs)
+        {
+            for (int attempt = 0; attempt < MaxHoverAttempts; attempt++)
+            {
+                // Pick a random position within entity bounds — first attempt is center-biased,
+                // subsequent attempts spread wider to find an unblocked spot
+                var spread = attempt == 0 ? 1f : 1f + attempt * 0.3f;
+                var clickPos = RandomizeWithinRect(screenCenter.X, screenCenter.Y,
+                    halfW * spread, halfH * spread);
+                var absPos = new Vector2(windowRect.X + clickPos.X, windowRect.Y + clickPos.Y);
+
+                // Move cursor and settle
+                await MoveCursorTo(absPos);
+                await Task.Delay(settleMs);
+
+                // Verify the game reports this entity as targeted (hover highlight)
+                try
+                {
+                    var targetable = entity.GetComponent<Targetable>();
+                    if (targetable?.isTargeted == true)
+                    {
+                        // Confirmed — click now
+                        Input.LeftDown();
+                        await Task.Delay(holdMs);
+                        Input.LeftUp();
+                        return;
+                    }
+                }
+                catch { }
+
+                // Not targeted — wait briefly then try next position
+                await Task.Delay(HoverVerifyDelayMs);
             }
 
-            var clickPos = RandomizeWithinRect(screenCenter.X, screenCenter.Y, halfW, halfH);
-            var absPos = new Vector2(windowRect.X + clickPos.X, windowRect.Y + clickPos.Y);
-            return Click(absPos);
+            // Exhausted attempts — click at last position anyway as fallback
+            Input.LeftDown();
+            await Task.Delay(holdMs);
+            Input.LeftUp();
         }
 
         /// <summary>

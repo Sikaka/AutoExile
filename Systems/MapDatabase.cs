@@ -110,11 +110,16 @@ namespace AutoExile.Systems
             try
             {
                 var json = JsonSerializer.Serialize(_entries, JsonOpts);
-                File.WriteAllText(_filePath, json);
+                var path = _filePath;
+                Task.Run(() =>
+                {
+                    try { File.WriteAllText(path, json); }
+                    catch (Exception ex) { _log($"MapDatabase: save error: {ex.Message}"); }
+                });
             }
             catch (Exception ex)
             {
-                _log($"MapDatabase: save error: {ex.Message}");
+                _log($"MapDatabase: serialize error: {ex.Message}");
             }
         }
     }

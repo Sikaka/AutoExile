@@ -446,24 +446,21 @@ namespace AutoExile.Systems
 
         // Fixed window-relative equipment slot positions (same as AutoPOE).
         // These are for 2560x1440. TODO: scale by resolution if needed.
-        private static readonly Dictionary<InventorySlotE, Vector2> EquipmentSlotPositions = new()
+        /// <summary>
+        /// Equipment slots that support incubators (same set as before — excludes weapon swap).
+        /// </summary>
+        private static readonly HashSet<InventorySlotE> IncubatorSlots = new()
         {
-            { InventorySlotE.Helm1, new Vector2(1585, 165) },
-            { InventorySlotE.BodyArmour1, new Vector2(1587, 296) },
-            { InventorySlotE.Weapon1, new Vector2(1369, 233) },
-            { InventorySlotE.Offhand1, new Vector2(1784, 232) },
-            { InventorySlotE.Amulet1, new Vector2(1690, 245) },
-            { InventorySlotE.Ring1, new Vector2(1480, 300) },
-            { InventorySlotE.Ring2, new Vector2(1687, 306) },
-            { InventorySlotE.Gloves1, new Vector2(1453, 398) },
-            { InventorySlotE.Boots1, new Vector2(1719, 391) },
-            { InventorySlotE.Belt1, new Vector2(1584, 421) },
+            InventorySlotE.Helm1, InventorySlotE.BodyArmour1,
+            InventorySlotE.Weapon1, InventorySlotE.Offhand1,
+            InventorySlotE.Amulet1, InventorySlotE.Ring1, InventorySlotE.Ring2,
+            InventorySlotE.Gloves1, InventorySlotE.Boots1, InventorySlotE.Belt1,
         };
 
         /// <summary>
         /// Find an equipped item that doesn't have an incubator applied.
-        /// Returns absolute screen position using fixed offsets (same approach as AutoPOE).
-        /// Uses ServerData to check incubator presence, fixed positions for clicking.
+        /// Uses ServerData to identify which slots need incubators, then finds the
+        /// matching entity in the InventoryPanel UI tree to get a resolution-independent click position.
         /// </summary>
         private Vector2? FindEquipmentSlotToApply(GameController gc)
         {
@@ -472,33 +469,45 @@ namespace AutoExile.Systems
                 var inventories = gc.IngameState.ServerData?.PlayerInventories;
                 if (inventories == null) return null;
 
-                var windowRect = gc.Window.GetWindowRectangle();
-
+                // Collect entity IDs that need an incubator from the slots we support
+                var needsIncubator = new HashSet<uint>();
                 foreach (var invHolder in inventories)
                 {
                     var inv = invHolder.Inventory;
-                    if (inv == null) continue;
-
-                    // Only check equipment slots we have positions for
-                    if (!EquipmentSlotPositions.ContainsKey(inv.InventSlot))
-                        continue;
-
-                    // Must have exactly 1 item (equipped)
+                    if (inv == null || !IncubatorSlots.Contains(inv.InventSlot)) continue;
                     if (inv.Items.Count != 1) continue;
 
                     var equippedItem = inv.Items.FirstOrDefault();
                     if (equippedItem == null) continue;
 
-                    // Check if item already has an incubator
                     if (equippedItem.TryGetComponent<Mods>(out var mods))
                     {
                         if (!string.IsNullOrEmpty(mods.IncubatorName))
                             continue; // already has incubator
                     }
 
-                    // Use fixed screen position for this slot
-                    var slotPos = EquipmentSlotPositions[inv.InventSlot];
-                    return new Vector2(windowRect.X + slotPos.X, windowRect.Y + slotPos.Y);
+                    needsIncubator.Add(equippedItem.Id);
+                }
+
+                if (needsIncubator.Count == 0) return null;
+
+                // Find matching entity in the equipment UI tree to get screen position
+                var equipContainer = gc.IngameState.IngameUi.InventoryPanel?.GetChildAtIndex(3);
+                if (equipContainer == null) return null;
+
+                var windowRect = gc.Window.GetWindowRectangle();
+
+                for (int i = 0; i < equipContainer.ChildCount; i++)
+                {
+                    var slot = equipContainer.GetChildAtIndex(i);
+                    if (slot == null || !slot.IsVisible || slot.ChildCount < 2) continue;
+
+                    var entity = slot.GetChildAtIndex(1)?.Entity;
+                    if (entity == null || !needsIncubator.Contains(entity.Id)) continue;
+
+                    var rect = slot.GetClientRect();
+                    var center = new Vector2(rect.X + rect.Width / 2, rect.Y + rect.Height / 2);
+                    return new Vector2(windowRect.X + center.X, windowRect.Y + center.Y);
                 }
             }
             catch { }

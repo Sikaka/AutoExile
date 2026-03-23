@@ -1058,11 +1058,11 @@ namespace AutoExile.Modes
                 _lastEmptyScanAt = DateTime.MinValue; // ensure grace starts fresh from arrival
             }
 
-            // Step 2: Stash remaining items before exiting
+            // Step 2: Stash items if inventory is above threshold (same check as between-waves)
             if (_state.StashPosition.HasValue)
             {
                 var invCount = (StashSystem.GetInventorySlotItems(gc)?.Count ?? 0);
-                if (invCount > 0)
+                if (invCount >= _settings.StashItemThreshold.Value)
                 {
                     // Navigate close to stash so the entity loads into the entity list
                     var playerPos = gc.Player.GridPosNum;

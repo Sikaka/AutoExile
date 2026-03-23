@@ -11,6 +11,7 @@ namespace AutoExile.WebServer
     {
         private string _configPath = "";
         private readonly Action<string> _log;
+        private volatile bool _saving;
 
         private static readonly JsonSerializerOptions WriteOpts = new()
         {
@@ -103,7 +104,15 @@ namespace AutoExile.WebServer
                     config["_ultimatumModOverrides"] = overrides;
 
                 var json = JsonSerializer.Serialize(config, WriteOpts);
-                File.WriteAllText(_configPath, json);
+                if (_saving) return;
+                _saving = true;
+                var path = _configPath;
+                Task.Run(() =>
+                {
+                    try { File.WriteAllText(path, json); }
+                    catch (Exception ex) { _log($"Config save failed (async): {ex.Message}"); }
+                    finally { _saving = false; }
+                });
             }
             catch (Exception ex)
             {

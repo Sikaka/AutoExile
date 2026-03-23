@@ -152,7 +152,7 @@ namespace AutoExile.WebServer
             {
                 foreach (var ws in _wsClients)
                 {
-                    try { ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Server stopping", CancellationToken.None).Wait(1000); }
+                    try { _ = ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Server stopping", CancellationToken.None); }
                     catch { }
                     try { ws.Dispose(); } catch { }
                 }
