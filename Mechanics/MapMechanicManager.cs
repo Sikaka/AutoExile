@@ -261,6 +261,56 @@ namespace AutoExile.Mechanics
             return _completionCounts.GetValueOrDefault(name);
         }
 
+        /// <summary>
+        /// Check if all mechanics marked ExitAfter=true have completed.
+        /// Returns false if no mechanics have ExitAfter=true (fall through to coverage-based exit).
+        /// Returns true when ALL exit-after mechanics are satisfied (completed at least once).
+        /// </summary>
+        public bool AreExitMechanicsComplete(BotSettings settings)
+        {
+            bool anyExitAfter = false;
+            foreach (var m in _mechanics)
+            {
+                var exitAfter = GetExitAfter(m, settings);
+                if (!exitAfter) continue;
+
+                anyExitAfter = true;
+
+                // Must have completed at least once
+                if (!_completionCounts.TryGetValue(m.Name, out var count) || count == 0)
+                    return false;
+            }
+            return anyExitAfter;
+        }
+
+        /// <summary>
+        /// Check if any registered mechanic is detected but not yet completed.
+        /// Used to delay map exit until in-progress mechanics finish.
+        /// </summary>
+        public bool HasPendingMechanics()
+        {
+            if (_active != null && !_active.IsComplete)
+                return true;
+            foreach (var m in _detected)
+            {
+                if (!m.IsComplete) return true;
+            }
+            return false;
+        }
+
+        private static bool GetExitAfter(IMapMechanic mechanic, BotSettings settings)
+        {
+            return mechanic.Name switch
+            {
+                "Ultimatum" => settings.Mechanics.Ultimatum.ExitAfter.Value,
+                "Harvest" => settings.Mechanics.Harvest.ExitAfter.Value,
+                "Wishes" => settings.Mechanics.Wishes.ExitAfter.Value,
+                "Essence" => settings.Mechanics.Essence.ExitAfter.Value,
+                "Ritual" => settings.Mechanics.Ritual.ExitAfter.Value,
+                _ => false,
+            };
+        }
+
         private MechanicMode GetMechanicMode(IMapMechanic mechanic, BotSettings.MechanicsSettings settings)
         {
             // Map mechanic name to its settings mode

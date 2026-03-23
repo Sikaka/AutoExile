@@ -36,6 +36,12 @@ namespace AutoExile.Systems
         /// <summary>Whether to apply incubators from stash to equipment after storing items.</summary>
         public bool ApplyIncubators { get; set; }
 
+        /// <summary>
+        /// Optional filter: return true to stash the item, false to keep it in inventory.
+        /// When null, all items are stashed.
+        /// </summary>
+        public Func<ServerInventory.InventSlotItem, bool>? ItemFilter { get; set; }
+
         // Incubator state
         private bool _cursorHasIncubator;
         private int _incubatorsApplied;
@@ -67,6 +73,7 @@ namespace AutoExile.Systems
         {
             nav?.Stop(gc);
             _phase = StashPhase.Idle;
+            ItemFilter = null;
             Status = "Cancelled";
         }
 
@@ -210,8 +217,25 @@ namespace AutoExile.Systems
                 return EnterCloseStash();
             }
 
-            // Detect failed transfer: if item count didn't decrease since last click
-            if (_prevItemCount >= 0 && slotItems.Count >= _prevItemCount)
+            // Filter: find first stashable item (skip items the filter wants to keep)
+            ServerInventory.InventSlotItem? itemToStash = null;
+            int stashableCount = 0;
+            foreach (var si in slotItems)
+            {
+                if (ItemFilter != null && !ItemFilter(si))
+                    continue; // keep this item
+                stashableCount++;
+                itemToStash ??= si;
+            }
+
+            if (itemToStash == null)
+            {
+                Status = $"Done — stored {_itemsStored} items (kept {slotItems.Count} filtered) — closing stash";
+                return EnterCloseStash();
+            }
+
+            // Detect failed transfer: if stashable count didn't decrease since last click
+            if (_prevItemCount >= 0 && stashableCount >= _prevItemCount)
             {
                 _consecutiveFailures++;
                 if (_consecutiveFailures >= MaxConsecutiveFailures)
@@ -225,10 +249,10 @@ namespace AutoExile.Systems
                 _consecutiveFailures = 0;
             }
 
-            _prevItemCount = slotItems.Count;
+            _prevItemCount = stashableCount;
 
-            // Get click position from first slot item
-            var item = slotItems[0];
+            // Get click position from first stashable item
+            var item = itemToStash;
             var rect = item.GetClientRect();
             var center = new Vector2(rect.Center.X, rect.Center.Y);
             var windowRect = gc.Window.GetWindowRectangle();
@@ -265,6 +289,22 @@ namespace AutoExile.Systems
         {
             var items = GetInventorySlotItems(gc);
             return items != null && items.Count > 0;
+        }
+
+        /// <summary>
+        /// Check if player has any stashable inventory items (respecting a filter).
+        /// Returns true only if at least one item passes the filter (should be stashed).
+        /// </summary>
+        public static bool HasStashableItems(GameController gc, Func<ServerInventory.InventSlotItem, bool>? filter)
+        {
+            var items = GetInventorySlotItems(gc);
+            if (items == null || items.Count == 0) return false;
+            if (filter == null) return true;
+            foreach (var item in items)
+            {
+                if (filter(item)) return true;
+            }
+            return false;
         }
 
         private StashResult EnterCloseStash()

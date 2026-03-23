@@ -12,7 +12,8 @@ namespace AutoExile.Mechanics
     {
         Idle,
         NavigateToEncounter,
-        WaitForCombatClear,
+        KillGuards,
+        WaitForNPC,
         NavigateToNPC,
         TalkToNPC,
         SelectWish,
@@ -28,7 +29,7 @@ namespace AutoExile.Mechanics
         public string Name => "Wishes";
         public string Status { get; private set; } = "";
         public Vector2? AnchorGridPos { get; private set; }
-        public bool IsEncounterActive => _phase is WishesPhase.WaitForCombatClear;
+        public bool IsEncounterActive => _phase is WishesPhase.KillGuards or WishesPhase.WaitForNPC;
         public bool IsComplete => _phase == WishesPhase.Complete;
         public bool TriggersSubZone => true;
 
@@ -63,7 +64,7 @@ namespace AutoExile.Mechanics
         private const float PhaseTimeoutSeconds = 60;
         private const int MaxClickAttempts = 8;
         private const int MaxNavFails = 10;
-        private uint _areaHashOnPortalClick;                  // area hash when portal was clicked — detects zone transition
+        // (removed _areaHashOnPortalClick — wish zones don't change area hash)
 
         // Wishes panel — discovered dynamically, cached until reset
         private int _wishesPanelIndex = -1;
@@ -83,35 +84,14 @@ namespace AutoExile.Mechanics
                     return false;
             }
 
-            // Look for original map encounter anchor
-            // Skip initiators we've already completed (survives Reset — prevents re-entry loop)
-            // Also skip non-targetable ones (encounter already triggered)
+            // Detect FaridunInitiator — even non-targetable (guards still alive).
+            // Skip initiators we've already completed (survives Reset — prevents re-entry loop).
             var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
-            Entity? foundNpc = null;
-            Entity? foundPortal = null;
 
             foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
             {
                 if (entity.Path == null) continue;
-
-                // Track NPC in case initiator is already non-targetable
-                if (entity.Path.Contains("Kubera/Varashta") && entity.IsTargetable)
-                {
-                    var npcDist = Vector2.Distance(playerGrid, entity.GridPosNum);
-                    if (npcDist <= Pathfinding.NetworkBubbleRadius)
-                        foundNpc = entity;
-                }
-
-                // Track DjinnPortal in case both initiator and NPC are done
-                if (entity.Path.Contains("Faridun/DjinnPortal") && entity.IsTargetable)
-                {
-                    var portalDist = Vector2.Distance(playerGrid, entity.GridPosNum);
-                    if (portalDist <= Pathfinding.NetworkBubbleRadius)
-                        foundPortal = entity;
-                }
-
                 if (!entity.Path.Contains("Faridun/FaridunInitiator")) continue;
-                if (!entity.IsTargetable) continue;
                 if (_completedInitiatorIds.Contains(entity.Id)) continue;
 
                 var dist = Vector2.Distance(playerGrid, entity.GridPosNum);
@@ -123,31 +103,7 @@ namespace AutoExile.Mechanics
                 AnchorGridPos = _initiatorGridPos;
 
                 ScanFaridunEntities(ctx);
-                ctx.Log($"[Wishes] Detected via initiator at ({AnchorGridPos.Value.X:F0}, {AnchorGridPos.Value.Y:F0})");
-                return true;
-            }
-
-            // Fallback: if the NPC is targetable but the initiator isn't (encounter already
-            // triggered, combat cleared, NPC waiting), detect via NPC directly
-            if (foundNpc != null)
-            {
-                _npc = foundNpc;
-                _npcId = foundNpc.Id;
-                _npcGridPos = new Vector2(foundNpc.GridPosNum.X, foundNpc.GridPosNum.Y);
-                AnchorGridPos = _npcGridPos;
-                ScanFaridunEntities(ctx);
-                ctx.Log($"[Wishes] Detected via NPC at ({AnchorGridPos.Value.X:F0}, {AnchorGridPos.Value.Y:F0})");
-                return true;
-            }
-
-            // Fallback: DjinnPortal is open (wish confirmed, NPC done, portal waiting)
-            if (foundPortal != null)
-            {
-                _portal = foundPortal;
-                _portalId = foundPortal.Id;
-                _portalGridPos = new Vector2(foundPortal.GridPosNum.X, foundPortal.GridPosNum.Y);
-                AnchorGridPos = _portalGridPos;
-                ctx.Log($"[Wishes] Detected via DjinnPortal at ({AnchorGridPos.Value.X:F0}, {AnchorGridPos.Value.Y:F0})");
+                ctx.Log($"[Wishes] Detected initiator at ({AnchorGridPos.Value.X:F0}, {AnchorGridPos.Value.Y:F0}) targetable={entity.IsTargetable}");
                 return true;
             }
 
@@ -174,7 +130,8 @@ namespace AutoExile.Mechanics
             {
                 WishesPhase.Idle => TickIdle(ctx),
                 WishesPhase.NavigateToEncounter => TickNavigateToEncounter(ctx),
-                WishesPhase.WaitForCombatClear => TickWaitForCombatClear(ctx),
+                WishesPhase.KillGuards => TickKillGuards(ctx),
+                WishesPhase.WaitForNPC => TickWaitForNPC(ctx),
                 WishesPhase.NavigateToNPC => TickNavigateToNPC(ctx),
                 WishesPhase.TalkToNPC => TickTalkToNPC(ctx),
                 WishesPhase.SelectWish => TickSelectWish(ctx),
@@ -213,7 +170,7 @@ namespace AutoExile.Mechanics
             _confirmClickAttempts = 0;
             _npcClickAttempts = 0;
             _portalClickAttempts = 0;
-            _areaHashOnPortalClick = 0;
+            // (removed _areaHashOnPortalClick)
             _navFailCount = 0;
             _wishesPanelIndex = -1;
         }
@@ -241,6 +198,8 @@ namespace AutoExile.Mechanics
             // Need initiator for the navigate-to-encounter path
             if (_initiator == null) return MechanicResult.Idle;
 
+            // Initiator exists but not targetable = guards still alive
+            // Navigate there and kill guards first
             SetPhase(WishesPhase.NavigateToEncounter, "Navigating to encounter area");
             return MechanicResult.InProgress;
         }
@@ -271,7 +230,7 @@ namespace AutoExile.Mechanics
 
             if (dist < 40)
             {
-                SetPhase(WishesPhase.WaitForCombatClear, "In encounter area, fighting");
+                SetPhase(WishesPhase.KillGuards, "In encounter area, killing guards");
                 return MechanicResult.InProgress;
             }
 
@@ -293,7 +252,7 @@ namespace AutoExile.Mechanics
             return MechanicResult.InProgress;
         }
 
-        private MechanicResult TickWaitForCombatClear(BotContext ctx)
+        private MechanicResult TickKillGuards(BotContext ctx)
         {
             var gc = ctx.Game;
 
@@ -305,24 +264,55 @@ namespace AutoExile.Mechanics
 
             ScanFaridunEntities(ctx);
 
-            // NPC targetable = combat phase is done, regardless of monster count
+            // NPC targetable = guards dead, skip straight to talking
             if (_npc != null && _npc.IsTargetable)
             {
                 SetPhase(WishesPhase.NavigateToNPC, "NPC available, going to talk");
                 return MechanicResult.InProgress;
             }
 
-            var monsterCount = CountFaridunMonsters(ctx);
-            if (monsterCount == 0)
+            // Initiator became targetable = guards dead, wait for NPC spawn
+            if (_initiator != null && _initiator.IsTargetable)
             {
-                var elapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
-                Status = $"[Combat] Monsters cleared, waiting for NPC ({elapsed:F0}s)";
-                // Don't timeout here — NPC can take a while to spawn after combat.
-                // The phase-level timeout (60s) handles true stuck states.
+                SetPhase(WishesPhase.WaitForNPC, "Guards cleared, waiting for NPC");
                 return MechanicResult.InProgress;
             }
 
-            Status = $"[Combat] Fighting ({monsterCount} Faridun monsters)";
+            var guardCount = CountFaridunGuards(ctx);
+            if (guardCount == 0)
+            {
+                // No guards visible but initiator not yet targetable — may still be loading
+                var elapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
+                Status = $"[Guards] No guards visible, waiting for trigger ({elapsed:F0}s)";
+                return MechanicResult.InProgress;
+            }
+
+            Status = $"[Guards] Killing guards ({guardCount} alive)";
+            return MechanicResult.InProgress;
+        }
+
+        private MechanicResult TickWaitForNPC(BotContext ctx)
+        {
+            ScanFaridunEntities(ctx);
+
+            if (_npc != null && _npc.IsTargetable)
+            {
+                SetPhase(WishesPhase.NavigateToNPC, "NPC spawned, going to talk");
+                return MechanicResult.InProgress;
+            }
+
+            var elapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
+            Status = $"[NPC] Waiting for Varashta to spawn ({elapsed:F0}s)";
+
+            // Short timeout — NPC spawns ~1-2s after last guard dies
+            if (elapsed > 10)
+            {
+                ctx.Log("[Wishes] WaitForNPC timed out (10s) — abandoning");
+                MarkInitiatorCompleted();
+                _phase = WishesPhase.Complete;
+                return MechanicResult.Failed;
+            }
+
             return MechanicResult.InProgress;
         }
 
@@ -345,7 +335,7 @@ namespace AutoExile.Mechanics
                 if (_npc == null || !_npc.IsTargetable)
                 {
                     // NPC disappeared — go back to waiting
-                    SetPhase(WishesPhase.WaitForCombatClear, "NPC not ready, returning to combat wait");
+                    SetPhase(WishesPhase.KillGuards, "NPC not ready, returning to guard area");
                     return MechanicResult.InProgress;
                 }
             }
@@ -595,16 +585,19 @@ namespace AutoExile.Mechanics
         {
             var gc = ctx.Game;
 
-            // Detect completed transition via area hash change.
-            // Grid positions are zone-relative, so position-based checks are unreliable across zones.
-            if (_portalClickAttempts > 0 && _areaHashOnPortalClick != 0)
+            // Detect completed transition: wish zones don't change area hash or name.
+            // The ONLY reliable signal is a targetable SekhemaPortal entity — it only exists
+            // inside the wish zone (parent map has a non-targetable minimap icon version).
+            if (_portalClickAttempts > 0)
             {
-                var currentHash = gc.IngameState?.Data?.CurrentAreaHash ?? 0;
-                if (currentHash != 0 && currentHash != _areaHashOnPortalClick)
+                foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
                 {
-                    ctx.Log($"[Wishes] Area hash changed ({_areaHashOnPortalClick} -> {currentHash}) — portal transition complete");
-                    _phase = WishesPhase.Complete;
-                    return MechanicResult.Complete;
+                    if (entity.Path != null && entity.Path.Contains("SekhemaPortal") && entity.IsTargetable)
+                    {
+                        ctx.Log("[Wishes] Targetable SekhemaPortal found — portal transition complete");
+                        _phase = WishesPhase.Complete;
+                        return MechanicResult.Complete;
+                    }
                 }
             }
 
@@ -619,17 +612,33 @@ namespace AutoExile.Mechanics
 
             if (_portal == null || !_portal.IsTargetable)
             {
-                // Portal gone but area hash hasn't changed yet — wait a few ticks for the transition.
-                // The area hash check above will complete us once the zone loads.
-                Status = $"[Enter] Portal gone, waiting for transition";
+                // DjinnPortal gone — either we transitioned (SekhemaPortal check above will catch it
+                // on next tick) or it despawned. Wait briefly for entities to load.
+                var elapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
+                if (elapsed > 10)
+                {
+                    // 10s with no DjinnPortal and no SekhemaPortal — something went wrong
+                    ctx.Log("[Wishes] Portal gone for 10s with no SekhemaPortal — abandoning");
+                    MarkInitiatorCompleted();
+                    _phase = WishesPhase.Complete;
+                    return MechanicResult.Failed;
+                }
+                Status = $"[Enter] Portal gone, waiting for SekhemaPortal ({elapsed:F0}s)";
                 return MechanicResult.InProgress;
             }
 
-            if (!CanClick()) return MechanicResult.InProgress;
-
-            // Record area hash before first click so we can detect zone transition
-            if (_portalClickAttempts == 0)
-                _areaHashOnPortalClick = gc.IngameState?.Data?.CurrentAreaHash ?? 0;
+            // After clicking the portal once, wait much longer before retrying.
+            // Zone transitions take 1-3 seconds. A quick re-click gets queued by the game
+            // and fires inside the wish zone — hitting the SekhemaPortal (exit) at the same
+            // screen position, sending the player right back to the parent map.
+            var portalClickCooldown = _portalClickAttempts > 0 ? 5000f : ClickCooldownMs;
+            if (!BotInput.CanAct) return MechanicResult.InProgress;
+            var msSinceClick = (DateTime.Now - _lastClickTime).TotalMilliseconds;
+            if (msSinceClick < portalClickCooldown)
+            {
+                Status = $"[Enter] Waiting for transition ({(portalClickCooldown - msSinceClick) / 1000:F1}s) attempts={_portalClickAttempts}";
+                return MechanicResult.InProgress;
+            }
 
             var screenPos = gc.IngameState.Camera.WorldToScreen(_portal.BoundsCenterPosNum);
             var windowRect = gc.Window.GetWindowRectangleTimeCache;
@@ -645,6 +654,7 @@ namespace AutoExile.Mechanics
             if (_portalClickAttempts >= MaxClickAttempts)
             {
                 ctx.Log("[Wishes] Failed to enter portal after max attempts, abandoning");
+                MarkInitiatorCompleted();
                 _phase = WishesPhase.Complete;
                 return MechanicResult.Abandoned;
             }
@@ -709,10 +719,10 @@ namespace AutoExile.Mechanics
             }
         }
 
-        private int CountFaridunMonsters(BotContext ctx)
+        /// <summary>Count alive FaridunLeague guards near the initiator position (~80 grid units).</summary>
+        private int CountFaridunGuards(BotContext ctx)
         {
             var gc = ctx.Game;
-            var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
             int count = 0;
 
             foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
@@ -722,7 +732,7 @@ namespace AutoExile.Mechanics
                 if (!entity.IsAlive || !entity.IsHostile) continue;
 
                 var entityGrid = new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y);
-                if (Vector2.Distance(playerGrid, entityGrid) < 120)
+                if (Vector2.Distance(_initiatorGridPos, entityGrid) < 80)
                     count++;
             }
 

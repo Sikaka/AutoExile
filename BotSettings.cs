@@ -31,7 +31,7 @@ namespace AutoExile
         public ListNode ActiveMode { get; set; } = new ListNode() { Value = "Idle" };
 
         [Menu("Action Cooldown (ms)", "Minimum time between mouse actions. Prevents server kicks from input spam.")]
-        public RangeNode<int> ActionCooldownMs { get; set; } = new RangeNode<int>(75, 50, 300);
+        public RangeNode<int> ActionCooldownMs { get; set; } = new RangeNode<int>(100, 50, 300);
 
         [Menu("Web UI Enabled", "Enable embedded web dashboard.")]
         public ToggleNode WebUiEnabled { get; set; } = new ToggleNode(true);
@@ -260,6 +260,9 @@ namespace AutoExile
 
             [Menu("Min Map Tier", "Minimum map tier to pick from stash when inserting. 0 = any tier.")]
             public RangeNode<int> MinMapTier { get; set; } = new RangeNode<int>(0, 0, 16);
+
+            [Menu("Portal Key", "Hotkey for portal scroll in-game. Used to open a portal when exiting maps.")]
+            public HotkeyNode PortalKey { get; set; } = new HotkeyNode(Keys.F);
 
             [Menu("Rush Boss", "Rush to boss room first using tile data (requires ★ supported map). Kills boss before exploring/clearing the rest of the map.")]
             public ToggleNode RushBoss { get; set; } = new ToggleNode(false);
@@ -557,6 +560,7 @@ namespace AutoExile
             public WishesMechanicSettings Wishes { get; set; } = new WishesMechanicSettings();
             public EssenceMechanicSettings Essence { get; set; } = new EssenceMechanicSettings();
             public RitualMechanicSettings Ritual { get; set; } = new RitualMechanicSettings();
+            public EldritchAltarSettings EldritchAltar { get; set; } = new EldritchAltarSettings();
             public InteractableSettings Interactables { get; set; } = new InteractableSettings();
         }
 
@@ -608,6 +612,9 @@ namespace AutoExile
             [Menu("Mode", "Skip=ignore, Optional=do if found, Required=must complete for map done.")]
             public ListNode Mode { get; set; } = new ListNode();
 
+            [Menu("Exit After", "Exit map after this mechanic completes. Used for mechanic-targeted farming.")]
+            public ToggleNode ExitAfter { get; set; } = new ToggleNode(false);
+
             [Menu("Preferred Colour", "Prefer this harvest type when scoring. Any = pure score only.")]
             public ListNode PreferredColour { get; set; } = new ListNode();
 
@@ -651,6 +658,9 @@ namespace AutoExile
             [Menu("Mode", "Skip=ignore, Optional=do if found, Required=must complete for map done.")]
             public ListNode Mode { get; set; } = new ListNode();
 
+            [Menu("Exit After", "Exit map after this mechanic completes. Used for mechanic-targeted farming.")]
+            public ToggleNode ExitAfter { get; set; } = new ToggleNode(false);
+
             [Menu("Preferred Wish", "Select by reward coin type. Any = pick the first available.")]
             public ListNode PreferredWish { get; set; } = new ListNode();
 
@@ -675,6 +685,9 @@ namespace AutoExile
             [Menu("Mode", "Skip=ignore, Optional=do if found, Required=must complete for map done.")]
             public ListNode Mode { get; set; } = new ListNode();
 
+            [Menu("Exit After", "Exit map after this mechanic completes. Used for mechanic-targeted farming.")]
+            public ToggleNode ExitAfter { get; set; } = new ToggleNode(false);
+
             [Menu("Min Essence Tier", "Skip encounters below this tier. 'Any' = always do.")]
             public ListNode MinEssenceTier { get; set; } = new ListNode();
 
@@ -697,8 +710,28 @@ namespace AutoExile
             [Menu("Mode", "BETA — Skip=ignore, Optional=do if found, Required=must complete for map done.")]
             public ListNode Mode { get; set; } = new ListNode();
 
+            [Menu("Exit After", "Exit map after this mechanic completes. Used for mechanic-targeted farming.")]
+            public ToggleNode ExitAfter { get; set; } = new ToggleNode(false);
+
             [Menu("Loot Sweep Seconds", "How long to loot after each ritual encounter.")]
             public RangeNode<float> LootSweepSeconds { get; set; } = new RangeNode<float>(3f, 1f, 10f);
+        }
+
+        [Submenu(CollapsedByDefault = false)]
+        public class EldritchAltarSettings
+        {
+            [Menu("Enabled", "Click eldritch altars during mapping when a choice scores above the threshold.")]
+            public ToggleNode Enabled { get; set; } = new ToggleNode(true);
+
+            [Menu("Min Score Threshold", "Only take an altar if the best choice's net score (positive - negative weights) is at or above this value. Higher = pickier. 0 = take anything not net-negative.")]
+            public RangeNode<int> MinScoreThreshold { get; set; } = new RangeNode<int>(0, -500, 500);
+
+            /// <summary>
+            /// User overrides for mod weights. Key = NormalizeLetters(mod text), Value = weight.
+            /// Positive = reward, negative = danger. Overrides the built-in defaults.
+            /// Managed via web UI altar mod editor.
+            /// </summary>
+            public Dictionary<string, int> ModWeights { get; set; } = new();
         }
 
         [Submenu(CollapsedByDefault = false)]
@@ -712,6 +745,9 @@ namespace AutoExile
 
             [Menu("Mode", "Skip=ignore, Optional=do if found, Required=must complete for map done.")]
             public ListNode Mode { get; set; } = new ListNode();
+
+            [Menu("Exit After", "Exit map after this mechanic completes. Used for mechanic-targeted farming.")]
+            public ToggleNode ExitAfter { get; set; } = new ToggleNode(false);
 
             // ── Encounter types ──
 

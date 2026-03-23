@@ -92,6 +92,22 @@ namespace AutoExile.Systems
         /// <summary>Whether any movement skill can cross terrain gaps.</summary>
         public bool HasGapCrosser => MovementSkills.Any(m => m.CanCrossTerrain);
 
+        // ── Attack connectivity tracking ──
+        // Monitors whether attacks are actually connecting (target HP changing).
+        // After a timeout with no damage, blacklists the entire cluster as unreachable.
+
+        /// <summary>Unreachable monster cluster anchors (entity IDs). Excluded from threat scan.</summary>
+        private readonly HashSet<long> _unreachableMonsters = new();
+
+        /// <summary>Number of unreachable clusters blacklisted this session.</summary>
+        public int UnreachableClusterCount { get; private set; }
+
+        private long _lastAttackTargetId;
+        private float _lastAttackTargetHp = -1f;
+        private DateTime _attackConnectivityStart = DateTime.MinValue;
+        private const float AttackConnectTimeoutSec = 2.5f;
+        private const float UnreachableClusterRadius = 45f; // grid units — blacklist all monsters in this radius
+
         // ── Timing ──
 
         private DateTime _lastSkillUseAt = DateTime.MinValue;
@@ -172,6 +188,9 @@ namespace AutoExile.Systems
             // Execute targeted skills (Enemy/Corpse roles need combat context)
             usedSkill |= TickSkills(gc, settings);
 
+            // Track attack connectivity — detect unreachable monsters
+            TickAttackConnectivity(gc);
+
             // Positioning — uses cursor + move key (same as NavigationSystem)
             // Suppressed when another system is navigating (e.g. loot pickup)
             if (!SuppressPositioning)
@@ -205,6 +224,7 @@ namespace AutoExile.Systems
             _lastSkillBarReadAt = DateTime.MinValue;
             _lastCastByKey.Clear();
             Profile = CombatProfile.Default;
+            ClearUnreachable();
         }
 
         // ═══════════════════════════════════════════════════
@@ -286,6 +306,9 @@ namespace AutoExile.Systems
 
                 // Skip monsters trapped inside essence monoliths (cannot be damaged until released)
                 if (IsInsideMonolith(entity)) continue;
+
+                // Skip monsters blacklisted as unreachable (attacks don't connect)
+                if (_unreachableMonsters.Contains(entity.Id)) continue;
 
                 cachedCount++;
 
@@ -1092,6 +1115,93 @@ namespace AutoExile.Systems
 
             var moveKey = PrimaryMoveKey ?? Keys.T;
             BotInput.CursorPressKey(absPos, moveKey);
+        }
+
+        // ═══════════════════════════════════════════════════
+        // Attack connectivity tracking
+        // ═══════════════════════════════════════════════════
+
+        /// <summary>
+        /// Track whether attacks are connecting by monitoring BestTarget's HP.
+        /// If HP doesn't change for AttackConnectTimeoutSec, blacklist the entire
+        /// cluster of monsters near the target as unreachable.
+        /// </summary>
+        private void TickAttackConnectivity(GameController gc)
+        {
+            if (BestTarget == null || !InCombat)
+            {
+                _lastAttackTargetId = 0;
+                _lastAttackTargetHp = -1f;
+                return;
+            }
+
+            var targetId = BestTarget.Id;
+            float targetHp;
+            try
+            {
+                var life = BestTarget.GetComponent<Life>();
+                if (life == null) return;
+                targetHp = life.CurHP + life.CurES;
+            }
+            catch { return; }
+
+            // New target — start tracking
+            if (targetId != _lastAttackTargetId)
+            {
+                _lastAttackTargetId = targetId;
+                _lastAttackTargetHp = targetHp;
+                _attackConnectivityStart = DateTime.Now;
+                return;
+            }
+
+            // HP changed — attacks are connecting, reset timer
+            if (Math.Abs(targetHp - _lastAttackTargetHp) > 1f)
+            {
+                _lastAttackTargetHp = targetHp;
+                _attackConnectivityStart = DateTime.Now;
+                return;
+            }
+
+            // HP hasn't changed — check timeout
+            if ((DateTime.Now - _attackConnectivityStart).TotalSeconds < AttackConnectTimeoutSec)
+                return;
+
+            // Attacks not connecting for too long — blacklist the cluster
+            var anchorPos = BestTarget.GridPosNum;
+            var playerGrid = gc.Player.GridPosNum;
+            int blacklisted = 0;
+
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (entity.Type != EntityType.Monster || !entity.IsAlive || !entity.IsHostile)
+                    continue;
+                if (_unreachableMonsters.Contains(entity.Id)) continue;
+
+                if (Vector2.Distance(entity.GridPosNum, anchorPos) <= UnreachableClusterRadius)
+                {
+                    _unreachableMonsters.Add(entity.Id);
+                    blacklisted++;
+                }
+            }
+
+            UnreachableClusterCount++;
+            LastAction = $"Blacklisted {blacklisted} unreachable monsters near ({anchorPos.X:F0},{anchorPos.Y:F0})";
+
+            // Reset tracking so we pick a new target
+            _lastAttackTargetId = 0;
+            _lastAttackTargetHp = -1f;
+        }
+
+        /// <summary>
+        /// Clear the unreachable blacklist. Call on area change — new zone, fresh state.
+        /// Some monsters become targetable after encounter mechanics trigger.
+        /// </summary>
+        public void ClearUnreachable()
+        {
+            _unreachableMonsters.Clear();
+            UnreachableClusterCount = 0;
+            _lastAttackTargetId = 0;
+            _lastAttackTargetHp = -1f;
         }
 
         // ═══════════════════════════════════════════════════

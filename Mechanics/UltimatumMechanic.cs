@@ -73,7 +73,6 @@ namespace AutoExile.Mechanics
         // ── Pre-start click state ──
         private bool _preStartModSelected;
         private int _preStartSelectedIndex = -1;
-        private bool _preStartEntityClicked;  // True after clicking the altar entity to open UI
         private DateTime _lastPreStartClickTime = DateTime.MinValue;
         private bool _preStartBeginClicked;   // True after clicking BEGIN, waiting for encounter_started=1
         private DateTime _preStartBeginClickTime = DateTime.MinValue;
@@ -180,6 +179,19 @@ namespace AutoExile.Mechanics
             var gc = ctx.Game;
             if (gc?.Player == null || !gc.InGame) return MechanicResult.InProgress;
 
+            // Refresh entity reference — stale refs lose IsTargetable/component access
+            if (_altarEntity != null)
+            {
+                foreach (var entity in gc.EntityListWrapper.ValidEntitiesByType[EntityType.IngameIcon])
+                {
+                    if (entity.Id == _altarEntity.Id)
+                    {
+                        _altarEntity = entity;
+                        break;
+                    }
+                }
+            }
+
             // Check for player death
             if (!gc.Player.IsAlive && _phase is UltimatumPhase.Fighting or UltimatumPhase.ChoosingMod or UltimatumPhase.TakeReward)
             {
@@ -281,8 +293,7 @@ namespace AutoExile.Mechanics
                 _phaseStartTime = DateTime.Now;
                 _preStartModSelected = false;
                 _preStartSelectedIndex = -1;
-                _preStartEntityClicked = false;
-                Status = "At altar, clicking to open UI";
+                Status = "At altar, waiting for ground label";
                 ctx.Log($"[Ultimatum] Arrived at altar, entering PreStart");
                 return MechanicResult.InProgress;
             }
@@ -309,64 +320,15 @@ namespace AutoExile.Mechanics
         {
             var settings = ctx.Settings.Mechanics.Ultimatum;
 
-            // Step 0: Click the altar entity to open the interaction UI
-            if (!_preStartEntityClicked)
-            {
-                if (!BotInput.CanAct) return MechanicResult.InProgress;
-
-                if (_altarEntity != null && _altarEntity.IsTargetable)
-                {
-                    var cam = gc.IngameState.Camera;
-                    var screenPos = cam.WorldToScreen(_altarEntity.BoundsCenterPosNum);
-                    var windowRect = gc.Window.GetWindowRectangleTimeCache;
-                    if (screenPos.X > 0 && screenPos.X < windowRect.Width &&
-                        screenPos.Y > 0 && screenPos.Y < windowRect.Height)
-                    {
-                        var absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
-                        BotInput.Click(absPos);
-                        _preStartEntityClicked = true;
-                        _lastPreStartClickTime = DateTime.Now;
-                        ctx.Log("[Ultimatum] Clicked altar entity to open UI");
-                        Status = "Clicked altar, waiting for panel...";
-                        return MechanicResult.InProgress;
-                    }
-                }
-
-                // Can't click entity — timeout
-                if ((DateTime.Now - _phaseStartTime).TotalSeconds > 10)
-                {
-                    _phase = UltimatumPhase.Failed;
-                    Status = "Timeout: cannot click altar entity";
-                    return MechanicResult.Failed;
-                }
-                Status = "Waiting to click altar...";
-                return MechanicResult.InProgress;
-            }
-
-            // Wait a moment after clicking for UI to appear
-            if ((DateTime.Now - _lastPreStartClickTime).TotalMilliseconds < 500)
-            {
-                Status = "Waiting for UI to open...";
-                return MechanicResult.InProgress;
-            }
-
-            // Find the ground label for the altar entity
+            // Poll for ground label — populates when player stands near altar
             var groundLabel = FindAltarGroundLabel(gc);
             if (groundLabel == null)
             {
-                // Retry clicking if label doesn't appear within 3s
-                if ((DateTime.Now - _lastPreStartClickTime).TotalSeconds > 3)
-                {
-                    _preStartEntityClicked = false; // Try clicking again
-                    ctx.Log("[Ultimatum] Ground label not found, retrying click");
-                    Status = "Retrying altar click...";
-                    return MechanicResult.InProgress;
-                }
-
+                _lastPreStartClickTime = DateTime.MinValue; // reset settle timer
                 if ((DateTime.Now - _phaseStartTime).TotalSeconds > 15)
                 {
                     _phase = UltimatumPhase.Failed;
-                    Status = "Timeout: ground label not found after clicking";
+                    Status = "Timeout: ground label not found";
                     return MechanicResult.Failed;
                 }
                 Status = "Waiting for ground label...";
@@ -377,8 +339,27 @@ namespace AutoExile.Mechanics
             var root = groundLabel.GetChildAtIndex(0)?.GetChildAtIndex(0);
             if (root == null || root.ChildCount < 5)
             {
-                Status = $"Ground label structure unexpected (children={root?.ChildCount ?? 0})";
-                ctx.Log($"[Ultimatum] Ground label root has {root?.ChildCount ?? 0} children, expected 5+");
+                _lastPreStartClickTime = DateTime.MinValue; // reset settle timer
+                if ((DateTime.Now - _phaseStartTime).TotalSeconds > 15)
+                {
+                    _phase = UltimatumPhase.Failed;
+                    Status = $"Timeout: ground label structure unexpected (children={root?.ChildCount ?? 0})";
+                    return MechanicResult.Failed;
+                }
+                Status = $"Waiting for ground label to populate ({root?.ChildCount ?? 0} children)...";
+                return MechanicResult.InProgress;
+            }
+
+            // Let the UI settle before clicking — elements need time to render
+            if (_lastPreStartClickTime == DateTime.MinValue)
+            {
+                _lastPreStartClickTime = DateTime.Now;
+                Status = "Ground label found, settling...";
+                return MechanicResult.InProgress;
+            }
+            if ((DateTime.Now - _lastPreStartClickTime).TotalMilliseconds < 500)
+            {
+                Status = "Ground label settling...";
                 return MechanicResult.InProgress;
             }
 
@@ -401,7 +382,7 @@ namespace AutoExile.Mechanics
                 return MechanicResult.Abandoned;
             }
 
-            // Get choices panel from root[2]
+            // Get choices panel from root[2] — re-poll each tick until populated
             var choicesElement = root.GetChildAtIndex(2);
             var choicePanel = choicesElement?.AsObject<UltimatumChoicePanel>();
             if (choicePanel == null)
@@ -529,11 +510,13 @@ namespace AutoExile.Mechanics
                 return MechanicResult.InProgress;
             }
 
-            // Retry BEGIN click if not confirmed after 3s
+            // Retry from modifier selection if not confirmed after 3s
+            // The modifier click may not have registered, leaving BEGIN inactive
             if ((DateTime.Now - _preStartBeginClickTime).TotalSeconds > 3)
             {
+                _preStartModSelected = false;
                 _preStartBeginClicked = false;
-                ctx.Log("[Ultimatum] BEGIN click not confirmed after 3s, retrying");
+                ctx.Log("[Ultimatum] BEGIN click not confirmed after 3s, retrying from mod selection");
                 Status = "BEGIN click missed, retrying...";
                 return MechanicResult.InProgress;
             }
@@ -625,16 +608,21 @@ namespace AutoExile.Mechanics
             ctx.Combat.SuppressPositioning = false;
 
             // Check if wave ended (UltimatumPanel appeared for between-wave choices)
-            var panel = gc.IngameState.IngameUi.UltimatumPanel;
-            if (panel != null && panel.IsVisible)
+            // Skip check for 2s after entering Fighting — the panel from the previous
+            // confirm click may still be closing, and we'd immediately re-enter ChoosingMod
+            if ((DateTime.Now - _phaseStartTime).TotalSeconds > 2)
             {
-                _activeCircleId = 0;
-                _activeCirclePos = null;
-                _phase = UltimatumPhase.ChoosingMod;
-                _phaseStartTime = DateTime.Now;
-                Status = "Wave complete, choosing next modifier";
-                ctx.Log($"[Ultimatum] UltimatumPanel visible during Fighting — transitioning to ChoosingMod (fightTime={(DateTime.Now - _phaseStartTime).TotalSeconds:F1}s)");
-                return MechanicResult.InProgress;
+                var panel = gc.IngameState.IngameUi.UltimatumPanel;
+                if (panel != null && panel.IsVisible)
+                {
+                    _activeCircleId = 0;
+                    _activeCirclePos = null;
+                    _phase = UltimatumPhase.ChoosingMod;
+                    _phaseStartTime = DateTime.Now;
+                    Status = "Wave complete, choosing next modifier";
+                    ctx.Log($"[Ultimatum] UltimatumPanel visible — transitioning to ChoosingMod");
+                    return MechanicResult.InProgress;
+                }
             }
 
             // Track encounter_started state — only treat 0 as "ended" after we've seen 1
@@ -979,7 +967,7 @@ namespace AutoExile.Mechanics
         /// </summary>
         private void ClickElement(GameController gc, Element element)
         {
-            var rect = element.GetClientRectCache;
+            var rect = element.GetClientRect();
             var clickPos = new Vector2(rect.Center.X, rect.Center.Y);
             var windowRect = gc.Window.GetWindowRectangleTimeCache;
             var absPos = clickPos + new Vector2(windowRect.X, windowRect.Y);
@@ -991,7 +979,8 @@ namespace AutoExile.Mechanics
         /// </summary>
         private bool ClickElementChecked(GameController gc, Element element)
         {
-            var rect = element.GetClientRectCache;
+            var rect = element.GetClientRect();
+            if (rect.Width < 1 || rect.Height < 1) return false; // rect not ready
             var clickPos = new Vector2(rect.Center.X, rect.Center.Y);
             var windowRect = gc.Window.GetWindowRectangleTimeCache;
             var absPos = clickPos + new Vector2(windowRect.X, windowRect.Y);
@@ -1216,7 +1205,6 @@ namespace AutoExile.Mechanics
             _savedCombatProfile = null;
             _preStartModSelected = false;
             _preStartSelectedIndex = -1;
-            _preStartEntityClicked = false;
             _lastPreStartClickTime = DateTime.MinValue;
             _preStartBeginClicked = false;
             _preStartBeginClickTime = DateTime.MinValue;

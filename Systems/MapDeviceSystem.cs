@@ -28,17 +28,36 @@ namespace AutoExile.Systems
         /// </summary>
         public float InteractRadius { get; set; } = 20f;
 
+        /// <summary>
+        /// Target map name to select in the atlas (e.g., "Mausoleum").
+        /// When set, the system clicks the correct atlas node before selecting a map from stash.
+        /// Strip any "★ " prefix before setting.
+        /// </summary>
+        public string? TargetMapName { get; set; }
+
+        /// <summary>
+        /// Minimum map tier to accept from the stash. 0 = any tier.
+        /// </summary>
+        public int MinMapTier { get; set; }
+
         // Navigation to device — track failed close-approach attempts
         private int _navAttempts;
         private float _bestDistSeen = float.MaxValue;
+
+        // Atlas node selection state
+        private bool _nodeSelected;
+        private int _nodeClickAttempts;
+        private const int MaxNodeClickAttempts = 3;
 
         // UI element indices for atlas panel
         // Map stash: atlas[3][0][1] — children are InventoryItem elements
         // Device slots: atlas[7][0][2] — 6 slots, occupied slot has ChildCount==2, child[1] is the item
         // Activate button: atlas[7][0][3] — child[0].Text == "activate"
+        // Map name text: atlas[7][0][1][0][0] — verifies correct node selected
         private static readonly int[] MapStashPath = { 3, 0, 1 };
         private static readonly int[] DeviceSlotsPath = { 7, 0, 2 };
         private static readonly int[] ActivateButtonPath = { 7, 0, 3 };
+        private static readonly int[] MapNameTextPath = { 7, 0, 1, 0, 0 };
 
         public MapDevicePhase Phase => _phase;
         public string Status { get; private set; } = "";
@@ -60,6 +79,8 @@ namespace AutoExile.Systems
             _lastActionTime = DateTime.MinValue;
             _navAttempts = 0;
             _bestDistSeen = float.MaxValue;
+            _nodeSelected = false;
+            _nodeClickAttempts = 0;
             Status = "Starting map creation";
             return true;
         }
@@ -69,6 +90,8 @@ namespace AutoExile.Systems
             nav?.Stop(gc);
             _phase = MapDevicePhase.Idle;
             _mapFilter = null;
+            TargetMapName = null;
+            MinMapTier = 0;
             Status = "Cancelled";
         }
 
@@ -242,7 +265,7 @@ namespace AutoExile.Systems
             return MapDeviceResult.InProgress;
         }
 
-        // --- Phase: Find and right-click a map from the stash ---
+        // --- Phase: Select map node + insert map from stash ---
 
         private MapDeviceResult TickSelectMap(GameController gc)
         {
@@ -263,46 +286,177 @@ namespace AutoExile.Systems
                 return MapDeviceResult.InProgress;
             }
 
+            // Device panel must be visible before we can insert maps
+            var devicePanel = atlas.GetChildAtIndex(7);
+            bool devicePanelVisible = devicePanel?.IsVisible == true;
+
+            // Step 1: Select atlas node — required when TargetMapName is set,
+            // and also required whenever the device panel isn't open yet
+            if (!devicePanelVisible)
+            {
+                if (!string.IsNullOrEmpty(TargetMapName))
+                {
+                    return TickSelectAtlasNode(gc, atlas);
+                }
+                else
+                {
+                    // No target map name and device panel not open — can't proceed
+                    Status = "[Select] No map selected and no TargetMapName configured";
+                    _phase = MapDevicePhase.Idle;
+                    return MapDeviceResult.Failed;
+                }
+            }
+
+            // Device panel is open — verify correct map is selected (if we have a target)
+            if (!string.IsNullOrEmpty(TargetMapName) && !_nodeSelected)
+            {
+                var nameEl = atlas.GetChildFromIndices(MapNameTextPath);
+                if (nameEl?.Text != null &&
+                    nameEl.Text.Equals(TargetMapName, StringComparison.OrdinalIgnoreCase))
+                {
+                    _nodeSelected = true;
+                    Status = $"[Select] {TargetMapName} confirmed selected";
+                }
+                else
+                {
+                    // Wrong map selected — click the correct node
+                    return TickSelectAtlasNode(gc, atlas);
+                }
+            }
+
+            // Step 2: Find and Ctrl+click a map from the stash to insert it
             var mapStash = atlas.GetChildFromIndices(MapStashPath);
             if (mapStash == null)
             {
-                Status = "Map stash panel not found";
+                Status = "[Select] Map stash panel not found";
                 _phase = MapDevicePhase.Idle;
                 return MapDeviceResult.Failed;
             }
 
-            // Find a matching map
+            // Find a matching map from the stash
             Element? targetMap = null;
+            int checkedCount = 0;
             for (int i = 0; i < mapStash.ChildCount; i++)
             {
                 var item = mapStash.GetChildAtIndex(i);
                 if (item == null || item.Type != ElementType.InventoryItem)
                     continue;
+                checkedCount++;
+
+                // Apply mode-specific filter (IsStandardMap, IsBlightMap, etc.)
                 if (_mapFilter != null && !_mapFilter(item))
                     continue;
+
                 targetMap = item;
                 break;
             }
 
             if (targetMap == null)
             {
-                Status = $"[Select] No matching maps in stash ({mapStash.ChildCount} items checked)";
+                Status = $"[Select] No matching maps in stash ({checkedCount} items checked)";
                 _phase = MapDevicePhase.Idle;
                 return MapDeviceResult.Failed;
             }
 
-            // Right-click the map to insert it into the device
+            // Ctrl+click the map to transfer it into the device
             var rect = targetMap.GetClientRect();
             var center = new Vector2(rect.Center.X, rect.Center.Y);
             var windowRect = gc.Window.GetWindowRectangle();
             var absPos = new Vector2(windowRect.X + center.X, windowRect.Y + center.Y);
 
-            BotInput.RightClick(absPos);
+            // Ctrl+click when atlas node was manually selected (mapping flow),
+            // right-click when map type auto-matches (blight/simulacrum flow)
+            if (!string.IsNullOrEmpty(TargetMapName))
+                BotInput.CtrlClick(absPos);
+            else
+                BotInput.RightClick(absPos);
             _lastActionTime = DateTime.Now;
-            Status = "Inserting map into device";
+            Status = "[Select] Inserting map into device";
 
-            // After right-click, wait a moment then check if it landed in the device
-            // We'll re-enter this phase and the IsMapInDevice check will advance us
+            // Re-enter this phase — IsMapInDevice check will advance us
+            return MapDeviceResult.InProgress;
+        }
+
+        /// <summary>
+        /// Find and click the atlas node for the target map name.
+        /// Uses AtlasNodes file index + 2 to find the UI element.
+        /// </summary>
+        private MapDeviceResult TickSelectAtlasNode(GameController gc, Element atlas)
+        {
+            if (_nodeClickAttempts >= MaxNodeClickAttempts)
+            {
+                Status = $"[Select] Failed to select {TargetMapName} after {MaxNodeClickAttempts} attempts";
+                _phase = MapDevicePhase.Idle;
+                return MapDeviceResult.Failed;
+            }
+
+            // Find the atlas node index for the target map name
+            var nodes = gc.Files?.AtlasNodes?.EntriesList;
+            if (nodes == null || nodes.Count == 0)
+            {
+                Status = "[Select] AtlasNodes not loaded";
+                return MapDeviceResult.InProgress;
+            }
+
+            int nodeIndex = -1;
+            for (int i = 0; i < Math.Min(nodes.Count, 110); i++)
+            {
+                var name = nodes[i].Area?.Name;
+                if (name != null && name.Equals(TargetMapName, StringComparison.OrdinalIgnoreCase))
+                {
+                    nodeIndex = i;
+                    break;
+                }
+            }
+
+            if (nodeIndex < 0)
+            {
+                Status = $"[Select] Map '{TargetMapName}' not found in AtlasNodes";
+                _phase = MapDevicePhase.Idle;
+                return MapDeviceResult.Failed;
+            }
+
+            // UI element index = file index + 2
+            var canvas = atlas.GetChildAtIndex(0);
+            if (canvas == null)
+            {
+                Status = "[Select] Atlas canvas not found";
+                return MapDeviceResult.InProgress;
+            }
+
+            var uiIndex = nodeIndex + 2;
+            if (uiIndex >= canvas.ChildCount)
+            {
+                Status = $"[Select] Atlas node UI index {uiIndex} out of range ({canvas.ChildCount} children)";
+                _phase = MapDevicePhase.Idle;
+                return MapDeviceResult.Failed;
+            }
+
+            var nodeElement = canvas.GetChildAtIndex(uiIndex);
+            if (nodeElement == null)
+            {
+                Status = $"[Select] Atlas node element is null at index {uiIndex}";
+                return MapDeviceResult.InProgress;
+            }
+
+            // Check if node is on screen
+            var nodeRect = nodeElement.GetClientRect();
+            var nodeCenter = new Vector2(nodeRect.Center.X, nodeRect.Center.Y);
+            var windowRect = gc.Window.GetWindowRectangle();
+
+            if (nodeCenter.X < 0 || nodeCenter.X > windowRect.Width ||
+                nodeCenter.Y < 0 || nodeCenter.Y > windowRect.Height)
+            {
+                Status = $"[Select] {TargetMapName} node is off-screen — center atlas on the map first";
+                _phase = MapDevicePhase.Idle;
+                return MapDeviceResult.Failed;
+            }
+
+            var absPos = new Vector2(windowRect.X + nodeCenter.X, windowRect.Y + nodeCenter.Y);
+            BotInput.Click(absPos);
+            _lastActionTime = DateTime.Now;
+            _nodeClickAttempts++;
+            Status = $"[Select] Clicking {TargetMapName} node (attempt {_nodeClickAttempts})";
             return MapDeviceResult.InProgress;
         }
 
@@ -374,6 +528,8 @@ namespace AutoExile.Systems
             {
                 _phase = MapDevicePhase.Idle;
                 _mapFilter = null;
+                TargetMapName = null;
+                MinMapTier = 0;
                 Status = "Entering map";
                 return MapDeviceResult.Succeeded;
             }
@@ -383,6 +539,8 @@ namespace AutoExile.Systems
             {
                 _phase = MapDevicePhase.Idle;
                 _mapFilter = null;
+                TargetMapName = null;
+                MinMapTier = 0;
                 Status = "Entered map";
                 return MapDeviceResult.Succeeded;
             }

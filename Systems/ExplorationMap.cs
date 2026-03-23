@@ -303,15 +303,19 @@ namespace AutoExile.Systems
                 var unseenCount = region.CellCount - region.SeenCount;
                 var dist = Vector2.Distance(playerGridPos, region.Center);
 
-                // Score: unseen cells per unit distance — naturally balances nearby small branches
-                // vs distant large regions. A 200-cell branch at dist 30 beats a 5000-cell
-                // region at dist 400 (200/60=3.3 vs 5000/430=11.6... but with sqrt scaling
-                // for diminishing returns on huge regions: 14.1/60=0.24 vs 70.7/430=0.16).
+                // Base score: unseen cells per unit distance with sqrt scaling
                 float sizeScore = MathF.Sqrt(unseenCount);
                 if (region.CellCount < SmallPocketThreshold)
                     sizeScore *= 0.5f; // mild deprioritize for tiny areas
 
                 float score = sizeScore / (dist + 30f);
+
+                // Branch score bonus: prefer regions with escape routes (loop paths)
+                // over dead-end branches. BranchScore adds +100 for escape routes.
+                // Scale it down relative to distance score so it's a tiebreaker for
+                // similar-distance regions, not a dominant override.
+                float branchBonus = BranchScore(blob, region);
+                score += branchBonus * 0.001f;
 
                 if (score > bestScore)
                 {
@@ -625,6 +629,9 @@ namespace AutoExile.Systems
                 }
             }
 
+            // Build region adjacency graph — regions sharing chunk boundaries are neighbors
+            BuildRegionAdjacency(blob, minX, minY, chunksX, chunksY);
+
             return blob;
         }
 
@@ -659,6 +666,7 @@ namespace AutoExile.Systems
                         CellCount = r.CellCount,
                         SeenCount = r.SeenCount,
                         Cells = new List<Vector2i>(r.Cells),
+                        Neighbors = new HashSet<int>(r.Neighbors),
                     }).ToList(),
                     CellToRegion = new Dictionary<Vector2i, int>(blob.CellToRegion),
                     Coverage = blob.Coverage,
@@ -712,6 +720,7 @@ namespace AutoExile.Systems
                         CellCount = rs.CellCount,
                         SeenCount = rs.SeenCount,
                         Cells = rs.Cells,
+                        Neighbors = rs.Neighbors,
                     });
                 }
 
@@ -728,6 +737,105 @@ namespace AutoExile.Systems
         // ═══════════════════════════════════════════════════
         // Helpers
         // ═══════════════════════════════════════════════════
+
+        /// <summary>
+        /// Build region adjacency by checking which chunk grid cells border each other.
+        /// Two regions are neighbors if their chunks are horizontally/vertically adjacent.
+        /// </summary>
+        private static void BuildRegionAdjacency(Blob blob, int minX, int minY, int chunksX, int chunksY)
+        {
+            // Map chunk index → region index (some chunks have no region or were merged)
+            var chunkToRegion = new Dictionary<int, int>();
+            foreach (var cell in blob.WalkableCells)
+            {
+                int rx = (cell.X - minX) / RegionChunkSize;
+                int ry = (cell.Y - minY) / RegionChunkSize;
+                int ci = ry * chunksX + rx;
+                if (!chunkToRegion.ContainsKey(ci) && blob.CellToRegion.TryGetValue(cell, out var ri))
+                    chunkToRegion[ci] = ri;
+            }
+
+            // Check 4-connected chunk neighbors
+            for (int cy = 0; cy < chunksY; cy++)
+            {
+                for (int cx = 0; cx < chunksX; cx++)
+                {
+                    int ci = cy * chunksX + cx;
+                    if (!chunkToRegion.TryGetValue(ci, out var regionA)) continue;
+
+                    // Right neighbor
+                    if (cx + 1 < chunksX)
+                    {
+                        int ni = cy * chunksX + (cx + 1);
+                        if (chunkToRegion.TryGetValue(ni, out var regionB) && regionA != regionB)
+                        {
+                            blob.Regions[regionA].Neighbors.Add(regionB);
+                            blob.Regions[regionB].Neighbors.Add(regionA);
+                        }
+                    }
+                    // Bottom neighbor
+                    if (cy + 1 < chunksY)
+                    {
+                        int ni = (cy + 1) * chunksX + cx;
+                        if (chunkToRegion.TryGetValue(ni, out var regionB) && regionA != regionB)
+                        {
+                            blob.Regions[regionA].Neighbors.Add(regionB);
+                            blob.Regions[regionB].Neighbors.Add(regionA);
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Score a region's branch quality using DFS. Counts reachable unseen cells down this branch
+        /// and gives a bonus if the branch has escape routes back to explored regions.
+        /// A region with only unexplored dead-end neighbors scores lower than one
+        /// that connects back to already-explored space (loop/circuit paths).
+        /// </summary>
+        private float BranchScore(Blob blob, Region startRegion)
+        {
+            // DFS from startRegion through unexplored neighbors
+            var visited = new HashSet<int> { startRegion.Index };
+            var stack = new Stack<int>();
+            stack.Push(startRegion.Index);
+
+            float unseenCells = 0f;
+            bool hasEscapeRoute = false;
+
+            while (stack.Count > 0)
+            {
+                var idx = stack.Pop();
+                var region = blob.Regions[idx];
+                unseenCells += region.CellCount - region.SeenCount;
+
+                foreach (var neighborIdx in region.Neighbors)
+                {
+                    if (FailedRegions.Contains(neighborIdx)) continue;
+                    var neighbor = blob.Regions[neighborIdx];
+
+                    if (visited.Contains(neighborIdx))
+                    {
+                        // Already visited in this DFS — loop/escape found
+                        if (neighbor.ExploredRatio > 0.5f)
+                            hasEscapeRoute = true;
+                        continue;
+                    }
+
+                    visited.Add(neighborIdx);
+
+                    // Only follow unexplored branches
+                    float exploredThreshold = SeenRadiusOverride > 0 ? 0.98f : 0.8f;
+                    if (neighbor.ExploredRatio < exploredThreshold)
+                        stack.Push(neighborIdx);
+                    else
+                        hasEscapeRoute = true; // explored neighbor = escape route
+                }
+            }
+
+            // Escape route bonus: prefer branches that don't dead-end
+            return hasEscapeRoute ? unseenCells + 100f : unseenCells;
+        }
 
         private static (int x, int y)? FindNearestWalkable(int[][] grid, int x, int y, int rows, int cols)
         {
@@ -790,6 +898,7 @@ namespace AutoExile.Systems
             public int CellCount;           // total walkable cells
             public int SeenCount;           // cells revealed by player proximity
             public List<Vector2i> Cells = new();
+            public HashSet<int> Neighbors = new(); // adjacent region indices
 
             public float ExploredRatio => CellCount > 0 ? (float)SeenCount / CellCount : 0f;
         }
@@ -831,6 +940,7 @@ namespace AutoExile.Systems
         public int CellCount;
         public int SeenCount;
         public List<Vector2i> Cells = new();
+        public HashSet<int> Neighbors = new();
     }
 
     /// <summary>

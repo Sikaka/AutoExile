@@ -7,6 +7,7 @@ using AutoExile.Mechanics;
 using AutoExile.Modes.Shared;
 using AutoExile.Systems;
 using System.Numerics;
+using System.Windows.Forms;
 using Pathfinding = AutoExile.Systems.Pathfinding;
 
 namespace AutoExile.Modes
@@ -61,6 +62,9 @@ namespace AutoExile.Modes
         private bool _expectingSubZone;       // set when TriggersSubZone mechanic activates
         private long _parentZoneHash;
         private MechanicsSnapshot? _parentMechanicsSnapshot;
+        private DateTime? _zoneSettleUntil;   // block actions until terrain/entities settle after hash change
+        private bool _zoneSettleExplorationDone; // exploration reinitialized after settle
+        private const float ZoneSettleSeconds = 3f;
 
         // ── Stats ──
         private DateTime _startTime;
@@ -91,15 +95,29 @@ namespace AutoExile.Modes
         private string _priorityTargetReason = "";   // why we're going there
         private readonly HashSet<long> _visitedIconIds = new(); // minimap icon entity IDs already handled
 
+        // ── Hideout loop state ──
+        private readonly HideoutFlow _hideoutFlow = new();
+        private bool _mapCompleted;
+        private string _lastAreaName = "";
+        private Vector2? _spawnPortalPos;          // cached from map entry (fallback for exit)
+
+        // ── ExitMap state ──
+        private DateTime _exitMapStartTime;
+        private bool _portalKeyPressed;
+        private const float ExitMapTimeoutSeconds = 60f;
+        private const float PortalAppearTimeoutSeconds = 5f;
+
         public enum MappingPhase
         {
             Idle,
+            InHideout,  // running HideoutFlow (stash → map device → enter)
             RushingBoss, // navigating to boss room, fighting on the way but not stopping
             Exploring,
             Fighting,
             Looting,
             Paused,
             Exiting,    // navigating to and clicking exit portal (wish zones)
+            ExitMap,    // opening portal → clicking it → back to hideout
             Complete,
         }
 
@@ -111,11 +129,38 @@ namespace AutoExile.Modes
             _exploreTargetsVisited = 0;
             _navFailures = 0;
             _navTarget = null;
+            _mapCompleted = false;
+            _spawnPortalPos = null;
+            _portalKeyPressed = false;
             Decision = "";
 
             var gc = ctx.Game;
+            _lastAreaName = gc.Area?.CurrentArea?.Name ?? "";
 
-            // Initialize exploration if not already done (area change handles it normally)
+            // Hideout/town → start hideout flow
+            if (gc.Area.CurrentArea.IsHideout || gc.Area.CurrentArea.IsTown)
+            {
+                _phase = MappingPhase.InHideout;
+                StartMappingHideoutFlow(ctx);
+                Status = "In hideout — starting map cycle";
+                ctx.Log("[Mapping] OnEnter: in hideout, starting HideoutFlow");
+                return;
+            }
+
+            // In map — initialize exploration
+            InitMapState(ctx, gc);
+        }
+
+        /// <summary>
+        /// Initialize in-map state (exploration, combat, boss rush).
+        /// Called from OnEnter (mid-map F5) and from area change handler (entering map from hideout).
+        /// </summary>
+        private void InitMapState(BotContext ctx, GameController gc)
+        {
+            // NOTE: Do NOT set _lastZoneHash here. It must only be updated by the hash change
+            // handler so that sub-zone transitions (wish zones with same area name) are detected.
+            // Setting it here would race with the hash handler and prevent detection.
+
             if (!ctx.Exploration.IsInitialized)
             {
                 var pfGrid = gc.IngameState?.Data?.RawPathfindingData;
@@ -128,8 +173,11 @@ namespace AutoExile.Modes
                 }
             }
 
-            // Enable combat with configured positioning
             ModeHelpers.EnableDefaultCombat(ctx);
+
+            // Cache spawn position for fallback portal exit
+            if (gc.Player != null)
+                _spawnPortalPos = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
 
             // Boss rush — deferred to first Tick since TileMap may not be loaded yet at OnEnter time
             _bossTarget = null;
@@ -138,7 +186,7 @@ namespace AutoExile.Modes
             _bossRushDebug = "";
 
             var rushBossEnabled = ctx.Settings.Mapping.RushBoss.Value;
-            ctx.Log($"[Mapping] OnEnter: rushBoss={rushBossEnabled} tileMapLoaded={ctx.TileMap.IsLoaded} area={gc.Area?.CurrentArea?.Name}");
+            ctx.Log($"[Mapping] InitMapState: rushBoss={rushBossEnabled} tileMapLoaded={ctx.TileMap.IsLoaded} area={gc.Area?.CurrentArea?.Name}");
 
             if (rushBossEnabled)
             {
@@ -182,6 +230,13 @@ namespace AutoExile.Modes
             _expectingSubZone = false;
             _parentZoneHash = 0;
             _parentMechanicsSnapshot = null;
+            _zoneSettleUntil = null;
+            _zoneSettleExplorationDone = false;
+            _hideoutFlow.Cancel();
+            _mapCompleted = false;
+            _spawnPortalPos = null;
+            _lastAreaName = "";
+            _portalKeyPressed = false;
             Status = "Stopped";
             Decision = "";
         }
@@ -202,6 +257,29 @@ namespace AutoExile.Modes
             }
         }
 
+        /// <summary>Keep portal scrolls in inventory, stash everything else.</summary>
+        private static bool ShouldStashItem(ServerInventory.InventSlotItem item)
+        {
+            return item.Item?.Path?.Contains("CurrencyPortal") != true;
+        }
+
+        /// <summary>Get clean map name from settings (strip ★ prefix).</summary>
+        private static string? GetTargetMapName(BotSettings settings)
+        {
+            var raw = settings.Mapping.MapName.Value;
+            if (string.IsNullOrEmpty(raw)) return null;
+            return raw.TrimStart('\u2605', ' ');
+        }
+
+        /// <summary>Start HideoutFlow with mapping-specific settings.</summary>
+        private void StartMappingHideoutFlow(BotContext ctx)
+        {
+            var mapName = GetTargetMapName(ctx.Settings);
+            var minTier = ctx.Settings.Mapping.MinMapTier.Value;
+            _hideoutFlow.Start(MapDeviceSystem.IsStandardMap, ShouldStashItem,
+                targetMapName: mapName, minMapTier: minTier);
+        }
+
         public void Tick(BotContext ctx)
         {
             if (_phase == MappingPhase.Idle || _phase == MappingPhase.Paused) return;
@@ -209,14 +287,48 @@ namespace AutoExile.Modes
             var gc = ctx.Game;
             if (gc?.Player == null || !gc.InGame || !gc.Player.IsAlive) return;
 
+            // ── Area change detection (hideout ↔ map transitions) ──
+            var currentArea = gc.Area?.CurrentArea?.Name ?? "";
+            if (!string.IsNullOrEmpty(currentArea) && currentArea != _lastAreaName)
+            {
+                Decision = $"AREA NAME CHANGED: '{_lastAreaName}'->'{currentArea}' subZone={_isInSubZone}";
+                OnAreaChanged(ctx, currentArea);
+                _lastAreaName = currentArea;
+            }
+
+            // ── InHideout phase — tick HideoutFlow ──
+            if (_phase == MappingPhase.InHideout)
+            {
+                var signal = _hideoutFlow.Tick(ctx);
+                Status = _hideoutFlow.Status;
+                if (signal == HideoutSignal.PortalTimeout)
+                {
+                    // No portal to re-enter — start fresh map
+                    StartMappingHideoutFlow(ctx);
+                    Status = "No portal found — starting new map";
+                }
+                return;
+            }
+
             // Detect zone changes (sub-zone transitions like wish zones)
             // Use area hash — area name can be identical between parent map and sub-zone
             var currentHash = gc.IngameState?.Data?.CurrentAreaHash ?? 0;
+
             if (currentHash != 0 && currentHash != _lastZoneHash)
             {
-                if (_lastZoneHash != 0)
+                if (_lastZoneHash == 0)
                 {
-                    ctx.Log($"[Mapping] Zone changed: hash {_lastZoneHash} -> {currentHash}, phase={_phase}, subZone={_isInSubZone}");
+                    // First time seeing a hash — initialize tracking without settlement
+                    ctx.Log($"[Mapping] Hash initialized: {currentHash} (was 0)");
+                }
+                else
+                {
+                    Decision = $"HASH CHANGED: {_lastZoneHash}->{currentHash} subZone={_isInSubZone} expecting={_expectingSubZone}";
+                    ctx.Log($"[Mapping] Zone changed: hash {_lastZoneHash} -> {currentHash}, phase={_phase}, subZone={_isInSubZone}, expecting={_expectingSubZone}");
+
+                    // Cancel all in-flight systems — stale state from old zone
+                    ModeHelpers.CancelAllSystems(ctx);
+                    ctx.Navigation.Stop(gc);
 
                     if (_isInSubZone && currentHash == _parentZoneHash)
                     {
@@ -239,27 +351,33 @@ namespace AutoExile.Modes
                     else if (_expectingSubZone)
                     {
                         // ── Entering sub-zone (mechanic flagged TriggersSubZone) ──
-                        // The flag was set when the mechanic activated. The mechanic may have
-                        // already timed out or completed by now — that's fine, we still need
-                        // to treat this zone as a sub-zone.
-                        var triggerMechName = ctx.Mechanics.ActiveMechanic?.Name
-                            ?? _pendingMechanic?.Name ?? "Unknown";
-                        ctx.Log($"[Mapping] Entering sub-zone (from {triggerMechName}), snapshotting mechanics");
+                        // NOTE: BotCore may have already called _mechanics.Reset() before we run.
+                        // Snapshot may be empty — that's OK, we just need the sub-zone flag.
+                        ctx.Log($"[Mapping] Entering sub-zone, snapshotting mechanics (active={ctx.Mechanics.ActiveMechanic?.Name ?? "null"})");
 
-                        // Snapshot parent mechanics state before resetting
                         _parentMechanicsSnapshot = ctx.Mechanics.CreateSnapshot();
                         _parentZoneHash = _lastZoneHash;
                         _isInSubZone = true;
                         _expectingSubZone = false;
 
-                        // Force-complete any still-active mechanic, then reset for fresh sub-zone detection
                         if (_mechanicActive && ctx.Mechanics.ActiveMechanic != null)
                             ctx.Mechanics.ForceCompleteActive();
                         ctx.Mechanics.Reset();
+                        ctx.Mechanics.SuppressMechanic("Wishes");
 
-                        // Suppress the triggering mechanic in the sub-zone — the wish zone
-                        // has its own Faridun entities that would re-trigger detection
-                        ctx.Mechanics.SuppressMechanic(triggerMechName);
+                        _mechanicActive = false;
+                        _pendingMechanic = null;
+                    }
+                    else if (_isInSubZone)
+                    {
+                        // ── Late hash change within sub-zone ──
+                        // The area hash loads AFTER entities — mechanic completion handler already
+                        // set up the sub-zone, but BotCore saw the hash change first and called
+                        // _mechanics.Reset() (clearing our Wishes suppression). Re-suppress it.
+                        // The generic zone-local reset below will restart the settle timer,
+                        // which re-initializes exploration with the now-stable terrain data.
+                        ctx.Log($"[Mapping] Late hash change in sub-zone — re-suppressing Wishes (parent={_parentZoneHash})");
+                        ctx.Mechanics.SuppressMechanic("Wishes");
 
                         _mechanicActive = false;
                         _pendingMechanic = null;
@@ -275,24 +393,67 @@ namespace AutoExile.Modes
                     _bossAreaArrivalTime = null;
                     _visitedIconIds.Clear();
 
-                    // Boss rush only in parent map, not sub-zones
-                    if (!_isInSubZone && ctx.Settings.Mapping.RushBoss.Value && !_bossRushComplete)
-                    {
-                        _bossTarget = null;
-                        _bossTargetResolved = false;
-                        _bossRushDebug = "New zone — re-resolving boss target";
-                        _phase = MappingPhase.RushingBoss;
-                        ctx.Log("[Mapping] Area changed — re-triggering boss rush");
-                    }
-                    else if (_phase == MappingPhase.Exiting || _phase == MappingPhase.RushingBoss)
-                    {
-                        _phase = MappingPhase.Exploring;
-                    }
+                    // Start settle timer — block actions until terrain/entities load
+                    _zoneSettleUntil = DateTime.Now.AddSeconds(ZoneSettleSeconds);
+                    _zoneSettleExplorationDone = false;
+                    _phase = MappingPhase.Exploring;
+                    Status = "Zone transition — settling...";
+
+                    ctx.Log($"[Mapping] Zone settle started ({ZoneSettleSeconds}s)");
                 }
                 _lastZoneHash = currentHash;
             }
 
+            // ── Zone settle gate ──
+            // After a hash-based zone change (sub-zone entry/exit), block all actions
+            // for a few seconds so terrain data, entity list, and server state stabilize.
+            if (_zoneSettleUntil.HasValue)
+            {
+                var settleRemaining = (_zoneSettleUntil.Value - DateTime.Now).TotalSeconds;
+                if (settleRemaining > 0)
+                {
+                    var curHash = gc.IngameState?.Data?.CurrentAreaHash ?? 0;
+                    Status = $"Zone settling ({settleRemaining:F1}s) subZone={_isInSubZone} hash={curHash} parent={_parentZoneHash}";
+                    return; // Block all actions
+                }
+
+                // Settle complete — reinitialize exploration with now-stable terrain data
+                _zoneSettleUntil = null;
+                if (!_zoneSettleExplorationDone)
+                {
+                    ReinitExplorationForNewZone(ctx, gc);
+                    _zoneSettleExplorationDone = true;
+                }
+
+                // Boss rush only in parent map, not sub-zones
+                if (!_isInSubZone && ctx.Settings.Mapping.RushBoss.Value && !_bossRushComplete)
+                {
+                    _bossTarget = null;
+                    _bossTargetResolved = false;
+                    _bossRushDebug = "New zone — re-resolving boss target";
+                    _phase = MappingPhase.RushingBoss;
+                    ctx.Log("[Mapping] Post-settle — re-triggering boss rush");
+                }
+                else
+                {
+                    _phase = MappingPhase.Exploring;
+                }
+                ModeHelpers.EnableDefaultCombat(ctx);
+                var settleCoverage = ctx.Exploration.ActiveBlobCoverage;
+                var settleHash = gc.IngameState?.Data?.CurrentAreaHash ?? 0;
+                var wishesSuppressed = ctx.Mechanics.CompletionCounts.ContainsKey("Wishes");
+                ctx.Log($"[Mapping] Zone settle complete — subZone={_isInSubZone} phase={_phase} coverage={settleCoverage:P1} hash={settleHash} parentHash={_parentZoneHash} wishesSuppressed={wishesSuppressed} icons={ctx.MinimapIcons.Count}");
+            }
+
             var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
+
+            // ── ExitMap phase — portal key → click portal → hideout ──
+            // Placed after hash change + settle gate so zone transitions can interrupt it
+            if (_phase == MappingPhase.ExitMap)
+            {
+                TickExitMap(ctx, gc);
+                return;
+            }
 
             // ── Combat (always runs — fires skills while exploring) ──
             // Navigation always owns movement. CombatSystem scans threats, fires skills,
@@ -433,13 +594,58 @@ namespace AutoExile.Modes
                 }
 
                 // Mechanic finished (complete/abandoned/failed)
-                // If it was a sub-zone mechanic that didn't trigger a zone change
-                // (abandoned/failed before entering portal), clear the expectation
+                var wasExpectingSubZone = _expectingSubZone;
                 if (result != MechanicResult.Complete)
                     _expectingSubZone = false;
                 _mechanicActive = false;
                 _pendingMechanic = null;
                 Decision = $"Mechanic result: {result}";
+
+                // Sub-zone entry: wish zones don't change area hash or name.
+                // The mechanic returns Complete when it detects SekhemaPortal (targetable).
+                // That means we're already inside the wish zone.
+                if (result == MechanicResult.Complete && wasExpectingSubZone)
+                {
+                    // CRITICAL: Stop navigation immediately. The mechanic was navigating to/clicking
+                    // the DjinnPortal. If nav keeps ticking, the player walks through the SekhemaPortal
+                    // (exit) during settle and gets sent back to the parent map.
+                    ctx.Navigation.Stop(gc);
+                    ModeHelpers.CancelAllSystems(ctx);
+
+                    ctx.Log($"[Mapping] Mechanic completed with sub-zone expected — entering sub-zone mode (hash={gc.IngameState?.Data?.CurrentAreaHash}, lastHash={_lastZoneHash})");
+                    _parentMechanicsSnapshot = ctx.Mechanics.CreateSnapshot();
+                    _parentZoneHash = _lastZoneHash;
+                    _isInSubZone = true;
+                    _expectingSubZone = false;
+
+                    ctx.Mechanics.Reset();
+                    ctx.Mechanics.SuppressMechanic("Wishes");
+
+                    // Settle + reinitialize for sub-zone
+                    _zoneEnteredAt = DateTime.Now;
+                    _exitPortal = null;
+                    _navTarget = null;
+                    _exploreTargetsVisited = 0;
+                    _navFailures = 0;
+                    _visitedIconIds.Clear();
+                    _zoneSettleUntil = DateTime.Now.AddSeconds(ZoneSettleSeconds);
+                    _zoneSettleExplorationDone = false;
+                    _phase = MappingPhase.Exploring;
+                    var entryHash = gc.IngameState?.Data?.CurrentAreaHash ?? 0;
+                    Status = $"Entered wish zone — settling... hash={entryHash} parent={_parentZoneHash}";
+                    ctx.Log($"[Mapping] Wish zone settle started ({ZoneSettleSeconds}s) hash={entryHash} parent={_parentZoneHash}");
+                    return;
+                }
+
+                // Check if ExitAfter mechanics are all done → exit map
+                if (result == MechanicResult.Complete && !_isInSubZone &&
+                    ctx.Mechanics.AreExitMechanicsComplete(ctx.Settings) &&
+                    !ctx.Mechanics.HasPendingMechanics())
+                {
+                    ctx.Log("[Mapping] All ExitAfter mechanics complete — exiting map");
+                    EnterExitMap(ctx, gc);
+                    return;
+                }
                 // Fall through to normal loot/explore
             }
 
@@ -450,7 +656,10 @@ namespace AutoExile.Modes
                 ctx.Mechanics.SetActive(_pendingMechanic);
                 _mechanicActive = true;
                 if (_pendingMechanic.TriggersSubZone)
+                {
                     _expectingSubZone = true;
+                    ctx.Log($"[Mapping] Set _expectingSubZone=true for {_pendingMechanic.Name}");
+                }
                 Status = $"Starting mechanic: {_pendingMechanic.Name}";
                 return;
             }
@@ -551,6 +760,19 @@ namespace AutoExile.Modes
                         ctx.Log($"[Interactable] Clicking {target.Path} dist={target.DistancePlayer:F0}");
                         return;
                     }
+                }
+            }
+
+            // ── Eldritch Altars (opportunistic — click as we pass by) ──
+            if (!ctx.Interaction.IsBusy)
+            {
+                var altarResult = ctx.AltarHandler.Tick(ctx);
+                if (altarResult == AltarTickResult.Busy)
+                {
+                    if (ctx.Navigation.IsNavigating)
+                        ctx.Navigation.Pause();
+                    Status = $"Altar: {ctx.AltarHandler.Status}";
+                    return;
                 }
             }
 
@@ -685,9 +907,9 @@ namespace AutoExile.Modes
                     }
                     else
                     {
-                        // Truly complete — check for exit portal or mark done
+                        // Truly complete — check for exit portal (sub-zone) or exit map
                         var zoneTime = (DateTime.Now - _zoneEnteredAt).TotalSeconds;
-                        ctx.Log($"[Mapping] Explore complete path: coverage={coverage:P1} zoneTime={zoneTime:F1}s noTarget=true noBoss=true");
+                        ctx.Log($"[Mapping] Explore complete path: coverage={coverage:P1} zoneTime={zoneTime:F1}s noTarget=true noBoss=true subZone={_isInSubZone}");
                         var exitPortal = FindExitPortal(ctx, gc, ctx.Combat, "explore-complete");
                         if (exitPortal != null)
                         {
@@ -695,8 +917,14 @@ namespace AutoExile.Modes
                             _phase = MappingPhase.Exiting;
                             var elapsed = (DateTime.Now - _startTime).TotalSeconds;
                             Status = $"Explored {coverage:P1} in {elapsed:F0}s — using exit portal";
-                            Decision = "Heading to exit portal";
+                            Decision = $"EXIT: explore-complete coverage={coverage:P1} zoneTime={zoneTime:F0}s subZone={_isInSubZone}";
                             ctx.Log($"[Mapping] Exploration complete, found exit portal — returning to parent map");
+                        }
+                        else if (!_isInSubZone)
+                        {
+                            // In parent map — exit via portal scroll
+                            ctx.Log("[Mapping] Exploration complete — exiting map");
+                            EnterExitMap(ctx, gc);
                         }
                         else
                         {
@@ -758,8 +986,13 @@ namespace AutoExile.Modes
                         _exitPortal = exitPortal;
                         _phase = MappingPhase.Exiting;
                         Status = $"Explored {coverage:P1} in {elapsed:F0}s — using exit portal";
-                        Decision = "Heading to exit portal";
+                        Decision = $"EXIT: no-targets coverage={coverage:P1} zoneTime={zoneTime:F0}s subZone={_isInSubZone}";
                         ctx.Log($"[Mapping] No more targets, found exit portal — returning");
+                    }
+                    else if (coverage > 0.10f && !_isInSubZone)
+                    {
+                        ctx.Log("[Mapping] No more targets — exiting map");
+                        EnterExitMap(ctx, gc);
                     }
                     else if (coverage > 0.10f)
                     {
@@ -786,6 +1019,186 @@ namespace AutoExile.Modes
             }
 
             Decision = $"5 consecutive pathfind failures ({ctx.Exploration.FailedRegions.Count} total unreachable)";
+        }
+
+        // =================================================================
+        // Area Change Handling (hideout ↔ map transitions)
+        // =================================================================
+
+        private void OnAreaChanged(BotContext ctx, string newArea)
+        {
+            var gc = ctx.Game;
+
+            // Cancel all in-flight systems on any area change
+            ModeHelpers.CancelAllSystems(ctx);
+            _hideoutFlow.Cancel();
+
+            if (gc.Area.CurrentArea.IsHideout || gc.Area.CurrentArea.IsTown)
+            {
+                // Arrived in hideout
+                ctx.Mechanics.Reset();
+                _pendingMechanic = null;
+                _mechanicActive = false;
+
+                if (_mapCompleted)
+                {
+                    // Map done — start new cycle
+                    _mapCompleted = false;
+                    _phase = MappingPhase.InHideout;
+                    StartMappingHideoutFlow(ctx);
+                    Status = "Back in hideout — starting new map";
+                    ctx.Log("[Mapping] Map completed, starting new hideout flow");
+                }
+                else
+                {
+                    // Died or unexpected return — try to re-enter map
+                    _phase = MappingPhase.InHideout;
+                    _hideoutFlow.StartPortalReentry();
+                    Status = "Back in hideout — re-entering map";
+                    ctx.Log("[Mapping] Returned to hideout unexpectedly — attempting portal re-entry");
+                }
+            }
+            else
+            {
+                // Entered map — initialize exploration and combat
+                ctx.Log($"[Mapping] Entered map: {newArea}");
+                _zoneEnteredAt = DateTime.Now;
+                _portalKeyPressed = false;
+                _failedInteractables.Clear();
+                _visitedIconIds.Clear();
+                _bossKillVerified = false;
+                _bossKillCheckPositions = null;
+                _bossAreaArrivalTime = null;
+                InitMapState(ctx, gc);
+            }
+        }
+
+        // =================================================================
+        // Exit Map (portal key → click portal → hideout)
+        // =================================================================
+
+        private void EnterExitMap(BotContext ctx, GameController gc)
+        {
+            // In sub-zones (wish zones), portal scrolls don't work — use SekhemaPortal instead
+            if (_isInSubZone)
+            {
+                var exitPortal = FindExitPortal(ctx, gc, ctx.Combat, "sub-zone-exit");
+                if (exitPortal != null)
+                {
+                    _exitPortal = exitPortal;
+                    _phase = MappingPhase.Exiting;
+                    Status = "Sub-zone complete — using exit portal";
+                    Decision = "Exiting sub-zone via SekhemaPortal";
+                    ctx.Log("[Mapping] Sub-zone complete — exiting via SekhemaPortal");
+                }
+                else
+                {
+                    // No exit portal found yet — keep exploring, it will be found later
+                    ctx.Log("[Mapping] Sub-zone complete but no exit portal found — continuing exploration");
+                }
+                return;
+            }
+
+            // Last-resort check — if there's a targetable SekhemaPortal (actual exit portal,
+            // not minimap icon), we're in a wish zone — don't press portal key
+            if (_isInSubZone || HasTargetableSekhemaPortal(gc))
+            {
+                ctx.Log("[Mapping] EnterExitMap: SekhemaPortal detected — redirecting to exit portal");
+                _isInSubZone = true; // Fix the flag retroactively
+                var exitPortal = FindExitPortal(ctx, gc, ctx.Combat, "exit-map-guard");
+                if (exitPortal != null)
+                {
+                    _exitPortal = exitPortal;
+                    _phase = MappingPhase.Exiting;
+                    Status = "Sub-zone complete — using exit portal";
+                    Decision = "Exiting sub-zone via SekhemaPortal";
+                }
+                else
+                {
+                    ctx.Log("[Mapping] SekhemaPortal exists but FindExitPortal blocked (combat/timing) — waiting");
+                }
+                return;
+            }
+
+            ctx.Navigation.Stop(gc);
+            _phase = MappingPhase.ExitMap;
+            _exitMapStartTime = DateTime.Now;
+            _portalKeyPressed = false;
+            _mapCompleted = true;
+            var elapsed = (DateTime.Now - _startTime).TotalSeconds;
+            Status = $"Map complete ({elapsed:F0}s) — opening portal";
+            Decision = "Exiting map";
+            ctx.Log($"[Mapping] EnterExitMap: elapsed={elapsed:F0}s coverage={ctx.Exploration.ActiveBlobCoverage:P1}");
+        }
+
+        private void TickExitMap(BotContext ctx, GameController gc)
+        {
+            var elapsed = (DateTime.Now - _exitMapStartTime).TotalSeconds;
+
+            // Overall timeout
+            if (elapsed > ExitMapTimeoutSeconds)
+            {
+                Status = "Exit map timed out";
+                _phase = MappingPhase.Complete;
+                ctx.Log("[Mapping] ExitMap timed out");
+                return;
+            }
+
+            // Step 1: Press portal key
+            if (!_portalKeyPressed)
+            {
+                if (BotInput.CanAct)
+                {
+                    BotInput.PressKey(ctx.Settings.Mapping.PortalKey.Value);
+                    _portalKeyPressed = true;
+                    Status = "Pressed portal key — waiting for portal";
+                    ctx.Log("[Mapping] Pressed portal key");
+                }
+                return;
+            }
+
+            // Step 2: Wait for TownPortal entity to appear
+            var portal = ModeHelpers.FindNearestPortal(gc);
+            if (portal == null)
+            {
+                if (elapsed > PortalAppearTimeoutSeconds)
+                {
+                    // No portal appeared — fallback to spawn position
+                    if (_spawnPortalPos.HasValue)
+                    {
+                        ctx.Log("[Mapping] No portal scroll — walking to spawn portal");
+                        ctx.Navigation.NavigateTo(gc, _spawnPortalPos.Value);
+                        Status = "No portal scroll — walking to spawn point";
+                        // Keep checking for portals while walking
+                    }
+                    else
+                    {
+                        Status = "No portal and no spawn position — stuck";
+                    }
+                }
+                else
+                {
+                    Status = $"Waiting for portal ({elapsed:F1}s)";
+                }
+                return;
+            }
+
+            // Step 3: Click the portal via InteractionSystem
+            if (!ctx.Interaction.IsBusy)
+            {
+                ctx.Interaction.InteractWithEntity(portal, ctx.Navigation, requireProximity: true);
+                Status = "Clicking portal to exit map";
+            }
+            else
+            {
+                var result = ctx.Interaction.Tick(gc);
+                Status = $"Exiting: {ctx.Interaction.Status}";
+                if (result == InteractionResult.Failed)
+                {
+                    // Retry
+                    ctx.Interaction.InteractWithEntity(portal, ctx.Navigation, requireProximity: true);
+                }
+            }
         }
 
         // =================================================================
@@ -834,6 +1247,10 @@ namespace AutoExile.Modes
             _priorityTarget = null;
             _priorityTargetReason = "";
 
+            // Sub-zones (wish zones): minimap icons from parent map may persist in the entity
+            // list as stale/cached entries. Don't route to them — explore the sub-zone normally.
+            if (_isInSubZone) return null;
+
             if (ctx.MinimapIcons.Count == 0) return null;
 
             var seen = ctx.Exploration.ActiveBlob?.SeenCells;
@@ -863,6 +1280,15 @@ namespace AutoExile.Modes
                 if (interactSetting != null)
                 {
                     if (interactSetting.Value == "Ignore") continue;
+
+                    // When close enough, verify the actual entity is still claimable.
+                    // TileEntity icons persist after shrines are claimed / chests are opened.
+                    if (dist < InteractableOptionalRadius && IsInteractableAlreadyClaimed(ctx.Game, icon))
+                    {
+                        _visitedIconIds.Add(id);
+                        continue;
+                    }
+
                     if (interactSetting.Value == "Required" && dist < bestRequiredDist)
                     {
                         bestRequired = icon.GridPos;
@@ -1115,6 +1541,27 @@ namespace AutoExile.Modes
         }
 
         /// <summary>
+        /// Check if a minimap icon's interactable entity is already claimed/opened.
+        /// Searches nearby entities matching the icon's path. Only reliable when close
+        /// (entities in network bubble range).
+        /// </summary>
+        private static bool IsInteractableAlreadyClaimed(GameController gc, BotCore.MinimapIconEntry icon)
+        {
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (entity.Path != icon.Path) continue;
+                var entityGrid = new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y);
+                if (Vector2.Distance(entityGrid, icon.GridPos) > 15) continue; // same location
+
+                if (!entity.IsTargetable) return true;
+                if (entity.TryGetComponent<Shrine>(out var shrine) && !shrine.IsAvailable) return true;
+                if (entity.TryGetComponent<Chest>(out var chest) && chest.IsOpened) return true;
+                return false; // found matching entity, it's still claimable
+            }
+            return false; // entity not loaded yet — don't mark as claimed
+        }
+
+        /// <summary>
         /// Check if an interactable has been successfully activated (shrine claimed or chest opened).
         /// </summary>
         private static bool IsInteractableDone(ExileCore.PoEMemory.MemoryObjects.Entity entity)
@@ -1136,6 +1583,38 @@ namespace AutoExile.Modes
                 if (entity.Id == entityId) return entity;
             }
             return null;
+        }
+
+        /// <summary>
+        /// Check if a targetable SekhemaPortal entity exists (the actual exit portal in wish zones).
+        /// Minimap icon entities also contain "SekhemaPortal" in their path but are NOT targetable.
+        /// Only the real portal entity in the wish zone is targetable.
+        /// </summary>
+        private static bool HasTargetableSekhemaPortal(GameController gc)
+        {
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (entity.Path != null && entity.Path.Contains("SekhemaPortal") && entity.IsTargetable)
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Reinitialize exploration for a new zone (sub-zone entry).
+        /// Wish zones have the same area name but different terrain — must rebuild the grid.
+        /// </summary>
+        private void ReinitExplorationForNewZone(BotContext ctx, GameController gc)
+        {
+            var pfGrid = gc.IngameState?.Data?.RawPathfindingData;
+            var tgtGrid = gc.IngameState?.Data?.RawTerrainTargetingData;
+            if (pfGrid != null && gc.Player != null)
+            {
+                var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
+                ctx.Exploration.EnterNewBlob(pfGrid, tgtGrid, playerGrid,
+                    ctx.Settings.Build.BlinkRange.Value);
+                ctx.Log($"[Mapping] Reinitialized exploration for sub-zone: {ctx.Exploration.TotalWalkableCells} cells");
+            }
         }
 
         /// <summary>
@@ -1240,12 +1719,14 @@ namespace AutoExile.Modes
 
             var phaseColor = _phase switch
             {
+                MappingPhase.InHideout => SharpDX.Color.CornflowerBlue,
                 MappingPhase.RushingBoss => SharpDX.Color.Gold,
                 MappingPhase.Fighting => SharpDX.Color.Red,
                 MappingPhase.Looting => SharpDX.Color.LimeGreen,
                 MappingPhase.Exploring => SharpDX.Color.Cyan,
                 MappingPhase.Complete => SharpDX.Color.LimeGreen,
                 MappingPhase.Exiting => SharpDX.Color.Magenta,
+                MappingPhase.ExitMap => SharpDX.Color.Orange,
                 MappingPhase.Paused => SharpDX.Color.Yellow,
                 _ => SharpDX.Color.White,
             };

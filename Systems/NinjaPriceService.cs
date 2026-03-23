@@ -306,6 +306,16 @@ namespace AutoExile.Systems
             if (!mapping.TryGetValue(artPath, out var candidateNames) || candidateNames.Count == 0)
                 return PriceResult.Zero;
 
+            // Get the item's actual link count to filter price entries
+            // poe.ninja has separate entries for 0-link, 5-link, 6-link variants
+            int itemLinks = 0;
+            if (entity.TryGetComponent<Sockets>(out var sockets))
+                itemLinks = sockets.LargestLinkSize;
+
+            // Map item links to the ninja link tier (0 = base, 5 = 5-link, 6 = 6-link)
+            // Items with <5 links use the base (links=0/null) price entry
+            int ninjaLinkTier = itemLinks >= 6 ? 6 : itemLinks >= 5 ? 5 : 0;
+
             // Look up all candidates across all unique categories
             double minVal = double.MaxValue;
             double maxVal = 0;
@@ -326,6 +336,10 @@ namespace AutoExile.Systems
 
                     foreach (var entry in entries)
                     {
+                        // Filter by link count — only match entries for the item's link tier
+                        var entryLinks = entry.Links ?? 0;
+                        if (entryLinks != ninjaLinkTier) continue;
+
                         var val = entry.ChaosValue ?? 0;
                         if (val <= 0) continue;
 

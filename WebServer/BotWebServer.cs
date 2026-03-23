@@ -235,6 +235,12 @@ namespace AutoExile.WebServer
                     case "/api/ninja/uniques" when method == "GET":
                         await HandleSearchUniques(req, resp);
                         break;
+                    case "/api/altar-mods" when method == "GET":
+                        await HandleGetAltarMods(resp);
+                        break;
+                    case "/api/altar-mods" when method == "POST":
+                        await HandleSetAltarMod(req, resp);
+                        break;
 
                     default:
                         resp.StatusCode = 404;
@@ -524,6 +530,62 @@ namespace AutoExile.WebServer
             // Persist
             ConfigManager?.Save(Settings);
             await ServeJson(resp, new { ok = true, id = modId, danger });
+        }
+
+        private async Task HandleGetAltarMods(HttpListenerResponse resp)
+        {
+            if (Settings == null) { resp.StatusCode = 503; await ServeJson(resp, new { error = "not ready" }); return; }
+
+            var userWeights = Settings.Mechanics.EldritchAltar.ModWeights;
+            var allMods = Mechanics.EldritchAltarHandler.AllKnownMods;
+
+            var result = allMods
+                .OrderByDescending(kv => kv.Value.Weight) // positive first, then negative
+                .Select(kv =>
+                {
+                    var key = kv.Key;
+                    var defaultWeight = kv.Value.Weight;
+                    var currentWeight = userWeights.TryGetValue(key, out var uw) ? uw : defaultWeight;
+                    return new
+                    {
+                        id = key,
+                        name = kv.Value.Display,
+                        defaultWeight,
+                        currentWeight,
+                        isOverridden = userWeights.ContainsKey(key),
+                    };
+                }).ToList();
+
+            await ServeJson(resp, result, pretty: true);
+        }
+
+        private async Task HandleSetAltarMod(HttpListenerRequest req, HttpListenerResponse resp)
+        {
+            if (Settings == null) { resp.StatusCode = 503; await ServeJson(resp, new { error = "not ready" }); return; }
+
+            var body = await ReadBody(req);
+            var doc = System.Text.Json.JsonDocument.Parse(body);
+            var root = doc.RootElement;
+
+            if (!root.TryGetProperty("id", out var idEl) || !root.TryGetProperty("weight", out var weightEl))
+            {
+                resp.StatusCode = 400;
+                await ServeJson(resp, new { error = "requires 'id' and 'weight'" });
+                return;
+            }
+
+            var modId = idEl.GetString() ?? "";
+            var weight = weightEl.GetInt32();
+            var userWeights = Settings.Mechanics.EldritchAltar.ModWeights;
+
+            // If setting back to default, remove the override
+            if (Mechanics.EldritchAltarHandler.AllKnownMods.TryGetValue(modId, out var known) && weight == known.Weight)
+                userWeights.Remove(modId);
+            else
+                userWeights[modId] = weight;
+
+            ConfigManager?.Save(Settings);
+            await ServeJson(resp, new { ok = true, id = modId, weight });
         }
 
         private async Task HandleSearchUniques(HttpListenerRequest req, HttpListenerResponse resp)

@@ -31,7 +31,7 @@ namespace AutoExile.Systems
         private const int DashAnimationMs = 300; // assume dash animation takes ~300ms
 
         // Dash-for-speed: use non-gap-crossing movement skills on long straight path segments
-        public int DashMinDistance { get; set; } = 60;       // min straight grid distance ahead (0 = disabled)
+        public int DashMinDistance { get; set; } = 25;       // min straight grid distance ahead (0 = disabled)
         private const float DashPathDeviationMax = 0.85f;    // dot product threshold — path must be this aligned
 
         public bool IsNavigating { get; private set; }
@@ -64,6 +64,17 @@ namespace AutoExile.Systems
         public string LastRecoveryAction { get; private set; } = "";
         private static readonly Random _rng = new();
 
+        // Position history — ring buffer of recent positions for backtrack recovery
+        private const int PositionHistorySize = 20;      // ~10 seconds at 0.5s intervals
+        private const float PositionHistoryIntervalSec = 0.5f;
+        private const float BacktrackMinDistance = 8f;    // grid units — minimum distance from current pos to be a useful backtrack target
+        private readonly Vector2[] _positionHistory = new Vector2[PositionHistorySize];
+        private int _positionHistoryIndex;
+        private int _positionHistoryCount;
+        private DateTime _lastPositionHistorySample = DateTime.MinValue;
+        private int _stuckAtSameSpotCount;               // how many times stuck at approximately the same position
+        private Vector2 _lastStuckPosition;
+
         // Blink tracking — geometry for wall-side detection (grid coordinates)
         private bool _blinkPending;           // true after blink fires, waiting to confirm crossing
         private Vector2 _blinkBoundary;       // walk waypoint before blink (origin side of gap)
@@ -85,6 +96,15 @@ namespace AutoExile.Systems
                 _dashActive = false;
 
             var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
+
+            // Sample position history for backtrack recovery
+            if ((DateTime.Now - _lastPositionHistorySample).TotalSeconds >= PositionHistoryIntervalSec)
+            {
+                _positionHistory[_positionHistoryIndex] = playerGrid;
+                _positionHistoryIndex = (_positionHistoryIndex + 1) % PositionHistorySize;
+                if (_positionHistoryCount < PositionHistorySize) _positionHistoryCount++;
+                _lastPositionHistorySample = DateTime.Now;
+            }
 
             // If we fired a blink, check each tick which side of the wall we're on
             if (_blinkPending)
@@ -172,7 +192,7 @@ namespace AutoExile.Systems
             var moved = Vector2.Distance(playerGrid, _lastPosition);
             if (moved < StuckThreshold)
             {
-                _stuckTimer += (float)gc.DeltaTime;
+                _stuckTimer += (float)gc.DeltaTime / 1000f;
                 if (_stuckTimer > StuckTimeLimit)
                 {
                     _stuckTimer = 0;
@@ -188,12 +208,23 @@ namespace AutoExile.Systems
                         return;
                     }
 
+                    // Track repeated stucks at the same spot
+                    if (Vector2.Distance(playerGrid, _lastStuckPosition) < 5f)
+                        _stuckAtSameSpotCount++;
+                    else
+                        _stuckAtSameSpotCount = 1;
+                    _lastStuckPosition = playerGrid;
+
                     // Try to find and interact with a door/breakable
                     if (TryInteractWithObstacle(gc, playerGrid))
                         return;
 
-                    // Fallback: micro-movement in a random direction
-                    MicroMovement(gc, playerGrid);
+                    // Try backtracking to a known-good position from history
+                    if (TryBacktrack(gc, playerGrid))
+                        return;
+
+                    // Fallback: escape probing with escalating distances
+                    EscapeProbe(gc, playerGrid);
                 }
             }
             else
@@ -325,6 +356,7 @@ namespace AutoExile.Systems
 
         /// <summary>
         /// Use a movement skill to speed up travel when the path ahead is long and straight.
+        /// Measures distance from PLAYER through remaining waypoints (not just waypoint-to-waypoint).
         /// All distance calculations in grid units.
         /// </summary>
         private bool TryDashForSpeed(GameController gc, Vector2 playerGrid,
@@ -339,27 +371,22 @@ namespace AutoExile.Systems
 
             var startWp = CurrentNavPath[idx].Position;
 
-            // Direction from current waypoint to next (the travel direction at dash point)
-            Vector2 travelDir;
-            if (idx + 1 < CurrentNavPath.Count)
-            {
-                travelDir = CurrentNavPath[idx + 1].Position - startWp;
-                if (travelDir.Length() < 1f)
-                    return false;
-                travelDir = Vector2.Normalize(travelDir);
-            }
-            else
-            {
-                travelDir = startWp - playerGrid;
-                if (travelDir.Length() < 1f)
-                    return false;
-                travelDir = Vector2.Normalize(travelDir);
-            }
+            // If the next waypoint is a blink, don't dash — let blink logic handle it
+            if (CurrentNavPath[idx].Action == WaypointAction.Blink)
+                return false;
 
-            // Walk forward from current waypoint, accumulating distance while path stays straight.
-            var straightDist = 0f;
+            // Travel direction: player → current waypoint
+            var travelDir = startWp - playerGrid;
+            if (travelDir.Length() < 1f)
+                return false;
+            travelDir = Vector2.Normalize(travelDir);
+
+            // Start with distance from player to current waypoint
+            var straightDist = Vector2.Distance(playerGrid, startWp);
             var straightMeasured = false;
             var hasUpcomingBlink = false;
+
+            // Continue accumulating through subsequent waypoints while path stays straight
             var prev = startWp;
             for (var i = idx + 1; i < CurrentNavPath.Count; i++)
             {
@@ -591,12 +618,72 @@ namespace AutoExile.Systems
             return false;
         }
 
-        private void MicroMovement(GameController gc, Vector2 playerGrid)
+        /// <summary>
+        /// Try to backtrack to a known-good position from history.
+        /// Only picks positions that are CLOSER to the destination than where we are now,
+        /// to avoid oscillating away from the goal. Clears history after backtracking
+        /// to prevent ping-pong between two stuck positions.
+        /// </summary>
+        private bool TryBacktrack(GameController gc, Vector2 playerGrid)
+        {
+            if (_positionHistoryCount == 0 || !Destination.HasValue) return false;
+
+            var dest = Destination.Value;
+            var currentDistToDest = Vector2.Distance(playerGrid, dest);
+
+            // Scan history for a position that is:
+            //  1) Far enough from current pos to be useful (BacktrackMinDistance)
+            //  2) CLOSER to the destination than we are now
+            // Among qualifying positions, pick the one closest to the destination.
+            Vector2? bestBacktrack = null;
+            float bestDistToDest = currentDistToDest;
+
+            for (int i = 1; i <= _positionHistoryCount; i++)
+            {
+                var idx = (_positionHistoryIndex - i + PositionHistorySize) % PositionHistorySize;
+                var histPos = _positionHistory[idx];
+                var distFromPlayer = Vector2.Distance(playerGrid, histPos);
+                var distToDest = Vector2.Distance(histPos, dest);
+
+                if (distFromPlayer > BacktrackMinDistance && distToDest < bestDistToDest)
+                {
+                    bestDistToDest = distToDest;
+                    bestBacktrack = histPos;
+                }
+            }
+
+            if (!bestBacktrack.HasValue) return false;
+
+            // Clear history to prevent ping-pong oscillation
+            _positionHistoryCount = 0;
+            _positionHistoryIndex = 0;
+
+            var screenPos = GridToScreen(gc, bestBacktrack.Value);
+            var windowRect = gc.Window.GetWindowRectangle();
+            ExecuteWalk(screenPos, windowRect);
+            LastRecoveryAction = $"Backtrack ({Vector2.Distance(playerGrid, bestBacktrack.Value):F0}g, {currentDistToDest - bestDistToDest:F0}g closer)";
+            return true;
+        }
+
+        /// <summary>
+        /// Escape probing — try random directional probes at escalating distances.
+        /// When stuck at the same spot repeatedly, uses larger probe distances.
+        /// </summary>
+        private void EscapeProbe(GameController gc, Vector2 playerGrid)
         {
             var waypoint = CurrentNavPath[CurrentWaypointIndex];
             var dirToWaypoint = waypoint.Position - playerGrid;
             if (dirToWaypoint.Length() > 0)
                 dirToWaypoint = Vector2.Normalize(dirToWaypoint);
+
+            // Escalating probe distances based on how many times stuck at same spot
+            float probeDistance = _stuckAtSameSpotCount switch
+            {
+                <= 1 => 18f,
+                2 => 30f,
+                3 => 50f,
+                _ => 70f,
+            };
 
             var angle = (float)(_rng.NextDouble() * Math.PI - Math.PI / 2);
             var cos = (float)Math.Cos(angle);
@@ -605,13 +692,12 @@ namespace AutoExile.Systems
                 dirToWaypoint.X * cos - dirToWaypoint.Y * sin,
                 dirToWaypoint.X * sin + dirToWaypoint.Y * cos);
 
-            // Nudge ~18 grid units in the randomized direction
-            var nudgeTarget = playerGrid + nudgeDir * 18f;
+            var nudgeTarget = playerGrid + nudgeDir * probeDistance;
             var screenPos = GridToScreen(gc, nudgeTarget);
             var windowRect = gc.Window.GetWindowRectangle();
 
             ExecuteWalk(screenPos, windowRect);
-            LastRecoveryAction = "Micro-move";
+            LastRecoveryAction = $"Escape probe ({probeDistance:F0}g, attempt #{_stuckAtSameSpotCount})";
         }
 
         // ═══════════════════════════════════════════════════
@@ -756,6 +842,9 @@ namespace AutoExile.Systems
             _stuckRecoveryCount = 0;
             _totalStuckRecoveries = 0;
             LastRecoveryAction = "";
+            _positionHistoryCount = 0;
+            _positionHistoryIndex = 0;
+            _stuckAtSameSpotCount = 0;
         }
 
         /// <summary>

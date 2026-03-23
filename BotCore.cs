@@ -40,6 +40,7 @@ namespace AutoExile
         private LootTracker _lootTracker = new();
         private MapMechanicManager _mechanics = new();
         private ThreatSystem _threat = new();
+        private EldritchAltarHandler _altarHandler = new();
         private NinjaPriceService _ninjaPrice = new();
         private BotRecorder _recorder = new();
         private BotWebServer? _webServer;
@@ -129,6 +130,7 @@ namespace AutoExile
                 LootTracker = _lootTracker,
                 Mechanics = _mechanics,
                 Threat = _threat,
+                AltarHandler = _altarHandler,
                 NinjaPrice = _ninjaPrice,
                 MapDatabase = _mapDatabase,
                 Settings = Settings,
@@ -157,8 +159,9 @@ namespace AutoExile
             _mechanics.Register(new RitualMechanic());
 
             // Populate mode dropdown and restore saved selection
-            Settings.ActiveMode.SetListValues(_modes.Keys.ToList());
+            // Save value before SetListValues — it resets Value to first item
             var savedMode = Settings.ActiveMode?.Value;
+            Settings.ActiveMode.SetListValues(_modes.Keys.ToList());
             if (!string.IsNullOrEmpty(savedMode) && _modes.ContainsKey(savedMode))
                 SetMode(savedMode);
             else
@@ -263,6 +266,7 @@ namespace AutoExile
             if (currentHash != _lastAreaHash && currentHash != 0)
             {
                 var previousAreaName = _lastAreaName;
+                LogMessage($"[BotCore] Area hash changed: {_lastAreaHash} -> {currentHash}, area='{currentArea}' (prev='{previousAreaName}')");
 
                 // Cache current area state before switching (for round-trip zone support)
                 // Use area name as cache key so returning to same-named area restores state
@@ -302,20 +306,14 @@ namespace AutoExile
                 _tileMap.Clear();
                 _tileMap.Load(GameController);
                 _loot.ClearFailed();
+                _combat.ClearUnreachable();
+                _altarHandler.Reset();
                 _lootTracker.OnAreaChanged();
                 ClearMinimapIcons();
                 ScanMinimapIcons(forceFullLog: true);
 
-                // Stop MappingMode if we landed in hideout/town (e.g. death respawn)
-                if (_mode == _mappingMode && _mappingMode != null)
-                {
-                    var area = GameController.Area?.CurrentArea;
-                    if (area != null && (area.IsHideout || area.IsTown))
-                    {
-                        _ctx.Log("Area changed to hideout/town — stopping MappingMode");
-                        SetMode("Idle");
-                    }
-                }
+                // NOTE: MappingMode handles hideout/town transitions internally via OnAreaChanged
+                // → HideoutFlow (stash → map device → enter map). Don't SetMode("Idle") here.
 
                 // Check if we have cached state for this area name AND matching hash
                 // (returning from sub-zone back to the original map instance)
@@ -509,6 +507,7 @@ namespace AutoExile
                 ?? (_mode as HeistMode)?.Decision
                 ?? (_mode as FollowerMode)?.Decision
                 ?? "",
+                (_mode as MappingMode)?.Status ?? "",
                 _navigation, _interaction, _loot);
 
             // Only run full mode logic when running
@@ -1976,17 +1975,25 @@ namespace AutoExile
                 mapNames.Sort((a, b) =>
                     a.TrimStart('\u2605', ' ').CompareTo(b.TrimStart('\u2605', ' ')));
 
+                // Save value before SetListValues — it resets Value to first item
+                var savedMapName = Settings.Mapping.MapName.Value;
                 Settings.Mapping.MapName.SetListValues(mapNames);
 
-                // Preserve existing selection if valid
-                var current = Settings.Mapping.MapName.Value;
-                if (string.IsNullOrEmpty(current) || !mapNames.Contains(current))
+                // Restore saved selection
+                if (!string.IsNullOrEmpty(savedMapName))
                 {
-                    // Try to match without the ★ prefix
-                    var plain = current?.TrimStart('\u2605', ' ') ?? "";
-                    var match = mapNames.FirstOrDefault(m => m.TrimStart('\u2605', ' ') == plain);
-                    if (match != null)
-                        Settings.Mapping.MapName.Value = match;
+                    if (mapNames.Contains(savedMapName))
+                    {
+                        Settings.Mapping.MapName.Value = savedMapName;
+                    }
+                    else
+                    {
+                        // Try to match without the ★ prefix (prefix may have changed)
+                        var plain = savedMapName.TrimStart('\u2605', ' ');
+                        var match = mapNames.FirstOrDefault(m => m.TrimStart('\u2605', ' ') == plain);
+                        if (match != null)
+                            Settings.Mapping.MapName.Value = match;
+                    }
                 }
 
                 _mapListPopulated = true;

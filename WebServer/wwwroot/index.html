@@ -700,7 +700,7 @@ function renderAllSettings() {
 
   // Modes tab
   const modes = makeTabContent('modes');
-  addSection(modes, 'Mapping', [['mapping.mapName'],['mapping.minMapTier'],['mapping.rushBoss'],
+  addSection(modes, 'Mapping', [['mapping.mapName'],['mapping.minMapTier'],['mapping.portalKey'],['mapping.rushBoss'],
     ['mapping.killBoss'],['mapping.bossKillRadius'],
     ['mapping.minPackDensity'],['mapping.detourForRares'],['mapping.maxDetourDistance']]);
   addSection(modes, 'Simulacrum', [['simulacrum.maxDeaths'],['simulacrum.minWaveDelaySeconds'],
@@ -744,7 +744,7 @@ function renderAllSettings() {
     ['mechanics.interactables.shrines'],['mechanics.interactables.strongboxes'],
     ['mechanics.interactables.djinnCaches'],['mechanics.interactables.heistCaches'],
     ['mechanics.interactables.craftingRecipes']]);
-  addSection(mech, 'Ultimatum', [['mechanics.ultimatum.mode'],
+  addSection(mech, 'Ultimatum', [['mechanics.ultimatum.mode'],['mechanics.ultimatum.exitAfter'],
     ['mechanics.ultimatum.doSurvive'],['mechanics.ultimatum.doKillEnemies'],
     ['mechanics.ultimatum.doDefendAltar'],['mechanics.ultimatum.doStandInCircles'],
     ['mechanics.ultimatum.maxWaves'],['mechanics.ultimatum.dangerThreshold'],
@@ -774,15 +774,39 @@ function renderAllSettings() {
     if (!ultModLoaded) { loadUltimatumMods(ultModBody, ultModFilter); ultModLoaded = true; }
   });
 
-  addSection(mech, 'Harvest', [['mechanics.harvest.mode'],['mechanics.harvest.preferredColour'],
+  addSection(mech, 'Harvest', [['mechanics.harvest.mode'],['mechanics.harvest.exitAfter'],['mechanics.harvest.preferredColour'],
     ['mechanics.harvest.colourPreferenceBonus'],['mechanics.harvest.normalWeight'],
     ['mechanics.harvest.magicWeight'],['mechanics.harvest.rareWeight'],
     ['mechanics.harvest.wildMultiplier'],['mechanics.harvest.vividMultiplier'],
     ['mechanics.harvest.primalMultiplier'],['mechanics.harvest.lootSweepSeconds']]);
-  addSection(mech, 'Wishes', [['mechanics.wishes.mode'],['mechanics.wishes.preferredWish'],
+  addSection(mech, 'Wishes', [['mechanics.wishes.mode'],['mechanics.wishes.exitAfter'],['mechanics.wishes.preferredWish'],
     ['mechanics.wishes.lootSweepSeconds']]);
-  addSection(mech, 'Essence', [['mechanics.essence.mode'],['mechanics.essence.minEssenceTier'],
+  addSection(mech, 'Essence', [['mechanics.essence.mode'],['mechanics.essence.exitAfter'],['mechanics.essence.minEssenceTier'],
     ['mechanics.essence.corruptEssences'],['mechanics.essence.lootSweepSeconds']]);
+  addSection(mech, 'Ritual', [['mechanics.ritual.mode'],['mechanics.ritual.exitAfter'],
+    ['mechanics.ritual.lootSweepSeconds']]);
+  addSection(mech, 'Eldritch Altars', [['mechanics.eldritchAltar.enabled'],['mechanics.eldritchAltar.minScoreThreshold']]);
+
+  // Eldritch Altar mod weight editor (custom API, not standard settings)
+  const altarModDiv = document.createElement('div');
+  const altarModTitle = document.createElement('div'); altarModTitle.className='section-divider'; altarModTitle.style.cursor='pointer';
+  altarModTitle.textContent = '\u25b6 Altar Mod Weights'; altarModDiv.appendChild(altarModTitle);
+  const altarModContent = document.createElement('div'); altarModContent.style.display='none';
+  const altarModFilter = document.createElement('input'); altarModFilter.type='text'; altarModFilter.placeholder='Filter mods...';
+  altarModFilter.style.cssText='width:100%;padding:8px;margin:8px 0;background:var(--surface2);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:13px;';
+  altarModContent.appendChild(altarModFilter);
+  const altarModBody = document.createElement('div'); altarModBody.style.maxHeight='400px'; altarModBody.style.overflowY='auto';
+  altarModContent.appendChild(altarModBody);
+  altarModDiv.appendChild(altarModContent);
+  mech.appendChild(altarModDiv);
+  let altarModLoaded = false;
+  altarModTitle.addEventListener('click', () => {
+    const open = altarModContent.style.display !== 'none';
+    altarModContent.style.display = open ? 'none' : '';
+    altarModTitle.textContent = (open ? '\u25b6' : '\u25bc') + ' Altar Mod Weights';
+    if (!altarModLoaded) { loadAltarMods(altarModBody, altarModFilter); altarModLoaded = true; }
+  });
+
   c.appendChild(mech);
 
   // Advanced tab
@@ -1067,6 +1091,66 @@ async function setUltMod(modId, danger, selectEl) {
       selectEl.style.borderColor = tier.color;
       selectEl.style.color = tier.color;
       showSaveFlash(selectEl.closest('td'));
+    }
+  } catch {}
+}
+
+function weightToColor(w) {
+  if (w >= 50) return '#4ade80';
+  if (w >= 20) return '#a3e635';
+  if (w > 0) return '#86efac';
+  if (w === 0) return '#8b90a5';
+  if (w > -50) return '#fbbf24';
+  if (w > -100) return '#fb923c';
+  return '#ef4444';
+}
+
+async function loadAltarMods(container, filterInput) {
+  try {
+    const resp = await fetch('/api/altar-mods');
+    if (!resp.ok) { container.textContent = 'Failed to load mods'; return; }
+    const mods = await resp.json();
+
+    function renderMods(filter) {
+      container.innerHTML = '';
+      const table = document.createElement('table'); table.className = 'tower-table';
+      table.innerHTML = '<thead><tr><th style="text-align:left">Modifier</th><th>Weight</th></tr></thead>';
+      const tbody = document.createElement('tbody');
+
+      for (const mod of mods) {
+        if (filter && !mod.name.toLowerCase().includes(filter)) continue;
+        const tr = document.createElement('tr');
+        const nameStyle = mod.isOverridden ? 'font-weight:bold' : '';
+        const color = weightToColor(mod.currentWeight);
+        tr.innerHTML = `<td style="${nameStyle}">${mod.name}${mod.isOverridden ? ' *' : ''}</td>
+          <td><input type="number" value="${mod.currentWeight}" style="width:70px;background:var(--bg-darker);border:2px solid ${color};color:${color};padding:2px 6px;border-radius:4px;font-weight:bold;text-align:center"
+            data-default="${mod.defaultWeight}" data-id="${mod.id}"
+            onchange="setAltarMod(this.dataset.id,parseInt(this.value),this)"></td>`;
+        tbody.appendChild(tr);
+      }
+      table.appendChild(tbody);
+      container.appendChild(table);
+    }
+
+    renderMods('');
+    filterInput.addEventListener('input', () => renderMods(filterInput.value.toLowerCase()));
+  } catch (e) {
+    container.textContent = 'Error loading mods: ' + e.message;
+  }
+}
+
+async function setAltarMod(modId, weight, inputEl) {
+  if (isNaN(weight)) return;
+  try {
+    const resp = await fetch('/api/altar-mods', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({id: modId, weight})
+    });
+    if (resp.ok) {
+      const color = weightToColor(weight);
+      inputEl.style.borderColor = color;
+      inputEl.style.color = color;
+      showSaveFlash(inputEl.closest('td'));
     }
   } catch {}
 }

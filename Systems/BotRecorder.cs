@@ -41,7 +41,7 @@ namespace AutoExile.Systems
         /// Record one tick of state. Call every tick from BotCore after mode + navigation.
         /// </summary>
         public void RecordTick(GameController gc, string modeName, string modePhase,
-            string modeDecision, NavigationSystem nav,
+            string modeDecision, string modeStatus, NavigationSystem nav,
             InteractionSystem? interaction = null, LootSystem? loot = null)
         {
             _tickNumber++;
@@ -109,6 +109,7 @@ namespace AutoExile.Systems
                 ModeName = modeName,
                 ModePhase = modePhase,
                 ModeDecision = modeDecision,
+                ModeStatus = modeStatus,
 
                 // Navigation state
                 IsNavigating = nav.IsNavigating,
@@ -253,6 +254,7 @@ namespace AutoExile.Systems
         public string ModeName { get; set; } = "";
         public string ModePhase { get; set; } = "";
         public string ModeDecision { get; set; } = "";
+        public string ModeStatus { get; set; } = "";
 
         // Navigation
         public bool IsNavigating { get; set; }

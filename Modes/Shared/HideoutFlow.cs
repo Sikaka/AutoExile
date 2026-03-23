@@ -18,6 +18,9 @@ namespace AutoExile.Modes.Shared
 
         // Configuration set via Start()
         private Func<Element, bool>? _mapFilter;
+        private Func<ServerInventory.InventSlotItem, bool>? _stashItemFilter;
+        private string? _targetMapName;
+        private int _minMapTier;
 
         private const float SettleSeconds = 3f;
         private const float PortalTimeoutSeconds = 15f;
@@ -30,9 +33,14 @@ namespace AutoExile.Modes.Shared
         /// <summary>
         /// Start a full hideout flow: settle → stash → open map → enter portal.
         /// </summary>
-        public void Start(Func<Element, bool> mapFilter)
+        public void Start(Func<Element, bool> mapFilter,
+            Func<ServerInventory.InventSlotItem, bool>? stashItemFilter = null,
+            string? targetMapName = null, int minMapTier = 0)
         {
             _mapFilter = mapFilter;
+            _stashItemFilter = stashItemFilter;
+            _targetMapName = targetMapName;
+            _minMapTier = minMapTier;
             _phase = HideoutPhase.Settle;
             _phaseStartTime = DateTime.Now;
             Status = "Hideout — settling";
@@ -73,6 +81,9 @@ namespace AutoExile.Modes.Shared
         {
             _phase = HideoutPhase.Idle;
             _mapFilter = null;
+            _stashItemFilter = null;
+            _targetMapName = null;
+            _minMapTier = 0;
             Status = "";
         }
 
@@ -87,11 +98,12 @@ namespace AutoExile.Modes.Shared
                 return HideoutSignal.InProgress;
             }
 
-            // Check if we have items to stash
-            if (ModeHelpers.HasInventoryItems(ctx.Game))
+            // Check if we have items to stash (respecting filter)
+            if (StashSystem.HasStashableItems(ctx.Game, _stashItemFilter))
             {
                 _phase = HideoutPhase.Stash;
                 _phaseStartTime = DateTime.Now;
+                ctx.Stash.ItemFilter = _stashItemFilter;
                 ctx.Stash.Start();
                 Status = "Stashing inventory items";
                 return HideoutSignal.InProgress;
@@ -133,6 +145,9 @@ namespace AutoExile.Modes.Shared
         {
             if (ctx.MapDevice.IsBusy)
                 ctx.MapDevice.Cancel(ctx.Game, ctx.Navigation);
+
+            ctx.MapDevice.TargetMapName = _targetMapName;
+            ctx.MapDevice.MinMapTier = _minMapTier;
 
             if (_mapFilter != null && !ctx.MapDevice.Start(_mapFilter))
                 Status = $"MapDevice.Start failed (phase={ctx.MapDevice.Phase})";

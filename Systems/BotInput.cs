@@ -19,10 +19,13 @@ namespace AutoExile.Systems
     /// Global action gate. ALL game inputs go through here.
     ///
     /// Design:
-    /// - Single NextActionAt timestamp. Checked in BotCore.Tick() — if not ready, entire tick skips.
+    /// - Single NextActionAt timestamp. Checked via CanAct — if not ready, actions are rejected.
+    /// - Bot logic (modes, combat, exploration) ALWAYS ticks to keep state fresh.
+    /// - Only actual input calls (Click, PressKey, etc.) are gated by CanAct.
     /// - When an action fires: set NextActionAt to now + full duration, then run async sequence.
-    /// - Sequence: move cursor → random delay (30-50ms) → button/key down → random delay (30-50ms) → up.
-    /// - No bot logic runs during the async sequence because NextActionAt is already in the future.
+    /// - Sequence: interpolate cursor → settle → button/key down → hold → up.
+    /// - All delays use Gaussian distribution for human-like timing variance.
+    /// - Mouse movement uses linear interpolation with random intermediate points.
     /// - All actions are logged to a ring buffer for post-hoc analysis.
     /// - Window bounds are enforced: positions outside the game window are clamped inward.
     /// </summary>
@@ -80,19 +83,7 @@ namespace AutoExile.Systems
         }
 
         /// <summary>Minimum ms between actions (end of one action to start of next). Configurable.</summary>
-        public static int ActionCooldownMs = 75;
-
-        /// <summary>Min ms for cursor settle delay before key/button press.</summary>
-        public const int SettleMinMs = 30;
-
-        /// <summary>Max ms for cursor settle delay.</summary>
-        public const int SettleMaxMs = 50;
-
-        /// <summary>Min ms to hold key/button down before releasing.</summary>
-        public const int HoldMinMs = 30;
-
-        /// <summary>Max ms to hold key/button down.</summary>
-        public const int HoldMaxMs = 50;
+        public static int ActionCooldownMs = 100;
 
         /// <summary>Global gate — no actions before this time.</summary>
         public static DateTime NextActionAt = DateTime.MinValue;
@@ -102,8 +93,112 @@ namespace AutoExile.Systems
         /// <summary>True if we can start a new action right now.</summary>
         public static bool CanAct => DateTime.Now >= NextActionAt;
 
-        private static int RandSettle() => _rng.Next(SettleMinMs, SettleMaxMs + 1);
-        private static int RandHold() => _rng.Next(HoldMinMs, HoldMaxMs + 1);
+        // ══════════════════════════════════════════════════════════════
+        // Gaussian delay generation (Box-Muller transform)
+        // Human reaction times follow normal distribution, not uniform.
+        // ══════════════════════════════════════════════════════════════
+
+        /// <summary>Mean settle delay in ms (cursor → click).</summary>
+        public const float SettleMeanMs = 70f;
+        /// <summary>Settle delay standard deviation.</summary>
+        public const float SettleStdDevMs = 10f;
+
+        /// <summary>Mean key/button hold duration in ms.</summary>
+        public const float HoldMeanMs = 40f;
+        /// <summary>Hold duration standard deviation.</summary>
+        public const float HoldStdDevMs = 10f;
+
+        /// <summary>Minimum delay for any Gaussian sample (floor).</summary>
+        private const int DelayFloorMs = 20;
+        /// <summary>Maximum delay for any Gaussian sample (ceiling).</summary>
+        private const int DelayCeilingMs = 100;
+
+        /// <summary>
+        /// Generate a Gaussian-distributed random delay using Box-Muller transform.
+        /// More human-like than uniform Random.Next — clusters around the mean
+        /// with occasional faster/slower outliers.
+        /// </summary>
+        private static int GaussianDelay(float mean, float stdDev)
+        {
+            // Box-Muller: two uniform randoms → one normal random
+            double u1 = 1.0 - _rng.NextDouble(); // (0, 1]
+            double u2 = _rng.NextDouble();        // [0, 1)
+            double normal = Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Sin(2.0 * Math.PI * u2);
+            int result = (int)(mean + stdDev * normal);
+            return Math.Clamp(result, DelayFloorMs, DelayCeilingMs);
+        }
+
+        private static int RandSettle() => GaussianDelay(SettleMeanMs, SettleStdDevMs);
+        private static int RandHold() => GaussianDelay(HoldMeanMs, HoldStdDevMs);
+
+        // ══════════════════════════════════════════════════════════════
+        // Mouse movement interpolation
+        // Instead of teleporting the cursor, move it in steps along
+        // a slightly randomized path. Duration scales with distance.
+        // ══════════════════════════════════════════════════════════════
+
+        /// <summary>Min ms for cursor travel (very short moves).</summary>
+        private const int MoveMinMs = 15;
+        /// <summary>Max ms for cursor travel (full screen moves).</summary>
+        private const int MoveMaxMs = 80;
+        /// <summary>Distance in pixels that maps to MoveMaxMs.</summary>
+        private const float MoveMaxDistance = 2000f;
+        /// <summary>Number of intermediate points for interpolation.</summary>
+        private const int MoveSteps = 8;
+        /// <summary>Max perpendicular pixel offset for path randomization.</summary>
+        private const float MoveJitterPx = 3f;
+        /// <summary>Max random pixel offset applied to final cursor landing position.</summary>
+        private const float LandingJitterPx = 3f;
+
+        /// <summary>
+        /// Interpolate cursor from current position to target over a distance-proportional duration.
+        /// Path has slight random perpendicular jitter for organic movement.
+        /// </summary>
+        private static async Task MoveCursorTo(Vector2 target)
+        {
+            var mp = Input.MousePosition;
+            var start = new Vector2(mp.X, mp.Y);
+            var delta = target - start;
+            var dist = delta.Length();
+
+            if (dist < 5f)
+            {
+                // Too close to bother interpolating
+                Input.SetCursorPos(target);
+                return;
+            }
+
+            // Duration scales linearly with distance, clamped
+            float t = Math.Clamp(dist / MoveMaxDistance, 0f, 1f);
+            int totalMs = MoveMinMs + (int)((MoveMaxMs - MoveMinMs) * t);
+            int stepDelayMs = Math.Max(1, totalMs / MoveSteps);
+
+            // Perpendicular direction for jitter
+            var perp = Vector2.Normalize(new Vector2(-delta.Y, delta.X));
+
+            for (int i = 1; i <= MoveSteps; i++)
+            {
+                float progress = (float)i / MoveSteps;
+                var pos = start + delta * progress;
+
+                // Add slight perpendicular jitter (not on final step)
+                if (i < MoveSteps)
+                {
+                    float jitter = (float)(_rng.NextDouble() * 2 - 1) * MoveJitterPx;
+                    // Taper jitter: strongest in the middle, zero at endpoints
+                    float taper = 1f - Math.Abs(progress - 0.5f) * 2f;
+                    pos += perp * jitter * taper;
+                }
+
+                Input.SetCursorPos(pos);
+                await Task.Delay(stepDelayMs);
+            }
+
+            // Land with slight random offset — avoids pixel-perfect cursor patterns
+            var jitterX = (float)(_rng.NextDouble() * 2 - 1) * LandingJitterPx;
+            var jitterY = (float)(_rng.NextDouble() * 2 - 1) * LandingJitterPx;
+            Input.SetCursorPos(target + new Vector2(jitterX, jitterY));
+        }
 
         // ── Cursor + key press (walk commands, targeted skills) ──
 
@@ -112,9 +207,10 @@ namespace AutoExile.Systems
         {
             if (!CanAct) { LogAction("CursorPressKey", absPos, key, false); return false; }
             if (!ClampToWindow(ref absPos)) { LogAction("CursorPressKey", absPos, key, false); return false; }
+            var moveMs = EstimateMoveMs(absPos);
             var settle = RandSettle();
             var hold = RandHold();
-            NextActionAt = DateTime.Now.AddMilliseconds(settle + hold + ActionCooldownMs);
+            NextActionAt = DateTime.Now.AddMilliseconds(moveMs + settle + hold + ActionCooldownMs);
             _ = DoCursorPressKey(absPos, key, settle, hold);
             LogAction("CursorPressKey", absPos, key, true);
             return true;
@@ -122,9 +218,8 @@ namespace AutoExile.Systems
 
         private static async Task DoCursorPressKey(Vector2 absPos, Keys key, int settleMs, int holdMs)
         {
-            Input.SetCursorPos(absPos);
+            await MoveCursorTo(absPos);
             await Task.Delay(settleMs);
-            Input.SetCursorPos(absPos); // re-assert in case of drift
             Input.KeyDown(key);
             await Task.Delay(holdMs);
             Input.KeyUp(key);
@@ -157,9 +252,10 @@ namespace AutoExile.Systems
         {
             if (!CanAct) { LogAction("Click", absPos, null, false); return false; }
             if (!ClampToWindow(ref absPos)) { LogAction("Click", absPos, null, false); return false; }
+            var moveMs = EstimateMoveMs(absPos);
             var settle = RandSettle();
             var hold = RandHold();
-            NextActionAt = DateTime.Now.AddMilliseconds(settle + hold + ActionCooldownMs);
+            NextActionAt = DateTime.Now.AddMilliseconds(moveMs + settle + hold + ActionCooldownMs);
             _ = DoClick(absPos, rightClick: false, settle, hold);
             LogAction("Click", absPos, null, true);
             return true;
@@ -170,9 +266,10 @@ namespace AutoExile.Systems
         {
             if (!CanAct) { LogAction("RightClick", absPos, null, false); return false; }
             if (!ClampToWindow(ref absPos)) { LogAction("RightClick", absPos, null, false); return false; }
+            var moveMs = EstimateMoveMs(absPos);
             var settle = RandSettle();
             var hold = RandHold();
-            NextActionAt = DateTime.Now.AddMilliseconds(settle + hold + ActionCooldownMs);
+            NextActionAt = DateTime.Now.AddMilliseconds(moveMs + settle + hold + ActionCooldownMs);
             _ = DoClick(absPos, rightClick: true, settle, hold);
             LogAction("RightClick", absPos, null, true);
             return true;
@@ -180,9 +277,8 @@ namespace AutoExile.Systems
 
         private static async Task DoClick(Vector2 absPos, bool rightClick, int settleMs, int holdMs)
         {
-            Input.SetCursorPos(absPos);
+            await MoveCursorTo(absPos);
             await Task.Delay(settleMs);
-            Input.SetCursorPos(absPos);
             if (rightClick)
             {
                 Input.RightDown();
@@ -202,10 +298,11 @@ namespace AutoExile.Systems
         {
             if (!CanAct) { LogAction("CtrlClick", absPos, null, false); return false; }
             if (!ClampToWindow(ref absPos)) { LogAction("CtrlClick", absPos, null, false); return false; }
+            var moveMs = EstimateMoveMs(absPos);
             var settle = RandSettle();
             var hold = RandHold();
-            // Ctrl down + settle + cursor + settle + click hold + release + ctrl up
-            NextActionAt = DateTime.Now.AddMilliseconds(hold + settle + hold + ActionCooldownMs);
+            // Ctrl down + settle + cursor move + settle + click hold + release + ctrl up
+            NextActionAt = DateTime.Now.AddMilliseconds(hold + moveMs + settle + hold + ActionCooldownMs);
             _ = DoCtrlClick(absPos, settle, hold);
             LogAction("CtrlClick", absPos, null, true);
             return true;
@@ -215,14 +312,28 @@ namespace AutoExile.Systems
         {
             Input.KeyDown(Keys.ControlKey);
             await Task.Delay(holdMs);
-            Input.SetCursorPos(absPos);
+            await MoveCursorTo(absPos);
             await Task.Delay(settleMs);
-            Input.SetCursorPos(absPos);
             Input.LeftDown();
             await Task.Delay(holdMs);
             Input.LeftUp();
             await Task.Delay(holdMs);
             Input.KeyUp(Keys.ControlKey);
+        }
+
+        // ── Helpers ──
+
+        /// <summary>
+        /// Estimate how long cursor interpolation will take for gate timing.
+        /// Must match the logic in MoveCursorTo.
+        /// </summary>
+        private static int EstimateMoveMs(Vector2 target)
+        {
+            var mp = Input.MousePosition;
+            var dist = (target - new Vector2(mp.X, mp.Y)).Length();
+            if (dist < 5f) return 0;
+            float t = Math.Clamp(dist / MoveMaxDistance, 0f, 1f);
+            return MoveMinMs + (int)((MoveMaxMs - MoveMinMs) * t);
         }
 
         /// <summary>Cancel any pending action and reset gate.</summary>
