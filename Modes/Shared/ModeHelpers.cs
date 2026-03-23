@@ -35,11 +35,8 @@ namespace AutoExile.Modes.Shared
         /// </summary>
         public static bool ClickEntity(GameController gc, Entity entity, ref DateTime lastActionTime)
         {
-            var screenPos = gc.IngameState.Camera.WorldToScreen(entity.BoundsCenterPosNum);
-            var windowRect = gc.Window.GetWindowRectangle();
-            var absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
             if (!BotInput.CanAct) return false;
-            BotInput.Click(absPos);
+            if (!BotInput.ClickEntity(gc, entity)) return false;
             lastActionTime = DateTime.Now;
             return true;
         }

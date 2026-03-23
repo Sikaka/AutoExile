@@ -329,15 +329,8 @@ namespace AutoExile.Mechanics
             }
 
             // Click the monolith entity
-            var cam = gc.IngameState.Camera;
-            var screenPos = cam.WorldToScreen(_monolith.BoundsCenterPosNum);
-            var windowRect = gc.Window.GetWindowRectangleTimeCache;
-
-            if (screenPos.X > 0 && screenPos.X < windowRect.Width &&
-                screenPos.Y > 0 && screenPos.Y < windowRect.Height)
+            if (BotInput.ClickEntity(gc, _monolith))
             {
-                var absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
-                BotInput.Click(absPos);
                 _clickAttempts++;
                 _lastClickTime = DateTime.Now;
                 Status = $"Clicking monolith (attempt {_clickAttempts})";

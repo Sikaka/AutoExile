@@ -1096,16 +1096,23 @@ namespace AutoExile.Systems
             var playerZ = gc.Player.PosNum.Z;
             var screenPos = camera.WorldToScreen(new Vector3(worldTarget.X, worldTarget.Y, playerZ));
             var windowRect = gc.Window.GetWindowRectangle();
+            var center = new Vector2(windowRect.Width / 2f, windowRect.Height / 2f);
 
             Vector2 absPos;
             if (screenPos.X > 0 && screenPos.X < windowRect.Width &&
                 screenPos.Y > 0 && screenPos.Y < windowRect.Height)
             {
+                // Push outward if too close to screen center — same guard as NavigationSystem
+                var dir = screenPos - center;
+                if (dir.Length() < NavigationSystem.MinScreenDist)
+                {
+                    if (dir.Length() < 1f) return;
+                    screenPos = center + Vector2.Normalize(dir) * NavigationSystem.MinScreenDist;
+                }
                 absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
             }
             else
             {
-                var center = new Vector2(windowRect.Width / 2f, windowRect.Height / 2f);
                 var dir = new Vector2(screenPos.X, screenPos.Y) - center;
                 if (dir.Length() < 1f) return;
                 dir = Vector2.Normalize(dir);

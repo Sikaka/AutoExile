@@ -318,7 +318,7 @@ namespace AutoExile.Modes
                 else
                 {
                     // Update destination if curio position changed (e.g., actual curio entity found)
-                    ctx.Navigation.UpdateDestination(gc, curioGridTarget, 30);
+                    ctx.Navigation.UpdateDestination(gc, curioGridTarget, 12);
                     _status = $"Navigating to curio — alert: {_state.AlertPercent:F0}%";
                     Decision = "navigating_to_curio";
                 }

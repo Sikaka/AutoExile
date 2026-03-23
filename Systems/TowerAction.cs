@@ -257,8 +257,7 @@ namespace AutoExile.Systems
             }
 
             var rect = label.Label.GetClientRect();
-            var center = new Vector2(rect.Center.X, rect.Center.Y);
-            if (!ClickRelative(gc, center)) return false;
+            if (!BotInput.ClickLabel(gc, rect)) return false;
 
             _labelClickedAt = DateTime.Now;
             CurrentPhase = Phase.WaitForMenu;
@@ -365,8 +364,7 @@ namespace AutoExile.Systems
             }
 
             var btnRect = button.GetClientRect();
-            var btnCenter = new Vector2(btnRect.Center.X, btnRect.Center.Y);
-            if (!ClickRelative(gc, btnCenter)) return false;
+            if (!BotInput.ClickLabel(gc, btnRect)) return false;
 
             CurrentPhase = Phase.Done;
             if (_type == ActionType.Build)
@@ -657,17 +655,7 @@ namespace AutoExile.Systems
 
         private bool TryClickWorldPosition(GameController gc, Entity targetEntity)
         {
-            var cam = gc.IngameState.Camera;
-            var worldPos = targetEntity.PosNum;
-            var screenPos = cam.WorldToScreen(worldPos);
-
-            // Check if the screen position is within the safe click area
-            var safe = GetSafeRect(gc);
-            if (screenPos.X < safe.Left || screenPos.X > safe.Right ||
-                screenPos.Y < safe.Top || screenPos.Y > safe.Bottom)
-                return false;
-
-            if (!ClickRelative(gc, screenPos)) return false;
+            if (!BotInput.ClickEntity(gc, targetEntity)) return false;
 
             _labelClickedAt = DateTime.Now;
             CurrentPhase = Phase.WaitForMenu;

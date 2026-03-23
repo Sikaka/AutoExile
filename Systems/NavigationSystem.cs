@@ -328,17 +328,29 @@ namespace AutoExile.Systems
             return Vector2.Dot(offset, _blinkDirection);
         }
 
+        /// <summary>Minimum screen distance (pixels) from center for effective move-clicks.</summary>
+        internal const float MinScreenDist = 40f;
+
         private void ExecuteWalk(Vector2 screenPos, SharpDX.RectangleF windowRect)
         {
+            var center = new Vector2(windowRect.Width / 2f, windowRect.Height / 2f);
+
             Vector2 absPos;
             if (screenPos.X > 0 && screenPos.X < windowRect.Width &&
                 screenPos.Y > 0 && screenPos.Y < windowRect.Height)
             {
+                // If target is too close to screen center, push it outward along the same
+                // direction so the click produces meaningful movement in PoE.
+                var dir = screenPos - center;
+                if (dir.Length() < MinScreenDist)
+                {
+                    if (dir.Length() < 1f) return; // target is exactly on player
+                    screenPos = center + Vector2.Normalize(dir) * MinScreenDist;
+                }
                 absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
             }
             else
             {
-                var center = new Vector2(windowRect.Width / 2f, windowRect.Height / 2f);
                 var dir = new Vector2(screenPos.X, screenPos.Y) - center;
                 if (dir.Length() < 1f) return;
                 dir = Vector2.Normalize(dir);
@@ -616,15 +628,8 @@ namespace AutoExile.Systems
             if (bestTarget == null)
                 return false;
 
-            // Convert entity position to screen for clicking (use entity's own world pos for accuracy)
-            var screenPos = gc.IngameState.Camera.WorldToScreen(bestTarget.BoundsCenterPosNum);
-            var windowRect = gc.Window.GetWindowRectangle();
-
-            if (screenPos.X > 0 && screenPos.X < windowRect.Width &&
-                screenPos.Y > 0 && screenPos.Y < windowRect.Height)
+            if (BotInput.ClickEntity(gc, bestTarget))
             {
-                var absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
-                BotInput.Click(absPos);
                 LastRecoveryAction = $"Interact: {bestTarget.Path?.Split('/').LastOrDefault() ?? "?"}";
                 return true;
             }

@@ -275,15 +275,8 @@ namespace AutoExile.Mechanics
             }
 
             // Click the altar entity
-            var cam = gc.IngameState.Camera;
-            var screenPos = cam.WorldToScreen(_altar.BoundsCenterPosNum);
-            var windowRect = gc.Window.GetWindowRectangleTimeCache;
-
-            if (screenPos.X > 0 && screenPos.X < windowRect.Width &&
-                screenPos.Y > 0 && screenPos.Y < windowRect.Height)
+            if (BotInput.ClickEntity(gc, _altar))
             {
-                var absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
-                BotInput.Click(absPos);
                 _clickAttempts++;
                 _lastClickTime = DateTime.Now;
                 Status = $"Clicking altar (attempt {_clickAttempts})";

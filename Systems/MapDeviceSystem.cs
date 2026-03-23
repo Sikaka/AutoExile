@@ -254,14 +254,14 @@ namespace AutoExile.Systems
                 return MapDeviceResult.Failed;
             }
 
-            // Click the device
-            var screenPos = gc.IngameState.Camera.WorldToScreen(device.BoundsCenterPosNum);
-            var windowRect = gc.Window.GetWindowRectangle();
-            var absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
-
-            BotInput.Click(absPos);
+            // Click the device — bounds-based randomization to avoid overlapping entities
+            if (!BotInput.ClickEntity(gc, device))
+            {
+                Status = "[Open] Device off screen or gate blocked";
+                return MapDeviceResult.InProgress;
+            }
             _lastActionTime = DateTime.Now;
-            Status = $"[Open] Clicking device at ({absPos.X:F0},{absPos.Y:F0})";
+            Status = "[Open] Clicking device";
             return MapDeviceResult.InProgress;
         }
 
@@ -481,12 +481,7 @@ namespace AutoExile.Systems
                 return MapDeviceResult.InProgress;
             }
 
-            var rect = activateBtn.GetClientRect();
-            var center = new Vector2(rect.Center.X, rect.Center.Y);
-            var windowRect = gc.Window.GetWindowRectangle();
-            var absPos = new Vector2(windowRect.X + center.X, windowRect.Y + center.Y);
-
-            BotInput.Click(absPos);
+            BotInput.ClickLabel(gc, activateBtn.GetClientRect());
             _lastActionTime = DateTime.Now;
 
             // Stay in Activate phase — next tick will detect atlas closing (lines above)
@@ -553,14 +548,9 @@ namespace AutoExile.Systems
                 return MapDeviceResult.Failed;
             }
 
-            var screenPos = gc.IngameState.Camera.WorldToScreen(portal.BoundsCenterPosNum);
-            var windowRect = gc.Window.GetWindowRectangle();
-
-            // Check if portal is on screen
-            if (screenPos.X < 0 || screenPos.X > windowRect.Width ||
-                screenPos.Y < 0 || screenPos.Y > windowRect.Height)
+            if (!BotInput.GetEntityScreenBounds(gc, portal, out _, out _, out _))
             {
-                // Navigate closer
+                // Off-screen — navigate closer
                 var portalDist = Vector2.Distance(
                     new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y),
                     new Vector2(portal.GridPosNum.X, portal.GridPosNum.Y));
@@ -594,10 +584,9 @@ namespace AutoExile.Systems
                 return MapDeviceResult.InProgress;
             }
 
-            var absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
-            var clicked = BotInput.Click(absPos);
+            var clicked = BotInput.ClickEntity(gc, portal);
             _lastActionTime = DateTime.Now;
-            Status = $"[Enter] Clicking portal at ({absPos.X:F0},{absPos.Y:F0}) sent={clicked}";
+            Status = $"[Enter] Clicking portal sent={clicked}";
             return MapDeviceResult.InProgress;
         }
 

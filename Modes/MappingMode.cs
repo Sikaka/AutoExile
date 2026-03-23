@@ -1688,11 +1688,7 @@ namespace AutoExile.Modes
             if (!BotInput.CanAct) return;
             if ((DateTime.Now - _lastExitClickTime).TotalMilliseconds < 500) return;
 
-            var screenPos = gc.IngameState.Camera.WorldToScreen(_exitPortal.BoundsCenterPosNum);
-            var windowRect = gc.Window.GetWindowRectangleTimeCache;
-            var absPos = new Vector2(screenPos.X + windowRect.X, screenPos.Y + windowRect.Y);
-
-            if (BotInput.Click(absPos))
+            if (BotInput.ClickEntity(gc, _exitPortal))
             {
                 _lastExitClickTime = DateTime.Now;
                 Status = "Exiting — clicked portal";

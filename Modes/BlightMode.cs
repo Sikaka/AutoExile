@@ -325,7 +325,7 @@ namespace AutoExile.Modes
                 _nudgedForPump = true;
                 var playerGrid = gc.Player.GridPosNum;
                 var nudgeTarget = new Vector2(playerGrid.X + 5, playerGrid.Y);
-                ctx.Navigation.NavigateTo(gc, nudgeTarget);
+                ctx.Navigation.MoveToward(gc, nudgeTarget);
                 StatusText = "Nudging to trigger entity loading...";
                 return;
             }

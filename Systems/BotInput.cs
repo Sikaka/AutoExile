@@ -1,5 +1,8 @@
 using System.Numerics;
 using System.Windows.Forms;
+using ExileCore;
+using ExileCore.PoEMemory.Components;
+using ExileCore.PoEMemory.MemoryObjects;
 using Input = ExileCore.Input;
 
 namespace AutoExile.Systems
@@ -80,6 +83,132 @@ namespace AutoExile.Systems
             _actionLog[_actionLogIndex] = new ActionRecord(DateTime.Now, type, position, key, accepted);
             _actionLogIndex = (_actionLogIndex + 1) % _actionLog.Length;
             if (_actionLogCount < _actionLog.Length) _actionLogCount++;
+        }
+
+        // ── Click position randomization ──
+
+        /// <summary>
+        /// Return a center-biased random point within a rectangle.
+        /// Uses triangular distribution (average of two uniforms) so clicks cluster
+        /// near the center but occasionally land toward edges — more human-like and
+        /// helps bypass overlapping entities.
+        /// </summary>
+        /// <param name="centerX">Center X of the clickable area (window-relative).</param>
+        /// <param name="centerY">Center Y of the clickable area (window-relative).</param>
+        /// <param name="halfWidth">Half the width of the clickable area.</param>
+        /// <param name="halfHeight">Half the height of the clickable area.</param>
+        public static Vector2 RandomizeWithinRect(float centerX, float centerY, float halfWidth, float halfHeight)
+        {
+            // Triangular distribution: average of two uniforms → peaks at center, tapers to edges
+            float rx = (float)(_rng.NextDouble() + _rng.NextDouble() - 1.0); // range [-1, 1], centered
+            float ry = (float)(_rng.NextDouble() + _rng.NextDouble() - 1.0);
+            return new Vector2(centerX + rx * halfWidth, centerY + ry * halfHeight);
+        }
+
+        /// <summary>
+        /// Return a center-biased random point within a label/client rect.
+        /// Convenience overload for SharpDX.RectangleF.
+        /// </summary>
+        public static Vector2 RandomizeWithinRect(SharpDX.RectangleF rect)
+        {
+            return RandomizeWithinRect(
+                rect.X + rect.Width / 2f,
+                rect.Y + rect.Height / 2f,
+                rect.Width * 0.4f,  // stay within inner 80% of rect
+                rect.Height * 0.4f);
+        }
+
+        // ── High-level click helpers (entity / label → randomized screen click) ──
+
+        /// <summary>
+        /// Click a world entity with center-biased randomization derived from its actual bounds.
+        /// Projects the entity's Render.BoundsNum to screen space for proper scaling with
+        /// camera zoom and distance. Falls back to a small fixed offset if Render is unavailable.
+        /// </summary>
+        /// <returns>True if the click was sent, false if gate blocked or entity off-screen.</returns>
+        public static bool ClickEntity(GameController gc, Entity entity)
+        {
+            var center = entity.BoundsCenterPosNum;
+            var camera = gc.IngameState.Camera;
+            var screenCenter = camera.WorldToScreen(center);
+            var windowRect = gc.Window.GetWindowRectangle();
+
+            // Off-screen check
+            if (screenCenter.X < 5 || screenCenter.X > windowRect.Width - 5 ||
+                screenCenter.Y < 5 || screenCenter.Y > windowRect.Height - 5)
+                return false;
+
+            // Derive screen-space extents from world-space bounds
+            float halfW = 12f, halfH = 8f; // fallback pixels if no Render component
+            var render = entity.GetComponent<Render>();
+            if (render != null)
+            {
+                var bounds = render.BoundsNum;
+                // Project center + X offset to screen, measure pixel delta for scale
+                var offsetWorld = new Vector3(center.X + bounds.X * 0.4f, center.Y, center.Z);
+                var screenOffset = camera.WorldToScreen(offsetWorld);
+                var dx = Math.Abs(screenOffset.X - screenCenter.X);
+                // Project center + Y offset (world Y maps to screen diagonal in isometric view)
+                var offsetWorldY = new Vector3(center.X, center.Y + bounds.Y * 0.4f, center.Z);
+                var screenOffsetY = camera.WorldToScreen(offsetWorldY);
+                var dy = Math.Abs(screenOffsetY.Y - screenCenter.Y);
+
+                if (dx > 3f) halfW = dx;
+                if (dy > 3f) halfH = dy;
+            }
+
+            var clickPos = RandomizeWithinRect(screenCenter.X, screenCenter.Y, halfW, halfH);
+            var absPos = new Vector2(windowRect.X + clickPos.X, windowRect.Y + clickPos.Y);
+            return Click(absPos);
+        }
+
+        /// <summary>
+        /// Click within a label/UI element rect with center-biased randomization.
+        /// The rect should be in window-relative coordinates (from GetClientRect/ClientRect).
+        /// </summary>
+        /// <returns>True if the click was sent, false if gate blocked.</returns>
+        public static bool ClickLabel(GameController gc, SharpDX.RectangleF rect)
+        {
+            var clickPos = RandomizeWithinRect(rect);
+            var windowRect = gc.Window.GetWindowRectangle();
+            var absPos = new Vector2(windowRect.X + clickPos.X, windowRect.Y + clickPos.Y);
+            return Click(absPos);
+        }
+
+        /// <summary>
+        /// Get screen-space center and half-extents for an entity, derived from Render.BoundsNum.
+        /// Useful when callers need the position for overlap checks before clicking.
+        /// </summary>
+        /// <returns>True if entity is on-screen; outputs screen center and half-extents.</returns>
+        public static bool GetEntityScreenBounds(GameController gc, Entity entity,
+            out Vector2 screenCenter, out float halfW, out float halfH)
+        {
+            var center = entity.BoundsCenterPosNum;
+            var camera = gc.IngameState.Camera;
+            screenCenter = camera.WorldToScreen(center);
+            halfW = 12f;
+            halfH = 8f;
+
+            var windowRect = gc.Window.GetWindowRectangle();
+            if (screenCenter.X < 5 || screenCenter.X > windowRect.Width - 5 ||
+                screenCenter.Y < 5 || screenCenter.Y > windowRect.Height - 5)
+                return false;
+
+            var render = entity.GetComponent<Render>();
+            if (render != null)
+            {
+                var bounds = render.BoundsNum;
+                var offsetWorld = new Vector3(center.X + bounds.X * 0.4f, center.Y, center.Z);
+                var screenOffset = camera.WorldToScreen(offsetWorld);
+                var dx = Math.Abs(screenOffset.X - screenCenter.X);
+                var offsetWorldY = new Vector3(center.X, center.Y + bounds.Y * 0.4f, center.Z);
+                var screenOffsetY = camera.WorldToScreen(offsetWorldY);
+                var dy = Math.Abs(screenOffsetY.Y - screenCenter.Y);
+                if (dx > 3f) halfW = dx;
+                if (dy > 3f) halfH = dy;
+            }
+
+            return true;
         }
 
         /// <summary>Minimum ms between actions (end of one action to start of next). Configurable.</summary>

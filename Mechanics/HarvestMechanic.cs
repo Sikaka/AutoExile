@@ -310,14 +310,8 @@ namespace AutoExile.Mechanics
             {
                 if (_entrancePortal != null && _entrancePortal.IsTargetable)
                 {
-                    var cam = gc.IngameState.Camera;
-                    var screenPos = cam.WorldToScreen(_entrancePortal.BoundsCenterPosNum);
-                    var windowRect = gc.Window.GetWindowRectangleTimeCache;
-                    if (screenPos.X > 0 && screenPos.X < windowRect.Width &&
-                        screenPos.Y > 0 && screenPos.Y < windowRect.Height)
+                    if (BotInput.ClickEntity(gc, _entrancePortal))
                     {
-                        var absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
-                        BotInput.Click(absPos);
                         _lastActionTime = DateTime.Now;
                         Status = "Clicked entrance portal...";
                         ctx.Log("[Harvest] Clicked entrance portal");
@@ -1073,14 +1067,8 @@ namespace AutoExile.Mechanics
             {
                 if (_returnPortal != null && _returnPortal.IsTargetable)
                 {
-                    var cam = gc.IngameState.Camera;
-                    var screenPos = cam.WorldToScreen(_returnPortal.BoundsCenterPosNum);
-                    var windowRect = gc.Window.GetWindowRectangleTimeCache;
-                    if (screenPos.X > 0 && screenPos.X < windowRect.Width &&
-                        screenPos.Y > 0 && screenPos.Y < windowRect.Height)
+                    if (BotInput.ClickEntity(gc, _returnPortal))
                     {
-                        var absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
-                        BotInput.Click(absPos);
                         _lastActionTime = DateTime.Now;
                         Status = "Clicked return portal...";
                     }

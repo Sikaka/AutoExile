@@ -393,11 +393,7 @@ namespace AutoExile.Mechanics
 
             if (!CanClick()) return MechanicResult.InProgress;
 
-            var screenPos = gc.IngameState.Camera.WorldToScreen(_npc.BoundsCenterPosNum);
-            var windowRect = gc.Window.GetWindowRectangleTimeCache;
-            var absPos = new Vector2(screenPos.X + windowRect.X, screenPos.Y + windowRect.Y);
-
-            if (BotInput.Click(absPos))
+            if (BotInput.ClickEntity(gc, _npc))
             {
                 _lastClickTime = DateTime.Now;
                 _npcClickAttempts++;
@@ -640,11 +636,7 @@ namespace AutoExile.Mechanics
                 return MechanicResult.InProgress;
             }
 
-            var screenPos = gc.IngameState.Camera.WorldToScreen(_portal.BoundsCenterPosNum);
-            var windowRect = gc.Window.GetWindowRectangleTimeCache;
-            var absPos = new Vector2(screenPos.X + windowRect.X, screenPos.Y + windowRect.Y);
-
-            if (BotInput.Click(absPos))
+            if (BotInput.ClickEntity(gc, _portal))
             {
                 _lastClickTime = DateTime.Now;
                 _portalClickAttempts++;

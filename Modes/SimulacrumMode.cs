@@ -686,8 +686,13 @@ namespace AutoExile.Modes
                 {
                     _wasSearching = true;
                     var monsterDist = Vector2.Distance(playerPos, nearestPos.Value);
-                    if (monsterDist > 20f && !ctx.Navigation.IsNavigating)
-                        ctx.Navigation.NavigateTo(gc, nearestPos.Value);
+                    if (monsterDist > 20f)
+                    {
+                        if (ctx.Navigation.IsNavigating)
+                            ctx.Navigation.UpdateDestination(gc, nearestPos.Value, driftThreshold: 15f);
+                        else
+                            ctx.Navigation.NavigateTo(gc, nearestPos.Value);
+                    }
                     StatusText = $"Wave {_state.CurrentWave}/15 — chasing nearest monster (dist: {monsterDist:F0}, {ctx.Combat.CachedMonsterCount} alive, {_blacklistedMonsters.Count} blacklisted)";
                     return;
                 }
@@ -880,24 +885,16 @@ namespace AutoExile.Modes
                 return;
             }
 
-            // Try 2: Click via WorldToScreen with bounds check
-            var screenPos = gc.IngameState.Camera.WorldToScreen(monolith.BoundsCenterPosNum);
-            var windowRect = gc.Window.GetWindowRectangle();
-
-            // Screen bounds check
-            if (screenPos.X < 10 || screenPos.X > windowRect.Width - 10 ||
-                screenPos.Y < 10 || screenPos.Y > windowRect.Height - 10)
-            {
-                StatusText = $"Monolith off screen — waiting";
-                return;
-            }
-
-            var absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
-            if (BotInput.Click(absPos))
+            // Try 2: Click entity directly using bounds-based randomization
+            if (BotInput.ClickEntity(gc, monolith))
             {
                 _lastActionTime = DateTime.Now;
                 _waveStartAttempts++;
                 StatusText = $"Clicking monolith to start wave {_state.CurrentWave + 1} (attempt {_waveStartAttempts})";
+            }
+            else
+            {
+                StatusText = $"Monolith off screen or gate blocked — waiting";
             }
         }
 
@@ -917,14 +914,7 @@ namespace AutoExile.Modes
                     if (label.Entity?.Id != monolith.Id) continue;
                     if (label.Label == null || !label.Label.IsVisible) continue;
 
-                    var labelRect = label.ClientRect;
-                    var clickPos = new Vector2(
-                        labelRect.X + labelRect.Width / 2f,
-                        labelRect.Y + labelRect.Height / 2f);
-                    var windowRect = gc.Window.GetWindowRectangle();
-                    var absPos = new Vector2(windowRect.X + clickPos.X, windowRect.Y + clickPos.Y);
-
-                    if (BotInput.Click(absPos))
+                    if (BotInput.ClickLabel(gc, label.ClientRect))
                     {
                         _lastActionTime = DateTime.Now;
                         return true;

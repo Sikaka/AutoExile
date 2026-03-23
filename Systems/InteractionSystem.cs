@@ -308,9 +308,7 @@ namespace AutoExile.Systems
             }
 
             var labelRect = labelDesc.ClientRect;
-            var clickPos = new Vector2(
-                labelRect.X + labelRect.Width / 2f,
-                labelRect.Y + labelRect.Height / 2f);
+            var clickPos = BotInput.RandomizeWithinRect(labelRect);
 
             var windowRect = gc.Window.GetWindowRectangle();
 
@@ -357,11 +355,7 @@ namespace AutoExile.Systems
                 return InteractionResult.Failed;
             }
 
-            var screenPos = gc.IngameState.Camera.WorldToScreen(entity.BoundsCenterPosNum);
-            var windowRect = gc.Window.GetWindowRectangle();
-
-            if (screenPos.X < 0 || screenPos.X > windowRect.Width ||
-                screenPos.Y < 0 || screenPos.Y > windowRect.Height)
+            if (!BotInput.GetEntityScreenBounds(gc, entity, out var screenCenter, out var halfW, out var halfH))
             {
                 // Off-screen — go back to navigating if we can
                 if (target.RequireProximity && target.Nav != null)
@@ -373,6 +367,11 @@ namespace AutoExile.Systems
                 Status = "Entity not on screen";
                 return InteractionResult.InProgress;
             }
+
+            var windowRect = gc.Window.GetWindowRectangle();
+
+            // Randomize click within entity's bounds-derived screen footprint
+            var screenPos = BotInput.RandomizeWithinRect(screenCenter.X, screenCenter.Y, halfW, halfH);
 
             // Check if a ground item label is covering our click target
             if (IsGroundLabelOverlapping(gc, screenPos))

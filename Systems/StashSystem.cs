@@ -183,11 +183,11 @@ namespace AutoExile.Systems
                 return StashResult.Failed;
             }
 
-            var screenPos = gc.IngameState.Camera.WorldToScreen(stash.BoundsCenterPosNum);
-            var windowRect = gc.Window.GetWindowRectangle();
-            var absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
-
-            BotInput.Click(absPos);
+            if (!BotInput.ClickEntity(gc, stash))
+            {
+                Status = "Stash off screen or gate blocked";
+                return StashResult.InProgress;
+            }
             _lastActionTime = DateTime.Now;
             Status = "Clicking stash";
             return StashResult.InProgress;
