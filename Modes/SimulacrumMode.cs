@@ -442,6 +442,8 @@ namespace AutoExile.Modes
                 Decision = "Wave timeout → LootSweep";
                 _phase = SimPhase.LootSweep;
                 _phaseStartTime = DateTime.Now;
+                _sweepNearMonolith = false;
+                _lastEmptyScanAt = DateTime.MinValue;
                 StatusText = $"Wave {_state.CurrentWave} timed out — sweeping loot before exit";
                 return;
             }
@@ -610,6 +612,8 @@ namespace AutoExile.Modes
                 Decision = "Wave 15 complete → LootSweep";
                 _phase = SimPhase.LootSweep;
                 _phaseStartTime = DateTime.Now;
+                _sweepNearMonolith = false;
+                _lastEmptyScanAt = DateTime.MinValue;
                 StatusText = "Wave 15 complete — sweeping loot";
                 return;
             }
@@ -631,6 +635,8 @@ namespace AutoExile.Modes
                 Decision = "Between-wave timeout → LootSweep";
                 _phase = SimPhase.LootSweep;
                 _phaseStartTime = DateTime.Now;
+                _sweepNearMonolith = false;
+                _lastEmptyScanAt = DateTime.MinValue;
                 StatusText = $"Stuck between waves for {BetweenWaveTimeoutSeconds}s — exiting";
                 return;
             }
@@ -640,6 +646,8 @@ namespace AutoExile.Modes
                 Decision = $"Failed to start wave after {MaxWaveStartAttempts} attempts → LootSweep";
                 _phase = SimPhase.LootSweep;
                 _phaseStartTime = DateTime.Now;
+                _sweepNearMonolith = false;
+                _lastEmptyScanAt = DateTime.MinValue;
                 StatusText = $"Can't start wave {_state.CurrentWave + 1} — exiting after {MaxWaveStartAttempts} failed attempts";
                 return;
             }
@@ -1015,8 +1023,10 @@ namespace AutoExile.Modes
         // =================================================================
 
         private DateTime _lastEmptyScanAt = DateTime.MinValue;
+        private bool _sweepNearMonolith; // true once we've confirmed proximity to monolith
         private const float EmptyGraceSeconds = 5f;
         private const float LootSweepTimeoutSeconds = 60f;
+        private const float SweepMonolithProximity = 25f; // grid distance to be "near" monolith for loot
 
         private void TickLootSweep(BotContext ctx, InteractionResult interactionResult)
         {
@@ -1033,7 +1043,32 @@ namespace AutoExile.Modes
 
             var gc = ctx.Game;
 
-            // Stash remaining items before exiting
+            // Step 1: Navigate to monolith before scanning for loot.
+            // Wave 15 rewards drop at the monolith — items won't appear in VisibleGroundItemLabels
+            // unless the player is close enough. Grace timer must NOT start until we're in position.
+            if (!_sweepNearMonolith && _state.MonolithPosition.HasValue)
+            {
+                var playerPos = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
+                var distToMonolith = Vector2.Distance(playerPos, _state.MonolithPosition.Value);
+
+                if (distToMonolith > SweepMonolithProximity)
+                {
+                    if (!ctx.Navigation.IsNavigating)
+                        ctx.Navigation.NavigateTo(gc, _state.MonolithPosition.Value);
+                    StatusText = $"Sweep: returning to monolith for drops (dist: {distToMonolith:F0})";
+                    // Reset grace timer — don't count travel time as empty scan time
+                    _lastEmptyScanAt = DateTime.MinValue;
+                    return;
+                }
+
+                // Arrived near monolith — stop navigation, begin scanning
+                if (ctx.Navigation.IsNavigating)
+                    ctx.Navigation.Stop(gc);
+                _sweepNearMonolith = true;
+                _lastEmptyScanAt = DateTime.MinValue; // ensure grace starts fresh from arrival
+            }
+
+            // Step 2: Stash remaining items before exiting
             if (_state.StashPosition.HasValue)
             {
                 var invCount = (StashSystem.GetInventorySlotItems(gc)?.Count ?? 0);
@@ -1063,7 +1098,8 @@ namespace AutoExile.Modes
                     var stashResult = ctx.Stash.Tick(gc, ctx.Navigation);
                     if (stashResult == StashResult.Succeeded || stashResult == StashResult.Failed)
                     {
-                        // Continue sweeping after stash
+                        // After stashing, need to return to monolith for remaining drops
+                        _sweepNearMonolith = false;
                     }
                     else
                     {
@@ -1073,7 +1109,7 @@ namespace AutoExile.Modes
                 }
             }
 
-            // Scan and pick up loot
+            // Step 3: Scan and pick up loot
             ctx.Loot.Scan(gc);
             var best = ctx.Loot.GetBestCandidate();
             if (best != null)
@@ -1087,7 +1123,8 @@ namespace AutoExile.Modes
                 return;
             }
 
-            // Grace period — wait a bit before declaring done
+            // Step 4: Grace period — wait near monolith for items to finish dropping.
+            // Timer only starts once near monolith AND scan finds nothing.
             if (_lastEmptyScanAt == DateTime.MinValue)
                 _lastEmptyScanAt = DateTime.Now;
 
@@ -1098,7 +1135,7 @@ namespace AutoExile.Modes
                 return;
             }
 
-            StatusText = $"Sweep: searching for loot... ({_lootTracker.PickupCount} picked)";
+            StatusText = $"Sweep: waiting for drops near monolith... ({_lootTracker.PickupCount} picked)";
         }
 
         // =================================================================
