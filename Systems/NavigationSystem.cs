@@ -268,6 +268,36 @@ namespace AutoExile.Systems
             {
                 var screenPos = GridToScreen(gc, waypoint.Position);
 
+                // If waypoint is too close on screen, the character barely moves (clicks near itself).
+                // Skip ahead to the next waypoint, or aim at the destination if this is the last one.
+                var screenCenter = new Vector2(windowRect.Width / 2f, windowRect.Height / 2f);
+                var screenDist = Vector2.Distance(screenPos, screenCenter);
+                const float MinScreenDist = 40f; // pixels — below this, PoE move-clicks produce negligible movement
+
+                if (screenDist < MinScreenDist)
+                {
+                    // Try to find a further waypoint to aim at
+                    Vector2? aimPos = null;
+                    for (int i = CurrentWaypointIndex + 1; i < CurrentNavPath.Count; i++)
+                    {
+                        if (CurrentNavPath[i].Action == WaypointAction.Blink)
+                            break; // don't skip past blink waypoints
+                        var candidateScreen = GridToScreen(gc, CurrentNavPath[i].Position);
+                        if (Vector2.Distance(candidateScreen, screenCenter) >= MinScreenDist)
+                        {
+                            aimPos = candidateScreen;
+                            break;
+                        }
+                    }
+
+                    if (aimPos.HasValue)
+                        screenPos = aimPos.Value;
+                    else if (Destination.HasValue)
+                        screenPos = GridToScreen(gc, Destination.Value);
+                    else
+                        return; // everything is too close, skip this tick
+                }
+
                 // Try dash-for-speed on long straight segments
                 if (!TryDashForSpeed(gc, playerGrid, windowRect))
                     ExecuteWalk(screenPos, windowRect);

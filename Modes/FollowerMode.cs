@@ -43,6 +43,13 @@ namespace AutoExile.Modes
         private bool _hasLastLeaderPos;
         private string _lastAreaName = "";
 
+        // Leader velocity tracking — smoothed over several ticks for prediction
+        private Vector2 _leaderVelocity; // grid units per second
+        private DateTime _lastLeaderSampleTime = DateTime.MinValue;
+        private const float VelocitySmoothing = 0.3f; // EMA alpha (0-1, higher = more responsive)
+        private const float VelocityLeadTimeSec = 0.4f; // how far ahead to aim (seconds)
+        private const float VelocityMinMagnitude = 2f; // ignore velocity below this (grid/sec)
+
         // LOS→pathfind hysteresis — once we switch to pathfinding, stay on the path
         // briefly before re-checking LOS to avoid flicker near terrain corners
         private DateTime _lastPathStartTime = DateTime.MinValue;
@@ -76,6 +83,8 @@ namespace AutoExile.Modes
         {
             _state = FollowerState.SearchingForLeader;
             _hasLastLeaderPos = false;
+            _leaderVelocity = Vector2.Zero;
+            _lastLeaderSampleTime = DateTime.MinValue;
             _transitionGridPos = null;
             _transitionEntityId = 0;
             _lastAreaName = "";
@@ -250,6 +259,8 @@ namespace AutoExile.Modes
 
             _state = FollowerState.SearchingForLeader;
             _hasLastLeaderPos = false;
+            _leaderVelocity = Vector2.Zero;
+            _lastLeaderSampleTime = DateTime.MinValue;
             _transitionGridPos = null;
             _transitionEntityId = 0;
             _consecutivePathFailures = 0;
@@ -278,8 +289,19 @@ namespace AutoExile.Modes
                 }
             }
 
+            // Update leader velocity (EMA-smoothed, grid units per second)
+            if (_hasLastLeaderPos && _lastLeaderSampleTime != DateTime.MinValue)
+            {
+                var dt = (float)(DateTime.Now - _lastLeaderSampleTime).TotalSeconds;
+                if (dt > 0.001f && dt < 2f) // ignore huge gaps (zone transition, pause)
+                {
+                    var instantVelocity = (leaderGridPos - _lastLeaderPos) / dt;
+                    _leaderVelocity = Vector2.Lerp(_leaderVelocity, instantVelocity, VelocitySmoothing);
+                }
+            }
             _lastLeaderPos = leaderGridPos;
             _hasLastLeaderPos = true;
+            _lastLeaderSampleTime = DateTime.Now;
 
             // In hideout: don't follow the leader around — just idle and track position.
             // The only meaningful actions (portal/teleport) happen in HandleLeaderMissing.
@@ -316,13 +338,22 @@ namespace AutoExile.Modes
                 }
             }
 
-            // Normal following
+            // Normal following — apply velocity prediction to aim ahead of leader
             var dist = Vector2.Distance(playerGridPos, leaderGridPos);
+            var followTarget = leaderGridPos;
+            if (_leaderVelocity.Length() > VelocityMinMagnitude)
+                followTarget = leaderGridPos + _leaderVelocity * VelocityLeadTimeSec;
 
-            if (dist > FollowDistance)
+            // Preemptive dead zone: if leader is moving away, start following before FollowDistance.
+            // This eliminates the lag when leader finishes stashing/standing and walks off.
+            var leaderMovingAway = Vector2.Dot(_leaderVelocity, leaderGridPos - playerGridPos) > 0;
+            var shouldFollow = dist > FollowDistance
+                || (dist > StopDistance + 4f && leaderMovingAway && _leaderVelocity.Length() > VelocityMinMagnitude);
+
+            if (shouldFollow)
             {
-                // Check walkable LOS to leader
-                var hasLOS = ctx.Navigation.HasWalkableLOS(gc, playerGridPos, leaderGridPos);
+                // Check walkable LOS to follow target
+                var hasLOS = ctx.Navigation.HasWalkableLOS(gc, playerGridPos, followTarget);
 
                 // Hysteresis: if we recently started a path, don't switch back to LOS movement
                 // too quickly — prevents flicker near terrain corners
@@ -332,7 +363,7 @@ namespace AutoExile.Modes
                 if (hasLOS && !preferPath)
                 {
                     // LOS clear — direct movement, no pathfinding
-                    ctx.Navigation.MoveToward(gc, leaderGridPos);
+                    ctx.Navigation.MoveToward(gc, followTarget);
                     _consecutivePathFailures = 0;
                     _state = FollowerState.Following;
                     _status = $"Following {LeaderName} (LOS, dist: {dist:F0})";
@@ -341,17 +372,28 @@ namespace AutoExile.Modes
                 else if (ctx.Navigation.IsNavigating)
                 {
                     // No LOS (or hysteresis active) but already have a path — graft destination
-                    ctx.Navigation.UpdateDestination(gc, leaderGridPos,
-                        driftThreshold: FollowDistance);
+                    ctx.Navigation.UpdateDestination(gc, followTarget,
+                        driftThreshold: 10f);
                     _consecutivePathFailures = 0;
                     _state = FollowerState.Following;
                     _status = $"Following {LeaderName} (path, dist: {dist:F0})";
                     _decision = "following_path_update";
                 }
+                else if (!hasLOS && dist < FollowDistance * 1.5f)
+                {
+                    // Short distance but no LOS (e.g., stash/obstacle between us and leader).
+                    // Use MoveToward in the leader's direction — game-engine pathing handles
+                    // small obstacle avoidance better than A* for trivial distances.
+                    ctx.Navigation.MoveToward(gc, followTarget);
+                    _consecutivePathFailures = 0;
+                    _state = FollowerState.Following;
+                    _status = $"Following {LeaderName} (direct, dist: {dist:F0})";
+                    _decision = "following_direct_short";
+                }
                 else
                 {
-                    // No LOS, no active path — start fresh pathfinding
-                    if (ctx.Navigation.NavigateTo(gc, leaderGridPos))
+                    // No LOS, no active path, longer distance — start fresh pathfinding
+                    if (ctx.Navigation.NavigateTo(gc, followTarget))
                     {
                         _lastPathStartTime = DateTime.Now;
                         _consecutivePathFailures = 0;
@@ -388,8 +430,8 @@ namespace AutoExile.Modes
             }
             else
             {
-                // In the follow/stop gap — keep current navigation but don't start new.
-                // If no active path, keep direct-moving toward leader when LOS is clear.
+                // In the follow/stop gap, leader not actively moving away.
+                // Keep current navigation but don't start new.
                 if (!ctx.Navigation.IsNavigating)
                 {
                     if (ctx.Navigation.HasWalkableLOS(gc, playerGridPos, leaderGridPos))
