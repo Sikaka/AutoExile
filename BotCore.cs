@@ -97,6 +97,10 @@ namespace AutoExile
         // Map list population (deferred to first tick when Files are available)
         private bool _mapListPopulated;
 
+        // Periodic config save — persists ImGui changes that would otherwise be lost on reload
+        private DateTime _lastConfigSave = DateTime.Now;
+        private const double ConfigSaveIntervalSec = 30.0;
+
         // --- Buff scanner ---
         private bool _buffScanActive;
         private int _buffScanSlotIndex = -1; // which skill slot (0-based) we're scanning for
@@ -226,6 +230,15 @@ namespace AutoExile
             // Runs before all early returns so the dashboard stays live even when
             // POE is unfocused or an async action is in flight.
             TickWebServer();
+
+            // Periodic config save — persists ImGui setting changes to config.json
+            // so they survive plugin reloads (web UI changes save immediately, but
+            // ImGui changes only live in memory without this).
+            if ((DateTime.Now - _lastConfigSave).TotalSeconds >= ConfigSaveIntervalSec)
+            {
+                _lastConfigSave = DateTime.Now;
+                _configManager?.Save(Settings);
+            }
 
             // Don't do anything when POE isn't the active window
             if (!GameController.IsForeGroundCache)

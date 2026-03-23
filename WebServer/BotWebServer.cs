@@ -82,25 +82,64 @@ namespace AutoExile.WebServer
             {
                 _cts = new CancellationTokenSource();
                 _listener = new HttpListener();
+
+                // Always bind localhost — works without admin/netsh
+                _listener.Prefixes.Add($"http://localhost:{_port}/");
+                _listener.Prefixes.Add($"http://127.0.0.1:{_port}/");
+
+                // Optionally bind all interfaces for LAN access
                 if (_networkAccess)
                 {
-                    _listener.Prefixes.Add($"http://+:{_port}/");
+                    try
+                    {
+                        // http://+:port/ requires admin or netsh URL reservation
+                        _listener.Prefixes.Add($"http://+:{_port}/");
+                    }
+                    catch (Exception ex)
+                    {
+                        _log($"Network access binding failed (need admin or netsh urlacl): {ex.Message}");
+                        _log("Web server will still work on localhost.");
+                    }
                 }
-                else
-                {
-                    _listener.Prefixes.Add($"http://localhost:{_port}/");
-                    _listener.Prefixes.Add($"http://127.0.0.1:{_port}/");
-                }
+
                 _listener.Start();
 
                 _listenTask = Task.Run(() => ListenLoop(_cts.Token));
                 _broadcastTask = Task.Run(() => BroadcastLoop(_cts.Token));
-                _log($"Web server started at {Url}");
+
+                if (_networkAccess)
+                    _log($"Web server started at {Url} (network access enabled)");
+                else
+                    _log($"Web server started at {Url}");
             }
             catch (Exception ex)
             {
-                _log($"Web server failed to start: {ex.Message}");
-                _listener = null;
+                // If even localhost binding fails (port in use, etc.), try without the + prefix
+                if (_networkAccess && _listener != null)
+                {
+                    try
+                    {
+                        _listener.Close();
+                        _listener = new HttpListener();
+                        _listener.Prefixes.Add($"http://localhost:{_port}/");
+                        _listener.Prefixes.Add($"http://127.0.0.1:{_port}/");
+                        _listener.Start();
+
+                        _listenTask = Task.Run(() => ListenLoop(_cts.Token));
+                        _broadcastTask = Task.Run(() => BroadcastLoop(_cts.Token));
+                        _log($"Network access failed ({ex.Message}), web server running on localhost only.");
+                    }
+                    catch (Exception ex2)
+                    {
+                        _log($"Web server failed to start: {ex2.Message}");
+                        _listener = null;
+                    }
+                }
+                else
+                {
+                    _log($"Web server failed to start: {ex.Message}");
+                    _listener = null;
+                }
             }
         }
 
