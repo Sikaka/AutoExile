@@ -355,44 +355,23 @@ namespace AutoExile.Systems
                 return InteractionResult.Failed;
             }
 
-            if (!BotInput.GetEntityScreenBounds(gc, entity, out var screenCenter, out var halfW, out var halfH))
+            // Use hover-verified click: moves cursor to random position within entity bounds,
+            // waits for settle, checks Targetable.isTargeted before clicking. Retries at different
+            // positions if something else is on top (player, ground label, etc.).
+            var sent = BotInput.ClickEntity(gc, entity);
+            if (!sent)
             {
-                // Off-screen — go back to navigating if we can
+                // Off-screen or gate blocked — go back to navigating if we can
                 if (target.RequireProximity && target.Nav != null)
                 {
                     target.Phase = InteractionPhase.Navigating;
                     Status = "Entity off screen — moving closer";
                     return InteractionResult.InProgress;
                 }
-                Status = "Entity not on screen";
+                Status = "Entity not on screen (or gate blocked)";
                 return InteractionResult.InProgress;
             }
 
-            var windowRect = gc.Window.GetWindowRectangle();
-
-            // Randomize click within entity's bounds-derived screen footprint
-            var screenPos = BotInput.RandomizeWithinRect(screenCenter.X, screenCenter.Y, halfW, halfH);
-
-            // Check if a ground item label is covering our click target
-            if (IsGroundLabelOverlapping(gc, screenPos))
-            {
-                var offsetPos = FindClearClickPosition(gc, entity, screenPos);
-                if (offsetPos == null)
-                {
-                    Status = "Blocked by item label — waiting";
-                    return InteractionResult.InProgress;
-                }
-                screenPos = offsetPos.Value;
-            }
-
-            if (IsBlockedByUI(gc, screenPos))
-            {
-                Status = "Blocked by UI panel";
-                return InteractionResult.InProgress;
-            }
-
-            var absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
-            BotInput.Click(absPos);
             _lastClickTime = DateTime.Now;
             _clickAttempts++;
             Status = $"Clicking entity (attempt {_clickAttempts})";

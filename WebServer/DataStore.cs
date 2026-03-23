@@ -169,24 +169,14 @@ namespace AutoExile.WebServer
             try
             {
                 var json = JsonSerializer.Serialize(record, JsonOpts);
-                Task.Run(() =>
+                lock (_writeLock)
                 {
-                    try
-                    {
-                        lock (_writeLock)
-                        {
-                            File.AppendAllText(filePath, json + "\n");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _log($"DataStore write error: {ex.Message}");
-                    }
-                });
+                    File.AppendAllText(filePath, json + "\n");
+                }
             }
             catch (Exception ex)
             {
-                _log($"DataStore serialize error: {ex.Message}");
+                _log($"DataStore write error: {ex.Message}");
             }
         }
 
@@ -197,7 +187,8 @@ namespace AutoExile.WebServer
 
             try
             {
-                foreach (var line in File.ReadLines(filePath))
+                var lines = File.ReadAllLines(filePath);
+                foreach (var line in lines)
                 {
                     if (string.IsNullOrWhiteSpace(line)) continue;
                     try

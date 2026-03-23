@@ -444,23 +444,28 @@ namespace AutoExile.Systems
             return null;
         }
 
-        // Fixed window-relative equipment slot positions (same as AutoPOE).
-        // These are for 2560x1440. TODO: scale by resolution if needed.
         /// <summary>
-        /// Equipment slots that support incubators (same set as before — excludes weapon swap).
+        /// Maps InventorySlotE to the child index within InventoryPanel[3] (equipment container).
+        /// These are the slots that support incubators — excludes weapon swap (Weapon2/Offhand2).
         /// </summary>
-        private static readonly HashSet<InventorySlotE> IncubatorSlots = new()
+        private static readonly Dictionary<InventorySlotE, int> SlotToUiIndex = new()
         {
-            InventorySlotE.Helm1, InventorySlotE.BodyArmour1,
-            InventorySlotE.Weapon1, InventorySlotE.Offhand1,
-            InventorySlotE.Amulet1, InventorySlotE.Ring1, InventorySlotE.Ring2,
-            InventorySlotE.Gloves1, InventorySlotE.Boots1, InventorySlotE.Belt1,
+            { InventorySlotE.Helm1, 16 },
+            { InventorySlotE.Amulet1, 17 },
+            { InventorySlotE.Offhand1, 19 },
+            { InventorySlotE.Weapon1, 20 },
+            { InventorySlotE.BodyArmour1, 23 },
+            { InventorySlotE.Ring1, 24 },
+            { InventorySlotE.Ring2, 25 },
+            { InventorySlotE.Gloves1, 27 },
+            { InventorySlotE.Belt1, 28 },
+            { InventorySlotE.Boots1, 29 },
         };
 
         /// <summary>
         /// Find an equipped item that doesn't have an incubator applied.
-        /// Uses ServerData to identify which slots need incubators, then finds the
-        /// matching entity in the InventoryPanel UI tree to get a resolution-independent click position.
+        /// Uses ServerData to identify which slots need incubators, then looks up the
+        /// corresponding UI element by index to get a resolution-independent click position.
         /// </summary>
         private Vector2? FindEquipmentSlotToApply(GameController gc)
         {
@@ -469,12 +474,15 @@ namespace AutoExile.Systems
                 var inventories = gc.IngameState.ServerData?.PlayerInventories;
                 if (inventories == null) return null;
 
-                // Collect entity IDs that need an incubator from the slots we support
-                var needsIncubator = new HashSet<uint>();
+                var equipContainer = gc.IngameState.IngameUi.InventoryPanel?.GetChildAtIndex(3);
+                if (equipContainer == null) return null;
+
+                var windowRect = gc.Window.GetWindowRectangle();
+
                 foreach (var invHolder in inventories)
                 {
                     var inv = invHolder.Inventory;
-                    if (inv == null || !IncubatorSlots.Contains(inv.InventSlot)) continue;
+                    if (inv == null || !SlotToUiIndex.TryGetValue(inv.InventSlot, out var uiIndex)) continue;
                     if (inv.Items.Count != 1) continue;
 
                     var equippedItem = inv.Items.FirstOrDefault();
@@ -486,24 +494,10 @@ namespace AutoExile.Systems
                             continue; // already has incubator
                     }
 
-                    needsIncubator.Add(equippedItem.Id);
-                }
-
-                if (needsIncubator.Count == 0) return null;
-
-                // Find matching entity in the equipment UI tree to get screen position
-                var equipContainer = gc.IngameState.IngameUi.InventoryPanel?.GetChildAtIndex(3);
-                if (equipContainer == null) return null;
-
-                var windowRect = gc.Window.GetWindowRectangle();
-
-                for (int i = 0; i < equipContainer.ChildCount; i++)
-                {
-                    var slot = equipContainer.GetChildAtIndex(i);
-                    if (slot == null || !slot.IsVisible || slot.ChildCount < 2) continue;
-
-                    var entity = slot.GetChildAtIndex(1)?.Entity;
-                    if (entity == null || !needsIncubator.Contains(entity.Id)) continue;
+                    // Look up the UI element directly by index
+                    if (uiIndex >= equipContainer.ChildCount) continue;
+                    var slot = equipContainer.GetChildAtIndex(uiIndex);
+                    if (slot == null) continue;
 
                     var rect = slot.GetClientRect();
                     var center = new Vector2(rect.X + rect.Width / 2, rect.Y + rect.Height / 2);
