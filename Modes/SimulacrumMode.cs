@@ -266,13 +266,26 @@ namespace AutoExile.Modes
             }
             else
             {
-                // Entered map
+                // Entered map — always reset exploration for simulacrum.
+                // Simulacrum maps are small and fixed-shape, and new instances of the same map
+                // share the area name + hash, so cached exploration state from a previous run
+                // would make the bot think the map is already fully explored.
                 var deathCount = _state.DeathCount;
                 _state.OnAreaChanged();
                 _state.DeathCount = deathCount;
                 _phase = SimPhase.FindMonolith;
                 _phaseStartTime = DateTime.Now;
-    
+
+                // Force-reinitialize exploration for this new instance
+                var pfGrid = gc.IngameState?.Data?.RawPathfindingData;
+                var tgtGrid = gc.IngameState?.Data?.RawTerrainTargetingData;
+                if (pfGrid != null && gc.Player != null)
+                {
+                    var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
+                    ctx.Exploration.Initialize(pfGrid, tgtGrid, playerGrid,
+                        ctx.Settings.Build.BlinkRange.Value);
+                }
+
                 _lootTracker.ResetCount();
                 StatusText = "Entered map — finding monolith";
             }
@@ -303,27 +316,36 @@ namespace AutoExile.Modes
             }
 
             // Explore the map until the monolith entity enters the network bubble.
-            // Previous approach used hardcoded map center coordinates, but these are
-            // fragile (can land on unwalkable terrain, wrong for map variants).
             if (ctx.Exploration.IsInitialized)
             {
                 ctx.Exploration.Update(gc.Player.GridPosNum);
                 var playerPos = gc.Player.GridPosNum;
+
+                // If exploration is exhausted (100% seen) but monolith not found,
+                // reset seen state so we re-sweep the map. Simulacrum maps are small
+                // and the monolith is always present — we just need to walk past it.
+                if (ctx.Exploration.ActiveBlobCoverage >= 0.99f)
+                {
+                    ctx.Exploration.ResetSeen();
+                    ctx.Exploration.Update(gc.Player.GridPosNum);
+                }
 
                 if (!ctx.Navigation.IsNavigating)
                 {
                     var target = ctx.Exploration.GetNextExplorationTarget(playerPos);
                     if (target.HasValue)
                     {
-                        ctx.Navigation.NavigateTo(gc,
-                            target.Value);
+                        ctx.Navigation.NavigateTo(gc, target.Value);
                     }
                 }
             }
 
             StatusText = "Exploring to find monolith...";
 
-            if (elapsed > 60)
+            // Use the wave timeout setting for the overall FindMonolith phase too.
+            // The 60s hardcoded timeout was too short for some maps and too generous
+            // for a true stuck condition — use the user-configured wave timeout instead.
+            if (elapsed > _settings.WaveTimeoutMinutes.Value * 60)
             {
                 StatusText = "No monolith found — timeout";
                 _phase = SimPhase.Done;
@@ -541,7 +563,30 @@ namespace AutoExile.Modes
 
             // --- Between waves ---
 
-            // Priority 4: Loot must be fully cleared before anything else between waves.
+            // Priority 4: Stash items if inventory above threshold (or continuing a stash cycle).
+            // Must run BEFORE loot pickup — otherwise the bot picks up one item, sees it's above
+            // threshold, stashes one, picks up another, loops forever.
+            // Don't start StashSystem here — TickBetweenWaveStash navigates to the
+            // cached stash position first so the entity loads into the entity list.
+            if (!_state.IsWaveActive && _state.StashPosition.HasValue && !ctx.Interaction.IsBusy)
+            {
+                var invCount = (StashSystem.GetInventorySlotItems(gc)?.Count ?? 0);
+                bool shouldStartStashing = invCount >= _settings.StashItemThreshold.Value;
+                bool shouldContinueStashing = _isStashing && invCount > 0;
+
+                if (shouldStartStashing || shouldContinueStashing)
+                {
+                    _isStashing = true;
+                    Decision = $"Between waves → Stash ({invCount} items)";
+                    _phase = SimPhase.BetweenWaveStash;
+                    _phaseStartTime = DateTime.Now;
+                    StatusText = $"Stashing items ({invCount} in inventory)";
+                    return;
+                }
+                _isStashing = false;
+            }
+
+            // Priority 5: Loot must be fully cleared before starting next wave.
             // Any visible loot (not blacklisted) resets the wave delay timer — we keep
             // looting until everything is picked up or blacklisted, then wait the full
             // delay for more drops before starting the next wave.
@@ -583,27 +628,6 @@ namespace AutoExile.Modes
                     StatusText = pickingUp ? $"Picking up loot (between waves)" : "Loot nearby — clearing before next wave";
                     return;
                 }
-            }
-
-            // Priority 5: Stash items if inventory above threshold
-            // Don't start StashSystem here — TickBetweenWaveStash navigates to the
-            // cached stash position first so the entity loads into the entity list.
-            if (_state.StashPosition.HasValue && !ctx.Interaction.IsBusy)
-            {
-                var invCount = (StashSystem.GetInventorySlotItems(gc)?.Count ?? 0);
-                bool shouldStartStashing = invCount >= _settings.StashItemThreshold.Value;
-                bool shouldContinueStashing = _isStashing && invCount > 0;
-
-                if (shouldStartStashing || shouldContinueStashing)
-                {
-                    _isStashing = true;
-                    Decision = $"Between waves → Stash ({invCount} items)";
-                    _phase = SimPhase.BetweenWaveStash;
-                    _phaseStartTime = DateTime.Now;
-                    StatusText = $"Stashing items ({invCount} in inventory)";
-                    return;
-                }
-                _isStashing = false;
             }
 
             // Priority 6: Wave 15 complete — sweep remaining loot and exit
@@ -992,7 +1016,10 @@ namespace AutoExile.Modes
             switch (result)
             {
                 case StashResult.Succeeded:
-                    _isStashing = false;
+                    // Stay in stashing mode (_isStashing = true) so shouldContinueStashing
+                    // keeps working. The between-waves loot logic (Priority 4) runs first,
+                    // and shouldContinueStashing ensures we come back to stash any new pickups
+                    // before starting the next wave. _isStashing resets when the wave starts.
                     _phase = SimPhase.WaveCycle;
                     _phaseStartTime = DateTime.Now;
                     StatusText = $"Stashed {ctx.Stash.ItemsStored} items — resuming wave cycle";
