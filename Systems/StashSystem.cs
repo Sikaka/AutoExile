@@ -448,27 +448,28 @@ namespace AutoExile.Systems
         }
 
         /// <summary>
-        /// Maps InventorySlotE to the child index within InventoryPanel[3] (equipment container).
-        /// These are the slots that support incubators — excludes weapon swap (Weapon2/Offhand2).
+        /// Equipment slot positions as fractions of the InventoryPanel rect.
+        /// Derived from live UI measurements — independent of UI element child indices,
+        /// which can be stale/wrong after zone loads until the panel is cycled.
         /// </summary>
-        private static readonly Dictionary<InventorySlotE, int> SlotToUiIndex = new()
+        private static readonly Dictionary<InventorySlotE, (float X, float Y)> SlotRelativePos = new()
         {
-            { InventorySlotE.Helm1, 12 },
-            { InventorySlotE.Amulet1, 13 },
-            { InventorySlotE.Offhand1, 15 },
-            { InventorySlotE.Weapon1, 16 },
-            { InventorySlotE.BodyArmour1, 19 },
-            { InventorySlotE.Ring1, 20 },
-            { InventorySlotE.Ring2, 21 },
-            { InventorySlotE.Gloves1, 23 },
-            { InventorySlotE.Belt1, 24 },
-            { InventorySlotE.Boots1, 25 },
+            { InventorySlotE.Helm1,       (0.5000f, 0.1486f) },
+            { InventorySlotE.Amulet1,     (0.6541f, 0.2213f) },
+            { InventorySlotE.Offhand1,    (0.8098f, 0.2093f) },
+            { InventorySlotE.Weapon1,     (0.1887f, 0.2093f) },
+            { InventorySlotE.BodyArmour1, (0.5000f, 0.2819f) },
+            { InventorySlotE.Ring1,       (0.3444f, 0.2824f) },
+            { InventorySlotE.Ring2,       (0.6541f, 0.2824f) },
+            { InventorySlotE.Gloves1,     (0.3045f, 0.3671f) },
+            { InventorySlotE.Belt1,       (0.5000f, 0.3917f) },
+            { InventorySlotE.Boots1,      (0.6940f, 0.3671f) },
         };
 
         /// <summary>
         /// Find an equipped item that doesn't have an incubator applied.
-        /// Uses ServerData to identify which slots need incubators, then looks up the
-        /// corresponding UI element by index to get a resolution-independent click position.
+        /// Uses ServerData to identify which slots need incubators, then computes
+        /// click position from panel-relative coordinates (no UI element index lookup).
         /// </summary>
         private Vector2? FindEquipmentSlotToApply(GameController gc)
         {
@@ -477,15 +478,16 @@ namespace AutoExile.Systems
                 var inventories = gc.IngameState.ServerData?.PlayerInventories;
                 if (inventories == null) return null;
 
-                var equipContainer = gc.IngameState.IngameUi.InventoryPanel?.GetChildAtIndex(3);
-                if (equipContainer == null) return null;
+                var panel = gc.IngameState.IngameUi.InventoryPanel;
+                if (panel == null || !panel.IsVisible) return null;
 
+                var panelRect = panel.GetClientRect();
                 var windowRect = gc.Window.GetWindowRectangle();
 
                 foreach (var invHolder in inventories)
                 {
                     var inv = invHolder.Inventory;
-                    if (inv == null || !SlotToUiIndex.TryGetValue(inv.InventSlot, out var uiIndex)) continue;
+                    if (inv == null || !SlotRelativePos.TryGetValue(inv.InventSlot, out var relPos)) continue;
                     if (inv.Items.Count != 1) continue;
 
                     var equippedItem = inv.Items.FirstOrDefault();
@@ -497,14 +499,10 @@ namespace AutoExile.Systems
                             continue; // already has incubator
                     }
 
-                    // Look up the UI element directly by index
-                    if (uiIndex >= equipContainer.ChildCount) continue;
-                    var slot = equipContainer.GetChildAtIndex(uiIndex);
-                    if (slot == null) continue;
-
-                    var rect = slot.GetClientRect();
-                    var center = new Vector2(rect.X + rect.Width / 2, rect.Y + rect.Height / 2);
-                    return new Vector2(windowRect.X + center.X, windowRect.Y + center.Y);
+                    // Compute absolute click position from panel-relative coordinates
+                    var screenX = panelRect.X + panelRect.Width * relPos.X;
+                    var screenY = panelRect.Y + panelRect.Height * relPos.Y;
+                    return new Vector2(windowRect.X + screenX, windowRect.Y + screenY);
                 }
             }
             catch { }
@@ -575,23 +573,24 @@ namespace AutoExile.Systems
                     }
                 }
 
-                // === Equipment slots ===
+                // === Equipment slots (panel-relative positions) ===
                 yOffset += 10;
-                g.DrawText("=== EQUIPMENT SLOTS ===", new Vector2(10, yOffset), SharpDX.Color.Cyan);
+                g.DrawText("=== EQUIPMENT SLOTS (panel-relative) ===", new Vector2(10, yOffset), SharpDX.Color.Cyan);
                 yOffset += 18;
 
                 var inventories = gc.IngameState.ServerData?.PlayerInventories;
-                var equipContainer = gc.IngameState.IngameUi.InventoryPanel?.GetChildAtIndex(3);
+                var panel = gc.IngameState.IngameUi.InventoryPanel;
 
-                if (inventories != null && equipContainer != null)
+                if (inventories != null && panel != null)
                 {
-                    g.DrawText($"EquipContainer childCount={equipContainer.ChildCount}", new Vector2(10, yOffset), SharpDX.Color.Gray);
+                    var panelRect = panel.GetClientRect();
+                    g.DrawText($"Panel rect=({panelRect.X:F0},{panelRect.Y:F0},{panelRect.Width:F0},{panelRect.Height:F0})", new Vector2(10, yOffset), SharpDX.Color.Gray);
                     yOffset += 15;
 
-                    foreach (var kvp in SlotToUiIndex)
+                    foreach (var kvp in SlotRelativePos)
                     {
                         var slotEnum = kvp.Key;
-                        var uiIndex = kvp.Value;
+                        var relPos = kvp.Value;
 
                         // Find the inventory for this slot
                         string incubName = "?";
@@ -616,43 +615,26 @@ namespace AutoExile.Systems
                             break;
                         }
 
-                        // Draw the UI element rect
-                        if (uiIndex < equipContainer.ChildCount)
-                        {
-                            var slot = equipContainer.GetChildAtIndex(uiIndex);
-                            if (slot != null)
-                            {
-                                var rect = slot.GetClientRect();
-                                var hasIncub = incubName != "NONE" && incubName != "empty" && incubName != "no-mods" && incubName != "?";
-                                var slotColor = !hasItem ? SharpDX.Color.Gray
-                                    : hasIncub ? SharpDX.Color.Orange
-                                    : SharpDX.Color.LimeGreen; // green = needs incubator
+                        // Compute screen position from panel-relative coords
+                        var screenX = panelRect.X + panelRect.Width * relPos.X;
+                        var screenY = panelRect.Y + panelRect.Height * relPos.Y;
+                        var hasIncub = incubName != "NONE" && incubName != "empty" && incubName != "no-mods" && incubName != "?";
+                        var slotColor = !hasItem ? SharpDX.Color.Gray
+                            : hasIncub ? SharpDX.Color.Orange
+                            : SharpDX.Color.LimeGreen;
 
-                                // Draw rect
-                                g.DrawBox(new RectangleF(rect.X, rect.Y, rect.Width, rect.Height),
-                                    new SharpDX.Color(slotColor.R, slotColor.G, slotColor.B, (byte)40));
-                                g.DrawBox(new RectangleF(rect.X, rect.Y, rect.Width, 1), slotColor);
-                                g.DrawBox(new RectangleF(rect.X, rect.Y + rect.Height - 1, rect.Width, 1), slotColor);
-                                g.DrawBox(new RectangleF(rect.X, rect.Y, 1, rect.Height), slotColor);
-                                g.DrawBox(new RectangleF(rect.X + rect.Width - 1, rect.Y, 1, rect.Height), slotColor);
+                        // Draw crosshair at computed click position
+                        const float crossSize = 8f;
+                        g.DrawBox(new RectangleF(screenX - crossSize, screenY, crossSize * 2, 1), slotColor);
+                        g.DrawBox(new RectangleF(screenX, screenY - crossSize, 1, crossSize * 2), slotColor);
 
-                                // Index label on slot
-                                g.DrawText($"i{uiIndex}", new Vector2(rect.X + 2, rect.Y + 2), SharpDX.Color.Yellow);
+                        // Label at position
+                        g.DrawText(slotEnum.ToString().Replace("1", ""), new Vector2(screenX + 4, screenY - 8), SharpDX.Color.Yellow);
 
-                                var absCenter = new Vector2(windowRect.X + rect.X + rect.Width / 2,
-                                    windowRect.Y + rect.Y + rect.Height / 2);
-
-                                g.DrawText($"{slotEnum} idx={uiIndex} incub={incubName}  rect=({rect.X:F0},{rect.Y:F0},{rect.Width:F0},{rect.Height:F0})  abs=({absCenter.X:F0},{absCenter.Y:F0})",
-                                    new Vector2(10, yOffset), slotColor);
-                                yOffset += 15;
-                            }
-                        }
-                        else
-                        {
-                            g.DrawText($"{slotEnum} idx={uiIndex} — OUT OF RANGE (childCount={equipContainer.ChildCount})",
-                                new Vector2(10, yOffset), SharpDX.Color.Red);
-                            yOffset += 15;
-                        }
+                        var absPos = new Vector2(windowRect.X + screenX, windowRect.Y + screenY);
+                        g.DrawText($"{slotEnum} rel=({relPos.X:F3},{relPos.Y:F3}) incub={incubName}  abs=({absPos.X:F0},{absPos.Y:F0})",
+                            new Vector2(10, yOffset), slotColor);
+                        yOffset += 15;
                     }
                 }
                 else
