@@ -601,6 +601,14 @@ namespace AutoExile
 
             _ctx.Graphics = null;
 
+            // Incubator debug overlay — shows when stash/inventory is open and setting enabled
+            if (Settings.DebugIncubatorOverlay.Value &&
+                (GameController.IngameState.IngameUi.StashElement?.IsVisible == true ||
+                 GameController.IngameState.IngameUi.InventoryPanel?.IsVisible == true))
+            {
+                _stash.RenderDebugIncubators(Graphics, GameController);
+            }
+
             // Tile signature overlay (F8)
             RenderTileSignatures();
 

@@ -48,6 +48,9 @@ namespace AutoExile
         [Menu("Auto Apply Incubators", "Apply incubators from stash to equipment during stash phase.")]
         public ToggleNode AutoApplyIncubators { get; set; } = new ToggleNode(true);
 
+        [Menu("Debug Incubator Overlay", "Show equipment slot indices and stash item rects when inventory/stash is open.")]
+        public ToggleNode DebugIncubatorOverlay { get; set; } = new ToggleNode(false);
+
         [Menu("Interact Radius", "Grid distance at which the bot can click entities, items, stash, map device, etc.")]
         public RangeNode<int> InteractRadius { get; set; } = new RangeNode<int>(20, 10, 80);
 

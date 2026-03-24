@@ -2,8 +2,11 @@ using ExileCore;
 using ExileCore.PoEMemory.Components;
 using ExileCore.PoEMemory.MemoryObjects;
 using ExileCore.Shared.Enums;
+using SharpDX;
 using System.Numerics;
 using System.Windows.Forms;
+using RectangleF = SharpDX.RectangleF;
+using Vector2 = System.Numerics.Vector2;
 
 namespace AutoExile.Systems
 {
@@ -450,16 +453,16 @@ namespace AutoExile.Systems
         /// </summary>
         private static readonly Dictionary<InventorySlotE, int> SlotToUiIndex = new()
         {
-            { InventorySlotE.Helm1, 16 },
-            { InventorySlotE.Amulet1, 17 },
-            { InventorySlotE.Offhand1, 19 },
-            { InventorySlotE.Weapon1, 20 },
-            { InventorySlotE.BodyArmour1, 23 },
-            { InventorySlotE.Ring1, 24 },
-            { InventorySlotE.Ring2, 25 },
-            { InventorySlotE.Gloves1, 27 },
-            { InventorySlotE.Belt1, 28 },
-            { InventorySlotE.Boots1, 29 },
+            { InventorySlotE.Helm1, 12 },
+            { InventorySlotE.Amulet1, 13 },
+            { InventorySlotE.Offhand1, 15 },
+            { InventorySlotE.Weapon1, 16 },
+            { InventorySlotE.BodyArmour1, 19 },
+            { InventorySlotE.Ring1, 20 },
+            { InventorySlotE.Ring2, 21 },
+            { InventorySlotE.Gloves1, 23 },
+            { InventorySlotE.Belt1, 24 },
+            { InventorySlotE.Boots1, 25 },
         };
 
         /// <summary>
@@ -516,6 +519,152 @@ namespace AutoExile.Systems
                     return entity;
             }
             return null;
+        }
+
+        /// <summary>
+        /// Debug overlay: draws rects around stash items and equipment slots with index IDs.
+        /// Call from BotCore.Render() when stash is open to diagnose incubator click targets.
+        /// </summary>
+        public void RenderDebugIncubators(ExileCore.Graphics g, GameController gc)
+        {
+            try
+            {
+                var windowRect = gc.Window.GetWindowRectangle();
+                float yOffset = 200f;
+
+                // === Stash items ===
+                var stashItems = gc.IngameState.IngameUi.StashElement?.VisibleStash?.VisibleInventoryItems;
+                if (stashItems != null)
+                {
+                    g.DrawText("=== STASH ITEMS ===", new Vector2(10, yOffset), SharpDX.Color.Cyan);
+                    yOffset += 18;
+
+                    int idx = 0;
+                    foreach (var item in stashItems)
+                    {
+                        var rect = item.GetClientRect();
+                        var path = item.Entity?.Path ?? "null";
+                        bool isIncubator = path.Contains("/CurrencyIncubation");
+
+                        // Draw rect outline on-screen (client-relative, no window offset needed for DrawBox)
+                        var drawRect = new RectangleF(rect.X, rect.Y, rect.Width, rect.Height);
+                        var color = isIncubator ? SharpDX.Color.LimeGreen : new SharpDX.Color(255, 255, 255, 60);
+                        g.DrawBox(drawRect, new SharpDX.Color(color.R, color.G, color.B, (byte)40));
+                        // Border
+                        g.DrawBox(new RectangleF(rect.X, rect.Y, rect.Width, 1), color);
+                        g.DrawBox(new RectangleF(rect.X, rect.Y + rect.Height - 1, rect.Width, 1), color);
+                        g.DrawBox(new RectangleF(rect.X, rect.Y, 1, rect.Height), color);
+                        g.DrawBox(new RectangleF(rect.X + rect.Width - 1, rect.Y, 1, rect.Height), color);
+
+                        // Index label on the item
+                        g.DrawText($"{idx}", new Vector2(rect.X + 2, rect.Y + 2), SharpDX.Color.Yellow);
+
+                        // Absolute click position (what we'd actually click)
+                        var absX = windowRect.X + rect.Center.X;
+                        var absY = windowRect.Y + rect.Center.Y;
+
+                        // Short path name
+                        var shortPath = path.Length > 40 ? "..." + path.Substring(path.Length - 37) : path;
+
+                        // Side panel text
+                        var label = isIncubator ? "[INCUB] " : "";
+                        g.DrawText($"#{idx} {label}{shortPath}  rect=({rect.X:F0},{rect.Y:F0},{rect.Width:F0},{rect.Height:F0})  abs=({absX:F0},{absY:F0})",
+                            new Vector2(10, yOffset), isIncubator ? SharpDX.Color.LimeGreen : SharpDX.Color.White);
+                        yOffset += 15;
+                        idx++;
+                    }
+                }
+
+                // === Equipment slots ===
+                yOffset += 10;
+                g.DrawText("=== EQUIPMENT SLOTS ===", new Vector2(10, yOffset), SharpDX.Color.Cyan);
+                yOffset += 18;
+
+                var inventories = gc.IngameState.ServerData?.PlayerInventories;
+                var equipContainer = gc.IngameState.IngameUi.InventoryPanel?.GetChildAtIndex(3);
+
+                if (inventories != null && equipContainer != null)
+                {
+                    g.DrawText($"EquipContainer childCount={equipContainer.ChildCount}", new Vector2(10, yOffset), SharpDX.Color.Gray);
+                    yOffset += 15;
+
+                    foreach (var kvp in SlotToUiIndex)
+                    {
+                        var slotEnum = kvp.Key;
+                        var uiIndex = kvp.Value;
+
+                        // Find the inventory for this slot
+                        string incubName = "?";
+                        bool hasItem = false;
+                        foreach (var invHolder in inventories)
+                        {
+                            var inv = invHolder.Inventory;
+                            if (inv?.InventSlot != slotEnum) continue;
+                            hasItem = inv.Items.Count > 0;
+                            if (hasItem)
+                            {
+                                var equippedItem = inv.Items.FirstOrDefault();
+                                if (equippedItem?.TryGetComponent<Mods>(out var mods) == true)
+                                    incubName = string.IsNullOrEmpty(mods.IncubatorName) ? "NONE" : mods.IncubatorName;
+                                else
+                                    incubName = "no-mods";
+                            }
+                            else
+                            {
+                                incubName = "empty";
+                            }
+                            break;
+                        }
+
+                        // Draw the UI element rect
+                        if (uiIndex < equipContainer.ChildCount)
+                        {
+                            var slot = equipContainer.GetChildAtIndex(uiIndex);
+                            if (slot != null)
+                            {
+                                var rect = slot.GetClientRect();
+                                var hasIncub = incubName != "NONE" && incubName != "empty" && incubName != "no-mods" && incubName != "?";
+                                var slotColor = !hasItem ? SharpDX.Color.Gray
+                                    : hasIncub ? SharpDX.Color.Orange
+                                    : SharpDX.Color.LimeGreen; // green = needs incubator
+
+                                // Draw rect
+                                g.DrawBox(new RectangleF(rect.X, rect.Y, rect.Width, rect.Height),
+                                    new SharpDX.Color(slotColor.R, slotColor.G, slotColor.B, (byte)40));
+                                g.DrawBox(new RectangleF(rect.X, rect.Y, rect.Width, 1), slotColor);
+                                g.DrawBox(new RectangleF(rect.X, rect.Y + rect.Height - 1, rect.Width, 1), slotColor);
+                                g.DrawBox(new RectangleF(rect.X, rect.Y, 1, rect.Height), slotColor);
+                                g.DrawBox(new RectangleF(rect.X + rect.Width - 1, rect.Y, 1, rect.Height), slotColor);
+
+                                // Index label on slot
+                                g.DrawText($"i{uiIndex}", new Vector2(rect.X + 2, rect.Y + 2), SharpDX.Color.Yellow);
+
+                                var absCenter = new Vector2(windowRect.X + rect.X + rect.Width / 2,
+                                    windowRect.Y + rect.Y + rect.Height / 2);
+
+                                g.DrawText($"{slotEnum} idx={uiIndex} incub={incubName}  rect=({rect.X:F0},{rect.Y:F0},{rect.Width:F0},{rect.Height:F0})  abs=({absCenter.X:F0},{absCenter.Y:F0})",
+                                    new Vector2(10, yOffset), slotColor);
+                                yOffset += 15;
+                            }
+                        }
+                        else
+                        {
+                            g.DrawText($"{slotEnum} idx={uiIndex} — OUT OF RANGE (childCount={equipContainer.ChildCount})",
+                                new Vector2(10, yOffset), SharpDX.Color.Red);
+                            yOffset += 15;
+                        }
+                    }
+                }
+                else
+                {
+                    g.DrawText("InventoryPanel or ServerData not available", new Vector2(10, yOffset), SharpDX.Color.Red);
+                    yOffset += 15;
+                }
+            }
+            catch (Exception ex)
+            {
+                g.DrawText($"IncubatorDebug error: {ex.Message}", new Vector2(10, 200), SharpDX.Color.Red);
+            }
         }
     }
 
