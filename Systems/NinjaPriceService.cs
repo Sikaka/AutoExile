@@ -286,6 +286,12 @@ namespace AutoExile.Systems
                 return PriceResult.Zero;
             }
 
+            // ── Skill gem: match on level + quality for accurate pricing ──
+            if (category.Value == NinjaPriceCategory.SkillGem)
+            {
+                return PriceSkillGem(entity, baseName);
+            }
+
             // ── Cluster jewel (non-unique): lookup by enchant + passive count + ilvl ──
             if (category.Value == NinjaPriceCategory.ClusterJewel)
             {
@@ -363,6 +369,56 @@ namespace AutoExile.Systems
         }
 
         private const string ClusterEnchantPrefix = "Added Small Passive Skills grant: ";
+
+        /// <summary>
+        /// Price a skill gem by matching its actual level and quality against poe.ninja entries.
+        /// Without this, LookupItem returns the max across all variants (e.g., 21/20 price for a 20/0 gem).
+        /// </summary>
+        private PriceResult PriceSkillGem(Entity entity, string baseName)
+        {
+            var prices = _prices;
+            if (!prices.TryGetValue(NinjaPriceCategory.SkillGem, out var byName)) return PriceResult.Zero;
+            if (!byName.TryGetValue(baseName, out var entries) || entries.Count == 0) return PriceResult.Zero;
+
+            // Read the gem's actual level and quality
+            int gemLevel = 1;
+            int gemQuality = 0;
+            if (entity.TryGetComponent<SkillGem>(out var sg))
+                gemLevel = sg.Level;
+            if (entity.TryGetComponent<Quality>(out var q))
+                gemQuality = q.ItemQuality;
+
+            // Try exact match first (level + quality)
+            foreach (var e in entries)
+            {
+                if ((e.GemLevel ?? 1) == gemLevel && (e.GemQuality ?? 0) == gemQuality)
+                {
+                    var val = e.ChaosValue ?? 0;
+                    return new PriceResult { MinChaosValue = val, MaxChaosValue = val, MatchCount = 1, DetailsId = e.DetailsId };
+                }
+            }
+
+            // Fallback: match level only (quality 0 is the most common default entry)
+            foreach (var e in entries)
+            {
+                if ((e.GemLevel ?? 1) == gemLevel && (e.GemQuality ?? 0) == 0)
+                {
+                    var val = e.ChaosValue ?? 0;
+                    return new PriceResult { MinChaosValue = val, MaxChaosValue = val, MatchCount = 1, DetailsId = e.DetailsId };
+                }
+            }
+
+            // Last resort: return the minimum value across all entries (conservative)
+            double minVal = double.MaxValue;
+            string detailsId = entries[0].DetailsId;
+            foreach (var e in entries)
+            {
+                var val = e.ChaosValue ?? 0;
+                if (val > 0 && val < minVal) { minVal = val; detailsId = e.DetailsId; }
+            }
+            if (minVal == double.MaxValue) return PriceResult.Zero;
+            return new PriceResult { MinChaosValue = minVal, MaxChaosValue = minVal, MatchCount = entries.Count, DetailsId = detailsId };
+        }
 
         /// <summary>
         /// Price a non-unique cluster jewel by its enchant text, passive count, and item level.
