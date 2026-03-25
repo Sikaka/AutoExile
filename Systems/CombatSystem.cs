@@ -105,7 +105,9 @@ namespace AutoExile.Systems
         private long _lastAttackTargetId;
         private float _lastAttackTargetHp = -1f;
         private DateTime _attackConnectivityStart = DateTime.MinValue;
-        private const float AttackConnectTimeoutSec = 2.5f;
+        private const float BaseAttackConnectTimeoutSec = 2.5f;
+        /// <summary>Extra seconds added to server-response timeouts. Synced from settings.</summary>
+        public float ExtraLatencySec { get; set; }
         private const float UnreachableClusterRadius = 45f; // grid units — blacklist all monsters in this radius
 
         // ── Timing ──
@@ -1130,7 +1132,7 @@ namespace AutoExile.Systems
 
         /// <summary>
         /// Track whether attacks are connecting by monitoring BestTarget's HP.
-        /// If HP doesn't change for AttackConnectTimeoutSec, blacklist the entire
+        /// If HP doesn't change for BaseAttackConnectTimeoutSec + ExtraLatencySec, blacklist the entire
         /// cluster of monsters near the target as unreachable.
         /// </summary>
         private void TickAttackConnectivity(GameController gc)
@@ -1170,7 +1172,7 @@ namespace AutoExile.Systems
             }
 
             // HP hasn't changed — check timeout
-            if ((DateTime.Now - _attackConnectivityStart).TotalSeconds < AttackConnectTimeoutSec)
+            if ((DateTime.Now - _attackConnectivityStart).TotalSeconds < BaseAttackConnectTimeoutSec + ExtraLatencySec)
                 return;
 
             // Attacks not connecting for too long — blacklist the cluster

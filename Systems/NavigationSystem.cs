@@ -83,7 +83,9 @@ namespace AutoExile.Systems
         private Vector2 _blinkWallMidpoint;   // midpoint of gap — used as wall reference for side detection
         private DateTime _blinkPendingStart;
         private const int BlinkCooldownMs = 500;
-        private const int BlinkPendingTimeoutMs = 2000;
+        private const int BaseBlinkPendingTimeoutMs = 2000;
+        /// <summary>Extra milliseconds added to server-response timeouts. Synced from settings.</summary>
+        public int ExtraLatencyMs { get; set; }
         private DateTime _lastBlinkTime = DateTime.MinValue;
 
         public void Tick(GameController gc)
@@ -122,7 +124,7 @@ namespace AutoExile.Systems
                     if (Destination.HasValue)
                         NavigateTo(gc, Destination.Value);
                 }
-                else if (elapsed > BlinkPendingTimeoutMs)
+                else if (elapsed > BaseBlinkPendingTimeoutMs + ExtraLatencyMs)
                 {
                     _blinkPending = false;
                     _dashActive = false;

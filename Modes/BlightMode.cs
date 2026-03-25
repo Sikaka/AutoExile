@@ -748,6 +748,7 @@ namespace AutoExile.Modes
         private bool TryStartTowerAction(BotContext ctx, TowerAction.ActionType type)
         {
             var action = new TowerAction(type, _blight, _settings, ctx.Navigation);
+            action.ExtraLatencySec = ctx.Settings.ExtraLatencyMs.Value / 1000f;
             action.Tick(ctx.Game);
             if (action.CurrentPhase == TowerAction.Phase.Failed)
                 return false;

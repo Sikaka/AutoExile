@@ -25,12 +25,15 @@ namespace AutoExile.Systems
         private DateTime _interactionStartTime;
         private float _currentTimeout;
         private int _clickAttempts;
-        private const int MaxClickAttempts = 3;
+        /// <summary>Max click retry attempts. Synced from settings.</summary>
+        public int MaxClickAttempts { get; set; } = 5;
         /// <summary>
         /// Minimum distance to click entities/items (grid units). Synced from InteractRadius setting.
         /// Navigation gets as close as possible; if within this range, clicks directly.
         /// </summary>
         public float InteractRadius { get; set; } = 20f;
+        /// <summary>Extra seconds added to all server-response timeouts. Synced from settings.</summary>
+        public float ExtraLatencySec { get; set; }
         private const float TimeoutDirect = 5f; // seconds — short timeout for range clicks
         private const float TimeoutClickBuffer = 5f; // seconds added on top of travel estimate
         private const float MinTimeoutNavigate = 10f; // minimum navigate timeout
@@ -385,15 +388,15 @@ namespace AutoExile.Systems
         /// Compute timeout based on distance. For navigation: travel time estimate + click buffer.
         /// For direct clicks: flat short timeout.
         /// </summary>
-        private static float ComputeTimeout(bool requireProximity, float gridDistance)
+        private float ComputeTimeout(bool requireProximity, float gridDistance)
         {
             if (!requireProximity)
-                return TimeoutDirect;
+                return TimeoutDirect + ExtraLatencySec;
 
             // Travel time: distance / speed + buffer for clicking + stuck recovery
             var travelEstimate = gridDistance / EstGridUnitsPerSecond;
-            var timeout = travelEstimate + TimeoutClickBuffer;
-            return Math.Clamp(timeout, MinTimeoutNavigate, MaxTimeoutNavigate);
+            var timeout = travelEstimate + TimeoutClickBuffer + ExtraLatencySec;
+            return Math.Clamp(timeout, MinTimeoutNavigate, MaxTimeoutNavigate + ExtraLatencySec);
         }
 
         // --- Overlap / UI helpers ---

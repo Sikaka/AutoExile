@@ -46,7 +46,9 @@ namespace AutoExile.Systems
 
         // Timing
         private DateTime _startedAt;
-        private const float TimeoutSeconds = 15f; // longer to allow navigation
+        private const float BaseTimeoutSeconds = 15f; // longer to allow navigation
+        /// <summary>Extra seconds added to server-response timeouts. Set from settings.</summary>
+        public float ExtraLatencySec { get; set; }
         private const float MenuWaitMs = 500f;
 
         // Minimum standoff from the tower when approaching (grid units).
@@ -85,7 +87,7 @@ namespace AutoExile.Systems
         {
             if (IsComplete) return false;
 
-            if ((DateTime.Now - _startedAt).TotalSeconds > TimeoutSeconds)
+            if ((DateTime.Now - _startedAt).TotalSeconds > BaseTimeoutSeconds + ExtraLatencySec)
             {
                 Fail("Timed out");
                 _nav.Stop(gc);

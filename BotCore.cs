@@ -508,7 +508,25 @@ namespace AutoExile
             // Sync interact radius (global setting used by all systems)
             _interaction.InteractRadius = Settings.InteractRadius.Value;
             _mapDevice.InteractRadius = Settings.InteractRadius.Value;
+            _mapDevice.Interaction = _interaction;
             _stash.InteractRadius = Settings.InteractRadius.Value;
+
+            // Sync latency + click attempts — used by systems for server-response timeouts
+            // If user set ExtraLatencyMs to 0, auto-detect from game's ServerData.Latency
+            var extraLatency = Settings.ExtraLatencyMs.Value;
+            if (extraLatency == 0)
+            {
+                var serverLatency = GameController.IngameState?.ServerData?.Latency ?? 0;
+                extraLatency = serverLatency > 0 ? serverLatency : 0;
+            }
+            float extraLatencySec = extraLatency / 1000f;
+            _interaction.ExtraLatencySec = extraLatencySec;
+            _interaction.MaxClickAttempts = Settings.MaxClickAttempts.Value;
+            _mapDevice.ExtraLatencySec = extraLatencySec;
+            _mapDevice.MaxClickAttempts = Settings.MaxClickAttempts.Value;
+            _stash.ExtraLatencySec = extraLatencySec;
+            _combat.ExtraLatencySec = extraLatencySec;
+            _navigation.ExtraLatencyMs = extraLatency;
 
             // Tick ninja price service (league detection, refresh timer)
             _ninjaPrice.Tick(GameController);

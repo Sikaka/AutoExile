@@ -811,7 +811,7 @@ function renderAllSettings() {
 
   // Advanced tab
   const adv = makeTabContent('advanced');
-  addSection(adv, 'General', [['actionCooldownMs'],['interactRadius'],['autoLevelGems'],['autoApplyIncubators'],['debugIncubatorOverlay']]);
+  addSection(adv, 'General', [['actionCooldownMs'],['extraLatencyMs'],['maxClickAttempts'],['interactRadius'],['autoLevelGems'],['autoApplyIncubators'],['debugIncubatorOverlay']]);
   addSection(adv, 'Threat Detection', [['threat.enabled'],['threat.monitorRares'],['threat.autoDodge'],
     ['threat.threatRadius'],['threat.dodgeTriggerDistance'],['threat.dodgeDistance'],
     ['threat.dodgeMinProgress'],['threat.dodgeMaxProgress'],['threat.dodgeCooldownMs']]);

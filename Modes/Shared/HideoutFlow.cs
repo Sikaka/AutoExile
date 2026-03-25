@@ -23,7 +23,7 @@ namespace AutoExile.Modes.Shared
         private int _minMapTier;
 
         private const float SettleSeconds = 3f;
-        private const float PortalTimeoutSeconds = 15f;
+        private const float BasePortalTimeoutSeconds = 15f;
         private const float MapDeviceRetrySeconds = 10f;
         private const float ActionCooldownMs = 500f;
 
@@ -185,7 +185,7 @@ namespace AutoExile.Modes.Shared
             if (!gc.Area.CurrentArea.IsHideout)
                 return HideoutSignal.InProgress;
 
-            if ((DateTime.Now - _phaseStartTime).TotalSeconds > PortalTimeoutSeconds)
+            if ((DateTime.Now - _phaseStartTime).TotalSeconds > BasePortalTimeoutSeconds + ctx.Settings.ExtraLatencyMs.Value / 1000f)
             {
                 Status = "No portal found";
                 ctx.Interaction.Cancel(gc);

@@ -19,14 +19,21 @@ namespace AutoExile.Systems
         private DateTime _lastActionTime;
         private Func<Element, bool>? _mapFilter;
         private const float ActionCooldownMs = 400;
-        private const float PhaseTimeoutSeconds = 30f;
-        private const float PortalWaitTimeoutSeconds = 10f;
+        private const float BasePhaseTimeoutSeconds = 30f;
+        private const float BasePortalWaitTimeoutSeconds = 10f;
+        /// <summary>Extra seconds added to all server-response timeouts. Synced from settings.</summary>
+        public float ExtraLatencySec { get; set; }
+        /// <summary>Max click retry attempts. Synced from settings.</summary>
+        public int MaxClickAttempts { get; set; } = 5;
 
         /// <summary>
         /// Grid distance considered "close enough" to interact with device/portal.
         /// Synced from InteractionSystem.InteractRadius (which comes from LootRadius setting).
         /// </summary>
         public float InteractRadius { get; set; } = 20f;
+
+        /// <summary>InteractionSystem reference for portal clicking. Synced from BotCore.</summary>
+        public InteractionSystem? Interaction { get; set; }
 
         /// <summary>
         /// Target map name to select in the atlas (e.g., "Mausoleum").
@@ -47,7 +54,6 @@ namespace AutoExile.Systems
         // Atlas node selection state
         private bool _nodeSelected;
         private int _nodeClickAttempts;
-        private const int MaxNodeClickAttempts = 3;
 
         // UI element indices for atlas panel
         // Map stash: atlas[3][0][1] — children are InventoryItem elements
@@ -88,6 +94,7 @@ namespace AutoExile.Systems
         public void Cancel(GameController gc, NavigationSystem? nav = null)
         {
             nav?.Stop(gc);
+            Interaction?.Cancel(gc);
             _phase = MapDevicePhase.Idle;
             _mapFilter = null;
             TargetMapName = null;
@@ -107,7 +114,7 @@ namespace AutoExile.Systems
             var phaseElapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
 
             // Phase timeout
-            if (phaseElapsed > PhaseTimeoutSeconds
+            if (phaseElapsed > BasePhaseTimeoutSeconds + ExtraLatencySec
                 && _phase != MapDevicePhase.WaitForPortals)
             {
                 Status = $"TIMEOUT after {phaseElapsed:F0}s in {_phase} — last status: {Status}";
@@ -381,9 +388,9 @@ namespace AutoExile.Systems
         /// </summary>
         private MapDeviceResult TickSelectAtlasNode(GameController gc, Element atlas)
         {
-            if (_nodeClickAttempts >= MaxNodeClickAttempts)
+            if (_nodeClickAttempts >= MaxClickAttempts)
             {
-                Status = $"[Select] Failed to select {TargetMapName} after {MaxNodeClickAttempts} attempts";
+                Status = $"[Select] Failed to select {TargetMapName} after {MaxClickAttempts} attempts";
                 _phase = MapDevicePhase.Idle;
                 return MapDeviceResult.Failed;
             }
@@ -492,7 +499,7 @@ namespace AutoExile.Systems
 
         private MapDeviceResult TickWaitForPortals(GameController gc)
         {
-            if ((DateTime.Now - _phaseStartTime).TotalSeconds > PortalWaitTimeoutSeconds)
+            if ((DateTime.Now - _phaseStartTime).TotalSeconds > BasePortalWaitTimeoutSeconds + ExtraLatencySec)
             {
                 Status = "Timed out waiting for portals";
                 _phase = MapDevicePhase.Idle;
@@ -519,6 +526,7 @@ namespace AutoExile.Systems
             // Check if we're loading (means we entered)
             if (gc.IsLoading)
             {
+                Interaction?.Cancel(gc);
                 _phase = MapDevicePhase.Idle;
                 _mapFilter = null;
                 TargetMapName = null;
@@ -530,6 +538,7 @@ namespace AutoExile.Systems
             // Check if we left hideout
             if (!gc.Area.CurrentArea.IsHideout)
             {
+                Interaction?.Cancel(gc);
                 _phase = MapDevicePhase.Idle;
                 _mapFilter = null;
                 TargetMapName = null;
@@ -538,40 +547,7 @@ namespace AutoExile.Systems
                 return MapDeviceResult.Succeeded;
             }
 
-            var portal = FindNearestPortal(gc);
-            if (portal == null)
-            {
-                Status = "Portal disappeared";
-                _phase = MapDevicePhase.Idle;
-                return MapDeviceResult.Failed;
-            }
-
-            if (!BotInput.GetEntityScreenBounds(gc, portal, out _, out _, out _))
-            {
-                // Off-screen — navigate closer
-                var portalDist = Vector2.Distance(
-                    new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y),
-                    new Vector2(portal.GridPosNum.X, portal.GridPosNum.Y));
-                if (!nav.IsNavigating)
-                {
-                    var portalGrid = portal.GridPosNum;
-                    var gridTarget = new Vector2(portalGrid.X, portalGrid.Y);
-                    var success = nav.NavigateTo(gc, gridTarget);
-                    if (!success && gc.Area.CurrentArea.IsHideout && BotInput.CanAct)
-                    {
-                        // Hideout decoration walls — direct walk toward portal
-                        var portalScreen = gc.IngameState.Camera.WorldToScreen(portal.BoundsCenterPosNum);
-                        var wr = gc.Window.GetWindowRectangle();
-                        BotInput.CursorPressKey(
-                            new Vector2(wr.X + portalScreen.X, wr.Y + portalScreen.Y),
-                            nav.MoveKey);
-                    }
-                }
-                Status = $"[Enter] Navigating to portal (dist: {portalDist:F0}, nav={nav.IsNavigating})";
-                return MapDeviceResult.InProgress;
-            }
-
-            // Check if UI panels are blocking the click
+            // Close UI panels that block portal clicks
             var stashBlocking = gc.IngameState.IngameUi.StashElement?.IsVisible == true;
             var invBlocking = gc.IngameState.IngameUi.InventoryPanel?.IsVisible == true;
             if (stashBlocking || invBlocking)
@@ -582,10 +558,38 @@ namespace AutoExile.Systems
                 return MapDeviceResult.InProgress;
             }
 
-            var clicked = BotInput.ClickEntity(gc, portal);
-            _lastActionTime = DateTime.Now;
-            Status = $"[Enter] Clicking portal sent={clicked}";
-            return MapDeviceResult.InProgress;
+            // Delegate to InteractionSystem — handles navigate, proximity, click, verify.
+            // InteractionSystem is already ticked by the mode each frame; we just
+            // start the interaction and monitor IsBusy / status.
+            if (Interaction != null)
+            {
+                if (Interaction.IsBusy)
+                {
+                    Status = $"[Enter] {Interaction.Status}";
+                    // Area change / loading detection above handles success
+                    return MapDeviceResult.InProgress;
+                }
+
+                // Interaction finished without area change — it either failed or
+                // succeeded but the entity vanished (portal consumed). Check if
+                // we're still in hideout — if so, retry with fresh portal reference.
+                var portal = FindNearestPortal(gc);
+                if (portal == null)
+                {
+                    Status = "Portal disappeared";
+                    _phase = MapDevicePhase.Idle;
+                    return MapDeviceResult.Failed;
+                }
+
+                Interaction.InteractWithEntity(portal, nav, requireProximity: true);
+                Status = "[Enter] Interacting with portal";
+                return MapDeviceResult.InProgress;
+            }
+
+            // Fallback if Interaction not wired (shouldn't happen)
+            Status = "[Enter] No InteractionSystem available";
+            _phase = MapDevicePhase.Idle;
+            return MapDeviceResult.Failed;
         }
 
         // --- Helpers ---

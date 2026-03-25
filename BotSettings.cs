@@ -33,6 +33,12 @@ namespace AutoExile
         [Menu("Action Cooldown (ms)", "Minimum time between mouse actions. Prevents server kicks from input spam.")]
         public RangeNode<int> ActionCooldownMs { get; set; } = new RangeNode<int>(100, 50, 300);
 
+        [Menu("Extra Latency (ms)", "Extra time added to server-response timeouts (portal spawns, click verification, damage confirmation, phase timeouts). 0 = auto-detect from game's ServerData.Latency. Set manually to override.")]
+        public RangeNode<int> ExtraLatencyMs { get; set; } = new RangeNode<int>(0, 0, 5000);
+
+        [Menu("Max Click Attempts", "Maximum click retry attempts for entity interactions, atlas nodes, altars, etc. Higher values help on laggy connections.")]
+        public RangeNode<int> MaxClickAttempts { get; set; } = new RangeNode<int>(5, 1, 20);
+
         [Menu("Web UI Enabled", "Enable embedded web dashboard.")]
         public ToggleNode WebUiEnabled { get; set; } = new ToggleNode(true);
 

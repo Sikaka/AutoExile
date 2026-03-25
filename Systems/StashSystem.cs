@@ -23,7 +23,9 @@ namespace AutoExile.Systems
         private int _itemsStored;
         private int _attempts;
         private int _prevItemCount; // track item count to detect failed transfers
-        private const float PhaseTimeoutSeconds = 30f;
+        private const float BasePhaseTimeoutSeconds = 30f;
+        /// <summary>Extra seconds added to all server-response timeouts. Synced from settings.</summary>
+        public float ExtraLatencySec { get; set; }
         private const int MaxAttempts = 50;
         /// <summary>
         /// Grid distance to consider "close enough" to interact with stash.
@@ -85,7 +87,7 @@ namespace AutoExile.Systems
             if (_phase == StashPhase.Idle)
                 return StashResult.None;
 
-            if ((DateTime.Now - _phaseStartTime).TotalSeconds > PhaseTimeoutSeconds)
+            if ((DateTime.Now - _phaseStartTime).TotalSeconds > BasePhaseTimeoutSeconds + ExtraLatencySec)
             {
                 Status = $"Timed out in phase: {_phase}";
                 _phase = StashPhase.Idle;

@@ -44,7 +44,7 @@ namespace AutoExile.Mechanics
         private uint _pendingAltarEntityId;
         private int _clickAttempts;
         private DateTime _lastClickTime = DateTime.MinValue;
-        private const int MaxClickAttempts = 5;
+        // MaxClickAttempts read from ctx.Settings.MaxClickAttempts.Value
         private const float ClickCooldownMs = 400;
         private const float SettleTimeMs = 300;
 
@@ -88,7 +88,8 @@ namespace AutoExile.Mechanics
                 // Click didn't take — retry
                 if ((DateTime.Now - _lastClickTime).TotalMilliseconds > 1000)
                 {
-                    if (_clickAttempts >= MaxClickAttempts)
+                    var maxClicks = ctx.Settings.MaxClickAttempts.Value;
+                    if (_clickAttempts >= maxClicks)
                     {
                         ctx.Log($"[Altar] Max click attempts, blacklisting altar");
                         _blacklist.Add(_pendingAltarEntityId);
@@ -111,11 +112,11 @@ namespace AutoExile.Mechanics
                         ClickElement(gc, _pendingButton);
                         _clickAttempts++;
                         _lastClickTime = DateTime.Now;
-                        ctx.Log($"[Altar] Retry click {_clickAttempts}/{MaxClickAttempts}");
+                        ctx.Log($"[Altar] Retry click {_clickAttempts}/{maxClicks}");
                     }
                 }
 
-                Status = $"Verifying altar click ({_clickAttempts}/{MaxClickAttempts})";
+                Status = $"Verifying altar click ({_clickAttempts}/{ctx.Settings.MaxClickAttempts.Value})";
                 return AltarTickResult.Busy;
             }
 

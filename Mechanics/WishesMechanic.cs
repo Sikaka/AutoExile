@@ -61,8 +61,7 @@ namespace AutoExile.Mechanics
         private int _navFailCount;
         private DateTime _lastClickTime = DateTime.MinValue;
         private const float ClickCooldownMs = 500;
-        private const float PhaseTimeoutSeconds = 60;
-        private const int MaxClickAttempts = 8;
+        private const float BasePhaseTimeoutSeconds = 60;
         private const int MaxNavFails = 10;
         // (removed _areaHashOnPortalClick — wish zones don't change area hash)
 
@@ -116,9 +115,10 @@ namespace AutoExile.Mechanics
 
             if (_phase != WishesPhase.Idle && _phase != WishesPhase.Complete)
             {
-                if ((DateTime.Now - _phaseStartTime).TotalSeconds > PhaseTimeoutSeconds)
+                var phaseTimeout = BasePhaseTimeoutSeconds + ctx.Settings.ExtraLatencyMs.Value / 1000f;
+                if ((DateTime.Now - _phaseStartTime).TotalSeconds > phaseTimeout)
                 {
-                    ctx.Log($"[Wishes] Phase {_phase} timed out after {PhaseTimeoutSeconds}s");
+                    ctx.Log($"[Wishes] Phase {_phase} timed out after {phaseTimeout}s");
                     Status = $"Timed out in {_phase}";
                     MarkInitiatorCompleted();
                     _phase = WishesPhase.Complete;
@@ -397,10 +397,10 @@ namespace AutoExile.Mechanics
             {
                 _lastClickTime = DateTime.Now;
                 _npcClickAttempts++;
-                Status = $"[NPC] Clicked Varashta (attempt {_npcClickAttempts}/{MaxClickAttempts})";
+                Status = $"[NPC] Clicked Varashta (attempt {_npcClickAttempts}/{ctx.Settings.MaxClickAttempts.Value})";
             }
 
-            if (_npcClickAttempts >= MaxClickAttempts)
+            if (_npcClickAttempts >= ctx.Settings.MaxClickAttempts.Value)
             {
                 ctx.Log("[Wishes] Failed to talk to NPC after max attempts, abandoning");
                 _phase = WishesPhase.Complete;
@@ -463,10 +463,10 @@ namespace AutoExile.Mechanics
                 _lastClickTime = DateTime.Now;
                 _wishClickAttempts++;
                 var wishName = GetWishName(option);
-                Status = $"[Wish] Clicking '{wishName}' (attempt {_wishClickAttempts}/{MaxClickAttempts})";
+                Status = $"[Wish] Clicking '{wishName}' (attempt {_wishClickAttempts}/{ctx.Settings.MaxClickAttempts.Value})";
             }
 
-            if (_wishClickAttempts >= MaxClickAttempts)
+            if (_wishClickAttempts >= ctx.Settings.MaxClickAttempts.Value)
             {
                 ctx.Log("[Wishes] Failed to select wish after max attempts, abandoning");
                 _phase = WishesPhase.Complete;
@@ -511,10 +511,10 @@ namespace AutoExile.Mechanics
             {
                 _lastClickTime = DateTime.Now;
                 _confirmClickAttempts++;
-                Status = $"[Wish] Clicked confirm (attempt {_confirmClickAttempts}/{MaxClickAttempts})";
+                Status = $"[Wish] Clicked confirm (attempt {_confirmClickAttempts}/{ctx.Settings.MaxClickAttempts.Value})";
             }
 
-            if (_confirmClickAttempts >= MaxClickAttempts)
+            if (_confirmClickAttempts >= ctx.Settings.MaxClickAttempts.Value)
             {
                 ctx.Log("[Wishes] Failed to confirm wish after max attempts, abandoning");
                 _phase = WishesPhase.Complete;
@@ -640,10 +640,10 @@ namespace AutoExile.Mechanics
             {
                 _lastClickTime = DateTime.Now;
                 _portalClickAttempts++;
-                Status = $"[Enter] Clicked portal (attempt {_portalClickAttempts}/{MaxClickAttempts})";
+                Status = $"[Enter] Clicked portal (attempt {_portalClickAttempts}/{ctx.Settings.MaxClickAttempts.Value})";
             }
 
-            if (_portalClickAttempts >= MaxClickAttempts)
+            if (_portalClickAttempts >= ctx.Settings.MaxClickAttempts.Value)
             {
                 ctx.Log("[Wishes] Failed to enter portal after max attempts, abandoning");
                 MarkInitiatorCompleted();

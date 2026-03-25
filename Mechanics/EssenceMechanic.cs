@@ -71,7 +71,7 @@ namespace AutoExile.Mechanics
         private DateTime _lastClickTime = DateTime.MinValue;
         private int _clickAttempts;
         private const float ClickCooldownMs = 500;
-        private const float PhaseTimeoutSeconds = 30;
+        private const float BasePhaseTimeoutSeconds = 30;
 
         // ── Combat tracking ──
         private DateTime _lastCombatTime;
@@ -169,9 +169,10 @@ namespace AutoExile.Mechanics
             if (_phase != EssencePhase.Idle && _phase != EssencePhase.Complete &&
                 _phase != EssencePhase.Abandoned && _phase != EssencePhase.Failed)
             {
-                if ((DateTime.Now - _phaseStartTime).TotalSeconds > PhaseTimeoutSeconds)
+                var phaseTimeout = BasePhaseTimeoutSeconds + ctx.Settings.ExtraLatencyMs.Value / 1000f;
+                if ((DateTime.Now - _phaseStartTime).TotalSeconds > phaseTimeout)
                 {
-                    ctx.Log($"[Essence] Phase {_phase} timed out after {PhaseTimeoutSeconds}s");
+                    ctx.Log($"[Essence] Phase {_phase} timed out after {phaseTimeout}s");
                     Status = $"Timed out in {_phase}";
                     _phase = EssencePhase.Failed;
                     return MechanicResult.Failed;
