@@ -92,6 +92,11 @@ namespace AutoExile.Systems
         /// <summary>Whether any movement skill can cross terrain gaps.</summary>
         public bool HasGapCrosser => MovementSkills.Any(m => m.CanCrossTerrain);
 
+        // ── Global enemy blacklist (by render name) ──
+
+        /// <summary>Enemy render names to ignore globally. Synced from settings each tick.</summary>
+        public HashSet<string> BlacklistedEnemies { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
         // ── Attack connectivity tracking ──
         // Monitors whether attacks are actually connecting (target HP changing).
         // After a timeout with no damage, blacklists the entire cluster as unreachable.
@@ -308,6 +313,10 @@ namespace AutoExile.Systems
 
                 // Skip monsters trapped inside essence monoliths (cannot be damaged until released)
                 if (IsInsideMonolith(entity)) continue;
+
+                // Skip globally blacklisted enemies (user-configured by render name)
+                if (BlacklistedEnemies.Count > 0 && !string.IsNullOrEmpty(entity.RenderName) &&
+                    BlacklistedEnemies.Contains(entity.RenderName)) continue;
 
                 // Skip monsters blacklisted as unreachable (attacks don't connect)
                 if (_unreachableMonsters.Contains(entity.Id)) continue;

@@ -150,6 +150,18 @@ namespace AutoExile.Systems
             _currencyPrices.TryGetValue("Divine Orb", out var val) ? val : 0;
 
         /// <summary>
+        /// Get all skill gem price entries for valuation (e.g. transfigured gem EV calculation).
+        /// Returns null if prices are not loaded or category is missing.
+        /// </summary>
+        public IReadOnlyDictionary<string, List<ItemLine>>? GetSkillGemPrices()
+        {
+            var prices = _prices;
+            if (prices.TryGetValue(NinjaPriceCategory.SkillGem, out var byName))
+                return byName;
+            return null;
+        }
+
+        /// <summary>
         /// Get the price of an item entity. Returns MaxChaosValue for unidentified uniques.
         /// </summary>
         public PriceResult GetPrice(GameController gc, Entity entity)

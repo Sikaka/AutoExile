@@ -88,6 +88,10 @@ namespace AutoExile
 
         public HeistSettings Heist { get; set; } = new HeistSettings();
 
+        // --- Labyrinth (mode-specific) ---
+
+        public LabyrinthSettings Labyrinth { get; set; } = new LabyrinthSettings();
+
         // --- Threat / Dodge ---
 
         public ThreatSettings Threat { get; set; } = new ThreatSettings();
@@ -152,6 +156,9 @@ namespace AutoExile
             }
 
             // ── Combat Behavior ──
+
+            [Menu("Blacklisted Enemies", "Comma-separated enemy render names to ignore globally. These monsters are excluded from all combat and seek-and-destroy logic.")]
+            public TextNode BlacklistedEnemies { get; set; } = new TextNode("");
 
             [Menu("Default Positioning", "How to position relative to monsters. Modes can override.")]
             public ListNode DefaultPositioning { get; set; } = new ListNode();
@@ -464,6 +471,50 @@ namespace AutoExile
                 HeistRewardType.Safe => true,
                 _ => false,
             };
+        }
+
+        [Submenu(CollapsedByDefault = true)]
+        public class LabyrinthSettings
+        {
+            [Menu("Difficulty", "Lab difficulty to run. Must match the UI text exactly.")]
+            public ListNode Difficulty { get; set; } = new ListNode
+            {
+                Values = new List<string>
+                {
+                    "The Labyrinth",
+                    "The Cruel Labyrinth",
+                    "The Merciless Labyrinth",
+                    "The Eternal Labyrinth",
+                },
+                Value = "The Labyrinth",
+            };
+
+            [Menu("Max Runs", "Stop after this many completed runs. 0 = unlimited.")]
+            public RangeNode<int> MaxRuns { get; set; } = new RangeNode<int>(0, 0, 100);
+
+            [Menu("Min Expected Profit (chaos)", "Minimum expected profit from transformation to start a run.")]
+            public RangeNode<int> MinExpectedProfit { get; set; } = new RangeNode<int>(10, 0, 500);
+
+            [Menu("Open Reward Chests", "Open Izaro treasure chests in the reward room.")]
+            public ToggleNode OpenRewardChests { get; set; } = new ToggleNode(true);
+
+            [Menu("Zone Timeout (s)", "Max seconds per zone before aborting the run.")]
+            public RangeNode<int> ZoneTimeoutSeconds { get; set; } = new RangeNode<int>(120, 30, 300);
+
+            [Menu("Izaro Timeout (s)", "Max seconds fighting Izaro before aborting.")]
+            public RangeNode<int> IzaroTimeoutSeconds { get; set; } = new RangeNode<int>(60, 20, 180);
+
+            [Menu("Max Deaths", "Abandon run after this many deaths.")]
+            public RangeNode<int> MaxDeaths { get; set; } = new RangeNode<int>(1, 0, 5);
+
+            [Menu("Settle Time (s)", "Seconds to wait after zone transitions before acting.")]
+            public RangeNode<float> SettleSeconds { get; set; } = new RangeNode<float>(2f, 0.5f, 5f);
+
+            [Menu("Prefer Same Type", "Prefer 'same type' transforms over 'same colour' when available.")]
+            public ToggleNode PreferSameType { get; set; } = new ToggleNode(true);
+
+            [Menu("Keep Threshold (chaos)", "Don't transform gems worth more than this. Protects valuable results from being recycled. 0 = disabled.")]
+            public RangeNode<int> KeepThreshold { get; set; } = new RangeNode<int>(10, 0, 500);
         }
 
         [Submenu(CollapsedByDefault = true)]

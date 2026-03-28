@@ -199,8 +199,8 @@ tr:hover td { background:var(--surface2); }
       <div class="controls">
         <select id="modeSelect" class="mode-select">
           <option>Idle</option><option>Mapping</option><option>Simulacrum</option>
-          <option>Blight</option><option>Heist</option><option>Follower</option>
-          <option>DebugPathfinding</option>
+          <option>Blight</option><option>Heist</option><option>Labyrinth</option>
+          <option>Follower</option><option>DebugPathfinding</option>
         </select>
         <button class="btn primary" onclick="sendCmd('start')">Start</button>
         <button class="btn danger" onclick="sendCmd('stop')">Stop</button>
@@ -264,6 +264,25 @@ tr:hover td { background:var(--surface2); }
         <div class="stat"><div class="stat-label">Avg Run Time</div><div id="simAvgRunTime" class="stat-value" style="font-size:16px">--</div></div>
       </div>
     </div>
+    <div id="labCard" class="card" style="display:none">
+      <h2>Labyrinth</h2>
+      <div class="status-grid">
+        <div class="stat"><div class="stat-label">Izaro</div><div id="labIzaro" class="stat-value accent">0/3</div></div>
+        <div class="stat"><div class="stat-label">Deaths</div><div id="labDeaths" class="stat-value">0</div></div>
+        <div class="stat"><div class="stat-label">Runs</div><div id="labRuns" class="stat-value accent">0</div></div>
+        <div class="stat"><div class="stat-label">Gems</div><div id="labGems" class="stat-value">0</div></div>
+        <div class="stat"><div class="stat-label">Profit</div><div id="labProfit" class="stat-value orange">0c</div></div>
+        <div class="stat"><div class="stat-label">Selected</div><div id="labSelectedGem" class="stat-value" style="font-size:12px">-</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Lab Gem Valuation</h2>
+    <p style="color:#888;font-size:12px;margin:0 0 8px">Expected value of Divine Font transformation per gem. Excludes corrupted (lvl 21 / 21+ quality).</p>
+    <button class="btn" onclick="loadGemReport()" style="margin-bottom:8px">Load / Refresh</button>
+    <div id="labColourSummary"></div>
+    <div id="labGemTable" style="max-height:500px;overflow-y:auto"></div>
   </div>
 
   <div class="card">
@@ -419,6 +438,21 @@ function updateDashboard(s) {
     document.getElementById('simAvgRunTime').textContent = s.simAvgRunTime || '--';
   } else {
     simCard.style.display = 'none';
+  }
+
+  // Labyrinth stats — show card only when mode is Labyrinth
+  const labCard = document.getElementById('labCard');
+  if (s.mode === 'Labyrinth') {
+    labCard.style.display = '';
+    document.getElementById('labIzaro').textContent = `${s.labIzaroEncounters}/3`;
+    document.getElementById('labDeaths').textContent = s.labDeaths;
+    document.getElementById('labDeaths').style.color = s.labDeaths > 0 ? '#ff4444' : '';
+    document.getElementById('labRuns').textContent = s.labRuns;
+    document.getElementById('labGems').textContent = s.labGemsTransformed;
+    document.getElementById('labProfit').textContent = s.labTotalProfit.toFixed(0) + 'c';
+    document.getElementById('labSelectedGem').textContent = s.labSelectedGem || '-';
+  } else {
+    labCard.style.display = 'none';
   }
 
   const sel = document.getElementById('modeSelect');
@@ -599,11 +633,158 @@ function buildMustLootUniques() {
   return wrap;
 }
 
+// Enemy blacklist with scan-nearby autocomplete
+function buildEnemyBlacklist() {
+  const key = 'build.blacklistedEnemies';
+  const wrap = document.createElement('div');
+  const titleEl = document.createElement('div'); titleEl.className='section-divider'; titleEl.textContent='Enemy Blacklist';
+  wrap.appendChild(titleEl);
+  const desc = document.createElement('div');
+  desc.style.cssText='font-size:12px;color:var(--text-dim);margin:0 12px 8px;';
+  desc.textContent='Enemies to ignore globally across all combat and seek-and-destroy logic. Click "Scan Nearby" while in-game to discover names.';
+  wrap.appendChild(desc);
+
+  const container = document.createElement('div'); container.style.padding='0 12px 12px';
+  const tagList = document.createElement('div'); tagList.className='tag-list';
+  container.appendChild(tagList);
+
+  const addRow = document.createElement('div'); addRow.className='tag-add-row';
+  const input = document.createElement('input'); input.type='text'; input.placeholder='Type enemy name or scan nearby...';
+  const addBtn = document.createElement('button'); addBtn.textContent='Add';
+  const scanBtn = document.createElement('button'); scanBtn.textContent='Scan Nearby'; scanBtn.style.marginLeft='4px';
+  addRow.appendChild(input); addRow.appendChild(addBtn); addRow.appendChild(scanBtn);
+
+  const dropdown = document.createElement('div'); dropdown.className='autocomplete-dropdown';
+  addRow.appendChild(dropdown);
+  container.appendChild(addRow);
+  wrap.appendChild(container);
+
+  function render() {
+    tagList.innerHTML = '';
+    const tags = parseTagList(key);
+    for (const tag of tags) {
+      const item = document.createElement('span'); item.className='tag-item';
+      item.innerHTML = `${esc(tag)}<button class="tag-remove" title="Remove">&times;</button>`;
+      item.querySelector('.tag-remove').onclick = () => {
+        const updated = parseTagList(key).filter(t => t !== tag);
+        saveTagList(key, updated);
+        render();
+      };
+      tagList.appendChild(item);
+    }
+  }
+
+  function addEnemy(name) {
+    const tags = parseTagList(key);
+    if (!tags.some(t => t.toLowerCase() === name.toLowerCase())) {
+      tags.push(name);
+      saveTagList(key, tags);
+    }
+    input.value = '';
+    dropdown.classList.remove('show');
+    render();
+  }
+
+  addBtn.onclick = () => { if (input.value.trim()) addEnemy(input.value.trim()); };
+  input.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); if (input.value.trim()) addEnemy(input.value.trim()); } };
+
+  scanBtn.onclick = async () => {
+    dropdown.innerHTML = '<div class="autocomplete-item" style="color:var(--text-dim)">Scanning...</div>';
+    dropdown.classList.add('show');
+    try {
+      const r = await fetch('/api/nearby-monsters');
+      if (!r.ok) { dropdown.innerHTML = '<div class="autocomplete-item" style="color:var(--text-dim)">Not available (bot not in game)</div>'; return; }
+      const monsters = await r.json();
+      dropdown.innerHTML = '';
+      if (monsters.length === 0) {
+        dropdown.innerHTML = '<div class="autocomplete-item" style="color:var(--text-dim)">No hostile monsters nearby</div>';
+        return;
+      }
+      const existing = new Set(parseTagList(key).map(t => t.toLowerCase()));
+      for (const m of monsters) {
+        if (existing.has(m.name.toLowerCase())) continue;
+        const el = document.createElement('div'); el.className='autocomplete-item';
+        const rarityColor = m.rarity === 'Unique' ? '#af6025' : m.rarity === 'Rare' ? '#ff7' : m.rarity === 'Magic' ? '#88f' : '#ccc';
+        el.innerHTML = `<span>${esc(m.name)}</span><span><span style="color:${rarityColor};margin-right:8px">${esc(m.rarity)}</span><span class="ac-cat">${m.distance.toFixed(0)}g &times;${m.count}</span></span>`;
+        el.onclick = () => addEnemy(m.name);
+        dropdown.appendChild(el);
+      }
+      if (dropdown.children.length === 0) {
+        dropdown.innerHTML = '<div class="autocomplete-item" style="color:var(--text-dim)">All nearby enemies already blacklisted</div>';
+      }
+    } catch(e) {
+      dropdown.innerHTML = `<div class="autocomplete-item" style="color:var(--text-dim)">Error: ${e.message}</div>`;
+    }
+  };
+
+  document.addEventListener('click', (e) => { if (!addRow.contains(e.target)) dropdown.classList.remove('show'); });
+
+  render();
+  return wrap;
+}
+
 // ==================== COMMANDS ====================
 async function sendCmd(action, value) {
   try { await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,value})}); } catch {}
 }
 document.getElementById('modeSelect').addEventListener('change', function(){sendCmd('setMode',this.value);});
+
+// ==================== LAB GEM REPORT ====================
+async function loadGemReport() {
+  const summaryEl = document.getElementById('labColourSummary');
+  const tableEl = document.getElementById('labGemTable');
+  summaryEl.innerHTML = 'Loading...';
+  tableEl.innerHTML = '';
+  try {
+    const resp = await fetch('/api/lab/gems');
+    if (!resp.ok) { const err = await resp.json().catch(() => ({})); summaryEl.innerHTML = 'Error: ' + (err.error || resp.status); return; }
+    const data = await resp.json();
+
+    // Colour summary with quality split
+    let html = '<div style="display:flex;gap:12px;margin-bottom:10px">';
+    for (const c of (data.colourSummary || [])) {
+      const col = c.colour === 'Red' ? '#e44' : c.colour === 'Green' ? '#4a4' : '#48f';
+      html += `<div style="border:1px solid ${col};border-radius:6px;padding:8px;flex:1;text-align:center">
+        <div style="color:${col};font-weight:bold">${c.colour}</div>
+        <div style="font-size:12px;color:#888">${c.totalVariants} variants</div>
+        <div style="font-size:14px;color:#fff">0q avg: ${c.avgValue0Q.toFixed(1)}c</div>
+        <div style="font-size:14px;color:#ccc">20q avg: ${c.avgValue20Q > 0 ? c.avgValue20Q.toFixed(1)+'c' : '-'}</div>
+        <div style="font-size:11px;color:#666">med: ${c.medianValue0Q.toFixed(0)}c | max: ${c.maxValue0Q.toFixed(0)}c</div>
+      </div>`;
+    }
+    html += '</div>';
+    summaryEl.innerHTML = html;
+
+    // Gem table
+    let tbl = `<table style="width:100%;border-collapse:collapse;font-size:12px">
+      <tr style="color:#888;text-align:left;border-bottom:1px solid #333">
+        <th style="padding:4px">Gem</th><th>Clr</th><th>#</th>
+        <th>Buy (0q)</th><th>Buy (20q)</th>
+        <th>Out (0q)</th><th>Out (20q)</th>
+        <th>Profit (0q)</th><th>Profit (20q)</th></tr>`;
+    for (const g of (data.topGems || [])) {
+      const col = g.colour === 'Red' ? '#e44' : g.colour === 'Green' ? '#4a4' : g.colour === 'Blue' ? '#48f' : '#888';
+      const p0 = g.expectedProfitLowQ;
+      const p20 = g.expectedProfit20Q;
+      const pc0 = p0 > 0 ? '#4a4' : p0 < 0 ? '#e44' : '#888';
+      const pc20 = p20 > 0 ? '#4a4' : p20 < 0 ? '#e44' : '#888';
+      tbl += `<tr style="border-bottom:1px solid #222">
+        <td style="padding:3px">${g.baseName}</td>
+        <td style="color:${col}">${g.colour}</td>
+        <td>${g.variantCount}</td>
+        <td>${g.inputCostLowQ > 0 ? g.inputCostLowQ.toFixed(1)+'c' : '-'}</td>
+        <td>${g.inputCost20Q > 0 ? g.inputCost20Q.toFixed(1)+'c' : '-'}</td>
+        <td>${g.avgOutput0Q.toFixed(1)}c</td>
+        <td>${g.avgOutput20Q > 0 ? g.avgOutput20Q.toFixed(1)+'c' : '-'}</td>
+        <td style="color:${pc0}">${p0 > 0 ? '+' : ''}${p0.toFixed(1)}c</td>
+        <td style="color:${pc20}">${p20 !== 0 ? (p20 > 0 ? '+' : '') + p20.toFixed(1)+'c' : '-'}</td></tr>`;
+    }
+    tbl += '</table>';
+    tableEl.innerHTML = tbl;
+  } catch (e) {
+    summaryEl.innerHTML = 'Failed to load: ' + e.message;
+  }
+}
 
 // ==================== SETTINGS ====================
 let settingsLoaded = false;
@@ -714,6 +895,7 @@ function renderAllSettings() {
   addSection(build, 'Movement', [['build.blinkRange'],['build.dashMinDistance','0 = disable dash-for-speed']]);
   addSection(build, 'Combat', [['build.defaultPositioning'],['build.fightRange'],['build.combatRange'],
     ['build.guardHpThreshold'],['build.guardEsThreshold'],['build.vaalMinMonsters'],['build.summonExpectedCount']]);
+  build.appendChild(buildEnemyBlacklist());
   build.appendChild(renderSkillsSection());
   addSection(build, 'Flasks', [['build.flasksEnabled'],['build.lifeFlaskSlot','0 = disabled'],['build.lifeFlaskHpThreshold'],
     ['build.manaFlaskSlot','0 = disabled'],['build.manaFlaskManaThreshold'],['build.utilityFlaskIntervalMs']]);

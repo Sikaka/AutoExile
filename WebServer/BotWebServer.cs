@@ -37,6 +37,10 @@ namespace AutoExile.WebServer
         public ConfigManager? ConfigManager { get; set; }
         public Systems.NinjaPriceService? NinjaPrice { get; set; }
         public Systems.LootTracker? LootTracker { get; set; }
+        public Systems.GemValuationService? GemValuation { get; set; }
+
+        /// <summary>Delegate to scan nearby hostile monsters. Returns (RenderName, Rarity, GridDistance) tuples. Set by BotCore.</summary>
+        public Func<List<(string Name, string Rarity, float Distance)>>? ScanNearbyMonsters { get; set; }
 
         // Cached terrain data — pushed from BotCore on area change
         private volatile MapTerrainData? _cachedTerrain;
@@ -256,6 +260,12 @@ namespace AutoExile.WebServer
                     case "/api/loot/reset" when method == "POST":
                         LootTracker?.ResetSession();
                         await ServeJson(resp, new { ok = true });
+                        break;
+                    case "/api/lab/gems" when method == "GET":
+                        await HandleLabGemValuation(resp);
+                        break;
+                    case "/api/nearby-monsters" when method == "GET":
+                        await HandleNearbyMonsters(resp);
                         break;
 
                     default:
@@ -639,6 +649,72 @@ namespace AutoExile.WebServer
             await ServeJson(resp, result, pretty: true);
         }
 
+        private async Task HandleLabGemValuation(HttpListenerResponse resp)
+        {
+            var ninja = NinjaPrice;
+            var gem = GemValuation;
+            if (ninja == null)
+            {
+                resp.StatusCode = 503;
+                await ServeJson(resp, new { error = "NinjaPrice service not available" });
+                return;
+            }
+            if (!ninja.IsLoaded)
+            {
+                resp.StatusCode = 503;
+                await ServeJson(resp, new { error = $"Ninja prices not loaded yet (status: {ninja.Status})" });
+                return;
+            }
+            if (gem == null)
+            {
+                resp.StatusCode = 503;
+                await ServeJson(resp, new { error = "GemValuation service not available" });
+                return;
+            }
+
+            var report = gem.GenerateReport(ninja, topN: 100);
+            await ServeJson(resp, report, pretty: true);
+        }
+
+        private async Task HandleNearbyMonsters(HttpListenerResponse resp)
+        {
+            var scanner = ScanNearbyMonsters;
+            if (scanner == null)
+            {
+                resp.StatusCode = 503;
+                await ServeJson(resp, new { error = "Not available (bot not running)" });
+                return;
+            }
+
+            try
+            {
+                var monsters = scanner();
+                // Deduplicate by name, keeping the closest distance and highest rarity
+                var grouped = monsters
+                    .GroupBy(m => m.Name, StringComparer.OrdinalIgnoreCase)
+                    .Select(g => new
+                    {
+                        name = g.Key,
+                        rarity = g.OrderByDescending(m => m.Rarity switch
+                        {
+                            "Unique" => 3, "Rare" => 2, "Magic" => 1, _ => 0
+                        }).First().Rarity,
+                        distance = g.Min(m => m.Distance),
+                        count = g.Count()
+                    })
+                    .OrderBy(m => m.distance)
+                    .Take(50)
+                    .ToList();
+
+                await ServeJson(resp, grouped);
+            }
+            catch (Exception ex)
+            {
+                resp.StatusCode = 500;
+                await ServeJson(resp, new { error = ex.Message });
+            }
+        }
+
         // ====================================================================
         // Helpers
         // ====================================================================
@@ -730,6 +806,14 @@ namespace AutoExile.WebServer
         public float SimAvgWaves { get; init; }
         public string SimAvgRunTime { get; init; } = "";
         public string SimRunTime { get; init; } = "";
+
+        // Labyrinth stats (populated only when mode is Labyrinth)
+        public int LabIzaroEncounters { get; init; }
+        public int LabDeaths { get; init; }
+        public int LabRuns { get; init; }
+        public int LabGemsTransformed { get; init; }
+        public float LabTotalProfit { get; init; }
+        public string LabSelectedGem { get; init; } = "";
 
         public long Timestamp { get; init; }
 

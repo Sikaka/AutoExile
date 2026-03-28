@@ -705,7 +705,7 @@ namespace AutoExile.Modes
             // Tier 1: Known monsters exist — navigate toward the nearest non-blacklisted one
             if (ctx.Combat.CachedMonsterCount > 0)
             {
-                var nearestPos = FindNearestNonBlacklisted(gc, playerPos);
+                var nearestPos = FindNearestNonBlacklisted(gc, playerPos, ctx.Combat.BlacklistedEnemies);
                 if (nearestPos.HasValue)
                 {
                     _wasSearching = true;
@@ -798,7 +798,7 @@ namespace AutoExile.Modes
         /// Find the nearest alive hostile monster that isn't blacklisted.
         /// Returns null if all cached monsters are blacklisted (or none exist).
         /// </summary>
-        private Vector2? FindNearestNonBlacklisted(GameController gc, Vector2 playerGrid)
+        private Vector2? FindNearestNonBlacklisted(GameController gc, Vector2 playerGrid, HashSet<string> enemyBlacklist)
         {
             float nearestDist = float.MaxValue;
             Vector2? nearestPos = null;
@@ -809,6 +809,8 @@ namespace AutoExile.Modes
                     continue;
                 if (_blacklistedMonsters.ContainsKey(entity.Id))
                     continue;
+                if (enemyBlacklist.Count > 0 && !string.IsNullOrEmpty(entity.RenderName) &&
+                    enemyBlacklist.Contains(entity.RenderName)) continue;
 
                 var dist = Vector2.Distance(entity.GridPosNum, playerGrid);
                 if (dist < nearestDist)

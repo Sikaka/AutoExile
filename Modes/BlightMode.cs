@@ -905,7 +905,7 @@ namespace AutoExile.Modes
 
                 // Find the monster closest to defense point (biggest threat).
                 // The return-to-pump timer (SweepPumpReturnSeconds) prevents staying away too long.
-                var nearestToPumpPos = FindMonsterClosestToDefense(gc, defensePos);
+                var nearestToPumpPos = FindMonsterClosestToDefense(gc, defensePos, ctx.Combat.BlacklistedEnemies);
                 if (nearestToPumpPos.HasValue)
                 {
                     var monsterDist = Vector2.Distance(playerPos, nearestToPumpPos.Value);
@@ -984,7 +984,7 @@ namespace AutoExile.Modes
         /// Find the alive hostile monster closest to the defense point (biggest threat).
         /// Uses OnlyValidEntities (entity list), not blight-specific cache.
         /// </summary>
-        private static Vector2? FindMonsterClosestToDefense(GameController gc, Vector2 defensePos)
+        private static Vector2? FindMonsterClosestToDefense(GameController gc, Vector2 defensePos, HashSet<string> enemyBlacklist)
         {
             float bestDist = float.MaxValue;
             Vector2? bestPos = null;
@@ -993,6 +993,8 @@ namespace AutoExile.Modes
             {
                 if (entity.Type != EntityType.Monster || !entity.IsHostile) continue;
                 if (!entity.IsAlive || !entity.IsTargetable) continue;
+                if (enemyBlacklist.Count > 0 && !string.IsNullOrEmpty(entity.RenderName) &&
+                    enemyBlacklist.Contains(entity.RenderName)) continue;
 
                 var dist = Vector2.Distance(entity.GridPosNum, defensePos);
                 if (dist < bestDist)

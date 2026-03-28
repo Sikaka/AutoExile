@@ -75,6 +75,13 @@ namespace AutoExile.Systems
         private int _stuckAtSameSpotCount;               // how many times stuck at approximately the same position
         private Vector2 _lastStuckPosition;
 
+        // No-progress detection — catches cases where player moves (e.g. shield charge bouncing
+        // off wall) but makes no progress toward the current waypoint
+        private float _bestDistToWaypoint = float.MaxValue;
+        private float _noProgressTimer;
+        private const float NoProgressTimeLimit = 1.0f;  // seconds of no progress before repath
+        private const float NoProgressThreshold = 2.0f;  // must get at least this much closer to count as progress
+
         // Blink tracking — geometry for wall-side detection (grid coordinates)
         private bool _blinkPending;           // true after blink fires, waiting to confirm crossing
         private Vector2 _blinkBoundary;       // walk waypoint before blink (origin side of gap)
@@ -160,6 +167,8 @@ namespace AutoExile.Systems
                 }
                 CurrentWaypointIndex++;
                 _stuckTimer = 0;
+                _bestDistToWaypoint = float.MaxValue;
+                _noProgressTimer = 0;
             }
             else if (!isLastWaypoint)
             {
@@ -187,7 +196,11 @@ namespace AutoExile.Systems
                         break;
                 }
                 if (advanced)
+                {
                     _stuckTimer = 0;
+                    _bestDistToWaypoint = float.MaxValue;
+                    _noProgressTimer = 0;
+                }
             }
 
             // Stuck detection (grid distance)
@@ -237,6 +250,30 @@ namespace AutoExile.Systems
             }
             _lastPosition = playerGrid;
 
+            // No-progress detection: player is moving (not stuck) but not getting closer
+            // to the current waypoint — e.g. shield charge bouncing off a wall repeatedly
+            {
+                var distToWp = Vector2.Distance(playerGrid, CurrentNavPath[CurrentWaypointIndex].Position);
+                if (distToWp < _bestDistToWaypoint - NoProgressThreshold)
+                {
+                    _bestDistToWaypoint = distToWp;
+                    _noProgressTimer = 0;
+                }
+                else
+                {
+                    _noProgressTimer += (float)gc.DeltaTime / 1000f;
+                    if (_noProgressTimer > NoProgressTimeLimit && Destination.HasValue)
+                    {
+                        _noProgressTimer = 0;
+                        _bestDistToWaypoint = float.MaxValue;
+                        LastRecoveryAction = "No waypoint progress, repath";
+                        _totalStuckRecoveries++;
+                        NavigateTo(gc, Destination.Value);
+                        return;
+                    }
+                }
+            }
+
             // All input goes through BotInput — if gate is closed, skip this tick
             if (!BotInput.CanAct)
                 return;
@@ -244,8 +281,9 @@ namespace AutoExile.Systems
             // Get current waypoint and determine action
             var waypoint = CurrentNavPath[CurrentWaypointIndex];
             var windowRect = gc.Window.GetWindowRectangle();
+            bool inTown = gc.Area?.CurrentArea?.IsTown == true;
 
-            if (waypoint.Action == WaypointAction.Blink)
+            if (waypoint.Action == WaypointAction.Blink && !inTown)
             {
                 var boundary = CurrentWaypointIndex > 0
                     ? CurrentNavPath[CurrentWaypointIndex - 1].Position
@@ -300,8 +338,8 @@ namespace AutoExile.Systems
                         return; // everything is too close, skip this tick
                 }
 
-                // Try dash-for-speed on long straight segments
-                if (!TryDashForSpeed(gc, playerGrid, windowRect))
+                // Try dash-for-speed on long straight segments (not in town — skills don't work there)
+                if (inTown || !TryDashForSpeed(gc, playerGrid, windowRect))
                     ExecuteWalk(screenPos, windowRect);
             }
         }
@@ -580,6 +618,8 @@ namespace AutoExile.Systems
             BlinkCount = CurrentNavPath.Count(w => w.Action == WaypointAction.Blink);
             _blinkPending = false;
             _stuckTimer = 0;
+            _bestDistToWaypoint = float.MaxValue;
+            _noProgressTimer = 0;
             _lastPosition = playerGrid;
 
             return true;
@@ -642,6 +682,9 @@ namespace AutoExile.Systems
             if (path.Contains("Door") || path.Contains("Blockage") ||
                 path.Contains("Breakable") || path.Contains("Switch"))
             {
+                // Skip locked puzzle doors and switches — doors need levers,
+                // switches need pathfinding to reach (handled by lab mode)
+                if (path.Contains("Door_Closed") || path.Contains("Switch_")) return false;
                 if (entity.IsTargetable)
                     return true;
             }
@@ -876,6 +919,8 @@ namespace AutoExile.Systems
             _positionHistoryCount = 0;
             _positionHistoryIndex = 0;
             _stuckAtSameSpotCount = 0;
+            _bestDistToWaypoint = float.MaxValue;
+            _noProgressTimer = 0;
         }
 
         /// <summary>

@@ -42,6 +42,7 @@ namespace AutoExile
         private ThreatSystem _threat = new();
         private EldritchAltarHandler _altarHandler = new();
         private NinjaPriceService _ninjaPrice = new();
+        private GemValuationService _gemValuation = new();
         private BotRecorder _recorder = new();
         private BotWebServer? _webServer;
         private DataStore? _dataStore;
@@ -70,6 +71,7 @@ namespace AutoExile
         private MappingMode? _mappingMode;
         private SimulacrumMode? _simulacrumMode;
         private HeistMode? _heistMode;
+        private LabyrinthMode? _labyrinthMode;
 
         // Area change tracking for tile map reload
         private string _lastAreaName = "";
@@ -154,6 +156,8 @@ namespace AutoExile
             RegisterMode(_simulacrumMode);
             _heistMode = new HeistMode();
             RegisterMode(_heistMode);
+            _labyrinthMode = new LabyrinthMode();
+            RegisterMode(_labyrinthMode);
 
             // Register in-map mechanics
             _mechanics.Register(new UltimatumMechanic());
@@ -216,10 +220,48 @@ namespace AutoExile
                 _webServer.MapDatabase = _mapDatabase;
                 _webServer.NinjaPrice = _ninjaPrice;
                 _webServer.LootTracker = _lootTracker;
+                _webServer.GemValuation = _gemValuation;
+                _webServer.ScanNearbyMonsters = ScanNearbyMonstersForWebUI;
                 _webServer.Start();
             }
 
             return base.Initialise();
+        }
+
+        /// <summary>
+        /// Scan nearby hostile monsters for the web UI enemy blacklist feature.
+        /// Called from a web request thread — reads entity list snapshot.
+        /// </summary>
+        private List<(string Name, string Rarity, float Distance)> ScanNearbyMonstersForWebUI()
+        {
+            var result = new List<(string Name, string Rarity, float Distance)>();
+            try
+            {
+                var gc = GameController;
+                if (gc?.Player == null || !gc.InGame) return result;
+                var playerPos = gc.Player.GridPosNum;
+
+                foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+                {
+                    if (entity.Type != ExileCore.Shared.Enums.EntityType.Monster) continue;
+                    if (!entity.IsHostile || !entity.IsAlive) continue;
+
+                    var name = entity.RenderName;
+                    if (string.IsNullOrEmpty(name)) continue;
+
+                    var dist = System.Numerics.Vector2.Distance(entity.GridPosNum, playerPos);
+                    var rarity = entity.Rarity switch
+                    {
+                        ExileCore.Shared.Enums.MonsterRarity.Magic => "Magic",
+                        ExileCore.Shared.Enums.MonsterRarity.Rare => "Rare",
+                        ExileCore.Shared.Enums.MonsterRarity.Unique => "Unique",
+                        _ => "Normal"
+                    };
+                    result.Add((name, rarity, dist));
+                }
+            }
+            catch { }
+            return result;
         }
 
         /// <summary>
@@ -351,20 +393,7 @@ namespace AutoExile
             if (!_mapListPopulated)
                 PopulateMapList();
 
-            // Toggle running with hotkey — always check, even during async actions
-            if (Settings.ToggleRunning.PressedOnce())
-            {
-                Settings.Running.Value = !Settings.Running.Value;
-                if (Settings.Running.Value)
-                {
-                    if (!_lootTracker.IsActive)
-                        _lootTracker.StartSession();
-                    // Reset wave timer so pause duration doesn't count toward timeout
-                    _simulacrumMode?.State.ResetWaveTimer();
-                }
-                else if (_lootTracker.IsActive)
-                    _lootTracker.StopSession();
-            }
+            // Toggle running hotkey is now in Render() so it's never blocked by early returns.
 
             // An async action is in flight (cursor settle, key hold).
             // Still tick combat for self-cast skills (RF, guards, etc.) and mode for state updates,
@@ -530,10 +559,19 @@ namespace AutoExile
             _mapDevice.MaxClickAttempts = Settings.MaxClickAttempts.Value;
             _stash.ExtraLatencySec = extraLatencySec;
             _combat.ExtraLatencySec = extraLatencySec;
+            // Parse enemy blacklist
+            var blacklistRaw = Settings.Build.BlacklistedEnemies.Value ?? "";
+            _combat.BlacklistedEnemies = new HashSet<string>(
+                blacklistRaw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .Where(s => s.Length > 0),
+                StringComparer.OrdinalIgnoreCase);
             _navigation.ExtraLatencyMs = extraLatency;
 
             // Tick ninja price service (league detection, refresh timer)
             _ninjaPrice.Tick(GameController);
+
+            // Build gem colour map from game data (once)
+            _gemValuation.BuildColourMap(GameController);
 
             // Sync stash/map device settings
             _stash.ActionCooldownMs = Settings.Loot.StashItemCooldownMs.Value;
@@ -545,6 +583,7 @@ namespace AutoExile
                 ?? (_mode as BlightMode)?.Phase.ToString()
                 ?? (_mode as SimulacrumMode)?.Phase.ToString()
                 ?? (_mode as HeistMode)?.Phase.ToString()
+                ?? (_mode as LabyrinthMode)?.Phase.ToString()
                 ?? (_mode as FollowerMode)?.State.ToString()
                 ?? "",
                 (_mode as MappingMode)?.Decision
@@ -601,6 +640,20 @@ namespace AutoExile
         {
             if (!Settings.Enable || !GameController.InGame)
                 return;
+
+            // Toggle running hotkey — checked in Render so it's never blocked by early returns in Tick
+            if (Settings.ToggleRunning.PressedOnce())
+            {
+                Settings.Running.Value = !Settings.Running.Value;
+                if (Settings.Running.Value)
+                {
+                    if (!_lootTracker.IsActive)
+                        _lootTracker.StartSession();
+                    _simulacrumMode?.State.ResetWaveTimer();
+                }
+                else if (_lootTracker.IsActive)
+                    _lootTracker.StopSession();
+            }
 
             UpdateDebugRangeCircle();
 
@@ -937,6 +990,23 @@ namespace AutoExile
                 }
             }
 
+            // Labyrinth mode status
+            if (_mode == _labyrinthMode && _labyrinthMode != null)
+            {
+                ImGui.Separator();
+                ImGui.Text("=== Labyrinth Mode ===");
+                ImGui.Text($"Phase: {_labyrinthMode.Phase}");
+                ImGui.Text($"Status: {_labyrinthMode.StatusText}");
+
+                var labState = _labyrinthMode.State;
+                ImGui.Text($"Izaro: {labState.IzaroEncounterCount}/3 | Zone: {labState.ZoneCount}");
+                ImGui.Text($"Deaths: {labState.DeathCount}/{Settings.Labyrinth.MaxDeaths.Value} | Runs: {labState.RunsCompleted}");
+                ImGui.Text($"Gems: {labState.GemsTransformed} | Profit: {labState.TotalProfit:F0}c");
+                ImGui.Text($"Selected gem: {labState.SelectedGemName ?? "none"}");
+                ImGui.Text($"Font: {(labState.HasFont ? "yes" : "no")} | Door: {(labState.HasIzaroDoor ? "yes" : "no")} | Izaro: {(labState.IsIzaroPresent ? "ALIVE" : "no")} | Portal: {(labState.HasReturnPortal ? "yes" : "no")}");
+                ImGui.Text($"Exits: {labState.ExitTransitions.Count} | Chests: {labState.ChestCount}");
+            }
+
             // Game state dump
             ImGui.Separator();
             ImGui.Text("=== Game State Dump ===");
@@ -1118,6 +1188,8 @@ namespace AutoExile
                 { phase = heist.Phase.ToString(); decision = heist.Decision; }
                 else if (_mode is FollowerMode follower)
                 { phase = follower.State.ToString(); decision = follower.Decision; status = follower.StatusText; }
+                else if (_mode is LabyrinthMode lab)
+                { phase = lab.Phase.ToString(); status = lab.StatusText; }
 
                 // Player position for map overlay
                 var playerGridPos = GameController.Player?.GridPosNum ?? Vector2.Zero;
@@ -1227,6 +1299,14 @@ namespace AutoExile
                     SimRunTime = _simulacrumMode != null && _mode == _simulacrumMode
                         && _simulacrumMode.Phase >= SimPhase.FindMonolith && _simulacrumMode.Phase <= SimPhase.ExitMap
                         ? (DateTime.Now - _simulacrumMode.State.RunStartedAt).ToString(@"m\:ss") : "",
+
+                    // Labyrinth stats
+                    LabIzaroEncounters = _labyrinthMode?.State.IzaroEncounterCount ?? 0,
+                    LabDeaths = _labyrinthMode?.State.DeathCount ?? 0,
+                    LabRuns = _labyrinthMode?.State.RunsCompleted ?? 0,
+                    LabGemsTransformed = _labyrinthMode?.State.GemsTransformed ?? 0,
+                    LabTotalProfit = Sanitize((float)(_labyrinthMode?.State.TotalProfit ?? 0)),
+                    LabSelectedGem = _labyrinthMode?.State.SelectedGemName ?? "",
 
                     Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
 
@@ -1790,6 +1870,8 @@ namespace AutoExile
                     _simulacrumMode.State.DeathCount++;
                 if (!_wasDead && _heistMode != null)
                     _heistMode.State.DeathCount++;
+                if (!_wasDead && _labyrinthMode != null)
+                    _labyrinthMode.State.DeathCount++;
                 _wasDead = true;
 
                 // Click resurrect button
