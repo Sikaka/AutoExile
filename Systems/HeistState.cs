@@ -4,6 +4,7 @@ using ExileCore.PoEMemory.MemoryObjects;
 using ExileCore.Shared.Enums;
 using AutoExile.Systems;
 using System.Numerics;
+using static AutoExile.BotSettings;
 
 namespace AutoExile.Systems
 {
@@ -32,6 +33,11 @@ namespace AutoExile.Systems
 
         // Full map navigation graph from TileEntities (available at zone load)
         public List<Vector2> PathNodes { get; } = new();
+
+        // Route planning — ordered list of targets (chests + curio) to visit
+        public List<RouteTarget> PlannedRoute { get; } = new();
+        public int CurrentRouteIndex { get; set; }
+        public RouteTarget? CurrentTarget => CurrentRouteIndex < PlannedRoute.Count ? PlannedRoute[CurrentRouteIndex] : null;
 
         // Death tracking
         public int DeathCount { get; set; }
@@ -156,20 +162,81 @@ namespace AutoExile.Systems
             Status = $"Init: exit={ExitPosition != null} curio={CurioTargetPosition != null} companion={CompanionEntityId != 0} rewards={RewardChests.Count} doors={Doors.Count} nodes={PathNodes.Count}";
         }
 
+        /// <summary>
+        /// Build an ordered route of targets (reward chests + curio) sorted by corridor order
+        /// (distance from exit). Only includes chests matching enabled reward type settings.
+        /// </summary>
+        public void BuildRoute(BotSettings.HeistSettings settings)
+        {
+            PlannedRoute.Clear();
+            CurrentRouteIndex = 0;
+            var exitPos = ExitPosition ?? Vector2.Zero;
+
+            // Add enabled reward chests
+            foreach (var chest in RewardChests.Values)
+            {
+                // Only route to valuable chests — skip filler path chests
+                if (chest.ChestType == HeistChestType.Normal) continue;
+
+                // Filter by user's per-reward-type toggles
+                if (chest.RewardType != HeistRewardType.None && !settings.IsRewardTypeEnabled(chest.RewardType))
+                    continue;
+
+                PlannedRoute.Add(new RouteTarget
+                {
+                    GridPos = chest.GridPos,
+                    Type = RouteTargetType.RewardChest,
+                    Label = chest.RewardLabel,
+                    EntityId = chest.Id,
+                    RewardType = chest.RewardType,
+                    DistFromExit = Vector2.Distance(exitPos, chest.GridPos),
+                });
+            }
+
+            // Add curio as final target (always)
+            if (CurioTargetPosition != null)
+            {
+                PlannedRoute.Add(new RouteTarget
+                {
+                    GridPos = CurioTargetPosition.Value,
+                    Type = RouteTargetType.Curio,
+                    Label = "Curio",
+                    DistFromExit = Vector2.Distance(exitPos, CurioTargetPosition.Value),
+                });
+            }
+
+            // Sort by distance from exit — visits chests in corridor order on the way to curio
+            PlannedRoute.Sort((a, b) => a.DistFromExit.CompareTo(b.DistFromExit));
+        }
+
         public void Tick(GameController gc)
         {
-            // Re-resolve companion
-            if (CompanionEntityId != 0)
+            // Re-resolve companions — grand heists have multiple, track the one that's working
+            CompanionLockPickProgress = 0;
+            CompanionIsBusy = false;
+            CompanionPosition = null;
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
             {
-                var companion = FindEntityById(gc, CompanionEntityId);
-                if (companion != null)
-                {
-                    CompanionPosition = companion.GridPosNum;
-                    var sm = companion.GetComponent<StateMachine>();
-                    CompanionLockPickProgress = GetStateValue(sm, "lock_pick_progress");
-                    var jobIdx = GetStateValue(sm, "current_job_index");
-                    CompanionIsBusy = jobIdx != 4294967295 && jobIdx >= 0;
-                }
+                if (entity?.Path == null) continue;
+                if (!entity.Path.Contains("LeagueHeist/NPCAllies") || entity.IsHostile || !entity.IsAlive)
+                    continue;
+
+                // Track first companion for position (backwards compat)
+                if (CompanionEntityId == 0)
+                    CompanionEntityId = entity.Id;
+                if (CompanionPosition == null)
+                    CompanionPosition = entity.GridPosNum;
+
+                var sm = entity.GetComponent<StateMachine>();
+                var progress = GetStateValue(sm, "lock_pick_progress");
+                var jobIdx = GetStateValue(sm, "current_job_index");
+                var busy = jobIdx != 4294967295 && jobIdx >= 0;
+
+                // If ANY companion is busy or has progress, report that
+                if (progress > CompanionLockPickProgress)
+                    CompanionLockPickProgress = progress;
+                if (busy)
+                    CompanionIsBusy = true;
             }
 
             // Read alert from UI
@@ -265,21 +332,23 @@ namespace AutoExile.Systems
                     }
                 }
 
-                // Detect basic doors too
-                if (entity.Path.Contains("Door_Basic") && entity.IsTargetable)
+                // Detect basic and generic doors
+                bool isClickDoor = entity.Path.Contains("Door_Basic")
+                    || entity.Path == "Metadata/MiscellaneousObjects/Door";
+                if (isClickDoor && entity.IsTargetable && entity.DistancePlayer < 25)
                 {
+                    // For Door_Basic, check open state. For generic doors, targetable=closed.
                     var sm = entity.GetComponent<StateMachine>();
                     var open = GetStateValue(sm, "open");
-                    if (open == 0 && entity.DistancePlayer < 25)
+                    if (open <= 0) // 0=closed for Door_Basic, -1=no state for generic doors
                     {
-                        // Nearby closed basic door — mode should handle this
                         if (!Doors.ContainsKey(entity.Id))
                         {
                             Doors[entity.Id] = new CachedHeistDoor
                             {
                                 Id = entity.Id,
                                 GridPos = entity.GridPosNum,
-                                HeistLocked = 0, // not NPC-locked, just closed
+                                HeistLocked = 0,
                                 Path = entity.Path,
                                 IsBasicDoor = true,
                                 IsTargetable = true
@@ -366,6 +435,8 @@ namespace AutoExile.Systems
             Doors.Clear();
             OpenedEntities.Clear();
             PathNodes.Clear();
+            PlannedRoute.Clear();
+            CurrentRouteIndex = 0;
             Status = "";
         }
 
@@ -513,5 +584,23 @@ namespace AutoExile.Systems
         public string Path { get; set; } = "";
         public bool IsBasicDoor { get; set; }
         public bool IsTargetable { get; set; } = true;
+    }
+
+    public enum RouteTargetType
+    {
+        RewardChest,
+        Curio,
+    }
+
+    public class RouteTarget
+    {
+        public Vector2 GridPos { get; set; }
+        public RouteTargetType Type { get; set; }
+        public string Label { get; set; } = "";
+        public long EntityId { get; set; }
+        public HeistRewardType RewardType { get; set; }
+        public float DistFromExit { get; set; }
+        public bool Reached { get; set; }
+        public bool Skipped { get; set; }
     }
 }

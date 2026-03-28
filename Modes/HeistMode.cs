@@ -4,6 +4,7 @@ using ExileCore.PoEMemory.MemoryObjects;
 using ExileCore.Shared.Enums;
 using AutoExile.Systems;
 using AutoExile.Modes.Shared;
+using System.Linq;
 using System.Numerics;
 using Pathfinding = AutoExile.Systems.Pathfinding;
 
@@ -25,6 +26,8 @@ namespace AutoExile.Modes
         private string _lastAreaName = "";
         private DateTime _phaseStartTime = DateTime.Now;
         private DateTime _lastActionTime = DateTime.MinValue;
+        private DateTime _lastRepathTime = DateTime.MinValue;
+        private const int RepathCooldownMs = 1250; // min time between A* pathfinding calls
 
         // Companion wait tracking
         private long _waitingOnEntityId;
@@ -36,12 +39,18 @@ namespace AutoExile.Modes
         // Loot
         private readonly LootPickupTracker _lootTracker = new();
         private DateTime _lastLootScanTime = DateTime.MinValue;
+        private DateTime _chestLootWindowEnd = DateTime.MinValue; // pause to loot after chest opens
+
+        // Curio display evaluation (grand heist reward room)
+        private List<CurioDisplayInfo> _curioDisplays = new();
+        private DateTime _lastCurioScanTime = DateTime.MinValue;
 
         // Navigation / exploration tracking
         private long _pendingInteractionEntityId;
         private int _lastStuckCount;           // track NavigationSystem stuck recoveries
-        private Vector2? _currentExploreTarget; // current explore/pathnode target
-        private readonly HashSet<Vector2> _visitedPathNodes = new(); // pathnode positions we've reached or failed
+        private int _lastRouteIndex = -1;      // detect route target changes for stuck reset
+        private Vector2? _currentExploreTarget; // current explore/pathnode target (fallback)
+        private readonly HashSet<Vector2> _visitedPathNodes = new(); // pathnode positions we've reached or failed (fallback)
 
         public void OnEnter(BotContext ctx)
         {
@@ -114,6 +123,13 @@ namespace AutoExile.Modes
 
             // Always tick state
             _state.Tick(gc);
+
+            // Scan curio displays for valuation overlay (every 2s)
+            if ((DateTime.Now - _lastCurioScanTime).TotalSeconds > 2)
+            {
+                _lastCurioScanTime = DateTime.Now;
+                ScanCurioDisplays(gc);
+            }
 
             // Phase machine
             switch (_phase)
@@ -191,9 +207,12 @@ namespace AutoExile.Modes
             }
 
             _state.Initialize(gc);
+            _state.BuildRoute(ctx.Settings.Heist);
             ModeHelpers.EnableDefaultCombat(ctx);
 
+            var routeDesc = string.Join(" → ", _state.PlannedRoute.Select(t => t.Label));
             ctx.Log($"Heist initialized: {_state.Status}");
+            ctx.Log($"Route ({_state.PlannedRoute.Count} targets): {routeDesc}");
 
             // Detect mid-lockdown start: no alert panel, no curio entity, companion present.
             // This happens when bot starts after curio was already grabbed.
@@ -250,8 +269,23 @@ namespace AutoExile.Modes
                 TryPickupLoot(ctx, gc);
             }
 
-            // Check for blocking doors nearby
-            if (!ctx.Interaction.IsBusy)
+            // After opening a chest, pause to loot dropped items before resuming navigation
+            if (DateTime.Now < _chestLootWindowEnd)
+            {
+                _status = "Looting chest drops...";
+                Decision = "chest_loot_window";
+                return; // keep scanning loot above, but don't navigate away
+            }
+
+            // Check for blocking doors nearby — but NOT when we're close to a chest route target.
+            // Otherwise the bot opens the door to a chest room, then immediately detects the NEXT
+            // locked door further down the corridor and walks past the chest to open that one.
+            var currentRouteTarget = _state.CurrentTarget;
+            bool nearChestTarget = currentRouteTarget != null
+                && currentRouteTarget.Type == RouteTargetType.RewardChest
+                && Vector2.Distance(playerGrid, currentRouteTarget.GridPos) < 60;
+
+            if (!ctx.Interaction.IsBusy && !nearChestTarget)
             {
                 var blockingDoor = FindBlockingDoor(gc, playerGrid);
                 if (blockingDoor != null)
@@ -262,146 +296,148 @@ namespace AutoExile.Modes
                 }
             }
 
-            // Evaluate nearby reward chests (if alert allows)
-            if (!ctx.Interaction.IsBusy && ctx.Settings.Heist.OpenRewardChests.Value)
+            // --- Route following ---
+
+            // Advance past completed/skipped route targets
+            while (_state.CurrentRouteIndex < _state.PlannedRoute.Count)
             {
-                var worthyChest = FindWorthyChest(gc, playerGrid, ctx.Settings.Heist);
-                if (worthyChest != null)
+                var t = _state.PlannedRoute[_state.CurrentRouteIndex];
+                if (t.Reached || t.Skipped)
                 {
-                    StartChestInteraction(ctx, gc, worthyChest);
-                    return;
+                    _state.CurrentRouteIndex++;
+                    continue;
                 }
-            }
-
-            // Navigate toward curio target, or explore forward if not yet visible
-            // If we're already at the curio target but no actual curio entity is nearby,
-            // the target was a stale HeistPathEndpoint from init — clear it and explore instead
-            if (_state.CurioTargetPosition != null
-                && Vector2.Distance(playerGrid, _state.CurioTargetPosition.Value) < 15
-                && _state.FindCurioEntity(gc) == null)
-            {
-                _state.ClearCurioTarget();
-            }
-
-            if (_state.CurioTargetPosition != null)
-            {
-                var curioGridTarget = _state.CurioTargetPosition.Value;
-                if (!ctx.Navigation.IsNavigating)
+                if (t.Type == RouteTargetType.RewardChest)
                 {
-                    if (!ctx.Navigation.NavigateTo(gc, curioGridTarget))
+                    // Check by ID (if IDs match) or by checking if any opened chest is near this position
+                    if (_state.OpenedEntities.Contains(t.EntityId))
                     {
-                        // Can't path to curio — check for blocking door first, then stepping stone
-                        var nextDoor = FindNextLockedDoor(gc, playerGrid);
-                        if (nextDoor != null)
+                        t.Reached = true;
+                        _state.CurrentRouteIndex++;
+                        continue;
+                    }
+                    // Position-based check: any opened chest within 15 grid units of route target?
+                    bool opened = false;
+                    foreach (var id in _state.OpenedEntities)
+                    {
+                        if (_state.RewardChests.TryGetValue(id, out var c) && Vector2.Distance(c.GridPos, t.GridPos) < 15)
                         {
-                            StartDoorInteraction(ctx, gc, nextDoor, HeistPhase.Infiltrating);
-                            return;
+                            opened = true;
+                            break;
+                        }
+                    }
+                    if (opened)
+                    {
+                        t.Reached = true;
+                        _state.CurrentRouteIndex++;
+                        continue;
+                    }
+                }
+                break;
+            }
+
+            // Reset stuck count when route target changes
+            if (_state.CurrentRouteIndex != _lastRouteIndex)
+            {
+                _lastStuckCount = ctx.Navigation.StuckRecoveries;
+                _lastRouteIndex = _state.CurrentRouteIndex;
+            }
+
+            var target = _state.CurrentTarget;
+
+            if (target != null && target.Type == RouteTargetType.RewardChest)
+            {
+                // Check alert budget before committing to this chest
+                if (_state.AlertPercent > ctx.Settings.Heist.AlertThreshold.Value)
+                {
+                    target.Skipped = true;
+                    _status = $"Skipping {target.Label} — alert {_state.AlertPercent:F0}%";
+                    Decision = "skip_chest_alert";
+                    return; // next tick advances past this
+                }
+
+                // Check if we're close enough to interact
+                var distToChest = Vector2.Distance(playerGrid, target.GridPos);
+                if (distToChest < 25)
+                {
+                    // Find live entity — match by ID first, fall back to nearest HeistChest by position.
+                    // TileEntity IDs may not match live entity IDs.
+                    Entity? chestEntity = null;
+                    float bestChestDist = 15f; // max distance to match a chest to its route target
+                    foreach (var e in gc.EntityListWrapper.OnlyValidEntities)
+                    {
+                        if (e?.Path == null || !e.IsTargetable) continue;
+                        if (!e.Path.Contains("HeistChest")) continue;
+
+                        if (e.Id == target.EntityId)
+                        {
+                            chestEntity = e;
+                            break; // exact ID match
                         }
 
-                        var stepNode = FindPathNodeToward(gc, playerGrid, _state.CurioTargetPosition.Value);
-                        if (stepNode.HasValue && ctx.Navigation.NavigateTo(gc, stepNode.Value))
+                        // Position match — closest HeistChest to the route target position
+                        var d = Vector2.Distance(e.GridPosNum, target.GridPos);
+                        if (d < bestChestDist)
                         {
-                            Decision = $"curio_step ({stepNode.Value.X:F0},{stepNode.Value.Y:F0})";
+                            var ch = e.GetComponent<Chest>();
+                            if (ch?.IsOpened != true)
+                            {
+                                bestChestDist = d;
+                                chestEntity = e;
+                            }
                         }
-                        else
+                    }
+
+                    if (chestEntity != null)
+                    {
+                        var chest = chestEntity.GetComponent<Chest>();
+                        if (chest?.IsOpened != true && !ctx.Interaction.IsBusy)
                         {
-                            _status = $"Can't reach curio — no path forward";
-                            Decision = "curio_blocked";
+                            ctx.Navigation.Stop(gc);
+                            StartChestInteraction(ctx, gc, chestEntity);
+                            return;
                         }
                     }
                     else
                     {
-                        _status = $"Navigating to curio — alert: {_state.AlertPercent:F0}%";
-                        Decision = "navigating_to_curio";
+                        // Entity not loaded yet — wait a bit before giving up (might be loading in)
+                        if ((DateTime.Now - _phaseStartTime).TotalSeconds > 10)
+                        {
+                            target.Reached = true;
+                            Decision = "chest_not_found";
+                            return;
+                        }
+                        _status = $"Waiting for chest entity near ({target.GridPos.X:F0},{target.GridPos.Y:F0})...";
+                        Decision = "chest_loading";
+                        return;
                     }
                 }
-                else
+
+                // Navigate toward the chest
+                NavigateToRouteTarget(ctx, gc, playerGrid, target);
+            }
+            else if (target != null && target.Type == RouteTargetType.Curio)
+            {
+                // If at the curio marker but no entity, marker was stale
+                if (Vector2.Distance(playerGrid, target.GridPos) < 15 && _state.FindCurioEntity(gc) == null)
                 {
-                    // Update destination if curio position changed (e.g., actual curio entity found)
-                    ctx.Navigation.UpdateDestination(gc, curioGridTarget, 12);
-                    _status = $"Navigating to curio — alert: {_state.AlertPercent:F0}%";
-                    Decision = "navigating_to_curio";
+                    target.Reached = true;
+                    _state.ClearCurioTarget();
+                    Decision = "curio_marker_reached";
+                    return;
                 }
+
+                // Update curio position if actual entity appeared
+                var curioEntity = _state.FindCurioEntity(gc);
+                if (curioEntity != null)
+                    target.GridPos = curioEntity.GridPosNum;
+
+                NavigateToRouteTarget(ctx, gc, playerGrid, target);
             }
             else
             {
-                // Curio not yet visible — push deeper into the heist.
-                // Strategy: navigate to farthest visible HeistPathNode from exit.
-                // If no reachable nodes, find and open the next locked door to unlock new corridor.
-                if (ctx.Navigation.IsNavigating && _currentExploreTarget.HasValue)
-                {
-                    // Mark node visited once close enough
-                    if (Vector2.Distance(playerGrid, _currentExploreTarget.Value) < 20)
-                        _visitedPathNodes.Add(_currentExploreTarget.Value);
-
-                    // Stuck abandonment
-                    var stuckDelta = ctx.Navigation.StuckRecoveries - _lastStuckCount;
-                    if (stuckDelta >= 3)
-                    {
-                        _visitedPathNodes.Add(_currentExploreTarget.Value);
-                        ctx.Navigation.Stop(gc);
-                        _currentExploreTarget = null;
-                        Decision = "pathnode_stuck";
-                    }
-                    else
-                    {
-                        _status = $"Following path — alert: {_state.AlertPercent:F0}%";
-                        Decision = "pathnode_moving";
-                    }
-                }
-                else if (!ctx.Navigation.IsNavigating)
-                {
-                    // Try pathnodes first
-                    var bestNode = FindNextPathNode(gc, playerGrid);
-                    if (bestNode.HasValue)
-                    {
-                        if (ctx.Navigation.NavigateTo(gc, bestNode.Value))
-                        {
-                            _currentExploreTarget = bestNode.Value;
-                            _lastStuckCount = ctx.Navigation.StuckRecoveries;
-                            _status = $"Following path — alert: {_state.AlertPercent:F0}%";
-                            Decision = $"pathnode ({bestNode.Value.X:F0},{bestNode.Value.Y:F0})";
-                        }
-                        else
-                        {
-                            _visitedPathNodes.Add(bestNode.Value);
-                            Decision = "pathnode_fail";
-                        }
-                    }
-                    else
-                    {
-                        // No reachable pathnodes — find the next locked door to open
-                        var nextDoor = FindNextLockedDoor(gc, playerGrid);
-                        if (nextDoor != null)
-                        {
-                            // Navigate to the door, then interact
-                            if (nextDoor.DistancePlayer < 20)
-                            {
-                                // Close enough — press interact key
-                                ctx.Navigation.Stop(gc);
-                                StartDoorInteraction(ctx, gc, nextDoor, HeistPhase.Infiltrating);
-                            }
-                            else
-                            {
-                                // Navigate to nearest walkable cell beside the door
-                                var nearWalkable = ctx.Navigation.FindNearestWalkable(gc, nextDoor.GridPosNum, 20);
-                                if (nearWalkable.HasValue)
-                                {
-                                        ctx.Navigation.NavigateTo(gc, nearWalkable.Value);
-                                    _currentExploreTarget = nearWalkable.Value;
-                                    _lastStuckCount = ctx.Navigation.StuckRecoveries;
-                                }
-                                _status = $"Navigating to locked door — alert: {_state.AlertPercent:F0}%";
-                                Decision = $"nav_to_door ({nextDoor.GridPosNum.X:F0},{nextDoor.GridPosNum.Y:F0})";
-                            }
-                        }
-                        else
-                        {
-                            _status = "No path forward — no nodes or doors";
-                            Decision = "no_path_forward";
-                        }
-                    }
-                }
+                // Route exhausted — fall back to pathnode exploration
+                FallbackExplore(ctx, gc, playerGrid);
             }
         }
 
@@ -428,8 +464,10 @@ namespace AutoExile.Modes
 
             var distToDoor = doorEntity.DistancePlayer;
 
-            // Check if it's a basic door — navigate to it and click
-            if (doorEntity.Path?.Contains("Door_Basic") == true)
+            // Check if it's a click-to-open door (basic or generic) — navigate to it and click
+            bool isClickDoor = doorEntity.Path == "Metadata/MiscellaneousObjects/Door"
+                || doorEntity.Path?.Contains("Door_Basic") == true;
+            if (isClickDoor)
             {
                 var sm = doorEntity.GetComponent<StateMachine>();
                 var open = HeistState.GetStateValue(sm, "open");
@@ -503,13 +541,18 @@ namespace AutoExile.Modes
                 return;
             }
 
-            // Ensure we're close enough to the door for companion to work
+            // Ensure we're close enough to the door for companion to work.
+            // V key works from any distance — companion walks to the entity himself.
+            // Stay at 30 grid units to avoid cursor-on-door UI issues during approach.
             distToDoor = doorEntity.DistancePlayer;
-            if (distToDoor > 15)
+            if (distToDoor > 30)
             {
                 if (!ctx.Navigation.IsNavigating)
                 {
-                    var nearWalkable = ctx.Navigation.FindNearestWalkable(gc, doorEntity.GridPosNum, 20);
+                    // Navigate toward door but stop ~25 units away (between player and door)
+                    var dir = Vector2.Normalize(doorEntity.GridPosNum - gc.Player.GridPosNum);
+                    var approachTarget = doorEntity.GridPosNum - dir * 25;
+                    var nearWalkable = ctx.Navigation.FindNearestWalkable(gc, approachTarget, 15);
                     bool started = false;
                     if (nearWalkable.HasValue)
                         started = ctx.Navigation.NavigateTo(gc, nearWalkable.Value);
@@ -531,18 +574,23 @@ namespace AutoExile.Modes
                     ctx.Navigation.Stop(gc);
             }
 
-            _status = $"Waiting for companion... progress: {_state.CompanionLockPickProgress:F0}% ({elapsed:F0}s) dist:{distToDoor:F0}";
-            Decision = "companion_channeling";
+            // Check door's own heist_locked state — 2=untouched, 1=companion assigned, 0=opened
+            var doorAccepted = locked < 2; // V was accepted if heist_locked dropped from 2
+            var companionWorking = _state.CompanionLockPickProgress > 0 || _state.CompanionIsBusy || doorAccepted;
 
-            // Only re-press V if companion is completely idle (not busy, no progress)
-            // and enough time has passed since last press. This prevents bouncing
-            // between multiple nearby interactables.
-            if (_state.CompanionLockPickProgress == 0 && !_state.CompanionIsBusy)
+            _status = $"Waiting for companion... locked:{locked:F0} progress:{_state.CompanionLockPickProgress:F0}% busy:{_state.CompanionIsBusy} ({elapsed:F0}s) dist:{distToDoor:F0}";
+            Decision = companionWorking ? "companion_channeling" : "companion_idle";
+
+            // Re-press V if companion hasn't accepted the job yet.
+            // Door heist_locked still at 2 means V wasn't received or no companion picked it up.
+            if (!companionWorking)
             {
                 var timeSinceClick = (DateTime.Now - _lastCompanionClickTime).TotalSeconds;
 
-                // Wait at least 5 seconds before re-pressing — companion needs time to walk
-                if (timeSinceClick > 5.0)
+                // First retry after 2s (initial V may have been eaten by input gate),
+                // subsequent retries every 3s
+                var retryDelay = _companionClickAttempts == 0 ? 0.5 : 3.0;
+                if (timeSinceClick > retryDelay)
                 {
                     var sent = BotInput.PressKey(settings.CompanionInteractKey);
                     if (sent)
@@ -581,6 +629,7 @@ namespace AutoExile.Modes
             {
                 _state.OpenedEntities.Add(_waitingOnEntityId);
                 _waitingOnEntityId = 0;
+                _chestLootWindowEnd = DateTime.Now.AddSeconds(3); // pause to loot drops
                 _phase = HeistPhase.Infiltrating;
                 _phaseStartTime = DateTime.Now;
                 Decision = "chest_opened";
@@ -592,6 +641,7 @@ namespace AutoExile.Modes
             {
                 _state.OpenedEntities.Add(_waitingOnEntityId);
                 _waitingOnEntityId = 0;
+                _chestLootWindowEnd = DateTime.Now.AddSeconds(3); // pause to loot drops
                 _phase = HeistPhase.Infiltrating;
                 _phaseStartTime = DateTime.Now;
                 Decision = "chest_looted";
@@ -617,18 +667,23 @@ namespace AutoExile.Modes
                 ctx.Navigation.Stop(gc);
             }
 
-            _status = $"Opening chest... progress: {_state.CompanionLockPickProgress:F0}% ({elapsed:F0}s)";
-            Decision = "chest_channeling";
-
             // Check if chest is heist_locked (needs companion) vs unlocked (direct click)
             var sm = chestEntity.GetComponent<StateMachine>();
             var heistLocked = HeistState.GetStateValue(sm, "heist_locked");
 
-            if (heistLocked > 0 && _state.CompanionLockPickProgress == 0 && !_state.CompanionIsBusy)
+            // heist_locked: 2=untouched, 1=companion assigned, 0=unlocked
+            var chestAccepted = heistLocked > 0 && heistLocked < 2;
+            var companionWorking = _state.CompanionLockPickProgress > 0 || _state.CompanionIsBusy || chestAccepted;
+
+            _status = $"Opening chest... locked:{heistLocked:F0} progress:{_state.CompanionLockPickProgress:F0}% ({elapsed:F0}s)";
+            Decision = companionWorking ? "chest_channeling" : (heistLocked > 0 ? "chest_waiting" : "chest_clicking");
+
+            if (heistLocked > 0 && !companionWorking)
             {
-                // Companion idle — press V to assign. Wait 5s between presses.
+                // Companion hasn't picked up the job — re-press V
                 var timeSinceClick = (DateTime.Now - _lastCompanionClickTime).TotalSeconds;
-                if (timeSinceClick > 5.0)
+                var retryDelay = _companionClickAttempts == 0 ? 0.5 : 3.0;
+                if (timeSinceClick > retryDelay)
                 {
                     var sent = BotInput.PressKey(settings.CompanionInteractKey);
                     if (sent) _lastCompanionClickTime = DateTime.Now;
@@ -865,8 +920,11 @@ namespace AutoExile.Modes
             _phase = HeistPhase.AtDoor;
             _phaseStartTime = DateTime.Now;
 
-            // Basic doors: click directly. NPC doors: press V once to assign companion.
-            if (door.Path?.Contains("Door_Basic") == true)
+            // Generic doors and Door_Basic: click directly. NPC/Vault doors: press V for companion.
+            bool isClickDoor = door.Path == "Metadata/MiscellaneousObjects/Door"
+                || door.Path?.Contains("Door_Basic") == true;
+
+            if (isClickDoor)
             {
                 if (!ctx.Interaction.IsBusy && door.DistancePlayer < 40)
                 {
@@ -876,9 +934,12 @@ namespace AutoExile.Modes
             }
             else if (door.DistancePlayer < 40)
             {
-                // Press V once — TickAtDoor will wait for companion to finish
-                BotInput.PressKey(ctx.Settings.Heist.CompanionInteractKey);
-                _lastCompanionClickTime = DateTime.Now;
+                // Press V — TickAtDoor will verify it was accepted via heist_locked state
+                var sent = BotInput.PressKey(ctx.Settings.Heist.CompanionInteractKey);
+                if (sent)
+                    _lastCompanionClickTime = DateTime.Now;
+                // If not sent (input gate blocked), _lastCompanionClickTime stays at MinValue
+                // so TickAtDoor will retry quickly
             }
             // else: TickAtDoor will navigate closer first
 
@@ -895,15 +956,174 @@ namespace AutoExile.Modes
             _phase = HeistPhase.AtChest;
             _phaseStartTime = DateTime.Now;
 
-            // Press V once to assign companion (if close enough)
-            if (chest.DistancePlayer < 40)
+            // Only press V for locked chests — unlocked chests are clicked directly
+            var sm = chest.GetComponent<StateMachine>();
+            var heistLocked = HeistState.GetStateValue(sm, "heist_locked");
+            if (heistLocked > 0 && chest.DistancePlayer < 40)
             {
-                BotInput.PressKey(ctx.Settings.Heist.CompanionInteractKey);
-                _lastCompanionClickTime = DateTime.Now;
+                var sent = BotInput.PressKey(ctx.Settings.Heist.CompanionInteractKey);
+                if (sent)
+                    _lastCompanionClickTime = DateTime.Now;
             }
 
             _status = $"Opening reward chest";
             Decision = "start_chest";
+        }
+
+        /// <summary>Navigate toward a route target with door/stepping-stone fallbacks and stuck handling.</summary>
+        private void NavigateToRouteTarget(BotContext ctx, GameController gc, Vector2 playerGrid, RouteTarget target)
+        {
+            // Stuck handling — skip target if stuck too many times
+            if (ctx.Navigation.IsNavigating)
+            {
+                var stuckDelta = ctx.Navigation.StuckRecoveries - _lastStuckCount;
+                if (stuckDelta >= 5)
+                {
+                    target.Skipped = true;
+                    ctx.Navigation.Stop(gc);
+                    _status = $"Skipping {target.Label} — stuck";
+                    Decision = "route_stuck_skip";
+                    return;
+                }
+
+                // While navigating, also check for locked doors in our path.
+                // NavigationSystem may have pathed around a door or tried to blink over it.
+                // If we detect a locked door nearby and roughly in our travel direction, stop and open it.
+                if (stuckDelta >= 1)
+                {
+                    var blockingDoor = FindBlockingDoor(gc, playerGrid);
+                    if (blockingDoor != null)
+                    {
+                        ctx.Navigation.Stop(gc);
+                        StartDoorInteraction(ctx, gc, blockingDoor, HeistPhase.Infiltrating);
+                        return;
+                    }
+                }
+            }
+
+            if (!ctx.Navigation.IsNavigating)
+            {
+                // Throttle A* pathfinding to avoid lag
+                if ((DateTime.Now - _lastRepathTime).TotalMilliseconds < RepathCooldownMs)
+                {
+                    Decision = $"route_wait → {target.Label}";
+                    return;
+                }
+
+                // Before pathfinding, check for locked doors — they block A* and cause failures
+                var nearbyDoor = FindNextLockedDoor(gc, playerGrid);
+                if (nearbyDoor != null)
+                {
+                    _lastRepathTime = DateTime.Now;
+                    StartDoorInteraction(ctx, gc, nearbyDoor, HeistPhase.Infiltrating);
+                    return;
+                }
+
+                if (!ctx.Navigation.NavigateTo(gc, target.GridPos))
+                {
+                    _lastRepathTime = DateTime.Now;
+
+                    // Can't path directly — use stepping stones to get closer
+                    var stepNode = FindPathNodeToward(gc, playerGrid, target.GridPos);
+                    if (stepNode.HasValue && ctx.Navigation.NavigateTo(gc, stepNode.Value))
+                    {
+                        Decision = $"route_step → {target.Label}";
+                    }
+                    else
+                    {
+                        Decision = $"route_blocked → {target.Label}";
+                    }
+                }
+                _lastRepathTime = DateTime.Now;
+            }
+            else
+            {
+                ctx.Navigation.UpdateDestination(gc, target.GridPos, 12);
+            }
+
+            var idx = _state.CurrentRouteIndex + 1;
+            var total = _state.PlannedRoute.Count;
+            _status = $"Route [{idx}/{total}]: → {target.Label} — alert: {_state.AlertPercent:F0}%";
+            if (string.IsNullOrEmpty(Decision)) Decision = $"route_{target.Label}";
+        }
+
+        /// <summary>Fallback exploration using pathnodes when planned route is exhausted.</summary>
+        private void FallbackExplore(BotContext ctx, GameController gc, Vector2 playerGrid)
+        {
+            if (ctx.Navigation.IsNavigating && _currentExploreTarget.HasValue)
+            {
+                if (Vector2.Distance(playerGrid, _currentExploreTarget.Value) < 20)
+                    _visitedPathNodes.Add(_currentExploreTarget.Value);
+
+                var stuckDelta = ctx.Navigation.StuckRecoveries - _lastStuckCount;
+                if (stuckDelta >= 3)
+                {
+                    _visitedPathNodes.Add(_currentExploreTarget.Value);
+                    ctx.Navigation.Stop(gc);
+                    _currentExploreTarget = null;
+                    Decision = "explore_stuck";
+                }
+                else
+                {
+                    _status = $"Exploring — alert: {_state.AlertPercent:F0}%";
+                    Decision = "exploring";
+                }
+            }
+            else if (!ctx.Navigation.IsNavigating)
+            {
+                // Throttle A* pathfinding
+                if ((DateTime.Now - _lastRepathTime).TotalMilliseconds < RepathCooldownMs)
+                {
+                    Decision = "explore_wait";
+                    return;
+                }
+
+                var bestNode = FindNextPathNode(gc, playerGrid);
+                if (bestNode.HasValue)
+                {
+                    if (ctx.Navigation.NavigateTo(gc, bestNode.Value))
+                    {
+                        _currentExploreTarget = bestNode.Value;
+                        _lastStuckCount = ctx.Navigation.StuckRecoveries;
+                        _status = $"Exploring — alert: {_state.AlertPercent:F0}%";
+                        Decision = $"explore ({bestNode.Value.X:F0},{bestNode.Value.Y:F0})";
+                    }
+                    else
+                    {
+                        _visitedPathNodes.Add(bestNode.Value);
+                        Decision = "explore_fail";
+                    }
+                }
+                else
+                {
+                    var nextDoor = FindNextLockedDoor(gc, playerGrid);
+                    if (nextDoor != null)
+                    {
+                        if (nextDoor.DistancePlayer < 20)
+                        {
+                            ctx.Navigation.Stop(gc);
+                            StartDoorInteraction(ctx, gc, nextDoor, HeistPhase.Infiltrating);
+                        }
+                        else
+                        {
+                            var nearWalkable = ctx.Navigation.FindNearestWalkable(gc, nextDoor.GridPosNum, 20);
+                            if (nearWalkable.HasValue)
+                            {
+                                ctx.Navigation.NavigateTo(gc, nearWalkable.Value);
+                                _currentExploreTarget = nearWalkable.Value;
+                                _lastStuckCount = ctx.Navigation.StuckRecoveries;
+                            }
+                            _status = $"Navigating to locked door";
+                            Decision = "nav_to_door";
+                        }
+                    }
+                    else
+                    {
+                        _status = "No path forward";
+                        Decision = "no_path_forward";
+                    }
+                }
+            }
         }
 
         /// <summary>
@@ -980,8 +1200,13 @@ namespace AutoExile.Modes
 
                 bool isDoor = false;
 
+                // Generic doors (Metadata/MiscellaneousObjects/Door) — targetable = closed
+                if (entity.Path == "Metadata/MiscellaneousObjects/Door")
+                {
+                    isDoor = true;
+                }
                 // Basic doors — check open state
-                if (entity.Path.Contains("Door_Basic"))
+                else if (entity.Path.Contains("Door_Basic"))
                 {
                     var sm = entity.GetComponent<StateMachine>();
                     if (HeistState.GetStateValue(sm, "open") == 0)
@@ -1052,7 +1277,13 @@ namespace AutoExile.Modes
                 if (entity.DistancePlayer > 50) continue;
 
                 bool isDoor = false;
-                if (entity.Path.Contains("Door_Basic"))
+
+                // Generic doors — targetable = closed, click to open
+                if (entity.Path == "Metadata/MiscellaneousObjects/Door")
+                {
+                    isDoor = true;
+                }
+                else if (entity.Path.Contains("Door_Basic"))
                 {
                     var sm = entity.GetComponent<StateMachine>();
                     if (HeistState.GetStateValue(sm, "open") == 0)
@@ -1241,6 +1472,17 @@ namespace AutoExile.Modes
                 hudY += lineH;
             }
 
+            // Route progress
+            if (_state.PlannedRoute.Count > 0)
+            {
+                var completed = _state.PlannedRoute.Count(t => t.Reached);
+                var skipped = _state.PlannedRoute.Count(t => t.Skipped);
+                var currentLabel = _state.CurrentTarget?.Label ?? "done";
+                g.DrawText($"Route: {completed}/{_state.PlannedRoute.Count} done ({skipped} skipped) → {currentLabel}",
+                    new Vector2(hudX, hudY), SharpDX.Color.Gold);
+                hudY += lineH;
+            }
+
             // Doors/chests
             var openedCount = _state.OpenedEntities.Count;
             g.DrawText($"Doors: {_state.Doors.Count} | Chests: {_state.RewardChests.Count} | Opened: {openedCount}",
@@ -1265,27 +1507,33 @@ namespace AutoExile.Modes
                 }
             }
 
-            // Curio target marker
-            if (_state.CurioTargetPosition.HasValue)
+            // Route target markers
+            for (int i = 0; i < _state.PlannedRoute.Count; i++)
             {
-                var curioWorld = Pathfinding.GridToWorld3D(gc, _state.CurioTargetPosition.Value);
-                var curioScreen = cam.WorldToScreen(curioWorld);
-                if (curioScreen.X > -200 && curioScreen.X < 2400)
-                {
-                    g.DrawCircleInWorld(curioWorld, 40f, SharpDX.Color.LimeGreen, 2f);
-                    g.DrawText("CURIO", curioScreen + new Vector2(-18, -25), SharpDX.Color.LimeGreen);
-                }
+                var rt = _state.PlannedRoute[i];
+                var rtWorld = Pathfinding.GridToWorld3D(gc, rt.GridPos);
+                var rtScreen = cam.WorldToScreen(rtWorld);
+                if (rtScreen.X < -200 || rtScreen.X > 2400) continue;
+
+                var isActive = i == _state.CurrentRouteIndex;
+                var color = rt.Reached ? SharpDX.Color.DarkGray
+                    : rt.Skipped ? SharpDX.Color.DarkRed
+                    : isActive ? SharpDX.Color.White
+                    : SharpDX.Color.Gold;
+
+                g.DrawCircleInWorld(rtWorld, isActive ? 35f : 25f, color, isActive ? 3f : 1.5f);
+                g.DrawText($"{i + 1}:{rt.Label}", rtScreen + new Vector2(-20, -25), color);
             }
 
-            // Current pathnode target
-            if (_currentExploreTarget.HasValue && _state.CurioTargetPosition == null)
+            // Fallback explore target (when route is exhausted)
+            if (_currentExploreTarget.HasValue && _state.CurrentTarget == null)
             {
                 var expWorld = Pathfinding.GridToWorld3D(gc, _currentExploreTarget.Value);
                 var expScreen = cam.WorldToScreen(expWorld);
                 if (expScreen.X > -200 && expScreen.X < 2400)
                 {
                     g.DrawCircleInWorld(expWorld, 30f, SharpDX.Color.Cyan, 2f);
-                    g.DrawText("PATHNODE", expScreen + new Vector2(-28, -25), SharpDX.Color.Cyan);
+                    g.DrawText("EXPLORE", expScreen + new Vector2(-28, -25), SharpDX.Color.Cyan);
                 }
             }
 
@@ -1338,6 +1586,243 @@ namespace AutoExile.Modes
                 if (compScreen.X > -200 && compScreen.X < 2400)
                     g.DrawText("NPC", compScreen + new Vector2(-10, -20), SharpDX.Color.Yellow);
             }
+
+            // ═══ Curio Display Valuation Overlay ═══
+            if (_curioDisplays.Count > 0)
+            {
+                // Find the best value for highlighting
+                double bestValue = 0;
+                foreach (var cd in _curioDisplays)
+                    if (!cd.IsOpened && cd.ChaosValue > bestValue) bestValue = cd.ChaosValue;
+
+                // World markers on each curio display
+                foreach (var cd in _curioDisplays)
+                {
+                    var cdWorld = Pathfinding.GridToWorld3D(gc, cd.GridPos);
+                    var cdScreen = cam.WorldToScreen(cdWorld);
+                    if (cdScreen.X < -200 || cdScreen.X > 2400) continue;
+
+                    bool isBest = !cd.IsOpened && cd.ChaosValue > 0 && cd.ChaosValue >= bestValue;
+                    var color = cd.IsOpened ? SharpDX.Color.DarkGray
+                        : isBest ? SharpDX.Color.LimeGreen
+                        : SharpDX.Color.White;
+
+                    var priceStr = cd.ChaosValue > 0 ? $"{cd.ChaosValue:F0}c" : "?";
+                    var label = $"{cd.ItemName} — {priceStr}";
+
+                    g.DrawCircleInWorld(cdWorld, isBest ? 30f : 20f, color, isBest ? 3f : 1.5f);
+                    g.DrawText(label, cdScreen + new Vector2(-40, -30), color);
+                    if (!string.IsNullOrEmpty(cd.ClassName))
+                        g.DrawText($"({cd.Rarity} {cd.ClassName})", cdScreen + new Vector2(-40, -15), SharpDX.Color.Gray);
+                }
+
+                // HUD list panel (sorted by value)
+                var listX = hudX;
+                var listY = hudY + 8;
+                g.DrawText("=== CURIO REWARDS ===", new Vector2(listX, listY), SharpDX.Color.Gold);
+                listY += lineH;
+
+                foreach (var cd in _curioDisplays)
+                {
+                    bool isBest = !cd.IsOpened && cd.ChaosValue > 0 && cd.ChaosValue >= bestValue;
+                    var color = cd.IsOpened ? SharpDX.Color.DarkGray
+                        : isBest ? SharpDX.Color.LimeGreen
+                        : SharpDX.Color.White;
+
+                    var prefix = isBest ? ">> " : "   ";
+                    var priceStr = cd.ChaosValue > 0 ? $"{cd.ChaosValue:F0}c" : "?c";
+                    var suffix = cd.IsOpened ? " [OPENED]" : "";
+                    g.DrawText($"{prefix}{priceStr} — {cd.ItemName}{suffix}", new Vector2(listX, listY), color);
+                    listY += lineH;
+                }
+            }
+
+            // ═══ Minimap Route Overlay (ImGui) ═══
+            RenderMinimapRoute(gc);
+        }
+
+        /// <summary>
+        /// Draw numbered route targets on the large minimap using ImGui, similar to DieselBot's
+        /// grid explorer overlay. Shows transparent boxes with numbers at each route target position.
+        /// </summary>
+        private void RenderMinimapRoute(GameController gc)
+        {
+            if (_state.PlannedRoute.Count == 0) return;
+
+            try
+            {
+                var largeMap = gc.IngameState.IngameUi.Map.LargeMap
+                    .AsObject<ExileCore.PoEMemory.Elements.SubMap>();
+                if (largeMap == null || !largeMap.IsVisible) return;
+
+                var mapCenter = largeMap.MapCenter;
+                var mapScale = (float)largeMap.MapScale;
+                var playerRender = gc.Player.GetComponent<Render>();
+                if (playerRender == null) return;
+
+                var playerPos = gc.Player.GridPosNum;
+                var playerHeight = -playerRender.RenderStruct.Height;
+
+                var heightData = gc.IngameState?.Data?.RawTerrainHeightData;
+
+                var rect = gc.Window.GetWindowRectangle();
+                ImGuiNET.ImGui.SetNextWindowSize(new Vector2(rect.Width, rect.Height));
+                ImGuiNET.ImGui.SetNextWindowPos(new Vector2(rect.Left, rect.Top));
+                ImGuiNET.ImGui.Begin("heist_route_overlay",
+                    ImGuiNET.ImGuiWindowFlags.NoDecoration |
+                    ImGuiNET.ImGuiWindowFlags.NoInputs |
+                    ImGuiNET.ImGuiWindowFlags.NoMove |
+                    ImGuiNET.ImGuiWindowFlags.NoScrollWithMouse |
+                    ImGuiNET.ImGuiWindowFlags.NoSavedSettings |
+                    ImGuiNET.ImGuiWindowFlags.NoFocusOnAppearing |
+                    ImGuiNET.ImGuiWindowFlags.NoBringToFrontOnFocus |
+                    ImGuiNET.ImGuiWindowFlags.NoBackground);
+
+                var dl = ImGuiNET.ImGui.GetWindowDrawList();
+                const float boxHalf = 12f;
+
+                Vector2 ToMap(Vector2 gp)
+                {
+                    float h = GetTerrainHeight(heightData, gp);
+                    return mapCenter + GridDeltaToMap(gp - playerPos, playerHeight + h, mapScale);
+                }
+
+                uint white = ImGuiNET.ImGui.ColorConvertFloat4ToU32(new Vector4(1f, 1f, 1f, 0.9f));
+
+                for (int i = 0; i < _state.PlannedRoute.Count; i++)
+                {
+                    var rt = _state.PlannedRoute[i];
+                    var isActive = i == _state.CurrentRouteIndex;
+
+                    uint fill;
+                    if (rt.Reached)
+                        fill = ImGuiNET.ImGui.ColorConvertFloat4ToU32(new Vector4(0f, 0.7f, 0f, 0.5f));    // green = done
+                    else if (rt.Skipped)
+                        fill = ImGuiNET.ImGui.ColorConvertFloat4ToU32(new Vector4(0.5f, 0f, 0f, 0.5f));    // dark red = skipped
+                    else if (isActive)
+                        fill = ImGuiNET.ImGui.ColorConvertFloat4ToU32(new Vector4(1f, 1f, 0f, 0.7f));      // yellow = current
+                    else
+                        fill = ImGuiNET.ImGui.ColorConvertFloat4ToU32(new Vector4(0.9f, 0.7f, 0f, 0.5f));  // gold = pending
+
+                    uint outline = ImGuiNET.ImGui.ColorConvertFloat4ToU32(new Vector4(1f, 1f, 1f, 0.3f));
+
+                    var center = ToMap(rt.GridPos);
+                    var tl = center + new Vector2(-boxHalf, -boxHalf);
+                    var br = center + new Vector2(boxHalf, boxHalf);
+
+                    dl.AddRectFilled(tl, br, fill, 3f);
+                    dl.AddRect(tl, br, outline, 3f);
+                    dl.AddText(center - new Vector2(4, 6), white, (i + 1).ToString());
+
+                    // Connect to next target with a line
+                    if (i + 1 < _state.PlannedRoute.Count && !rt.Reached && !rt.Skipped)
+                    {
+                        var nextCenter = ToMap(_state.PlannedRoute[i + 1].GridPos);
+                        uint lineColor = ImGuiNET.ImGui.ColorConvertFloat4ToU32(new Vector4(0.6f, 0.6f, 0.6f, 0.4f));
+                        dl.AddLine(center, nextCenter, lineColor, 1f);
+                    }
+                }
+
+                ImGuiNET.ImGui.End();
+            }
+            catch { }
+        }
+
+        // --- Curio Display Evaluation ---
+
+        private class CurioDisplayInfo
+        {
+            public long EntityId;
+            public Vector2 GridPos;
+            public string ItemName = "";
+            public string BaseName = "";
+            public string ClassName = "";
+            public string Rarity = "";
+            public double ChaosValue;
+            public bool IsOpened;
+        }
+
+        /// <summary>
+        /// Scan nearby HeistChestPrimaryTarget entities, read their HeistRewardDisplay items,
+        /// and price them via the NinjaPrice PluginBridge.
+        /// </summary>
+        private void ScanCurioDisplays(GameController gc)
+        {
+            _curioDisplays.Clear();
+
+            Func<Entity, double>? getPrice = null;
+            try { getPrice = gc.PluginBridge.GetMethod<Func<Entity, double>>("NinjaPrice.GetValue"); }
+            catch { }
+
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (entity?.Path == null || !entity.Path.Contains("HeistChestPrimaryTarget"))
+                    continue;
+
+                var info = new CurioDisplayInfo
+                {
+                    EntityId = entity.Id,
+                    GridPos = entity.GridPosNum,
+                };
+
+                var chest = entity.GetComponent<Chest>();
+                info.IsOpened = chest?.IsOpened == true || !entity.IsTargetable;
+
+                try
+                {
+                    var hrd = entity.GetComponent<HeistRewardDisplay>();
+                    var rewardItem = hrd?.RewardItem;
+                    if (rewardItem != null && rewardItem.IsValid)
+                    {
+                        var baseType = gc.Files.BaseItemTypes.Translate(rewardItem.Path);
+                        info.BaseName = baseType?.BaseName ?? "";
+                        info.ClassName = baseType?.ClassName ?? "";
+
+                        var mods = rewardItem.GetComponent<Mods>();
+                        if (mods != null)
+                        {
+                            info.Rarity = mods.ItemRarity.ToString();
+                            info.ItemName = mods.UniqueName ?? info.BaseName;
+                        }
+                        else
+                        {
+                            info.ItemName = info.BaseName;
+                        }
+
+                        if (getPrice != null)
+                            info.ChaosValue = getPrice(rewardItem);
+                    }
+                }
+                catch { }
+
+                _curioDisplays.Add(info);
+            }
+
+            // Sort by value descending
+            _curioDisplays.Sort((a, b) => b.ChaosValue.CompareTo(a.ChaosValue));
+        }
+
+        // Camera projection constants for minimap overlay
+        private const float GridToWorldMultiplier = 250f / 23f;
+        private const double CameraAngle = 38.7 * Math.PI / 180;
+        private static readonly float CamCos = (float)Math.Cos(CameraAngle);
+        private static readonly float CamSin = (float)Math.Sin(CameraAngle);
+
+        private static Vector2 GridDeltaToMap(Vector2 delta, float deltaZ, float mapScale)
+        {
+            deltaZ /= GridToWorldMultiplier;
+            return mapScale * new Vector2(
+                (delta.X - delta.Y) * CamCos,
+                (deltaZ - (delta.X + delta.Y)) * CamSin);
+        }
+
+        private static float GetTerrainHeight(float[][]? heightData, Vector2 pos)
+        {
+            if (heightData == null) return 0f;
+            int x = (int)pos.X, y = (int)pos.Y;
+            if (y >= 0 && y < heightData.Length && x >= 0 && x < heightData[y].Length)
+                return heightData[y][x];
+            return 0f;
         }
     }
 

@@ -64,6 +64,24 @@ namespace AutoExile.Systems
         public string LastRecoveryAction { get; private set; } = "";
         private static readonly Random _rng = new();
 
+        // Obstacle injection — modes can mark grid positions as blocked (e.g. locked puzzle doors)
+        // NavigateTo patches these cells to 0 before running A*, without modifying game memory.
+        private readonly List<Vector2> _blockedPositions = new();
+        private const int BlockedRadius = 3; // cells around each blocked position to zero out
+
+        /// <summary>
+        /// Set grid positions that A* should treat as impassable.
+        /// Cleared automatically — caller should re-set each tick or when positions change.
+        /// </summary>
+        public void SetBlockedPositions(IEnumerable<Vector2> positions)
+        {
+            _blockedPositions.Clear();
+            _blockedPositions.AddRange(positions);
+        }
+
+        /// <summary>Clear all blocked positions.</summary>
+        public void ClearBlockedPositions() => _blockedPositions.Clear();
+
         // Position history — ring buffer of recent positions for backtrack recovery
         private const int PositionHistorySize = 20;      // ~10 seconds at 0.5s intervals
         private const float PositionHistoryIntervalSec = 0.5f;
@@ -81,6 +99,14 @@ namespace AutoExile.Systems
         private float _noProgressTimer;
         private const float NoProgressTimeLimit = 1.0f;  // seconds of no progress before repath
         private const float NoProgressThreshold = 2.0f;  // must get at least this much closer to count as progress
+        private const int NoProgressEscapeThreshold = 3;  // after this many repaths without progress, escape probe instead
+
+        // Periodic repath — forces path recalculation using live pathfinding grid.
+        // Handles terrain changes (doors, traps) and situations where micro-knockback
+        // from hazards (lab spikes) fools the stuck timer but blocks real progress.
+        private DateTime _lastRepathTime = DateTime.MinValue;
+        private int _lastRepathWaypointIndex;
+        private const float PeriodicRepathIntervalSec = 3.0f; // repath if waypoint hasn't advanced in this long
 
         // Blink tracking — geometry for wall-side detection (grid coordinates)
         private bool _blinkPending;           // true after blink fires, waiting to confirm crossing
@@ -169,6 +195,8 @@ namespace AutoExile.Systems
                 _stuckTimer = 0;
                 _bestDistToWaypoint = float.MaxValue;
                 _noProgressTimer = 0;
+                _lastRepathTime = DateTime.Now;
+                _lastRepathWaypointIndex = CurrentWaypointIndex;
             }
             else if (!isLastWaypoint)
             {
@@ -200,7 +228,34 @@ namespace AutoExile.Systems
                     _stuckTimer = 0;
                     _bestDistToWaypoint = float.MaxValue;
                     _noProgressTimer = 0;
+                    _lastRepathTime = DateTime.Now;
+                    _lastRepathWaypointIndex = CurrentWaypointIndex;
                 }
+            }
+
+            // Periodic repath — if waypoint index hasn't advanced in PeriodicRepathIntervalSec,
+            // recalculate path using live pathfinding grid. Catches trap/knockback situations
+            // where micro-movement fools stuck detection but blocks real progress.
+            if (Destination.HasValue && (DateTime.Now - _lastRepathTime).TotalSeconds >= PeriodicRepathIntervalSec)
+            {
+                if (CurrentWaypointIndex <= _lastRepathWaypointIndex)
+                {
+                    _totalStuckRecoveries++;
+                    if (_totalStuckRecoveries >= NoProgressEscapeThreshold)
+                    {
+                        _stuckAtSameSpotCount = Math.Max(_stuckAtSameSpotCount, _totalStuckRecoveries - NoProgressEscapeThreshold + 1);
+                        LastRecoveryAction = $"Periodic repath failed (×{_totalStuckRecoveries}), escape probe";
+                        EscapeProbe(gc, playerGrid);
+                    }
+                    else
+                    {
+                        LastRecoveryAction = $"Periodic repath (no waypoint advance in {PeriodicRepathIntervalSec:F0}s)";
+                        NavigateTo(gc, Destination.Value);
+                    }
+                    return;
+                }
+                _lastRepathTime = DateTime.Now;
+                _lastRepathWaypointIndex = CurrentWaypointIndex;
             }
 
             // Stuck detection (grid distance)
@@ -217,9 +272,19 @@ namespace AutoExile.Systems
                     if (_stuckRecoveryCount >= MaxRecoveriesBeforeRepath && Destination.HasValue)
                     {
                         _stuckRecoveryCount = 0;
-                        LastRecoveryAction = "Repath";
-                        var dest = Destination.Value;
-                        NavigateTo(gc, dest);
+                        // After multiple repath cycles at the same spot, escape probe instead.
+                        // Repeated repaths produce identical routes when the obstacle (e.g., trap)
+                        // isn't in the pathfinding grid.
+                        if (_totalStuckRecoveries >= NoProgressEscapeThreshold * MaxRecoveriesBeforeRepath)
+                        {
+                            LastRecoveryAction = $"Stuck repath failed (×{_totalStuckRecoveries}), escape probe";
+                            EscapeProbe(gc, playerGrid);
+                        }
+                        else
+                        {
+                            LastRecoveryAction = "Repath";
+                            NavigateTo(gc, Destination.Value);
+                        }
                         return;
                     }
 
@@ -251,7 +316,8 @@ namespace AutoExile.Systems
             _lastPosition = playerGrid;
 
             // No-progress detection: player is moving (not stuck) but not getting closer
-            // to the current waypoint — e.g. shield charge bouncing off a wall repeatedly
+            // to the current waypoint — e.g. shield charge bouncing off a wall, or trapped
+            // by lab spike trap that blocks movement but causes micro-knockback
             {
                 var distToWp = Vector2.Distance(playerGrid, CurrentNavPath[CurrentWaypointIndex].Position);
                 if (distToWp < _bestDistToWaypoint - NoProgressThreshold)
@@ -266,9 +332,22 @@ namespace AutoExile.Systems
                     {
                         _noProgressTimer = 0;
                         _bestDistToWaypoint = float.MaxValue;
-                        LastRecoveryAction = "No waypoint progress, repath";
                         _totalStuckRecoveries++;
-                        NavigateTo(gc, Destination.Value);
+
+                        // After multiple failed repaths at the same spot, escape probe first.
+                        // Plain repath produces the same route when terrain hasn't changed
+                        // (e.g., lab traps that block movement but aren't in the pathfinding grid).
+                        if (_totalStuckRecoveries >= NoProgressEscapeThreshold)
+                        {
+                            _stuckAtSameSpotCount = Math.Max(_stuckAtSameSpotCount, _totalStuckRecoveries - NoProgressEscapeThreshold + 1);
+                            LastRecoveryAction = $"No progress (×{_totalStuckRecoveries}), escape probe";
+                            EscapeProbe(gc, playerGrid);
+                        }
+                        else
+                        {
+                            LastRecoveryAction = "No waypoint progress, repath";
+                            NavigateTo(gc, Destination.Value);
+                        }
                         return;
                     }
                 }
@@ -556,6 +635,36 @@ namespace AutoExile.Systems
             if (pfGrid == null || pfGrid.Length == 0)
                 return false;
 
+            // Patch grid with blocked positions (e.g. locked puzzle doors).
+            // Create a shallow copy of the row array, then clone+zero only affected rows.
+            // This avoids modifying game memory (pfGrid is a reference to RawFramePathfindingData).
+            if (_blockedPositions.Count > 0)
+            {
+                int rows = pfGrid.Length;
+                int cols = rows > 0 ? pfGrid[0].Length : 0;
+                var gridCopy = new int[rows][];
+                Array.Copy(pfGrid, gridCopy, rows); // shallow — same row references
+                var patchedRows = new HashSet<int>();
+                foreach (var bp in _blockedPositions)
+                {
+                    int cx = (int)bp.X, cy = (int)bp.Y;
+                    for (int dy = -BlockedRadius; dy <= BlockedRadius; dy++)
+                    {
+                        int ry = cy + dy;
+                        if (ry < 0 || ry >= rows) continue;
+                        if (patchedRows.Add(ry))
+                            gridCopy[ry] = (int[])pfGrid[ry].Clone(); // deep-copy this row only
+                        for (int dx = -BlockedRadius; dx <= BlockedRadius; dx++)
+                        {
+                            int rx = cx + dx;
+                            if (rx < 0 || rx >= cols) continue;
+                            gridCopy[ry][rx] = 0;
+                        }
+                    }
+                }
+                pfGrid = gridCopy; // A* runs on our patched copy
+            }
+
             // Auto-scale node budget based on grid size.
             if (maxNodes <= 0)
             {
@@ -621,6 +730,8 @@ namespace AutoExile.Systems
             _bestDistToWaypoint = float.MaxValue;
             _noProgressTimer = 0;
             _lastPosition = playerGrid;
+            _lastRepathTime = DateTime.Now;
+            _lastRepathWaypointIndex = CurrentWaypointIndex;
 
             return true;
         }

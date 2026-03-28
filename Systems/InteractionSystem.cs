@@ -18,6 +18,10 @@ namespace AutoExile.Systems
     {
         // Minimum time between any interaction clicks
         private const int ClickCooldownMs = 300;
+        // After clicking a world entity, gate ALL bot actions for this long.
+        // Gives transitions/waypoints/doors time to open UI or load screens
+        // before anything else fires. Prevents rapid re-click toggling.
+        private const int EntityClickGateMs = 700;
         private DateTime _lastClickTime = DateTime.MinValue;
 
         // Track current interaction
@@ -378,6 +382,13 @@ namespace AutoExile.Systems
             _lastClickTime = DateTime.Now;
             _clickAttempts++;
             Status = $"Clicking entity (attempt {_clickAttempts})";
+
+            // Gate the entire bot after clicking a world entity.
+            // Transitions (waypoints, doors, portals) need time for UI/loading screens
+            // to appear. Without this, rapid re-clicks toggle UI open/closed.
+            var gateUntil = DateTime.Now.AddMilliseconds(EntityClickGateMs);
+            if (gateUntil > BotInput.NextActionAt)
+                BotInput.NextActionAt = gateUntil;
 
             return InteractionResult.InProgress;
         }

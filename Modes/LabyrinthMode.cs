@@ -66,6 +66,21 @@ namespace AutoExile.Modes
         private readonly LabRoutingData _routing = new();
         private List<string> _preferredExits = new(); // preferred destination zone names for current room
 
+        // Exit memory — angle-based layout learning across runs
+        private readonly LabExitMemory _exitMemory = new();
+        private bool _exitMemoryLoaded;
+        private DateTime _lastMemorySave = DateTime.MinValue;
+        private string? _pluginDir; // cached for memory save path
+
+        // Scouting state — approach random exits to read RenderName
+        private readonly HashSet<long> _rejectedExitIds = new(); // confirmed non-preferred
+        private long _scoutTargetId; // exit we're approaching to read
+
+        // Retroactive recording — track which exit we took so area change can record the outcome
+        private string _exitTakenFromZone = ""; // zone name we were in when we clicked an exit
+        private Vector2? _exitTakenPosition; // grid position of the exit we clicked
+        private int _exitTakenExitCount; // how many forward exits that zone had
+
         // Dedicated log file — cleared on each OnEnter
         private string? _logPath;
         private void LabLog(string msg)
@@ -143,7 +158,8 @@ namespace AutoExile.Modes
             // Init dedicated log file
             try
             {
-                var pluginDir = Path.GetDirectoryName(typeof(LabyrinthMode).Assembly.Location) ?? ".";
+                _pluginDir = Path.GetDirectoryName(typeof(LabyrinthMode).Assembly.Location) ?? ".";
+                var pluginDir = _pluginDir;
                 _logPath = Path.Combine(pluginDir, "lab_debug.log");
                 File.WriteAllText(_logPath, $"=== Lab mode started {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===\n");
 
@@ -164,6 +180,13 @@ namespace AutoExile.Modes
                             break;
                     }
                 }
+
+                // Load exit memory (angle-based layout learning)
+                if (!_exitMemoryLoaded)
+                {
+                    _exitMemory.Load(Path.Combine(pluginDir, "lab_memory.json"), LabLog);
+                    _exitMemoryLoaded = true;
+                }
             }
             catch { _logPath = null; }
 
@@ -171,6 +194,11 @@ namespace AutoExile.Modes
             _lastStuckRecoveries = 0;
             _fontClickAttempts = 0;
             _portalClicked = false;
+            _rejectedExitIds.Clear();
+            _scoutTargetId = 0;
+            _exitTakenFromZone = "";
+            _exitTakenPosition = null;
+            _exitTakenExitCount = 0;
             _loggedPlazaEntry = false;
             _activateClicked = false;
             _arenaTransitionClicked = false;
@@ -200,8 +228,15 @@ namespace AutoExile.Modes
 
         public void OnExit()
         {
+            SaveExitMemory();
             _state.Reset();
             _phase = LabPhase.Idle;
+        }
+
+        private void SaveExitMemory()
+        {
+            if (_pluginDir != null && _exitMemory.IsDirty)
+                _exitMemory.Save(Path.Combine(_pluginDir, "lab_memory.json"), LabLog);
         }
 
         // ═══════════════════════════════════════════════════
@@ -339,6 +374,29 @@ namespace AutoExile.Modes
             _izaroRetreated = false;
             _izaroExitClicked = false;
             _izaroWasSeen = false;
+            _rejectedExitIds.Clear();
+            _scoutTargetId = 0;
+
+            // Retroactive exit recording — we just arrived somewhere, record which exit led here
+            if (_exitTakenPosition.HasValue && !string.IsNullOrEmpty(_exitTakenFromZone) && _exitTakenExitCount > 0)
+            {
+                // newArea is where we ended up — that's the destination name for the exit we took
+                var destName = newArea;
+                // Compute angle from the old zone's entry position to the exit we clicked
+                // _entryPosition was set for the OLD zone and hasn't been cleared yet
+                if (_entryPosition.HasValue)
+                {
+                    var angle = LabExitMemory.ComputeAngle(_entryPosition.Value, _exitTakenPosition.Value);
+                    _exitMemory.Record(_exitTakenFromZone, _exitTakenExitCount, angle, destName);
+                    LabLog($"Retroactive: {_exitTakenFromZone} [{_exitTakenExitCount} exits] angle={angle:F0}° → '{destName}'");
+                }
+                _exitTakenFromZone = "";
+                _exitTakenPosition = null;
+                _exitTakenExitCount = 0;
+            }
+
+            // Save exit memory if dirty
+            SaveExitMemory();
             _settleUntil = DateTime.Now.AddSeconds(ctx.Settings.Labyrinth.SettleSeconds.Value);
 
             var gc = ctx.Game;
@@ -354,6 +412,7 @@ namespace AutoExile.Modes
                     if (_phase == LabPhase.ExitLab)
                     {
                         _state.RecordRunComplete();
+                        ctx.LootTracker.RecordMapComplete();
                         ctx.Log($"Lab run {_state.RunsCompleted} complete. Profit: {_state.TotalProfit:F0}c");
                     }
                     else
@@ -1076,6 +1135,21 @@ namespace AutoExile.Modes
             var gc = ctx.Game;
             var settings = ctx.Settings.Labyrinth;
 
+            // Feed locked puzzle door positions to NavigationSystem so A* routes around them.
+            // These doors are invisible to the pathfinding grid but block player movement.
+            {
+                var blockedPositions = new List<Vector2>();
+                foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+                {
+                    if (entity.IsTargetable &&
+                        entity.Path?.Contains("Puzzle_Parts/Door_", StringComparison.Ordinal) == true)
+                    {
+                        blockedPositions.Add(new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y));
+                    }
+                }
+                ctx.Navigation.SetBlockedPositions(blockedPositions);
+            }
+
             // Zone timeout
             if ((DateTime.Now - _phaseStartTime).TotalSeconds > settings.ZoneTimeoutSeconds.Value)
             {
@@ -1312,79 +1386,178 @@ namespace AutoExile.Modes
             {
                 var playerPos = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
                 var currentZone = gc.Area?.CurrentArea?.Name ?? "";
+                // Use tile cluster count as ground truth — entity exits may not all be loaded
+                BuildExitClusters(ctx);
+                int knownExitCount = GetForwardExitClusterCount();
+                bool isMultiExit = knownExitCount > 1 || forwardExits.Count > 1;
+                bool useRouting = _routing.IsLoaded && isMultiExit;
 
-                // If routing data is loaded, prefer the exit leading to shortest path
-                (long Id, Vector2 Position) nearest = default;
-                bool foundPreferred = false;
-
-                if (_routing.IsLoaded && forwardExits.Count > 1)
-                {
+                if (useRouting)
                     _preferredExits = _routing.GetPreferredExits(currentZone, _state.IzaroEncounterCount);
 
-                    // Check each exit entity's RenderName against preferred destinations
-                    foreach (var exit in forwardExits)
+                // ── Single exit or no routing: go directly ──
+                // NavigateToExit will still check the name in multi-exit zones before clicking
+                if (!useRouting || _preferredExits.Count == 0)
+                {
+                    var target = forwardExits.OrderBy(e => Vector2.Distance(playerPos, e.Position)).First();
+                    if (NavigateToExit(ctx, gc, target, playerPos))
+                        return;
+                }
+                else
+                {
+                    // ── Multiple exits + routing data: smart selection ──
+                    var preferred = _preferredExits[0];
+                    var nonRejected = forwardExits.Where(e => !_rejectedExitIds.Contains(e.Id)).ToList();
+
+                    // Step 1: Memory match — check if we already know which angle leads to preferred
+                    if (_entryPosition.HasValue && nonRejected.Count > 1)
                     {
-                        foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+                        var memAngle = _exitMemory.FindPreferredAngle(currentZone, forwardExits.Count, preferred);
+                        if (memAngle.HasValue)
                         {
-                            if (entity.Id != exit.Id || !entity.IsTargetable) continue;
-                            var renderName = entity.RenderName ?? "";
-                            if (_preferredExits.Count > 0 &&
-                                renderName.Equals(_preferredExits[0], StringComparison.OrdinalIgnoreCase))
+                            // Find the exit whose angle best matches the remembered one
+                            (long Id, Vector2 Position) bestMatch = default;
+                            float bestAngleDiff = float.MaxValue;
+                            foreach (var exit in nonRejected)
                             {
-                                nearest = exit;
-                                foundPreferred = true;
-                                LabLog($"Routing: preferred exit '{renderName}' found (shortest path to trial)");
-                                break;
+                                var angle = LabExitMemory.ComputeAngle(_entryPosition.Value, exit.Position);
+                                var diff = LabExitMemory.AngleDifference(angle, memAngle.Value);
+                                if (diff < bestAngleDiff)
+                                {
+                                    bestAngleDiff = diff;
+                                    bestMatch = exit;
+                                }
+                            }
+
+                            if (bestAngleDiff < 25f) // within tolerance
+                            {
+                                // Verify when close enough to read name
+                                var name = ReadExitName(gc, bestMatch.Id);
+                                if (!string.IsNullOrEmpty(name))
+                                {
+                                    RecordExitAngle(currentZone, forwardExits.Count, bestMatch.Position, name);
+                                    if (name.Equals(preferred, StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        LabLog($"Memory: confirmed '{name}' at angle {memAngle.Value:F0}° — clicking");
+                                        if (NavigateToExit(ctx, gc, bestMatch, playerPos))
+                                            return;
+                                    }
+                                    else
+                                    {
+                                        // Memory was wrong — reject and fall through to scouting
+                                        LabLog($"Memory: expected '{preferred}' but got '{name}' — memory stale");
+                                        _rejectedExitIds.Add(bestMatch.Id);
+                                        nonRejected = forwardExits.Where(e => !_rejectedExitIds.Contains(e.Id)).ToList();
+                                    }
+                                }
+                                else
+                                {
+                                    // Name not readable yet — navigate toward it to get closer
+                                    if (!ctx.Navigation.IsNavigating)
+                                        LabLog($"Memory: heading to memorized exit (angle diff={bestAngleDiff:F0}°)");
+                                    if (NavigateToExit(ctx, gc, bestMatch, playerPos))
+                                        return;
+                                }
                             }
                         }
-                        if (foundPreferred) break;
                     }
-                }
 
-                // Fall back to nearest exit if no routing preference or can't read names yet
-                if (!foundPreferred)
-                {
-                    nearest = forwardExits
-                        .OrderBy(e => Vector2.Distance(playerPos, e.Position))
-                        .First();
-                }
+                    // Step 2: Process of elimination — if all but one rejected, the remaining must be preferred
+                    if (nonRejected.Count == 1)
+                    {
+                        var remaining = nonRejected[0];
+                        if (_entryPosition.HasValue)
+                            RecordExitAngle(currentZone, forwardExits.Count, remaining.Position, preferred);
+                        if (NavigateToExit(ctx, gc, remaining, playerPos))
+                            return;
+                    }
+                    if (nonRejected.Count == 0)
+                    {
+                        // All rejected (shouldn't happen) — pick nearest, force click without name check
+                        var fallback = forwardExits.OrderBy(e => Vector2.Distance(playerPos, e.Position)).First();
+                        LabLog("All exits rejected — using nearest as fallback (force click)");
+                        if (NavigateToExit(ctx, gc, fallback, playerPos, forceClick: true))
+                            return;
+                    }
 
-                var dist = Vector2.Distance(playerPos, nearest.Position);
+                    // Step 3: Opportunistic name reads — check any exit we're near
+                    foreach (var exit in nonRejected)
+                    {
+                        var dist = Vector2.Distance(playerPos, exit.Position);
+                        if (dist > 80f) continue; // too far to read name reliably
 
-                // Find the actual entity to click
-                Entity? exitEntity = null;
-                foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
-                {
-                    if (entity.Id == nearest.Id && entity.IsTargetable)
-                    {
-                        exitEntity = entity;
-                        break;
-                    }
-                }
+                        var name = ReadExitName(gc, exit.Id);
+                        if (string.IsNullOrEmpty(name)) continue;
 
-                if (exitEntity != null)
-                {
-                    if (dist < 20f && !ctx.Interaction.IsBusy)
-                    {
-                        ctx.Interaction.InteractWithEntity(exitEntity, requireProximity: false);
-                        StatusText = $"Clicking exit (dist: {dist:F0})";
+                        if (_entryPosition.HasValue)
+                            RecordExitAngle(currentZone, forwardExits.Count, exit.Position, name);
+
+                        if (name.Equals(preferred, StringComparison.OrdinalIgnoreCase))
+                        {
+                            LabLog($"Scouted: '{name}' — preferred, clicking");
+                            if (NavigateToExit(ctx, gc, exit, playerPos))
+                                return;
+                        }
+                        else
+                        {
+                            LabLog($"Scouted: '{name}' — rejected (want '{preferred}')");
+                            _rejectedExitIds.Add(exit.Id);
+                        }
                     }
-                    else if (!ctx.Navigation.IsNavigating || ctx.Navigation.Destination != nearest.Position)
+                    // Refresh after possible rejections
+                    nonRejected = forwardExits.Where(e => !_rejectedExitIds.Contains(e.Id)).ToList();
+                    if (nonRejected.Count == 1)
                     {
-                        ctx.Navigation.NavigateTo(gc, nearest.Position);
-                        StatusText = $"Navigating to exit (dist: {dist:F0})";
+                        var remaining = nonRejected[0];
+                        if (_entryPosition.HasValue)
+                            RecordExitAngle(currentZone, forwardExits.Count, remaining.Position, preferred);
+                        if (NavigateToExit(ctx, gc, remaining, playerPos))
+                            return;
                     }
-                    else
+
+                    // Step 4: Scout — pick a random non-rejected exit to approach
+                    if (nonRejected.Count == 0)
                     {
-                        StatusText = $"Walking to exit (dist: {dist:F0})";
+                        // All rejected after scouting — force click nearest
+                        var fallback = forwardExits.OrderBy(e => Vector2.Distance(playerPos, e.Position)).First();
+                        LabLog("All exits rejected after scout — force clicking nearest");
+                        if (NavigateToExit(ctx, gc, fallback, playerPos, forceClick: true))
+                            return;
                     }
-                    return;
+                    if (_scoutTargetId == 0 || _rejectedExitIds.Contains(_scoutTargetId) ||
+                        !nonRejected.Any(e => e.Id == _scoutTargetId))
+                    {
+                        // Pick random from non-rejected exits
+                        var rng = new Random();
+                        var pick = nonRejected[rng.Next(nonRejected.Count)];
+                        _scoutTargetId = pick.Id;
+                        var angle = _entryPosition.HasValue
+                            ? LabExitMemory.ComputeAngle(_entryPosition.Value, pick.Position) : 0f;
+                        LabLog($"Scouting: approaching exit id={pick.Id} at angle={angle:F0}° (random pick from {nonRejected.Count})");
+                    }
+
+                    var scoutTarget = nonRejected.FirstOrDefault(e => e.Id == _scoutTargetId);
+                    if (scoutTarget.Id != 0)
+                    {
+                        if (NavigateToExit(ctx, gc, scoutTarget, playerPos))
+                            return;
+                    }
                 }
             }
 
             // Try tile-based exit detection via TileMap
-            // Navigate toward nearest non-entry exit cluster
-            var tileExit = FindExitViaTileMap(ctx);
+            // Navigate toward exit cluster, preferring memorized angle if available
+            float? preferredAngle = null;
+            if (_routing.IsLoaded && _preferredExits.Count > 0 && _entryPosition.HasValue)
+            {
+                var currentZone2 = gc.Area?.CurrentArea?.Name ?? "";
+                var nonRejectedCount2 = _state.ExitTransitions.Count -
+                    _entryTransitionIds.Count - _rejectedExitIds.Count;
+                var exitCount2 = _state.ExitTransitions.Count - _entryTransitionIds.Count;
+                if (exitCount2 > 0)
+                    preferredAngle = _exitMemory.FindPreferredAngle(currentZone2, exitCount2, _preferredExits[0]);
+            }
+            var tileExit = FindExitViaTileMap(ctx, preferredAngle);
             if (tileExit.HasValue)
             {
                 var playerPos2 = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
@@ -1628,6 +1801,129 @@ namespace AutoExile.Modes
         }
 
         /// <summary>
+        /// Read an exit transition's RenderName. Returns empty if not readable.
+        /// </summary>
+        private static string ReadExitName(GameController gc, long entityId)
+        {
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (entity.Id != entityId || !entity.IsTargetable) continue;
+                var name = entity.RenderName;
+                if (!string.IsNullOrEmpty(name) && name != "AreaTransition")
+                    return name;
+                break;
+            }
+            return "";
+        }
+
+        /// <summary>
+        /// Navigate to an exit transition and click it when close enough.
+        /// Returns true if actively handling this exit (caller should return).
+        /// Returns false if the exit was rejected (wrong destination in a multi-exit zone).
+        /// Set forceClick=true to skip name verification (used when all exits rejected as fallback).
+        /// </summary>
+        private bool NavigateToExit(BotContext ctx, GameController gc, (long Id, Vector2 Position) exit, Vector2 playerPos, bool forceClick = false)
+        {
+            var dist = Vector2.Distance(playerPos, exit.Position);
+            Entity? exitEntity = null;
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (entity.Id == exit.Id && entity.IsTargetable)
+                {
+                    exitEntity = entity;
+                    break;
+                }
+            }
+            if (exitEntity == null) return false;
+
+            // Before clicking: in multi-exit zones with routing, verify this is the right exit
+            // Use tile cluster count as ground truth for how many exits exist (entity count
+            // may be low since distant exits aren't in the network bubble yet)
+            var currentZone = gc.Area?.CurrentArea?.Name ?? "";
+            int knownExitCount = GetForwardExitClusterCount();
+            bool isMultiExit = knownExitCount > 1 && _routing.IsLoaded && _preferredExits.Count > 0;
+
+            if (dist < 80f && isMultiExit && _entryPosition.HasValue && !forceClick
+                && !_rejectedExitIds.Contains(exit.Id)) // don't re-check already rejected exits
+            {
+                var name = ReadExitName(gc, exit.Id);
+                if (!string.IsNullOrEmpty(name))
+                {
+                    RecordExitAngle(currentZone, knownExitCount, exit.Position, name);
+
+                    if (!name.Equals(_preferredExits[0], StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Wrong exit — reject it
+                        LabLog($"NavigateToExit: '{name}' is not preferred '{_preferredExits[0]}' — rejecting");
+                        _rejectedExitIds.Add(exit.Id);
+                        return false; // caller will pick a different exit
+                    }
+                }
+            }
+
+            if (dist < 20f && !ctx.Interaction.IsBusy)
+            {
+                // Track which exit we're taking for retroactive recording on area change
+                if (!string.IsNullOrEmpty(currentZone) && _entryPosition.HasValue)
+                {
+                    _exitTakenFromZone = currentZone;
+                    _exitTakenPosition = exit.Position;
+                    _exitTakenExitCount = knownExitCount > 0 ? knownExitCount : 1;
+                }
+                ctx.Interaction.InteractWithEntity(exitEntity, requireProximity: false);
+                StatusText = $"Clicking exit (dist: {dist:F0})";
+            }
+            else if (!ctx.Navigation.IsNavigating || ctx.Navigation.Destination != exit.Position)
+            {
+                ctx.Navigation.NavigateTo(gc, exit.Position);
+                StatusText = $"Navigating to exit (dist: {dist:F0})";
+            }
+            else
+            {
+                StatusText = $"Walking to exit (dist: {dist:F0})";
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Count non-entry, non-skipped exit clusters. Uses tile data as ground truth
+        /// since entity-based exits may not all be in the network bubble.
+        /// </summary>
+        private int GetForwardExitClusterCount()
+        {
+            if (_exitClusters == null || _exitClusters.Count == 0) return 0;
+            int count = 0;
+            for (int i = 0; i < _exitClusters.Count; i++)
+            {
+                if (i == _entryClusterIndex) continue;
+                if (_skippedClusters.Contains(i)) continue;
+                count++;
+            }
+            return count;
+        }
+
+        /// <summary>
+        /// Record an exit angle mapping and save periodically.
+        /// </summary>
+        private void RecordExitAngle(string zoneName, int exitCount, Vector2 exitPos, string destinationName)
+        {
+            if (!_entryPosition.HasValue) return;
+            var angle = LabExitMemory.ComputeAngle(_entryPosition.Value, exitPos);
+            bool isNew = _exitMemory.Record(zoneName, exitCount, angle, destinationName);
+            if (isNew)
+            {
+                LabLog($"Recorded: {zoneName} [{exitCount} exits] angle={angle:F0}° → '{destinationName}'");
+
+                // Save after new data
+                if ((DateTime.Now - _lastMemorySave).TotalSeconds > 30)
+                {
+                    SaveExitMemory();
+                    _lastMemorySave = DateTime.Now;
+                }
+            }
+        }
+
+        /// <summary>
         /// Build exit clusters from TileMap data. Groups nearby exit tiles into clusters
         /// and identifies the entry cluster (nearest to spawn position).
         /// </summary>
@@ -1718,30 +2014,42 @@ namespace AutoExile.Modes
         }
 
         /// <summary>
-        /// Find nearest non-entry exit cluster centroid.
+        /// Find best non-entry exit cluster centroid.
+        /// If preferredAngleDegrees is set (from memory), picks the cluster whose angle
+        /// from entry best matches. Otherwise picks nearest by distance.
         /// </summary>
-        private Vector2? FindExitViaTileMap(BotContext ctx)
+        private Vector2? FindExitViaTileMap(BotContext ctx, float? preferredAngleDegrees = null)
         {
             BuildExitClusters(ctx);
             if (_exitClusters == null || _exitClusters.Count == 0) return null;
 
             var playerPos = new Vector2(ctx.Game.Player.GridPosNum.X, ctx.Game.Player.GridPosNum.Y);
-            Vector2? nearest = null;
-            float nearestDist = float.MaxValue;
 
+            // Collect valid (non-entry, non-skipped) clusters
+            var valid = new List<(int Index, Vector2 Pos)>();
             for (int i = 0; i < _exitClusters.Count; i++)
             {
-                if (i == _entryClusterIndex) continue; // skip entrance
-                if (_skippedClusters.Contains(i)) continue; // skip unreachable
-                var dist = Vector2.Distance(playerPos, _exitClusters[i]);
-                if (dist < nearestDist)
-                {
-                    nearestDist = dist;
-                    nearest = _exitClusters[i];
-                }
+                if (i == _entryClusterIndex) continue;
+                if (_skippedClusters.Contains(i)) continue;
+                valid.Add((i, _exitClusters[i]));
+            }
+            if (valid.Count == 0) return null;
+
+            // If we have a preferred angle from memory and an entry position, sort by angle match
+            if (preferredAngleDegrees.HasValue && _entryPosition.HasValue && valid.Count > 1)
+            {
+                var best = valid
+                    .OrderBy(v => LabExitMemory.AngleDifference(
+                        LabExitMemory.ComputeAngle(_entryPosition.Value, v.Pos),
+                        preferredAngleDegrees.Value))
+                    .First();
+                return best.Pos;
             }
 
-            return nearest;
+            // Default: nearest by distance
+            return valid
+                .OrderBy(v => Vector2.Distance(playerPos, v.Pos))
+                .First().Pos;
         }
 
         // ═══════════════════════════════════════════════════
@@ -1760,6 +2068,20 @@ namespace AutoExile.Modes
                 StatusText = "Detected reward room";
                 return;
             }
+
+            // Check for LabyrinthComplete entity — reward room fallback
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (entity.Path?.Contains("LabyrinthComplete", StringComparison.Ordinal) == true)
+                {
+                    _phase = LabPhase.RewardRoom;
+                    _phaseStartTime = DateTime.Now;
+                    LabLog("StagingRoom: detected LabyrinthComplete → RewardRoom");
+                    StatusText = "Detected reward room (LabyrinthComplete)";
+                    return;
+                }
+            }
+
             if (_state.IsIzaroPresent)
             {
                 _phase = LabPhase.FightIzaro;
@@ -1885,6 +2207,34 @@ namespace AutoExile.Modes
                 _phase = LabPhase.ExitLab;
                 _phaseStartTime = DateTime.Now;
                 return;
+            }
+
+            // Check if we're already in the reward room — the game can auto-teleport us here
+            // after the 3rd Izaro kill without a normal area transition. Also catches cases where
+            // the exit interaction completed but font wasn't detected on the first scan.
+            if (_state.HasFont)
+            {
+                _phase = LabPhase.RewardRoom;
+                _phaseStartTime = DateTime.Now;
+                _entryPosition = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
+                LabLog("FightIzaro: detected font — transitioning to RewardRoom");
+                StatusText = "Detected reward room";
+                return;
+            }
+
+            // Also check for LabyrinthComplete entity — signals we're in the final reward room
+            // even if the font hasn't been scanned yet
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (entity.Path?.Contains("LabyrinthComplete", StringComparison.Ordinal) == true)
+                {
+                    _phase = LabPhase.RewardRoom;
+                    _phaseStartTime = DateTime.Now;
+                    _entryPosition = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
+                    LabLog("FightIzaro: detected LabyrinthComplete — transitioning to RewardRoom");
+                    StatusText = "Detected reward room (LabyrinthComplete)";
+                    return;
+                }
             }
 
             // Izaro has retreated — loot then exit
@@ -2669,6 +3019,9 @@ namespace AutoExile.Modes
                         _resultGemClicked = true;
                         var profit = bestValue - _state.SelectedGemValue;
                         _state.TotalProfit += profit;
+                        // Record gem transformation profit to global loot tracker for div/hour
+                        if (profit > 0)
+                            ctx.LootTracker.RecordItem($"[Font] {bestName}", profit);
                         StatusText = $"Selected: {bestName} ({bestValue:F0}c) — waiting for confirm";
                         LabLog($"FontSelectResult: clicked best gem '{bestName}' = {bestValue:F0}c (profit: {profit:F0}c)");
                     }
@@ -2934,9 +3287,31 @@ namespace AutoExile.Modes
                     bool isPreferred = _preferredExits.Count > 0 &&
                         !string.IsNullOrEmpty(destName) &&
                         destName.Equals(_preferredExits[0], StringComparison.OrdinalIgnoreCase);
+                    bool isRejected = _rejectedExitIds.Contains(id);
+                    bool isScoutTarget = id == _scoutTargetId;
 
-                    var color = isPreferred ? SharpDX.Color.Gold : SharpDX.Color.LimeGreen;
-                    var label = isPreferred ? $"★ {destName}" : (string.IsNullOrEmpty(destName) ? "EXIT" : destName);
+                    SharpDX.Color color;
+                    string label;
+                    if (isRejected)
+                    {
+                        color = SharpDX.Color.Red;
+                        label = $"X {(string.IsNullOrEmpty(destName) ? "REJECTED" : destName)}";
+                    }
+                    else if (isPreferred)
+                    {
+                        color = SharpDX.Color.Gold;
+                        label = $"★ {destName}";
+                    }
+                    else if (isScoutTarget)
+                    {
+                        color = SharpDX.Color.Cyan;
+                        label = $"SCOUT → {(string.IsNullOrEmpty(destName) ? "EXIT" : destName)}";
+                    }
+                    else
+                    {
+                        color = SharpDX.Color.LimeGreen;
+                        label = string.IsNullOrEmpty(destName) ? "EXIT" : destName;
+                    }
                     g.DrawText(label, screenPos + new Vector2(-30, -15), color);
                 }
             }

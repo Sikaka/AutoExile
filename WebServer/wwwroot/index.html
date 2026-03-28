@@ -924,6 +924,10 @@ function renderAllSettings() {
   addSection(modes, 'Mapping', [['mapping.mapName'],['mapping.minMapTier'],['mapping.portalKey'],['mapping.rushBoss'],
     ['mapping.killBoss'],['mapping.bossKillRadius'],
     ['mapping.minPackDensity'],['mapping.detourForRares'],['mapping.maxDetourDistance']]);
+  addSection(modes, 'Labyrinth', [['labyrinth.difficulty'],['labyrinth.maxRuns'],
+    ['labyrinth.minExpectedProfit'],['labyrinth.keepThreshold'],['labyrinth.preferSameType'],
+    ['labyrinth.openRewardChests'],['labyrinth.zoneTimeoutSeconds'],['labyrinth.izaroTimeoutSeconds'],
+    ['labyrinth.maxDeaths'],['labyrinth.settleSeconds']]);
   addSection(modes, 'Simulacrum', [['simulacrum.maxDeaths'],['simulacrum.minWaveDelaySeconds'],
     ['simulacrum.waveTimeoutMinutes'],['simulacrum.stashItemThreshold']]);
   addSection(modes, 'Follower', [['follower.leaderName'],['follower.followDistance'],['follower.stopDistance'],
