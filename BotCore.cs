@@ -215,10 +215,110 @@ namespace AutoExile
                 _webServer.ConfigManager = _configManager;
                 _webServer.MapDatabase = _mapDatabase;
                 _webServer.NinjaPrice = _ninjaPrice;
+                _webServer.LootTracker = _lootTracker;
                 _webServer.Start();
             }
 
             return base.Initialise();
+        }
+
+        /// <summary>
+        /// ExileCore callback — fires once per area transition, before Tick() resumes.
+        /// Replaces manual CurrentAreaHash polling in the tick loop.
+        /// </summary>
+        public override void AreaChange(AreaInstance area)
+        {
+            var currentArea = area?.Name ?? "";
+            var currentHash = GameController.IngameState?.Data?.CurrentAreaHash ?? 0;
+            if (currentHash == 0) return; // Not loaded yet
+
+            // Skip if same hash (ExileCore may fire AreaChange on reload without actual transition)
+            if (currentHash == _lastAreaHash) return;
+
+            var previousAreaName = _lastAreaName;
+            LogMessage($"[BotCore] Area changed: '{previousAreaName}' -> '{currentArea}' (hash {_lastAreaHash} -> {currentHash})");
+
+            // Cache current area state before switching (for round-trip zone support)
+            // Use area name as cache key so returning to same-named area restores state
+            if (!string.IsNullOrEmpty(previousAreaName) && _exploration.IsInitialized)
+            {
+                // Only cache if we don't already have an entry for this name
+                // (prevents overwriting original map cache with wish zone state)
+                if (!_areaStateCache.ContainsKey(previousAreaName))
+                {
+                    // Force-complete active mechanic before caching — if the mechanic
+                    // sent us through a portal (e.g., Wishes), it should be done
+                    // so it doesn't re-detect when we return
+                    _mechanics.ForceCompleteActive();
+
+                    _areaStateCache[previousAreaName] = new AreaStateCache
+                    {
+                        Exploration = _exploration.CreateSnapshot(),
+                        Mechanics = _mechanics.CreateSnapshot(),
+                        AreaHash = _lastAreaHash,
+                        CachedAt = DateTime.Now,
+                    };
+
+                    // Evict oldest if cache is full
+                    while (_areaStateCache.Count > MaxCachedAreas)
+                    {
+                        string? oldest = null;
+                        var oldestTime = DateTime.MaxValue;
+                        foreach (var kv in _areaStateCache)
+                        {
+                            if (kv.Value.CachedAt < oldestTime)
+                            {
+                                oldestTime = kv.Value.CachedAt;
+                                oldest = kv.Key;
+                            }
+                        }
+                        if (oldest != null) _areaStateCache.Remove(oldest);
+                        else break;
+                    }
+
+                    _ctx.Log($"[Cache] Saved area state for '{previousAreaName}' hash={_lastAreaHash} ({_areaStateCache.Count} cached)");
+                }
+            }
+
+            _lastAreaName = currentArea;
+            _lastAreaHash = currentHash;
+            _areaChangedAt = DateTime.Now;
+            _tileMap.Clear();
+            _tileMap.Load(GameController);
+            _loot.ClearFailed();
+            _combat.ClearUnreachable();
+            _altarHandler.Reset();
+            _lootTracker.OnAreaChanged();
+            ClearMinimapIcons();
+            ScanMinimapIcons(forceFullLog: true);
+
+            // Check if we have cached state for this area name AND matching hash
+            // (returning from sub-zone back to the original map instance)
+            if (_areaStateCache.TryGetValue(currentArea, out var cached) && cached.AreaHash == currentHash)
+            {
+                _exploration.RestoreSnapshot(cached.Exploration);
+                _mechanics.RestoreSnapshot(cached.Mechanics);
+                _areaStateCache.Remove(currentArea);
+                _ctx.Log($"[Cache] Restored area state for '{currentArea}' hash={currentHash}");
+            }
+            else
+            {
+                // Fresh area or different instance — reset mechanics and initialize exploration
+                // Do NOT remove cache entry — sub-zones (wish zones) share the same area name
+                // and we need the original map's cache intact for when the player returns
+                _mechanics.Reset();
+
+                var terrainData = GameController.IngameState?.Data?.RawPathfindingData;
+                var targetingData = GameController.IngameState?.Data?.RawTerrainTargetingData;
+                if (terrainData != null && GameController.Player != null)
+                {
+                    var playerGrid = new Vector2(
+                        GameController.Player.GridPosNum.X,
+                        GameController.Player.GridPosNum.Y);
+                    _exploration.Initialize(terrainData, targetingData, playerGrid,
+                        Settings.Build.BlinkRange.Value);
+                }
+            }
         }
 
         public override Job Tick()
@@ -271,103 +371,7 @@ namespace AutoExile
             // but skip navigation which would queue conflicting cursor movements.
             var canAct = Systems.BotInput.CanAct;
 
-            // Reload tile map + exploration on area change
-            // Use area hash (unique per instance) to detect changes — area name alone
-            // can be the same for sub-zones (e.g., wish zone shares name with parent map)
-            var currentArea = GameController.Area?.CurrentArea?.Name ?? "";
-            var currentHash = GameController.IngameState?.Data?.CurrentAreaHash ?? 0;
-            if (currentHash != _lastAreaHash && currentHash != 0)
-            {
-                var previousAreaName = _lastAreaName;
-                LogMessage($"[BotCore] Area hash changed: {_lastAreaHash} -> {currentHash}, area='{currentArea}' (prev='{previousAreaName}')");
-
-                // Cache current area state before switching (for round-trip zone support)
-                // Use area name as cache key so returning to same-named area restores state
-                if (!string.IsNullOrEmpty(previousAreaName) && _exploration.IsInitialized)
-                {
-                    // Only cache if we don't already have an entry for this name
-                    // (prevents overwriting original map cache with wish zone state)
-                    if (!_areaStateCache.ContainsKey(previousAreaName))
-                    {
-                        // Force-complete active mechanic before caching — if the mechanic
-                        // sent us through a portal (e.g., Wishes), it should be done
-                        // so it doesn't re-detect when we return
-                        _mechanics.ForceCompleteActive();
-
-                        _areaStateCache[previousAreaName] = new AreaStateCache
-                        {
-                            Exploration = _exploration.CreateSnapshot(),
-                            Mechanics = _mechanics.CreateSnapshot(),
-                            AreaHash = _lastAreaHash,
-                            CachedAt = DateTime.Now,
-                        };
-
-                        // Evict oldest if cache is full
-                        while (_areaStateCache.Count > MaxCachedAreas)
-                        {
-                            string? oldest = null;
-                            var oldestTime = DateTime.MaxValue;
-                            foreach (var kv in _areaStateCache)
-                            {
-                                if (kv.Value.CachedAt < oldestTime)
-                                {
-                                    oldestTime = kv.Value.CachedAt;
-                                    oldest = kv.Key;
-                                }
-                            }
-                            if (oldest != null) _areaStateCache.Remove(oldest);
-                            else break;
-                        }
-
-                        _ctx.Log($"[Cache] Saved area state for '{previousAreaName}' hash={_lastAreaHash} ({_areaStateCache.Count} cached)");
-                    }
-                }
-
-                _lastAreaName = currentArea;
-                _lastAreaHash = currentHash;
-                _areaChangedAt = DateTime.Now;
-                _tileMap.Clear();
-                _tileMap.Load(GameController);
-                _loot.ClearFailed();
-                _combat.ClearUnreachable();
-                _altarHandler.Reset();
-                _lootTracker.OnAreaChanged();
-                ClearMinimapIcons();
-                ScanMinimapIcons(forceFullLog: true);
-
-                // NOTE: MappingMode handles hideout/town transitions internally via OnAreaChanged
-                // → HideoutFlow (stash → map device → enter map). Don't SetMode("Idle") here.
-
-                // Check if we have cached state for this area name AND matching hash
-                // (returning from sub-zone back to the original map instance)
-                if (_areaStateCache.TryGetValue(currentArea, out var cached) && cached.AreaHash == currentHash)
-                {
-                    _exploration.RestoreSnapshot(cached.Exploration);
-                    _mechanics.RestoreSnapshot(cached.Mechanics);
-                    _areaStateCache.Remove(currentArea);
-                    _ctx.Log($"[Cache] Restored area state for '{currentArea}' hash={currentHash}");
-                }
-                else
-                {
-                    // Fresh area or different instance — reset mechanics and initialize exploration
-                    // Do NOT remove cache entry — sub-zones (wish zones) share the same area name
-                    // and we need the original map's cache intact for when the player returns
-                    _mechanics.Reset();
-
-                    var terrainData = GameController.IngameState?.Data?.RawPathfindingData;
-                    var targetingData = GameController.IngameState?.Data?.RawTerrainTargetingData;
-                    if (terrainData != null && GameController.Player != null)
-                    {
-                        var playerGrid = new Vector2(
-                            GameController.Player.GridPosNum.X,
-                            GameController.Player.GridPosNum.Y);
-                        _exploration.Initialize(terrainData, targetingData, playerGrid,
-                            Settings.Build.BlinkRange.Value);
-                    }
-                }
-            }
-
-            // Retry exploration init if it was missed (terrain data not ready on area change tick)
+            // Retry exploration init if it was missed (terrain data not ready when AreaChange fired)
             if (!_exploration.IsInitialized && GameController.Player != null)
             {
                 var terrainData = GameController.IngameState?.Data?.RawPathfindingData;
@@ -476,7 +480,7 @@ namespace AutoExile
             }
 
             // Clear tile signatures on area change
-            if (_tileSignatures.Count > 0 && currentArea != _tileSignatureArea)
+            if (_tileSignatures.Count > 0 && _lastAreaName != _tileSignatureArea)
                 _tileSignatures.Clear();
 
             // Sync loot settings
@@ -1207,10 +1211,23 @@ namespace AutoExile
                     LootCandidates = _loot.Candidates.Count,
                     SessionChaos = Sanitize((float)_lootTracker.TotalChaosValue),
                     ChaosPerHour = Sanitize((float)_lootTracker.ChaosPerHour),
+                    ChaosPerDivine = Sanitize((float)(_ninjaPrice.ChaosPerDivine)),
                     ItemsLooted = _lootTracker.TotalItemsLooted,
                     MapsCompleted = _lootTracker.MapsCompleted,
                     SessionDuration = _lootTracker.SessionDuration.TotalSeconds > 0
                         ? _lootTracker.SessionDuration.ToString(@"hh\:mm\:ss") : "",
+                    // Simulacrum stats
+                    SimWave = _simulacrumMode?.State.CurrentWave ?? 0,
+                    SimWaveActive = _simulacrumMode?.State.IsWaveActive ?? false,
+                    SimDeaths = _simulacrumMode?.State.DeathCount ?? 0,
+                    SimRuns = _simulacrumMode?.State.RunsCompleted ?? 0,
+                    SimAvgWaves = Sanitize((float)(_simulacrumMode?.State.AverageWavesPerRun ?? 0)),
+                    SimAvgRunTime = _simulacrumMode?.State.RunsCompleted > 0
+                        ? _simulacrumMode.State.AverageRunDuration.ToString(@"m\:ss") : "",
+                    SimRunTime = _simulacrumMode != null && _mode == _simulacrumMode
+                        && _simulacrumMode.Phase >= SimPhase.FindMonolith && _simulacrumMode.Phase <= SimPhase.ExitMap
+                        ? (DateTime.Now - _simulacrumMode.State.RunStartedAt).ToString(@"m\:ss") : "",
+
                     Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
 
                     // Map overlay
@@ -2236,11 +2253,7 @@ namespace AutoExile
 
                 // Draw world marker
                 var camera = gc.IngameState.Camera;
-                var playerZ = gc.Player.PosNum.Z;
-                var bossWorld = new System.Numerics.Vector3(
-                    bossPos.Value.X * (float)Systems.Pathfinding.GridToWorld,
-                    bossPos.Value.Y * (float)Systems.Pathfinding.GridToWorld,
-                    playerZ);
+                var bossWorld = Systems.Pathfinding.GridToWorld3D(gc, bossPos.Value);
                 Graphics.DrawCircleInWorld(bossWorld, 60f, SharpDX.Color.Gold, 3f);
                 Graphics.DrawCircleInWorld(bossWorld, 30f, SharpDX.Color.Gold, 2f);
                 var bossScreen = camera.WorldToScreen(bossWorld);
@@ -2287,10 +2300,7 @@ namespace AutoExile
                 {
                     // Tile center = gridPos + half tile size (23/2 ≈ 11.5)
                     var centerGrid = gridPos + new Vector2(11.5f, 11.5f);
-                    var worldPos = new System.Numerics.Vector3(
-                        centerGrid.X * (float)Systems.Pathfinding.GridToWorld,
-                        centerGrid.Y * (float)Systems.Pathfinding.GridToWorld,
-                        gc.Player.PosNum.Z);
+                    var worldPos = Systems.Pathfinding.GridToWorld3D(gc, centerGrid);
 
                     // Circle
                     Graphics.DrawCircleInWorld(worldPos, 80f, color, 2f);

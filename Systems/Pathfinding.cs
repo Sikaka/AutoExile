@@ -1,3 +1,4 @@
+using ExileCore;
 using System.Numerics;
 
 namespace AutoExile.Systems
@@ -51,6 +52,21 @@ namespace AutoExile.Systems
 
         public static (int x, int y) WorldToGridPos(Vector2 world) =>
             ((int)(world.X * WorldToGrid), (int)(world.Y * WorldToGrid));
+
+        /// <summary>
+        /// Convert grid position to world Vector3 using ExileCore's terrain height lookup.
+        /// This is more accurate than manual GridToWorld multiplication because it includes
+        /// proper terrain elevation from the game's height map.
+        /// </summary>
+        public static Vector3 GridToWorld3D(GameController gc, Vector2 gridPos) =>
+            gc.IngameState.Data.ToWorldWithTerrainHeight(gridPos);
+
+        /// <summary>
+        /// Convert grid position to screen coordinates via ToWorldWithTerrainHeight.
+        /// Preferred over manual GridToWorld * 10.88 + manual height lookup.
+        /// </summary>
+        public static Vector2 GridToScreen(GameController gc, Vector2 gridPos) =>
+            gc.IngameState.Camera.WorldToScreen(gc.IngameState.Data.ToWorldWithTerrainHeight(gridPos));
 
         /// <summary>
         /// Run A* from start to goal on the pathfinding grid.

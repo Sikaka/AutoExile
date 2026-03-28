@@ -488,14 +488,10 @@ namespace AutoExile.Modes
                 new Vector2(100, yOffset), SharpDX.Color.Gray);
             yOffset += 20;
 
-            var playerZ = ctx.Game.Player.PosNum.Z;
-
             // Draw target marker
             if (_targetGridPos != null)
             {
-                var gtw = (float)Pathfinding.GridToWorld;
-                var targetScreen = camera.WorldToScreen(
-                    new System.Numerics.Vector3(_targetGridPos.Value.X * gtw, _targetGridPos.Value.Y * gtw, playerZ));
+                var targetScreen = Pathfinding.GridToScreen(ctx.Game, _targetGridPos.Value);
 
                 if (IsOnScreen(targetScreen, ctx.Game))
                 {
@@ -511,10 +507,8 @@ namespace AutoExile.Modes
             {
                 for (var i = 0; i < _renderNavPath.Count - 1; i++)
                 {
-                    var a = _renderNavPath[i].Position;
-                    var b = _renderNavPath[i + 1].Position;
-                    var sa = camera.WorldToScreen(new System.Numerics.Vector3(a.X, a.Y, playerZ));
-                    var sb = camera.WorldToScreen(new System.Numerics.Vector3(b.X, b.Y, playerZ));
+                    var sa = Pathfinding.GridToScreen(ctx.Game, _renderNavPath[i].Position);
+                    var sb = Pathfinding.GridToScreen(ctx.Game, _renderNavPath[i + 1].Position);
 
                     if (!IsOnScreen(sa, ctx.Game) && !IsOnScreen(sb, ctx.Game))
                         continue;
@@ -535,7 +529,7 @@ namespace AutoExile.Modes
                 for (var i = 0; i < _renderNavPath.Count; i++)
                 {
                     var wp = _renderNavPath[i];
-                    var sw = camera.WorldToScreen(new System.Numerics.Vector3(wp.Position.X * Pathfinding.GridToWorld, wp.Position.Y * Pathfinding.GridToWorld, playerZ));
+                    var sw = Pathfinding.GridToScreen(ctx.Game, wp.Position);
                     if (!IsOnScreen(sw, ctx.Game))
                         continue;
 
@@ -564,8 +558,6 @@ namespace AutoExile.Modes
                 var playerGrid = new Vector2(
                     ctx.Game.Player.GridPosNum.X,
                     ctx.Game.Player.GridPosNum.Y);
-                var gtw = (float)Pathfinding.GridToWorld;
-
                 foreach (var kv in ctx.Threat.TrackedMonsters)
                 {
                     var mt = kv.Value;
@@ -580,11 +572,7 @@ namespace AutoExile.Modes
                     if (mt.HasCast)
                     {
                         // Draw line from monster to cast destination
-                        var destWorld3 = new System.Numerics.Vector3(
-                            mt.CastDestination.X * gtw,
-                            mt.CastDestination.Y * gtw,
-                            playerZ);
-                        var destScreen = camera.WorldToScreen(destWorld3);
+                        var destScreen = Pathfinding.GridToScreen(ctx.Game, mt.CastDestination);
                         var ds = new Vector2(destScreen.X, destScreen.Y);
 
                         var lineColor = mt.DodgeSignaled
@@ -630,11 +618,7 @@ namespace AutoExile.Modes
                 // Draw dodge direction arrow when actively dodging
                 if (_dodging)
                 {
-                    var dodgeWorld3 = new System.Numerics.Vector3(
-                        _dodgeTarget.X * gtw,
-                        _dodgeTarget.Y * gtw,
-                        playerZ);
-                    var dodgeScreen = camera.WorldToScreen(dodgeWorld3);
+                    var dodgeScreen = Pathfinding.GridToScreen(ctx.Game, _dodgeTarget);
                     if (IsOnScreen(dodgeScreen, ctx.Game))
                     {
                         var dts = new Vector2(dodgeScreen.X, dodgeScreen.Y);

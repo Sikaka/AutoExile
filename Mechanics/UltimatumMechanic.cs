@@ -1065,7 +1065,6 @@ namespace AutoExile.Mechanics
             if (g == null || gc?.Player == null || !gc.InGame) return;
 
             var cam = gc.IngameState.Camera;
-            var playerZ = gc.Player.PosNum.Z;
             var settings = ctx.Settings.Mechanics.Ultimatum;
 
             // ═══ HUD Panel ═══
@@ -1153,9 +1152,7 @@ namespace AutoExile.Mechanics
             // ═══ World Overlays ═══
             if (AnchorGridPos.HasValue)
             {
-                var altarWorld = new Vector3(
-                    AnchorGridPos.Value.X * Pathfinding.GridToWorld,
-                    AnchorGridPos.Value.Y * Pathfinding.GridToWorld, playerZ);
+                var altarWorld = Pathfinding.GridToWorld3D(gc, AnchorGridPos.Value);
 
                 var effectiveRadius = GetEffectiveOrbitRadius(settings.OrbitRadius.Value);
                 var orbitWorldRadius = effectiveRadius * Pathfinding.GridToWorld;
@@ -1173,9 +1170,7 @@ namespace AutoExile.Mechanics
             // Active circle marker (Stand in the Circles)
             if (_activeCirclePos.HasValue && _phase == UltimatumPhase.Fighting)
             {
-                var circleWorld = new Vector3(
-                    _activeCirclePos.Value.X * Pathfinding.GridToWorld,
-                    _activeCirclePos.Value.Y * Pathfinding.GridToWorld, playerZ);
+                var circleWorld = Pathfinding.GridToWorld3D(gc, _activeCirclePos.Value);
                 var circleScreen = cam.WorldToScreen(circleWorld);
                 if (circleScreen.X > -200 && circleScreen.X < 2400)
                 {

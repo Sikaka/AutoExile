@@ -1319,12 +1319,10 @@ namespace AutoExile.Modes
             if (gc.Area.CurrentArea.IsHideout || gc.Area.CurrentArea.IsTown)
                 return;
 
-            var playerZ = gc.Player.PosNum.Z;
-
             // Pump entity (clickable)
             if (_blight.PumpPosition.HasValue)
             {
-                var pumpWorld = BlightState.ToWorld3(_blight.PumpPosition.Value, playerZ);
+                var pumpWorld = Systems.Pathfinding.GridToWorld3D(gc, _blight.PumpPosition.Value);
                 g.DrawText("PUMP", cam.WorldToScreen(pumpWorld), SharpDX.Color.Yellow);
                 g.DrawCircleInWorld(pumpWorld, 30f, SharpDX.Color.Yellow, 2f);
 
@@ -1335,7 +1333,7 @@ namespace AutoExile.Modes
             // Defense point (lane hub — where monsters converge)
             if (_blight.DefensePosition.HasValue && _blight.DefensePosition != _blight.PumpPosition)
             {
-                var defWorld = BlightState.ToWorld3(_blight.DefensePosition.Value, playerZ);
+                var defWorld = Systems.Pathfinding.GridToWorld3D(gc, _blight.DefensePosition.Value);
                 g.DrawText("DEFEND", cam.WorldToScreen(defWorld), SharpDX.Color.Cyan);
                 g.DrawCircleInWorld(defWorld, 30f, SharpDX.Color.Cyan, 2f);
             }
@@ -1343,7 +1341,7 @@ namespace AutoExile.Modes
             // Active tower target
             if (_towerAction != null && !_towerAction.IsComplete)
             {
-                var targetWorld = BlightState.ToWorld3(_towerAction.TargetGridPos, playerZ);
+                var targetWorld = Systems.Pathfinding.GridToWorld3D(gc, _towerAction.TargetGridPos);
                 var targetScreen = cam.WorldToScreen(targetWorld);
                 g.DrawCircleInWorld(targetWorld, 25f, SharpDX.Color.Gold, 3f);
                 g.DrawText("TARGET", targetScreen + new Vector2(-20, -25), SharpDX.Color.Gold);
@@ -1352,7 +1350,7 @@ namespace AutoExile.Modes
             // Cached portal
             if (_blight.PortalPosition.HasValue)
             {
-                var portalWorld = BlightState.ToWorld3(_blight.PortalPosition.Value, playerZ);
+                var portalWorld = Systems.Pathfinding.GridToWorld3D(gc, _blight.PortalPosition.Value);
                 var portalScreen = cam.WorldToScreen(portalWorld);
                 g.DrawText("PORTAL", portalScreen + new Vector2(-20, -15), SharpDX.Color.Aqua);
                 g.DrawCircleInWorld(portalWorld, 20f, SharpDX.Color.Aqua, 1.5f);
@@ -1361,8 +1359,7 @@ namespace AutoExile.Modes
             // Chests
             foreach (var chestPos in _blight.ChestPositions)
             {
-                var chestScreen = cam.WorldToScreen(BlightState.ToWorld3(chestPos, playerZ));
-                g.DrawText("C", chestScreen, SharpDX.Color.Gold);
+                g.DrawText("C", Systems.Pathfinding.GridToScreen(gc, chestPos), SharpDX.Color.Gold);
             }
 
             // Lanes
@@ -1378,7 +1375,7 @@ namespace AutoExile.Modes
                         ? SharpDX.Color.Red
                         : SharpDX.Color.LightGreen;
 
-                    g.DrawText($"L{i}", cam.WorldToScreen(BlightState.ToWorld3(lane[0], playerZ)), color);
+                    g.DrawText($"L{i}", Systems.Pathfinding.GridToScreen(gc, lane[0]), color);
                 }
             }
 
@@ -1388,8 +1385,8 @@ namespace AutoExile.Modes
                 var path = ctx.Navigation.CurrentNavPath;
                 for (int i = ctx.Navigation.CurrentWaypointIndex; i < path.Count - 1; i++)
                 {
-                    var from = cam.WorldToScreen(new Vector3(path[i].Position.X * Systems.Pathfinding.GridToWorld, path[i].Position.Y * Systems.Pathfinding.GridToWorld, playerZ));
-                    var to = cam.WorldToScreen(new Vector3(path[i + 1].Position.X * Systems.Pathfinding.GridToWorld, path[i + 1].Position.Y * Systems.Pathfinding.GridToWorld, playerZ));
+                    var from = Systems.Pathfinding.GridToScreen(gc, path[i].Position);
+                    var to = Systems.Pathfinding.GridToScreen(gc, path[i + 1].Position);
                     g.DrawLine(from, to, 1.5f, SharpDX.Color.CornflowerBlue);
                 }
             }

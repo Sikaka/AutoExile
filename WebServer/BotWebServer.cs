@@ -36,6 +36,7 @@ namespace AutoExile.WebServer
         public Systems.MapDatabase? MapDatabase { get; set; }
         public ConfigManager? ConfigManager { get; set; }
         public Systems.NinjaPriceService? NinjaPrice { get; set; }
+        public Systems.LootTracker? LootTracker { get; set; }
 
         // Cached terrain data — pushed from BotCore on area change
         private volatile MapTerrainData? _cachedTerrain;
@@ -251,6 +252,10 @@ namespace AutoExile.WebServer
                         break;
                     case "/api/altar-mods" when method == "POST":
                         await HandleSetAltarMod(req, resp);
+                        break;
+                    case "/api/loot/reset" when method == "POST":
+                        LootTracker?.ResetSession();
+                        await ServeJson(resp, new { ok = true });
                         break;
 
                     default:
@@ -712,9 +717,19 @@ namespace AutoExile.WebServer
         public int LootCandidates { get; init; }
         public float SessionChaos { get; init; }
         public float ChaosPerHour { get; init; }
+        public float ChaosPerDivine { get; init; }
         public int ItemsLooted { get; init; }
         public int MapsCompleted { get; init; }
         public string SessionDuration { get; init; } = "";
+
+        // Simulacrum stats (populated only when mode is Simulacrum)
+        public int SimWave { get; init; }
+        public bool SimWaveActive { get; init; }
+        public int SimDeaths { get; init; }
+        public int SimRuns { get; init; }
+        public float SimAvgWaves { get; init; }
+        public string SimAvgRunTime { get; init; } = "";
+        public string SimRunTime { get; init; } = "";
 
         public long Timestamp { get; init; }
 

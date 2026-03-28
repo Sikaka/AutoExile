@@ -1251,16 +1251,14 @@ namespace AutoExile.Modes
             if (gc.Area.CurrentArea.IsHideout || gc.Area.CurrentArea.IsTown)
                 return;
 
-            var playerZ = gc.Player.PosNum.Z;
-
             // Navigation path
             if (ctx.Navigation.IsNavigating)
             {
                 var path = ctx.Navigation.CurrentNavPath;
                 for (int i = ctx.Navigation.CurrentWaypointIndex; i < path.Count - 1; i++)
                 {
-                    var from = cam.WorldToScreen(new Vector3(path[i].Position.X * Pathfinding.GridToWorld, path[i].Position.Y * Pathfinding.GridToWorld, playerZ));
-                    var to = cam.WorldToScreen(new Vector3(path[i + 1].Position.X * Pathfinding.GridToWorld, path[i + 1].Position.Y * Pathfinding.GridToWorld, playerZ));
+                    var from = Pathfinding.GridToScreen(gc, path[i].Position);
+                    var to = Pathfinding.GridToScreen(gc, path[i + 1].Position);
                     if (from.X < -200 || from.X > 2400 || to.X < -200 || to.X > 2400) continue;
                     var isBlink = path[i + 1].Action == WaypointAction.Blink;
                     g.DrawLine(from, to, isBlink ? 3f : 2f, isBlink ? SharpDX.Color.Magenta : SharpDX.Color.Orange);
@@ -1270,9 +1268,7 @@ namespace AutoExile.Modes
             // Curio target marker
             if (_state.CurioTargetPosition.HasValue)
             {
-                var curioWorld = new Vector3(
-                    _state.CurioTargetPosition.Value.X * Pathfinding.GridToWorld,
-                    _state.CurioTargetPosition.Value.Y * Pathfinding.GridToWorld, playerZ);
+                var curioWorld = Pathfinding.GridToWorld3D(gc, _state.CurioTargetPosition.Value);
                 var curioScreen = cam.WorldToScreen(curioWorld);
                 if (curioScreen.X > -200 && curioScreen.X < 2400)
                 {
@@ -1284,9 +1280,7 @@ namespace AutoExile.Modes
             // Current pathnode target
             if (_currentExploreTarget.HasValue && _state.CurioTargetPosition == null)
             {
-                var expWorld = new Vector3(
-                    _currentExploreTarget.Value.X * Pathfinding.GridToWorld,
-                    _currentExploreTarget.Value.Y * Pathfinding.GridToWorld, playerZ);
+                var expWorld = Pathfinding.GridToWorld3D(gc, _currentExploreTarget.Value);
                 var expScreen = cam.WorldToScreen(expWorld);
                 if (expScreen.X > -200 && expScreen.X < 2400)
                 {
@@ -1298,9 +1292,7 @@ namespace AutoExile.Modes
             // Exit marker
             if (_state.ExitPosition.HasValue)
             {
-                var exitWorld = new Vector3(
-                    _state.ExitPosition.Value.X * Pathfinding.GridToWorld,
-                    _state.ExitPosition.Value.Y * Pathfinding.GridToWorld, playerZ);
+                var exitWorld = Pathfinding.GridToWorld3D(gc, _state.ExitPosition.Value);
                 var exitScreen = cam.WorldToScreen(exitWorld);
                 if (exitScreen.X > -200 && exitScreen.X < 2400)
                 {
@@ -1312,9 +1304,7 @@ namespace AutoExile.Modes
             // Doors (closed = red, open = green)
             foreach (var door in _state.Doors.Values)
             {
-                var doorWorld = new Vector3(
-                    door.GridPos.X * Pathfinding.GridToWorld,
-                    door.GridPos.Y * Pathfinding.GridToWorld, playerZ);
+                var doorWorld = Pathfinding.GridToWorld3D(gc, door.GridPos);
                 var doorScreen = cam.WorldToScreen(doorWorld);
                 if (doorScreen.X < -200 || doorScreen.X > 2400) continue;
                 var isOpen = _state.OpenedEntities.Contains(door.Id);
@@ -1328,9 +1318,7 @@ namespace AutoExile.Modes
             foreach (var chest in _state.RewardChests.Values)
             {
                 if (_state.OpenedEntities.Contains(chest.Id)) continue;
-                var chestWorld = new Vector3(
-                    chest.GridPos.X * Pathfinding.GridToWorld,
-                    chest.GridPos.Y * Pathfinding.GridToWorld, playerZ);
+                var chestWorld = Pathfinding.GridToWorld3D(gc, chest.GridPos);
                 var chestScreen = cam.WorldToScreen(chestWorld);
                 if (chestScreen.X < -200 || chestScreen.X > 2400) continue;
                 var circleColor = chest.ChestType == HeistChestType.RewardRoom ? SharpDX.Color.Gold
@@ -1346,10 +1334,7 @@ namespace AutoExile.Modes
             // Companion marker
             if (_state.CompanionPosition.HasValue)
             {
-                var compWorld = new Vector3(
-                    _state.CompanionPosition.Value.X * Pathfinding.GridToWorld,
-                    _state.CompanionPosition.Value.Y * Pathfinding.GridToWorld, playerZ);
-                var compScreen = cam.WorldToScreen(compWorld);
+                var compScreen = Pathfinding.GridToScreen(gc, _state.CompanionPosition.Value);
                 if (compScreen.X > -200 && compScreen.X < 2400)
                     g.DrawText("NPC", compScreen + new Vector2(-10, -20), SharpDX.Color.Yellow);
             }

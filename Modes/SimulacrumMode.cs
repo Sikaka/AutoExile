@@ -1311,12 +1311,10 @@ namespace AutoExile.Modes
             if (gc.Area.CurrentArea.IsHideout || gc.Area.CurrentArea.IsTown)
                 return;
 
-            var playerZ = gc.Player.PosNum.Z;
-
             // Monolith
             if (_state.MonolithPosition.HasValue)
             {
-                var monolithWorld = SimulacrumState.ToWorld3(_state.MonolithPosition.Value, playerZ);
+                var monolithWorld = Systems.Pathfinding.GridToWorld3D(gc, _state.MonolithPosition.Value);
                 g.DrawText("MONOLITH", cam.WorldToScreen(monolithWorld), SharpDX.Color.Purple);
                 g.DrawCircleInWorld(monolithWorld, 30f, SharpDX.Color.Purple, 2f);
             }
@@ -1324,7 +1322,7 @@ namespace AutoExile.Modes
             // Portal
             if (_state.PortalPosition.HasValue)
             {
-                var portalWorld = SimulacrumState.ToWorld3(_state.PortalPosition.Value, playerZ);
+                var portalWorld = Systems.Pathfinding.GridToWorld3D(gc, _state.PortalPosition.Value);
                 g.DrawText("PORTAL", cam.WorldToScreen(portalWorld) + new Vector2(-20, -15),
                     SharpDX.Color.Aqua);
                 g.DrawCircleInWorld(portalWorld, 20f, SharpDX.Color.Aqua, 1.5f);
@@ -1333,8 +1331,7 @@ namespace AutoExile.Modes
             // Stash
             if (_state.StashPosition.HasValue)
             {
-                var stashWorld = SimulacrumState.ToWorld3(_state.StashPosition.Value, playerZ);
-                g.DrawText("STASH", cam.WorldToScreen(stashWorld) + new Vector2(-15, -15),
+                g.DrawText("STASH", Systems.Pathfinding.GridToScreen(gc, _state.StashPosition.Value) + new Vector2(-15, -15),
                     SharpDX.Color.Gold);
             }
 
@@ -1344,10 +1341,8 @@ namespace AutoExile.Modes
                 var path = ctx.Navigation.CurrentNavPath;
                 for (int i = ctx.Navigation.CurrentWaypointIndex; i < path.Count - 1; i++)
                 {
-                    var from = cam.WorldToScreen(new Vector3(
-                        path[i].Position.X * Systems.Pathfinding.GridToWorld, path[i].Position.Y * Systems.Pathfinding.GridToWorld, playerZ));
-                    var to = cam.WorldToScreen(new Vector3(
-                        path[i + 1].Position.X * Systems.Pathfinding.GridToWorld, path[i + 1].Position.Y * Systems.Pathfinding.GridToWorld, playerZ));
+                    var from = Systems.Pathfinding.GridToScreen(gc, path[i].Position);
+                    var to = Systems.Pathfinding.GridToScreen(gc, path[i + 1].Position);
                     g.DrawLine(from, to, 1.5f, SharpDX.Color.CornflowerBlue);
                 }
             }

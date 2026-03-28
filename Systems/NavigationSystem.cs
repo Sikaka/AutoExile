@@ -308,17 +308,11 @@ namespace AutoExile.Systems
 
         /// <summary>
         /// Convert a grid position to screen coordinates using terrain height.
-        /// This is the ONLY place grid→world→screen conversion should happen for navigation.
+        /// Delegates to Pathfinding.GridToScreen which uses ToWorldWithTerrainHeight
+        /// for accurate elevation-aware conversion.
         /// </summary>
-        private static Vector2 GridToScreen(GameController gc, Vector2 gridPos)
-        {
-            var heightGrid = gc.IngameState?.Data?.RawTerrainHeightData;
-            var gx = (int)gridPos.X;
-            var gy = (int)gridPos.Y;
-            var z = Pathfinding.GetTerrainHeight(heightGrid, gx, gy, gc.Player.PosNum.Z);
-            return gc.IngameState.Camera.WorldToScreen(
-                new Vector3(gridPos.X * Pathfinding.GridToWorld, gridPos.Y * Pathfinding.GridToWorld, z));
-        }
+        private static Vector2 GridToScreen(GameController gc, Vector2 gridPos) =>
+            Pathfinding.GridToScreen(gc, gridPos);
 
         /// <summary>
         /// Determine which side of the wall the player is on (grid coordinates).

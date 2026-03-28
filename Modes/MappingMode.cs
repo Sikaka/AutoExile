@@ -1704,7 +1704,6 @@ namespace AutoExile.Modes
             if (g == null || gc?.Player == null || !gc.InGame) return;
 
             var cam = gc.IngameState.Camera;
-            var playerZ = gc.Player.PosNum.Z;
             var playerGrid = gc.Player.GridPosNum;
             var blob = ctx.Exploration.ActiveBlob;
 
@@ -1818,9 +1817,7 @@ namespace AutoExile.Modes
             // Nav target marker
             if (_navTarget.HasValue && ctx.Navigation.IsNavigating)
             {
-                var targetWorld = new Vector3(
-                    _navTarget.Value.X * Pathfinding.GridToWorld,
-                    _navTarget.Value.Y * Pathfinding.GridToWorld, playerZ);
+                var targetWorld = Pathfinding.GridToWorld3D(gc, _navTarget.Value);
                 var targetScreen = cam.WorldToScreen(targetWorld);
                 if (targetScreen.X > -200 && targetScreen.X < 2400)
                 {
@@ -1837,8 +1834,8 @@ namespace AutoExile.Modes
                 var path = ctx.Navigation.CurrentNavPath;
                 for (int i = ctx.Navigation.CurrentWaypointIndex; i < path.Count - 1; i++)
                 {
-                    var from = cam.WorldToScreen(new Vector3(path[i].Position.X * Pathfinding.GridToWorld, path[i].Position.Y * Pathfinding.GridToWorld, playerZ));
-                    var to = cam.WorldToScreen(new Vector3(path[i + 1].Position.X * Pathfinding.GridToWorld, path[i + 1].Position.Y * Pathfinding.GridToWorld, playerZ));
+                    var from = Pathfinding.GridToScreen(gc, path[i].Position);
+                    var to = Pathfinding.GridToScreen(gc, path[i + 1].Position);
                     if (from.X < -200 || from.X > 2400 || to.X < -200 || to.X > 2400) continue;
 
                     var isBlink = path[i + 1].Action == WaypointAction.Blink;
@@ -1850,9 +1847,7 @@ namespace AutoExile.Modes
             // Boss target world marker
             if (_bossTarget.HasValue)
             {
-                var bossWorld = new Vector3(
-                    _bossTarget.Value.X * (float)Pathfinding.GridToWorld,
-                    _bossTarget.Value.Y * (float)Pathfinding.GridToWorld, playerZ);
+                var bossWorld = Pathfinding.GridToWorld3D(gc, _bossTarget.Value);
                 g.DrawCircleInWorld(bossWorld, 60f, SharpDX.Color.Gold, 3f);
                 var bossScreen = cam.WorldToScreen(bossWorld);
                 if (bossScreen.X > -200 && bossScreen.X < 2400)

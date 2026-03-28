@@ -909,5 +909,6 @@ namespace AutoExile
             [Menu("Dodge Cooldown (ms)", "Minimum time between dodge movements.")]
             public RangeNode<int> DodgeCooldownMs { get; set; } = new RangeNode<int>(500, 100, 2000);
         }
+
     }
 }

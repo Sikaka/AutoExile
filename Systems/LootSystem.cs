@@ -161,6 +161,11 @@ namespace AutoExile.Systems
                     // Check if this is a unique we should skip
                     var priceResult = GetPriceResult(gc, priceEntity);
                     var chaosValue = priceResult.MaxChaosValue; // Use max for loot decisions
+
+                    // Voices has a huge price range (1-passive is 150x rarer than 3-passive).
+                    // Divide max by 150 to approximate expected value rather than best-case.
+                    if (priceResult.DetailsId.Contains("voices", StringComparison.OrdinalIgnoreCase))
+                        chaosValue = priceResult.MaxChaosValue / 150.0;
                     var invSlots = GetInventorySlots(priceEntity);
                     var chaosPerSlot = invSlots > 0 ? chaosValue / invSlots : chaosValue;
 

@@ -143,6 +143,13 @@ namespace AutoExile.Systems
         }
 
         /// <summary>
+        /// Current chaos value of one Divine Orb (from poe.ninja currency data).
+        /// Returns 0 if not yet loaded.
+        /// </summary>
+        public double ChaosPerDivine =>
+            _currencyPrices.TryGetValue("Divine Orb", out var val) ? val : 0;
+
+        /// <summary>
         /// Get the price of an item entity. Returns MaxChaosValue for unidentified uniques.
         /// </summary>
         public PriceResult GetPrice(GameController gc, Entity entity)

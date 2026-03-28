@@ -735,8 +735,8 @@ namespace AutoExile.Systems
                 // All "when to fire" logic is in conditions
                 if (!CheckSkillConditions(gc, entry, settings)) continue;
 
-                var targetPos = GetSkillTarget(gc, entry);
-                UseSkill(gc, entry, targetPos);
+                var targetGridPos = GetSkillTargetGrid(gc, entry);
+                UseSkill(gc, entry, targetGridPos);
                 return true;
             }
 
@@ -810,27 +810,25 @@ namespace AutoExile.Systems
             return true;
         }
 
-        private Vector2? GetSkillTarget(GameController gc, SkillBarEntry entry)
+        private Vector2? GetSkillTargetGrid(GameController gc, SkillBarEntry entry)
         {
             return entry.Role switch
             {
-                SkillRole.Enemy => BestTarget != null ? ToWorld(BestTarget.GridPosNum) : null,
-                SkillRole.Corpse => NearestCorpse.HasValue ? ToWorld(NearestCorpse.Value) : null,
+                SkillRole.Enemy => BestTarget?.GridPosNum,
+                SkillRole.Corpse => NearestCorpse,
                 SkillRole.Self => null,
                 _ => null
             };
         }
 
-        private void UseSkill(GameController gc, SkillBarEntry entry, Vector2? worldTarget)
+        private void UseSkill(GameController gc, SkillBarEntry entry, Vector2? gridTarget)
         {
             bool acted;
 
-            if (worldTarget.HasValue)
+            if (gridTarget.HasValue)
             {
                 // Targeted skill — cursor + key press through BotInput
-                var camera = gc.IngameState.Camera;
-                var screenPos = camera.WorldToScreen(
-                    new Vector3(worldTarget.Value.X, worldTarget.Value.Y, gc.Player.PosNum.Z));
+                var screenPos = Pathfinding.GridToScreen(gc, gridTarget.Value);
 
                 var windowRect = gc.Window.GetWindowRectangle();
 
@@ -1084,19 +1082,18 @@ namespace AutoExile.Systems
                 return;
 
             WantsToMove = true;
+            MoveTargetGrid = validPos.Value;
             MoveTarget = ToWorld(validPos.Value);
-            ExecuteMove(gc, MoveTarget);
+            ExecuteMove(gc, validPos.Value);
         }
 
         /// <summary>
-        /// Move toward a world position using cursor + move key (same as NavigationSystem).
+        /// Move toward a grid position using cursor + move key (same as NavigationSystem).
         /// Never clicks — prevents accidental item/entity interactions.
         /// </summary>
-        private void ExecuteMove(GameController gc, Vector2 worldTarget)
+        private void ExecuteMove(GameController gc, Vector2 gridTarget)
         {
-            var camera = gc.IngameState.Camera;
-            var playerZ = gc.Player.PosNum.Z;
-            var screenPos = camera.WorldToScreen(new Vector3(worldTarget.X, worldTarget.Y, playerZ));
+            var screenPos = Pathfinding.GridToScreen(gc, gridTarget);
             var windowRect = gc.Window.GetWindowRectangle();
             var center = new Vector2(windowRect.Width / 2f, windowRect.Height / 2f);
 

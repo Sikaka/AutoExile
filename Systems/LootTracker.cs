@@ -211,11 +211,23 @@ namespace AutoExile.Systems
             graphics.DrawText($"Items: {_totalItemsLooted}", new Vector2(x, y), textColor);
             y += lineH;
 
-            graphics.DrawText($"Total: {_totalChaosValue:F1}c", new Vector2(x, y), valueColor);
-            y += lineH;
-
-            graphics.DrawText($"Per Hour: {ChaosPerHour:F1}c/h", new Vector2(x, y), valueColor);
-            y += lineH;
+            var chaosPerDiv = PriceService?.ChaosPerDivine ?? 0;
+            if (chaosPerDiv > 0)
+            {
+                var totalDiv = _totalChaosValue / chaosPerDiv;
+                var divPerHour = ChaosPerHour / chaosPerDiv;
+                graphics.DrawText($"Total: {totalDiv:F2} div", new Vector2(x, y), valueColor);
+                y += lineH;
+                graphics.DrawText($"Per Hour: {divPerHour:F2} div/h", new Vector2(x, y), valueColor);
+                y += lineH;
+            }
+            else
+            {
+                graphics.DrawText($"Total: {_totalChaosValue:F1}c", new Vector2(x, y), valueColor);
+                y += lineH;
+                graphics.DrawText($"Per Hour: {ChaosPerHour:F1}c/h", new Vector2(x, y), valueColor);
+                y += lineH;
+            }
 
             // Show last few pickups
             if (_recentLoot.Count > 0)

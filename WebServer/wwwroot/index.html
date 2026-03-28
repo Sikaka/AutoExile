@@ -243,14 +243,25 @@ tr:hover td { background:var(--surface2); }
       </div>
     </div>
     <div class="card">
-      <h2>Loot Tracker</h2>
+      <h2 style="display:flex;align-items:center;gap:12px">Loot Tracker <button onclick="resetLootStats()" style="font-size:12px;padding:3px 10px;background:#c44;border:none;color:#fff;border-radius:4px;cursor:pointer">Reset</button></h2>
       <div class="status-grid">
-        <div class="stat"><div class="stat-label">Session Chaos</div><div id="sessionChaos" class="stat-value yellow">0</div></div>
-        <div class="stat"><div class="stat-label">Chaos / Hour</div><div id="chaosPerHour" class="stat-value orange">0</div></div>
+        <div class="stat"><div class="stat-label">Session Div</div><div id="sessionDiv" class="stat-value yellow">0</div></div>
+        <div class="stat"><div class="stat-label">Div / Hour</div><div id="divPerHour" class="stat-value orange">0</div></div>
         <div class="stat"><div class="stat-label">Items Looted</div><div id="itemsLooted" class="stat-value accent">0</div></div>
         <div class="stat"><div class="stat-label">Maps Done</div><div id="mapsCompleted" class="stat-value accent">0</div></div>
         <div class="stat"><div class="stat-label">Session Time</div><div id="sessionTime" class="stat-value" style="font-size:16px">--</div></div>
         <div class="stat"><div class="stat-label">Loot Nearby</div><div id="lootNearby" class="stat-value accent">0</div></div>
+      </div>
+    </div>
+    <div id="simCard" class="card" style="display:none">
+      <h2>Simulacrum</h2>
+      <div class="status-grid">
+        <div class="stat"><div class="stat-label">Wave</div><div id="simWave" class="stat-value accent">-</div></div>
+        <div class="stat"><div class="stat-label">Deaths</div><div id="simDeaths" class="stat-value">0</div></div>
+        <div class="stat"><div class="stat-label">Run Time</div><div id="simRunTime" class="stat-value" style="font-size:16px">--</div></div>
+        <div class="stat"><div class="stat-label">Total Runs</div><div id="simRuns" class="stat-value accent">0</div></div>
+        <div class="stat"><div class="stat-label">Avg Waves</div><div id="simAvgWaves" class="stat-value orange">-</div></div>
+        <div class="stat"><div class="stat-label">Avg Run Time</div><div id="simAvgRunTime" class="stat-value" style="font-size:16px">--</div></div>
       </div>
     </div>
   </div>
@@ -310,6 +321,11 @@ let wsRetryTimer = null;
 let lastDecision = '', lastStatus = '';
 let logLines = [];
 const MAX_LOG = 50;
+
+async function resetLootStats() {
+  if (!confirm('Reset loot tracking stats?')) return;
+  try { await fetch('/api/loot/reset', {method:'POST'}); } catch(e) { console.error(e); }
+}
 
 function connectWs() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -375,12 +391,35 @@ function updateDashboard(s) {
 
   document.getElementById('coverage').textContent = (s.explorationCoverage*100).toFixed(1)+'%';
   document.getElementById('regions').textContent = s.explorationRegions;
-  document.getElementById('sessionChaos').textContent = s.sessionChaos.toFixed(1);
-  document.getElementById('chaosPerHour').textContent = s.chaosPerHour.toFixed(1);
+  const cpd = s.chaosPerDivine || 0;
+  if (cpd > 0) {
+    document.getElementById('sessionDiv').textContent = (s.sessionChaos / cpd).toFixed(2);
+    document.getElementById('divPerHour').textContent = (s.chaosPerHour / cpd).toFixed(2);
+  } else {
+    document.getElementById('sessionDiv').textContent = s.sessionChaos.toFixed(1) + 'c';
+    document.getElementById('divPerHour').textContent = s.chaosPerHour.toFixed(1) + 'c';
+  }
   document.getElementById('itemsLooted').textContent = s.itemsLooted;
   document.getElementById('mapsCompleted').textContent = s.mapsCompleted;
   document.getElementById('sessionTime').textContent = s.sessionDuration || '--';
   document.getElementById('lootNearby').textContent = s.lootCandidates;
+
+  // Simulacrum stats — show card only when mode is Simulacrum
+  const simCard = document.getElementById('simCard');
+  if (s.mode === 'Simulacrum') {
+    simCard.style.display = '';
+    const waveText = s.simWave > 0 ? `${s.simWave}/15` : '-';
+    document.getElementById('simWave').textContent = waveText;
+    document.getElementById('simWave').style.color = s.simWaveActive ? '#ff4444' : '';
+    document.getElementById('simDeaths').textContent = s.simDeaths;
+    document.getElementById('simDeaths').style.color = s.simDeaths > 0 ? '#ff4444' : '';
+    document.getElementById('simRunTime').textContent = s.simRunTime || '--';
+    document.getElementById('simRuns').textContent = s.simRuns;
+    document.getElementById('simAvgWaves').textContent = s.simAvgWaves > 0 ? s.simAvgWaves.toFixed(1) : '-';
+    document.getElementById('simAvgRunTime').textContent = s.simAvgRunTime || '--';
+  } else {
+    simCard.style.display = 'none';
+  }
 
   const sel = document.getElementById('modeSelect');
   if (!sel.matches(':focus')) { for(let o of sel.options) if(o.value===s.mode){sel.value=s.mode;break;} }

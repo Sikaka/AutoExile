@@ -1142,16 +1142,12 @@ namespace AutoExile.Modes
             // Draw nav path if navigating
             if (ctx.Navigation.IsNavigating && ctx.Navigation.CurrentNavPath.Count > 1)
             {
-                var camera = ctx.Game.IngameState.Camera;
-                var playerZ = ctx.Game.Player.PosNum.Z;
                 var path = ctx.Navigation.CurrentNavPath;
 
                 for (var i = ctx.Navigation.CurrentWaypointIndex; i < path.Count - 1; i++)
                 {
-                    var a = path[i].Position;
-                    var b = path[i + 1].Position;
-                    var sa = camera.WorldToScreen(new System.Numerics.Vector3(a.X * Pathfinding.GridToWorld, a.Y * Pathfinding.GridToWorld, playerZ));
-                    var sb = camera.WorldToScreen(new System.Numerics.Vector3(b.X * Pathfinding.GridToWorld, b.Y * Pathfinding.GridToWorld, playerZ));
+                    var sa = Pathfinding.GridToScreen(ctx.Game, path[i].Position);
+                    var sb = Pathfinding.GridToScreen(ctx.Game, path[i + 1].Position);
                     var windowRect = ctx.Game.Window.GetWindowRectangle();
 
                     if (sa.X > 0 && sa.X < windowRect.Width && sa.Y > 0 && sa.Y < windowRect.Height)
