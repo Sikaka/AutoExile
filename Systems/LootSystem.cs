@@ -56,6 +56,27 @@ namespace AutoExile.Systems
         /// </summary>
         public Action<string, string, double>? OnItemSkipped { get; set; }
 
+        // ── Label toggle unstick ──
+        public bool LabelToggleUnstick { get; set; } = true;
+        public float LabelToggleCooldownSeconds { get; set; } = 5f;
+
+        /// <summary>Current label toggle state machine phase.</summary>
+        public LabelTogglePhase TogglePhase { get; private set; } = LabelTogglePhase.Idle;
+        public string ToggleStatus { get; private set; } = "";
+        private DateTime _toggleStartTime;
+        private DateTime _lastToggleAttempt = DateTime.MinValue;
+        private int _preToggleLabelCount;
+        private const int ToggleDelayMs = 500;
+
+        public enum LabelTogglePhase
+        {
+            Idle,
+            PressingOff,    // Pressed Z to hide, waiting for labels to disappear
+            WaitingOff,     // Verifying labels are gone
+            PressingOn,     // Pressed Z to show, waiting for labels to reappear
+            WaitingOn,      // Verifying labels returned
+        }
+
         // State
         public bool HasLootNearby { get; private set; }
         public int LootableCount { get; private set; }
@@ -257,6 +278,145 @@ namespace AutoExile.Systems
                 requireProximity: !withinRadius);
 
             return (withinRadius, best);
+        }
+
+        // =================================================================
+        // Label Toggle Unstick
+        // =================================================================
+
+        /// <summary>
+        /// Check if a label toggle is needed: no loot candidates but WorldItem entities
+        /// exist nearby (labels stacked off-screen after loot explosion).
+        /// </summary>
+        public bool ShouldToggleLabels(GameController gc)
+        {
+            if (!LabelToggleUnstick) return false;
+            if (TogglePhase != LabelTogglePhase.Idle) return false;
+            if ((DateTime.Now - _lastToggleAttempt).TotalSeconds < LabelToggleCooldownSeconds) return false;
+            if (_candidates.Count > 0) return false; // still have lootable candidates
+
+            // Check if WorldItem entities exist nearby but we have no candidates
+            int nearbyItems = 0;
+            foreach (var entity in gc.EntityListWrapper.ValidEntitiesByType[EntityType.WorldItem])
+            {
+                if (entity.DistancePlayer > 30) continue; // within loot range
+                if (_failedEntities.ContainsKey(entity.Id)) continue;
+                nearbyItems++;
+                if (nearbyItems >= 2) break; // enough to justify a toggle
+            }
+
+            return nearbyItems >= 2;
+        }
+
+        /// <summary>
+        /// Start the label toggle sequence. Call when ShouldToggleLabels returns true
+        /// and the interaction system is idle.
+        /// </summary>
+        public bool StartLabelToggle(GameController gc)
+        {
+            if (TogglePhase != LabelTogglePhase.Idle) return false;
+
+            _preToggleLabelCount = gc.IngameState.IngameUi.ItemsOnGroundLabelElement
+                .LabelsOnGroundVisible.Count;
+            _lastToggleAttempt = DateTime.Now;
+            _toggleStartTime = DateTime.Now;
+
+            // Press Z to turn labels OFF
+            if (!BotInput.PressKey(System.Windows.Forms.Keys.Z)) return false;
+
+            TogglePhase = LabelTogglePhase.PressingOff;
+            ToggleStatus = "Toggling labels off...";
+            return true;
+        }
+
+        /// <summary>
+        /// Tick the label toggle state machine. Returns true while busy.
+        /// Caller should not do other loot actions while this returns true.
+        /// </summary>
+        public bool TickLabelToggle(GameController gc)
+        {
+            if (TogglePhase == LabelTogglePhase.Idle) return false;
+
+            var elapsed = (DateTime.Now - _toggleStartTime).TotalMilliseconds;
+
+            // Safety timeout — 3s max for the whole sequence
+            if (elapsed > 3000)
+            {
+                // If labels seem off (very few visible), press Z to restore
+                var currentCount = gc.IngameState.IngameUi.ItemsOnGroundLabelElement
+                    .LabelsOnGroundVisible.Count;
+                if (currentCount < _preToggleLabelCount / 2 && _preToggleLabelCount > 3)
+                {
+                    BotInput.PressKey(System.Windows.Forms.Keys.Z);
+                    ToggleStatus = "Safety: restoring labels after timeout";
+                }
+                TogglePhase = LabelTogglePhase.Idle;
+                ToggleStatus = "";
+                return false;
+            }
+
+            switch (TogglePhase)
+            {
+                case LabelTogglePhase.PressingOff:
+                    // Wait for the key press to process
+                    if (!BotInput.CanAct) return true;
+                    TogglePhase = LabelTogglePhase.WaitingOff;
+                    _toggleStartTime = DateTime.Now; // reset for delay timing
+                    ToggleStatus = "Waiting for labels to hide...";
+                    return true;
+
+                case LabelTogglePhase.WaitingOff:
+                {
+                    if (elapsed < ToggleDelayMs) return true;
+
+                    // Verify labels actually disappeared
+                    var currentCount = gc.IngameState.IngameUi.ItemsOnGroundLabelElement
+                        .LabelsOnGroundVisible.Count;
+
+                    if (currentCount >= _preToggleLabelCount && _preToggleLabelCount > 3)
+                    {
+                        // Labels didn't disappear — Z didn't work or wrong key. Abort.
+                        TogglePhase = LabelTogglePhase.Idle;
+                        ToggleStatus = "";
+                        return false;
+                    }
+
+                    // Labels are off — press Z again to turn them back on
+                    if (!BotInput.PressKey(System.Windows.Forms.Keys.Z)) return true;
+                    TogglePhase = LabelTogglePhase.PressingOn;
+                    ToggleStatus = "Toggling labels back on...";
+                    return true;
+                }
+
+                case LabelTogglePhase.PressingOn:
+                    if (!BotInput.CanAct) return true;
+                    TogglePhase = LabelTogglePhase.WaitingOn;
+                    _toggleStartTime = DateTime.Now;
+                    ToggleStatus = "Waiting for labels to show...";
+                    return true;
+
+                case LabelTogglePhase.WaitingOn:
+                {
+                    if (elapsed < ToggleDelayMs) return true;
+
+                    // Verify labels came back
+                    var currentCount = gc.IngameState.IngameUi.ItemsOnGroundLabelElement
+                        .LabelsOnGroundVisible.Count;
+
+                    if (currentCount <= 1 && _preToggleLabelCount > 3)
+                    {
+                        // Labels didn't come back — press Z one more time as safety
+                        BotInput.PressKey(System.Windows.Forms.Keys.Z);
+                        ToggleStatus = "Safety: labels didn't return, pressing Z again";
+                    }
+
+                    TogglePhase = LabelTogglePhase.Idle;
+                    ToggleStatus = "";
+                    return false;
+                }
+            }
+
+            return false;
         }
 
         /// <summary>

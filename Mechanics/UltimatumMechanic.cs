@@ -209,6 +209,18 @@ namespace AutoExile.Mechanics
                     var finished = sm.States.FirstOrDefault(s => s.Name == "encounter_finished");
                     if (finished != null && finished.Value > 0)
                     {
+                        // finished=1 means completed successfully (rewards dropped),
+                        // finished=2 means failed (no rewards).
+                        if (finished.Value == 1 && _encounterConfirmedStarted)
+                        {
+                            _rewardTakenTime = DateTime.Now;
+                            _phase = UltimatumPhase.WaitingForLoot;
+                            _phaseStartTime = DateTime.Now;
+                            Status = "Encounter finished — waiting for drops";
+                            RestoreCombatProfile(ctx);
+                            ctx.Log($"[Ultimatum] encounter_finished={finished.Value}, waiting for loot");
+                            return MechanicResult.InProgress;
+                        }
                         _phase = UltimatumPhase.Failed;
                         Status = $"Encounter ended (finished={finished.Value})";
                         RestoreCombatProfile(ctx);
@@ -393,7 +405,14 @@ namespace AutoExile.Mechanics
 
             var modifiers = choicePanel.Modifiers;
             var choiceElements = choicePanel.ChoiceElements;
-            if (modifiers == null || modifiers.Count == 0 || choiceElements == null || choiceElements.Count == 0)
+            bool hasModifierData = modifiers != null && modifiers.Count > 0 && choiceElements != null && choiceElements.Count > 0;
+
+            // After BEGIN is clicked, modifier data may clear as encounter starts.
+            // Skip straight to encounter verification (Step 3) instead of waiting for data that won't come.
+            if (_preStartBeginClicked)
+                goto verifyEncounterStarted;
+
+            if (!hasModifierData)
             {
                 Status = "Waiting for modifier data...";
                 return MechanicResult.InProgress;
@@ -472,6 +491,7 @@ namespace AutoExile.Mechanics
             }
 
             // Step 3: Verify encounter actually started (encounter_started == 1 or ground label gone)
+            verifyEncounterStarted:
             bool encounterStarted = false;
             if (_altarEntity?.TryGetComponent<StateMachine>(out var preSm) == true)
             {
@@ -635,10 +655,13 @@ namespace AutoExile.Mechanics
                 }
                 else if (started?.Value == 0 && _encounterConfirmedStarted)
                 {
-                    _phase = UltimatumPhase.Complete;
-                    Status = "Encounter ended during fight";
+                    _rewardTakenTime = DateTime.Now;
+                    _phase = UltimatumPhase.WaitingForLoot;
+                    _phaseStartTime = DateTime.Now;
+                    Status = "Encounter ended — waiting for drops";
                     RestoreCombatProfile(ctx);
-                    return MechanicResult.Complete;
+                    ctx.Log("[Ultimatum] encounter_started→0 during fight, waiting for loot");
+                    return MechanicResult.InProgress;
                 }
             }
 
@@ -648,7 +671,12 @@ namespace AutoExile.Mechanics
                 var dist = Vector2.Distance(playerGrid, AnchorGridPos.Value);
                 if (dist > effectiveRadius)
                 {
-                    ctx.Navigation.NavigateTo(gc, AnchorGridPos.Value);
+                    // Only repath if not already navigating back to altar
+                    if (!ctx.Navigation.IsNavigating ||
+                        (ctx.Navigation.Destination.HasValue && Vector2.Distance(ctx.Navigation.Destination.Value, AnchorGridPos.Value) > 10f))
+                    {
+                        ctx.Navigation.NavigateTo(gc, AnchorGridPos.Value);
+                    }
                     Status = $"Round {_currentRound} — leashing back (dist={dist:F0}, radius={effectiveRadius:F0})";
                 }
                 else if (!_encounterType.Contains("Circle", StringComparison.OrdinalIgnoreCase))
@@ -1018,7 +1046,7 @@ namespace AutoExile.Mechanics
                 "Survive" => settings.DoSurvive.Value,
                 "Kill Enemies" => settings.DoKillEnemies.Value,
                 "Defend the Altar" or "Protect the Altar" => settings.DoDefendAltar.Value,
-                "Stand in the Circles" => settings.DoStandInCircles.Value,
+                "Stand in the Stone Circles" or "Stand in the Circles" => settings.DoStandInCircles.Value,
                 _ => true,
             };
         }

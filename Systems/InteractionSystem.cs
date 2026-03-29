@@ -252,7 +252,9 @@ namespace AutoExile.Systems
             if (target.Nav != null && target.Nav.IsNavigating)
             {
                 target.Nav.Stop(gc);
-                _navStoppedAt = DateTime.Now;
+                // Only set settle timestamp once — don't reset if something else restarted nav
+                if (_navStoppedAt == DateTime.MinValue)
+                    _navStoppedAt = DateTime.Now;
             }
 
             // Wait for character to settle after stopping navigation
@@ -315,11 +317,9 @@ namespace AutoExile.Systems
             }
 
             var labelRect = labelDesc.ClientRect;
-            var clickPos = BotInput.RandomizeWithinRect(labelRect);
+            var clickCenter = new Vector2(labelRect.X + labelRect.Width / 2, labelRect.Y + labelRect.Height / 2);
 
-            var windowRect = gc.Window.GetWindowRectangle();
-
-            if (IsBlockedByUI(gc, clickPos))
+            if (IsBlockedByUI(gc, clickCenter))
             {
                 Status = "Label blocked by UI";
                 LastFailReason = "blocked by UI";
@@ -327,8 +327,25 @@ namespace AutoExile.Systems
                 return InteractionResult.Failed;
             }
 
-            var absPos = new Vector2(windowRect.X + clickPos.X, windowRect.Y + clickPos.Y);
-            BotInput.Click(absPos);
+            // Use hover-verified click: moves cursor within label, waits for settle,
+            // checks Targetable.isTargeted on the WorldItem entity before clicking.
+            // Falls back to clicking anyway if verification fails — the scan-time quest
+            // filter is the primary defense against picking up wrong items.
+            var worldEntity = FindEntity(gc, target.EntityId);
+            if (worldEntity == null)
+            {
+                Status = "Item collected (or gone)";
+                _currentTarget = null;
+                return InteractionResult.Succeeded;
+            }
+
+            var sent = BotInput.ClickLabelVerified(gc, labelRect, worldEntity);
+            if (!sent)
+            {
+                Status = "Gate blocked";
+                return InteractionResult.InProgress;
+            }
+
             _lastClickTime = DateTime.Now;
             _clickAttempts++;
             Status = $"Clicking item (attempt {_clickAttempts})";

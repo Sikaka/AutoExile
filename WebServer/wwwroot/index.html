@@ -916,13 +916,12 @@ function renderAllSettings() {
   loot.appendChild(buildTagListEditor('loot.synthesisedWhitelist', 'Implicit Whitelist',
     'Add implicit mod substring (e.g. "Onslaught", "maximum Power Charge")',
     'loot.filterSynthesisedItems'));
-  addSection(loot, 'Other', [['loot.ignoreQuestItems'],['loot.stashItemCooldownMs']]);
+  addSection(loot, 'Other', [['loot.ignoreQuestItems'],['loot.labelToggleUnstick'],['loot.labelToggleCooldownSeconds'],['loot.stashItemCooldownMs']]);
   c.appendChild(loot);
 
   // Modes tab
   const modes = makeTabContent('modes');
-  addSection(modes, 'Mapping', [['mapping.mapName'],['mapping.minMapTier'],['mapping.portalKey'],['mapping.rushBoss'],
-    ['mapping.killBoss'],['mapping.bossKillRadius'],
+  addSection(modes, 'Mapping', [['mapping.mapName'],['mapping.minMapTier'],['mapping.portalKey'],
     ['mapping.minPackDensity'],['mapping.detourForRares'],['mapping.maxDetourDistance']]);
   addSection(modes, 'Labyrinth', [['labyrinth.difficulty'],['labyrinth.maxRuns'],
     ['labyrinth.minExpectedProfit'],['labyrinth.keepThreshold'],['labyrinth.preferSameType'],
@@ -968,7 +967,7 @@ function renderAllSettings() {
   addSection(mech, 'Interactables', [
     ['mechanics.interactables.shrines'],['mechanics.interactables.strongboxes'],
     ['mechanics.interactables.djinnCaches'],['mechanics.interactables.heistCaches'],
-    ['mechanics.interactables.craftingRecipes']]);
+    ['mechanics.interactables.craftingRecipes'],['mechanics.interactables.memoryTears']]);
   addSection(mech, 'Ultimatum', [['mechanics.ultimatum.mode'],['mechanics.ultimatum.exitAfter'],
     ['mechanics.ultimatum.doSurvive'],['mechanics.ultimatum.doKillEnemies'],
     ['mechanics.ultimatum.doDefendAltar'],['mechanics.ultimatum.doStandInCircles'],

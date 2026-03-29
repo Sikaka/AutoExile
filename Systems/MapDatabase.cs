@@ -11,7 +11,7 @@ namespace AutoExile.Systems
     public class MapDatabase
     {
         private string _filePath = "";
-        private Dictionary<string, MapBossEntry> _entries = new(StringComparer.OrdinalIgnoreCase);
+        private Dictionary<string, MapEntry> _entries = new(StringComparer.OrdinalIgnoreCase);
         private readonly Action<string> _log;
 
         private static readonly JsonSerializerOptions JsonOpts = new()
@@ -30,7 +30,19 @@ namespace AutoExile.Systems
         {
             var dataDir = Path.Combine(pluginDir, "Data");
             Directory.CreateDirectory(dataDir);
-            _filePath = Path.Combine(dataDir, "map_bosses.json");
+            _filePath = Path.Combine(dataDir, "map_data.json");
+
+            // Migration: load from old filename if new doesn't exist
+            if (!File.Exists(_filePath))
+            {
+                var oldPath = Path.Combine(dataDir, "map_bosses.json");
+                if (File.Exists(oldPath))
+                {
+                    File.Copy(oldPath, _filePath);
+                    _log("MapDatabase: migrated map_bosses.json → map_data.json");
+                }
+            }
+
             Load();
         }
 
@@ -55,7 +67,7 @@ namespace AutoExile.Systems
         /// <summary>
         /// Get the full entry for a map, or null.
         /// </summary>
-        public MapBossEntry? GetEntry(string mapName)
+        public MapEntry? GetEntry(string mapName)
         {
             return _entries.TryGetValue(mapName, out var entry) ? entry : null;
         }
@@ -72,13 +84,28 @@ namespace AutoExile.Systems
         /// </summary>
         public void SaveBossTiles(string mapName, List<string> tileKeys)
         {
-            _entries[mapName] = new MapBossEntry
-            {
-                BossTiles = tileKeys,
-                LastScanned = DateTime.UtcNow,
-            };
+            if (!_entries.TryGetValue(mapName, out var entry))
+                entry = new MapEntry();
+            entry.BossTiles = tileKeys;
+            entry.LastScanned = DateTime.UtcNow;
+            _entries[mapName] = entry;
             Save();
             _log($"MapDatabase: saved {tileKeys.Count} boss tiles for '{mapName}'");
+        }
+
+        /// <summary>
+        /// Save transition detail name for a map. Called by F8 scanner when a
+        /// concentrated cluster of medium-rarity tiles is detected near the player.
+        /// </summary>
+        public void SaveTransitionDetailName(string mapName, string detailName)
+        {
+            if (!_entries.TryGetValue(mapName, out var entry))
+                entry = new MapEntry();
+            entry.TransitionDetailName = detailName;
+            entry.LastScanned = DateTime.UtcNow;
+            _entries[mapName] = entry;
+            Save();
+            _log($"MapDatabase: saved transition detail '{detailName}' for '{mapName}'");
         }
 
         private void Load()
@@ -92,10 +119,10 @@ namespace AutoExile.Systems
             try
             {
                 var json = File.ReadAllText(_filePath);
-                var data = JsonSerializer.Deserialize<Dictionary<string, MapBossEntry>>(json, JsonOpts);
+                var data = JsonSerializer.Deserialize<Dictionary<string, MapEntry>>(json, JsonOpts);
                 if (data != null)
                 {
-                    _entries = new Dictionary<string, MapBossEntry>(data, StringComparer.OrdinalIgnoreCase);
+                    _entries = new Dictionary<string, MapEntry>(data, StringComparer.OrdinalIgnoreCase);
                     _log($"MapDatabase: loaded {_entries.Count} map entries ({SupportedMaps.Count()} supported)");
                 }
             }
@@ -124,7 +151,7 @@ namespace AutoExile.Systems
         }
     }
 
-    public class MapBossEntry
+    public class MapEntry
     {
         public List<string>? BossTiles { get; set; }
         public DateTime? LastScanned { get; set; }
@@ -134,5 +161,11 @@ namespace AutoExile.Systems
         /// When null, any unique monster death in the boss radius counts.
         /// </summary>
         public string? BossEntityPath { get; set; }
+
+        /// <summary>
+        /// Tile detail name used for area transition detection (e.g., "beachtownnorth" for Strand).
+        /// Set by F8 scanner. TileScanner uses this to find transition clusters at map load.
+        /// </summary>
+        public string? TransitionDetailName { get; set; }
     }
 }

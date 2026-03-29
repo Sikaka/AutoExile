@@ -35,6 +35,12 @@ namespace AutoExile
             = new Dictionary<long, BotCore.MinimapIconEntry>();
 
         /// <summary>
+        /// Tile-based mechanic scan results. Computed at map load from terrain tile data.
+        /// Covers entire map — instant mechanic detection before exploration.
+        /// </summary>
+        public TileScanResult? TileScan { get; set; }
+
+        /// <summary>
         /// Graphics API for rendering overlays. Set during Render() calls.
         /// </summary>
         public ExileCore.Graphics? Graphics { get; set; }

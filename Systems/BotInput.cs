@@ -208,6 +208,70 @@ namespace AutoExile.Systems
         }
 
         /// <summary>
+        /// Click within a label rect with hover verification via Targetable.isTargeted.
+        /// Moves cursor to a random position within the rect, waits for settle, then checks
+        /// that the expected entity is targeted. If a different entity is under the cursor
+        /// (overlapping labels), retries at different positions. Aborts without clicking if
+        /// verification fails on all attempts.
+        /// </summary>
+        /// <returns>True if initiated, false if gate blocked. Check WasVerified after completion.</returns>
+        public static bool ClickLabelVerified(GameController gc, SharpDX.RectangleF rect, Entity entity)
+        {
+            if (!CanAct) return false;
+            var windowRect = gc.Window.GetWindowRectangle();
+            var settle = RandSettle();
+            var hold = RandHold();
+            var center = new Vector2(rect.X + rect.Width / 2, rect.Y + rect.Height / 2);
+            var moveMs = EstimateMoveMs(new Vector2(windowRect.X + center.X, windowRect.Y + center.Y));
+            NextActionAt = DateTime.Now.AddMilliseconds(
+                MaxHoverAttempts * (moveMs + settle) + hold + ActionCooldownMs);
+            _ = DoClickLabelVerified(entity, rect, windowRect, settle, hold);
+            LogAction("ClickLabelVerified", center, null, true);
+            return true;
+        }
+
+        /// <summary>True if the last ClickLabelVerified confirmed the correct entity before clicking.</summary>
+        public static bool LastClickWasVerified { get; private set; }
+
+        private static async Task DoClickLabelVerified(
+            Entity entity, SharpDX.RectangleF rect, SharpDX.RectangleF windowRect,
+            int settleMs, int holdMs)
+        {
+            LastClickWasVerified = false;
+
+            for (int attempt = 0; attempt < MaxHoverAttempts; attempt++)
+            {
+                var clickPos = RandomizeWithinRect(rect);
+                var absPos = new Vector2(windowRect.X + clickPos.X, windowRect.Y + clickPos.Y);
+
+                await MoveCursorTo(absPos);
+                await Task.Delay(settleMs);
+
+                try
+                {
+                    var targetable = entity.GetComponent<Targetable>();
+                    if (targetable?.isTargeted == true)
+                    {
+                        LastClickWasVerified = true;
+                        Input.LeftDown();
+                        await Task.Delay(holdMs);
+                        Input.LeftUp();
+                        return;
+                    }
+                }
+                catch { }
+
+                await Task.Delay(HoverVerifyDelayMs);
+            }
+
+            // Verification failed on all attempts — click anyway as fallback.
+            // The scan-time quest filter is the primary defense; hover verification is best-effort.
+            Input.LeftDown();
+            await Task.Delay(holdMs);
+            Input.LeftUp();
+        }
+
+        /// <summary>
         /// Get screen-space center and half-extents for an entity, derived from Render.BoundsNum.
         /// Useful when callers need the position for overlap checks before clicking.
         /// </summary>

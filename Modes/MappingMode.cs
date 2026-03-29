@@ -30,7 +30,7 @@ namespace AutoExile.Modes
         private Vector2? _navTarget;           // current nav target (grid coords)
         private int _exploreTargetsVisited;
         private int _navFailures;              // consecutive pathfind failures
-        private float _minCoverage = 0.70f;
+        // MinCoverage is now a setting: ctx.Settings.Mapping.MinCoverage.Value
 
         // ── Loot state ──
         private DateTime _lastLootScan = DateTime.MinValue;
@@ -49,6 +49,19 @@ namespace AutoExile.Modes
         // ── Mechanic state ──
         private IMapMechanic? _pendingMechanic;    // Detected, navigating to it
         private bool _mechanicActive;               // Mechanic owns the tick loop
+
+        // ── Post-mechanic settle (wait for loot drops after mechanic completes) ──
+        private bool _postMechanicSettle;
+        private DateTime _postMechanicSettleUntil;
+
+        // ── Mechanic rush (beeline to Required mechanic minimap icons) ──
+        private Vector2? _mechanicRushTarget;      // grid position of rush target
+        private string _mechanicRushName = "";      // icon name for overlay/logging
+
+        // ── Tile-based mechanic detection (map-wide, instant at load) ──
+        private Vector2? _tileMechanicTarget;      // blob-snapped grid position
+        private string _tileMechanicName = "";      // mechanic name
+        private bool _tileScanProcessed;            // processed TileScanResult for this map?
 
         // ── Exit portal (wish zones, sub-zones with return portals) ──
         private Entity? _exitPortal;
@@ -78,18 +91,6 @@ namespace AutoExile.Modes
         public Vector2? NavTarget => _navTarget;
         public bool IsPaused => _phase == MappingPhase.Paused;
 
-        // ── Boss rush state ──
-        private Vector2? _bossTarget;          // grid position of boss room tile
-        private bool _bossRushComplete;        // boss rush done, switch to normal explore
-        private bool _bossTargetResolved;      // true after we've attempted to look up boss tiles
-        private string _bossRushDebug = "";    // debug info for overlay
-
-        // ── Boss kill verification ──
-        private bool _bossKillVerified;              // boss confirmed dead
-        private List<Vector2>? _bossKillCheckPositions; // boss tile grid positions to check
-        private DateTime? _bossAreaArrivalTime;      // when player entered boss radius
-        private const float BossAreaDwellSeconds = 3f; // wait for entities to load
-
         // ── Priority targets (minimap icon routing) ──
         private Vector2? _priorityTarget;            // current priority nav target (grid)
         private string _priorityTargetReason = "";   // why we're going there
@@ -111,7 +112,6 @@ namespace AutoExile.Modes
         {
             Idle,
             InHideout,  // running HideoutFlow (stash → map device → enter)
-            RushingBoss, // navigating to boss room, fighting on the way but not stopping
             Exploring,
             Fighting,
             Looting,
@@ -119,6 +119,14 @@ namespace AutoExile.Modes
             Exiting,    // navigating to and clicking exit portal (wish zones)
             ExitMap,    // opening portal → clicking it → back to hideout
             Complete,
+        }
+
+        private enum MapCompletionStatus
+        {
+            Incomplete,        // Keep exploring
+            MechanicsDone,     // ExitAfter mechanics satisfied, exit now
+            FullyExplored,     // Coverage met + no targets
+            WaitingForMechanic,// Required mechanic pending
         }
 
         public void OnEnter(BotContext ctx)
@@ -179,26 +187,13 @@ namespace AutoExile.Modes
             if (gc.Player != null)
                 _spawnPortalPos = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
 
-            // Boss rush — deferred to first Tick since TileMap may not be loaded yet at OnEnter time
-            _bossTarget = null;
-            _bossRushComplete = false;
-            _bossTargetResolved = false;
-            _bossRushDebug = "";
+            // Tile-based mechanic detection — re-process on each map entry
+            _tileMechanicTarget = null;
+            _tileMechanicName = "";
+            _tileScanProcessed = false;
 
-            var rushBossEnabled = ctx.Settings.Mapping.RushBoss.Value;
-            ctx.Log($"[Mapping] InitMapState: rushBoss={rushBossEnabled} tileMapLoaded={ctx.TileMap.IsLoaded} area={gc.Area?.CurrentArea?.Name}");
-
-            if (rushBossEnabled)
-            {
-                _phase = MappingPhase.RushingBoss;
-                Status = "Waiting for tile data to resolve boss position...";
-                _bossRushDebug = "Pending tile map load";
-            }
-            else
-            {
-                _phase = MappingPhase.Exploring;
-                Status = "Started";
-            }
+            _phase = MappingPhase.Exploring;
+            Status = "Started";
 
             ctx.Log($"Mapping — {ctx.Exploration.TotalWalkableCells} cells, " +
                     $"{ctx.Exploration.ActiveBlob?.Regions.Count ?? 0} regions");
@@ -208,18 +203,17 @@ namespace AutoExile.Modes
         {
             _phase = MappingPhase.Idle;
             _navTarget = null;
-            _bossTarget = null;
-            _bossRushComplete = false;
-            _bossTargetResolved = false;
-            _bossRushDebug = "";
-            _bossKillVerified = false;
-            _bossKillCheckPositions = null;
-            _bossAreaArrivalTime = null;
             _priorityTarget = null;
             _priorityTargetReason = "";
             _visitedIconIds.Clear();
             _pendingMechanic = null;
             _mechanicActive = false;
+            _mechanicRushTarget = null;
+            _mechanicRushName = "";
+            _tileMechanicTarget = null;
+            _tileMechanicName = "";
+            _tileScanProcessed = false;
+            _postMechanicSettle = false;
             _pendingInteractableId = 0;
             _pendingInteractableName = "";
             _interactableClickAttempts = 0;
@@ -299,6 +293,8 @@ namespace AutoExile.Modes
             // ── InHideout phase — tick HideoutFlow ──
             if (_phase == MappingPhase.InHideout)
             {
+                // InteractionSystem must be ticked for HideoutFlow's portal clicking to work
+                ctx.Interaction.Tick(gc);
                 var signal = _hideoutFlow.Tick(ctx);
                 Status = _hideoutFlow.Status;
                 if (signal == HideoutSignal.PortalTimeout)
@@ -387,10 +383,13 @@ namespace AutoExile.Modes
                     _zoneEnteredAt = DateTime.Now;
                     _exitPortal = null;
                     _navTarget = null;
+                    _mechanicRushTarget = null;
+                    _mechanicRushName = "";
+                    _tileMechanicTarget = null;
+                    _tileMechanicName = "";
+                    _tileScanProcessed = false;
                     _exploreTargetsVisited = 0;
                     _navFailures = 0;
-                    _bossKillCheckPositions = null;
-                    _bossAreaArrivalTime = null;
                     _visitedIconIds.Clear();
 
                     // Start settle timer — block actions until terrain/entities load
@@ -425,19 +424,7 @@ namespace AutoExile.Modes
                     _zoneSettleExplorationDone = true;
                 }
 
-                // Boss rush only in parent map, not sub-zones
-                if (!_isInSubZone && ctx.Settings.Mapping.RushBoss.Value && !_bossRushComplete)
-                {
-                    _bossTarget = null;
-                    _bossTargetResolved = false;
-                    _bossRushDebug = "New zone — re-resolving boss target";
-                    _phase = MappingPhase.RushingBoss;
-                    ctx.Log("[Mapping] Post-settle — re-triggering boss rush");
-                }
-                else
-                {
-                    _phase = MappingPhase.Exploring;
-                }
+                _phase = MappingPhase.Exploring;
                 ModeHelpers.EnableDefaultCombat(ctx);
                 var settleCoverage = ctx.Exploration.ActiveBlobCoverage;
                 var settleHash = gc.IngameState?.Data?.CurrentAreaHash ?? 0;
@@ -465,111 +452,11 @@ namespace AutoExile.Modes
                 ctx.Combat.Tick(ctx);
             }
 
-            // ── Boss Rush (navigate to boss, fight on the way, don't stop) ──
-            if (_phase == MappingPhase.RushingBoss)
-            {
-                // Lazy resolve: TileMap may not have been loaded when OnEnter ran
-                if (!_bossTargetResolved)
-                {
-                    if (!ctx.TileMap.IsLoaded)
-                    {
-                        Status = "Rush boss — waiting for tile map...";
-                        _bossRushDebug = "TileMap not loaded yet";
-                        return;
-                    }
-
-                    _bossTargetResolved = true;
-                    var areaName = gc.Area?.CurrentArea?.Name ?? "";
-                    var bossTiles = ctx.MapDatabase.GetBossTiles(areaName);
-
-                    if (bossTiles == null || bossTiles.Count == 0)
-                    {
-                        _bossRushDebug = $"No boss tiles in database for '{areaName}'";
-                        ctx.Log($"[Mapping] Boss rush: {_bossRushDebug}");
-                        _phase = MappingPhase.Exploring;
-                        ModeHelpers.EnableDefaultCombat(ctx);
-                        Decision = _bossRushDebug;
-                    }
-                    else
-                    {
-                        // Find the first boss tile key that has positions in the tile map
-                        foreach (var tileKey in bossTiles)
-                        {
-                            var positions = ctx.TileMap.GetPositions(tileKey);
-                            if (positions != null && positions.Count > 0)
-                            {
-                                // Tile center = gridPos + half tile (23/2 ≈ 11.5)
-                                _bossTarget = positions
-                                    .OrderBy(p => Vector2.Distance(playerGrid, p))
-                                    .First() + new Vector2(11.5f, 11.5f);
-                                _bossRushDebug = $"Found '{tileKey}' at ({_bossTarget.Value.X:F0}, {_bossTarget.Value.Y:F0})";
-                                break;
-                            }
-                            else
-                            {
-                                _bossRushDebug = $"Tile key '{tileKey}' not found in TileMap ({ctx.TileMap.TileCount} tiles)";
-                            }
-                        }
-
-                        if (_bossTarget.HasValue)
-                        {
-                            ctx.Combat.SetProfile(new CombatProfile { Enabled = true, Positioning = CombatPositioning.Aggressive });
-                            ctx.Log($"[Mapping] Boss rush: {_bossRushDebug}");
-                        }
-                        else
-                        {
-                            ctx.Log($"[Mapping] Boss rush failed: {_bossRushDebug}");
-                            _phase = MappingPhase.Exploring;
-                            ModeHelpers.EnableDefaultCombat(ctx);
-                            Decision = $"Boss rush failed: {_bossRushDebug}";
-                        }
-                    }
-
-                    if (_phase != MappingPhase.RushingBoss) return;
-                }
-
-                if (_bossTarget.HasValue)
-                {
-                    var distToBoss = Vector2.Distance(playerGrid, _bossTarget.Value);
-
-                    // Arrived at boss area (within 2 tiles = 46 grid units)
-                    if (distToBoss < 46)
-                    {
-                        _bossRushComplete = true;
-                        _bossTarget = null;
-                        _phase = MappingPhase.Exploring;
-                        ModeHelpers.EnableDefaultCombat(ctx);
-                        Decision = "Boss area reached — switching to explore+clear";
-                        _bossRushDebug = "Complete — arrived at boss area";
-                        ctx.Log("Boss rush complete — switching to normal exploration");
-                    }
-                    else
-                    {
-                        if (!ctx.Navigation.IsNavigating)
-                        {
-                            ctx.Log($"[BossRush] Starting nav to ({_bossTarget.Value.X:F0}, {_bossTarget.Value.Y:F0}) dist={distToBoss:F0}");
-                            var success = ctx.Navigation.NavigateTo(ctx.Game, _bossTarget.Value);
-                            if (!success)
-                            {
-                                ctx.Log($"[BossRush] NavigateTo failed — no path");
-                                _bossRushComplete = true;
-                                _bossTarget = null;
-                                _phase = MappingPhase.Exploring;
-                                ModeHelpers.EnableDefaultCombat(ctx);
-                                Decision = "Can't path to boss — exploring normally";
-                                _bossRushDebug = "Failed — no path to boss";
-                            }
-                            else
-                            {
-                                ctx.Log($"[BossRush] Nav started, waypoints={ctx.Navigation.CurrentNavPath?.Count ?? 0}");
-                            }
-                        }
-                        Status = $"Rushing boss — dist: {distToBoss:F0} nav={ctx.Navigation.IsNavigating}";
-                        Decision = $"Rush boss ({distToBoss:F0} away, nav={ctx.Navigation.IsNavigating})";
-                        return; // Skip loot, mechanics, explore — just rush
-                    }
-                }
-            }
+            // ── Mechanic Rush (beeline to Required mechanic minimap icons) ──
+            // Don't rush while interaction system is busy (loot pickup, interactable click) —
+            // rush navigation would override the interaction's navigation every tick.
+            var _isRushing = !_mechanicActive && !ctx.Interaction.IsBusy
+                && TryMechanicRush(ctx, playerGrid);
 
             // Resume navigation when density drops below threshold (detour over)
             if (!_mechanicActive && ctx.Navigation.IsPaused)
@@ -637,42 +524,109 @@ namespace AutoExile.Modes
                     return;
                 }
 
-                // Check if ExitAfter mechanics are all done → exit map
-                if (result == MechanicResult.Complete && !_isInSubZone &&
-                    ctx.Mechanics.AreExitMechanicsComplete(ctx.Settings) &&
-                    !ctx.Mechanics.HasPendingMechanics())
+                // Start post-mechanic settle period for loot pickup
+                if (result == MechanicResult.Complete)
+                {
+                    var settleSeconds = ctx.Settings.Mechanics.PostMechanicSettleSeconds.Value;
+                    if (settleSeconds > 0)
+                    {
+                        _postMechanicSettle = true;
+                        _postMechanicSettleUntil = DateTime.Now.AddSeconds(settleSeconds);
+                        ctx.Log($"[Mapping] Post-mechanic settle: {settleSeconds}s for loot pickup");
+                    }
+                    else if (!_isInSubZone && EvaluateCompletion(ctx, playerGrid) == MapCompletionStatus.MechanicsDone)
+                    {
+                        ctx.Log("[Mapping] All ExitAfter mechanics complete — exiting map");
+                        EnterExitMap(ctx, gc);
+                        return;
+                    }
+                }
+                // Fall through to normal loot/explore
+            }
+
+            // ── Post-mechanic settle: loot nearby items, then check map exit ──
+            if (_postMechanicSettle)
+            {
+                var settleRemaining = (_postMechanicSettleUntil - DateTime.Now).TotalSeconds;
+                if (settleRemaining > 0)
+                {
+                    // Scan and pick up loot during settle period
+                    if ((DateTime.Now - _lastLootScan).TotalMilliseconds >= LootScanIntervalMs)
+                    {
+                        ctx.Loot.Scan(gc);
+                        _lastLootScan = DateTime.Now;
+                    }
+                    if (ctx.Interaction.IsBusy)
+                    {
+                        var interResult = ctx.Interaction.Tick(gc);
+                        var hadPending = _lootTracker.HasPending;
+                        _lootTracker.HandleResult(interResult, ctx);
+                        if (hadPending && interResult == InteractionResult.Succeeded)
+                        {
+                            ctx.Loot.Scan(gc);
+                            _lastLootScan = DateTime.Now;
+                        }
+                    }
+                    else if (ctx.Loot.TogglePhase != LootSystem.LabelTogglePhase.Idle)
+                    {
+                        ctx.Loot.TickLabelToggle(gc);
+                    }
+                    else if (ctx.Loot.HasLootNearby)
+                    {
+                        var (_, candidate) = ctx.Loot.PickupNext(ctx.Interaction, ctx.Navigation);
+                        if (candidate != null && ctx.Interaction.IsBusy)
+                            _lootTracker.SetPending(candidate.Entity.Id, candidate.ItemName, candidate.ChaosValue);
+                    }
+                    else if (ctx.Loot.ShouldToggleLabels(gc))
+                    {
+                        ctx.Loot.StartLabelToggle(gc);
+                        ctx.Log("[Loot] Post-mechanic: starting label toggle unstick");
+                    }
+                    Status = ctx.Loot.TogglePhase != LootSystem.LabelTogglePhase.Idle
+                        ? $"Post-mechanic: {ctx.Loot.ToggleStatus} ({settleRemaining:F1}s remaining)"
+                        : $"Post-mechanic loot settle ({settleRemaining:F1}s remaining)";
+                    return;
+                }
+
+                // Settle expired
+                _postMechanicSettle = false;
+                ctx.Log("[Mapping] Post-mechanic settle complete");
+                if (!_isInSubZone && EvaluateCompletion(ctx, playerGrid) == MapCompletionStatus.MechanicsDone)
                 {
                     ctx.Log("[Mapping] All ExitAfter mechanics complete — exiting map");
                     EnterExitMap(ctx, gc);
                     return;
                 }
-                // Fall through to normal loot/explore
             }
 
-            // Check for pending mechanic to start (navigate to it)
-            if (_pendingMechanic != null && !_pendingMechanic.IsComplete)
+            // Skip mechanic start/detection during rush — we're beelining to the target
+            if (!_isRushing)
             {
-                // Let the mechanic handle its own navigation
-                ctx.Mechanics.SetActive(_pendingMechanic);
-                _mechanicActive = true;
-                if (_pendingMechanic.TriggersSubZone)
+                // Check for pending mechanic to start (navigate to it)
+                if (_pendingMechanic != null && !_pendingMechanic.IsComplete)
                 {
-                    _expectingSubZone = true;
-                    ctx.Log($"[Mapping] Set _expectingSubZone=true for {_pendingMechanic.Name}");
+                    // Let the mechanic handle its own navigation
+                    ctx.Mechanics.SetActive(_pendingMechanic);
+                    _mechanicActive = true;
+                    if (_pendingMechanic.TriggersSubZone)
+                    {
+                        _expectingSubZone = true;
+                        ctx.Log($"[Mapping] Set _expectingSubZone=true for {_pendingMechanic.Name}");
+                    }
+                    Status = $"Starting mechanic: {_pendingMechanic.Name}";
+                    return;
                 }
-                Status = $"Starting mechanic: {_pendingMechanic.Name}";
-                return;
-            }
 
-            // ── Mechanic detection (periodic scan for in-map encounters) ──
-            // Runs before loot so in-progress encounters get immediate priority
-            var detectedMechanic = ctx.Mechanics.DetectAndPrioritize(ctx);
-            if (detectedMechanic != null && _pendingMechanic == null && !_mechanicActive)
-            {
-                _pendingMechanic = detectedMechanic;
-                Decision = $"Found mechanic: {detectedMechanic.Name}";
-                // Start immediately on next iteration (top of tick)
-                return;
+                // ── Mechanic detection (periodic scan for in-map encounters) ──
+                // Runs before loot so in-progress encounters get immediate priority
+                var detectedMechanic = ctx.Mechanics.DetectAndPrioritize(ctx);
+                if (detectedMechanic != null && _pendingMechanic == null && !_mechanicActive)
+                {
+                    _pendingMechanic = detectedMechanic;
+                    Decision = $"Found mechanic: {detectedMechanic.Name}";
+                    // Start immediately on next iteration (top of tick)
+                    return;
+                }
             }
 
             // ── Looting (between combat and exploration) ──
@@ -732,6 +686,19 @@ namespace AutoExile.Modes
                 }
             }
 
+            // ── Label toggle unstick (runs mid-sequence, blocks other actions) ──
+            if (ctx.Loot.TogglePhase != LootSystem.LabelTogglePhase.Idle)
+            {
+                if (ctx.Loot.TickLabelToggle(gc))
+                {
+                    Status = $"Label toggle: {ctx.Loot.ToggleStatus}";
+                    return;
+                }
+                // Toggle finished — re-scan immediately
+                ctx.Loot.Scan(gc);
+                _lastLootScan = DateTime.Now;
+            }
+
             // ── Looting (pick up nearby items) ──
             if (ctx.Loot.HasLootNearby && !ctx.Interaction.IsBusy)
             {
@@ -743,6 +710,16 @@ namespace AutoExile.Modes
                     Status = $"Looting: {candidate.ItemName}";
                     return;
                 }
+            }
+
+            // ── Label toggle: no candidates but items exist nearby → toggle labels ──
+            if (!ctx.Loot.HasLootNearby && !ctx.Interaction.IsBusy &&
+                ctx.Loot.ShouldToggleLabels(gc))
+            {
+                ctx.Loot.StartLabelToggle(gc);
+                ctx.Log("[Loot] Starting label toggle unstick");
+                Status = "Label toggle: unsticking stacked labels";
+                return;
             }
 
             // ── Clickable interactables (shrines, heist caches — click as we pass by) ──
@@ -775,6 +752,10 @@ namespace AutoExile.Modes
                     return;
                 }
             }
+
+            // Rushing — loot/interactables handled above, skip exploration and combat detours
+            if (_isRushing)
+                return;
 
             // ── Density-gated combat detour ──
             // Only pause exploration for dense packs or rare/unique targets.
@@ -862,10 +843,6 @@ namespace AutoExile.Modes
                 Decision = $"Abandoned stuck target ({ctx.Exploration.FailedRegions.Count} failed regions)";
             }
 
-            // ── Boss kill verification (runs every tick when in boss area) ──
-            if (ctx.Settings.Mapping.KillBoss.Value && !_bossKillVerified)
-                TickBossKillCheck(ctx, gc, playerGrid);
-
             // Pick next target when idle (not navigating, or paused nav just resumed)
             if (!ctx.Navigation.IsNavigating)
             {
@@ -876,69 +853,27 @@ namespace AutoExile.Modes
                     NavigateToTarget(ctx, gc, playerGrid, priority.Value);
                     Decision = $"Priority: {_priorityTargetReason}";
                 }
-                // Priority 2: Boss kill — navigate to boss area if not yet verified
-                else if (ctx.Settings.Mapping.KillBoss.Value && !_bossKillVerified && _bossKillCheckPositions != null)
-                {
-                    var nearest = _bossKillCheckPositions
-                        .OrderBy(p => Vector2.Distance(playerGrid, p))
-                        .First();
-                    var dist = Vector2.Distance(playerGrid, nearest);
-                    if (dist > ctx.Settings.Mapping.BossKillRadius.Value)
-                    {
-                        NavigateToTarget(ctx, gc, playerGrid, nearest);
-                        Decision = $"Boss kill: navigating to boss area ({dist:F0}g away)";
-                    }
-                }
-                // Priority 3: Normal exploration
-                else if (coverage >= _minCoverage)
-                {
-                    // Check if outstanding requirements prevent completion
-                    bool needsBossKill = ctx.Settings.Mapping.KillBoss.Value && !_bossKillVerified;
-
-                    var nextTarget = ctx.Exploration.GetNextExplorationTarget(playerGrid);
-                    if (nextTarget.HasValue)
-                    {
-                        NavigateToTarget(ctx, gc, playerGrid, nextTarget.Value);
-                    }
-                    else if (needsBossKill)
-                    {
-                        // Exploration exhausted but boss not killed — keep waiting near boss area
-                        Status = $"Waiting for boss kill — coverage {coverage:P1}";
-                    }
-                    else
-                    {
-                        // Truly complete — check for exit portal (sub-zone) or exit map
-                        var zoneTime = (DateTime.Now - _zoneEnteredAt).TotalSeconds;
-                        ctx.Log($"[Mapping] Explore complete path: coverage={coverage:P1} zoneTime={zoneTime:F1}s noTarget=true noBoss=true subZone={_isInSubZone}");
-                        var exitPortal = FindExitPortal(ctx, gc, ctx.Combat, "explore-complete");
-                        if (exitPortal != null)
-                        {
-                            _exitPortal = exitPortal;
-                            _phase = MappingPhase.Exiting;
-                            var elapsed = (DateTime.Now - _startTime).TotalSeconds;
-                            Status = $"Explored {coverage:P1} in {elapsed:F0}s — using exit portal";
-                            Decision = $"EXIT: explore-complete coverage={coverage:P1} zoneTime={zoneTime:F0}s subZone={_isInSubZone}";
-                            ctx.Log($"[Mapping] Exploration complete, found exit portal — returning to parent map");
-                        }
-                        else if (!_isInSubZone)
-                        {
-                            // In parent map — exit via portal scroll
-                            ctx.Log("[Mapping] Exploration complete — exiting map");
-                            EnterExitMap(ctx, gc);
-                        }
-                        else
-                        {
-                            _phase = MappingPhase.Complete;
-                            var elapsed = (DateTime.Now - _startTime).TotalSeconds;
-                            Status = $"COMPLETE — {coverage:P1} coverage in {elapsed:F0}s";
-                            Decision = $"{ctx.Exploration.FailedRegions.Count} unreachable regions";
-                        }
-                    }
-                }
+                // Priority 2: Normal exploration — use unified completion check
                 else
                 {
-                    // Under coverage threshold — check for priority targets mixed with exploration
-                    NavigateToNextExploreTarget(ctx, gc, playerGrid);
+                    HandleExplorationCompletion(ctx, gc, playerGrid, coverage);
+                }
+            }
+            else
+            {
+                // Nav is active — check if a Required target appeared that should override current exploration
+                var priority = GetPriorityTarget(ctx, playerGrid);
+                if (priority.HasValue && _priorityTargetReason.Contains("Required") &&
+                    _mechanicRushTarget == null) // mechanic rush handles Required mechanics already
+                {
+                    // Only redirect if current target is generic exploration (not already a priority)
+                    if (_navTarget.HasValue && _priorityTarget.HasValue &&
+                        Vector2.Distance(_navTarget.Value, _priorityTarget.Value) > 30)
+                    {
+                        ctx.Navigation.Stop(gc);
+                        NavigateToTarget(ctx, gc, playerGrid, priority.Value);
+                        Decision = $"Redirected: {_priorityTargetReason}";
+                    }
                 }
             }
         }
@@ -968,38 +903,13 @@ namespace AutoExile.Modes
                 if (!target.HasValue)
                 {
                     var coverage = ctx.Exploration.ActiveBlobCoverage;
-                    var elapsed = (DateTime.Now - _startTime).TotalSeconds;
-                    var zoneTime = (DateTime.Now - _zoneEnteredAt).TotalSeconds;
                     var blob = ctx.Exploration.ActiveBlob;
-                    var regionCount = blob?.Regions.Count ?? 0;
-                    var failedCount = ctx.Exploration.FailedRegions.Count;
-                    var totalCells = blob?.WalkableCells.Count ?? 0;
-                    var seenCells = blob?.SeenCells.Count ?? 0;
-                    ctx.Log($"[Mapping] No explore target: coverage={coverage:P1} zoneTime={zoneTime:F1}s regions={regionCount} failed={failedCount} cells={seenCells}/{totalCells} attempt={attempt}");
+                    ctx.Log($"[Mapping] No explore target: coverage={coverage:P1} regions={blob?.Regions.Count ?? 0} failed={ctx.Exploration.FailedRegions.Count} cells={blob?.SeenCells.Count ?? 0}/{blob?.WalkableCells.Count ?? 0} attempt={attempt}");
 
-                    // Only consider exit portals after meaningful exploration (>10% coverage).
-                    // Prevents immediately exiting wish zones / sub-zones before exploring them
-                    // (exploration can return null briefly on fresh zone init).
-                    var exitPortal = coverage > 0.10f ? FindExitPortal(ctx, gc, ctx.Combat, "no-targets") : null;
-                    if (exitPortal != null)
-                    {
-                        _exitPortal = exitPortal;
-                        _phase = MappingPhase.Exiting;
-                        Status = $"Explored {coverage:P1} in {elapsed:F0}s — using exit portal";
-                        Decision = $"EXIT: no-targets coverage={coverage:P1} zoneTime={zoneTime:F0}s subZone={_isInSubZone}";
-                        ctx.Log($"[Mapping] No more targets, found exit portal — returning");
-                    }
-                    else if (coverage > 0.10f && !_isInSubZone)
-                    {
-                        ctx.Log("[Mapping] No more targets — exiting map");
-                        EnterExitMap(ctx, gc);
-                    }
-                    else if (coverage > 0.10f)
-                    {
-                        _phase = MappingPhase.Complete;
-                        Status = $"COMPLETE — {coverage:P1} coverage in {elapsed:F0}s";
-                        Decision = $"No more targets ({ctx.Exploration.FailedRegions.Count} unreachable)";
-                    }
+                    // Only consider exit after meaningful exploration (>10% coverage).
+                    // Prevents immediately exiting wish zones / sub-zones before exploring them.
+                    if (coverage > 0.10f)
+                        HandleMapExit(ctx, gc, playerGrid, coverage, "no-targets");
                     // else: fresh zone, no targets yet — wait for exploration to populate
                     return;
                 }
@@ -1021,6 +931,66 @@ namespace AutoExile.Modes
             Decision = $"5 consecutive pathfind failures ({ctx.Exploration.FailedRegions.Count} total unreachable)";
         }
 
+        /// <summary>
+        /// Handle exploration when nav is idle — use EvaluateCompletion to decide next action.
+        /// </summary>
+        private void HandleExplorationCompletion(BotContext ctx, GameController gc, Vector2 playerGrid, float coverage)
+        {
+            var status = EvaluateCompletion(ctx, playerGrid);
+            switch (status)
+            {
+                case MapCompletionStatus.MechanicsDone:
+                    ctx.Log("[Mapping] All ExitAfter mechanics complete — exiting map");
+                    EnterExitMap(ctx, gc);
+                    break;
+
+                case MapCompletionStatus.FullyExplored:
+                    HandleMapExit(ctx, gc, playerGrid, coverage, "explore-complete");
+                    break;
+
+                case MapCompletionStatus.WaitingForMechanic:
+                    // Required mechanic detected but not done — keep exploring nearby
+                    NavigateToNextExploreTarget(ctx, gc, playerGrid);
+                    break;
+
+                case MapCompletionStatus.Incomplete:
+                    NavigateToNextExploreTarget(ctx, gc, playerGrid);
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// Common exit logic: try exit portal (sub-zones) or portal scroll (parent map).
+        /// </summary>
+        private void HandleMapExit(BotContext ctx, GameController gc, Vector2 playerGrid, float coverage, string caller)
+        {
+            var zoneTime = (DateTime.Now - _zoneEnteredAt).TotalSeconds;
+            ctx.Log($"[Mapping] HandleMapExit ({caller}): coverage={coverage:P1} zoneTime={zoneTime:F1}s subZone={_isInSubZone}");
+
+            var exitPortal = FindExitPortal(ctx, gc, ctx.Combat, caller);
+            if (exitPortal != null)
+            {
+                _exitPortal = exitPortal;
+                _phase = MappingPhase.Exiting;
+                var elapsed = (DateTime.Now - _startTime).TotalSeconds;
+                Status = $"Explored {coverage:P1} in {elapsed:F0}s — using exit portal";
+                Decision = $"EXIT: {caller} coverage={coverage:P1} zoneTime={zoneTime:F0}s subZone={_isInSubZone}";
+                ctx.Log($"[Mapping] Found exit portal — returning to parent map");
+            }
+            else if (!_isInSubZone)
+            {
+                ctx.Log($"[Mapping] Map complete ({caller}) — exiting via portal scroll");
+                EnterExitMap(ctx, gc);
+            }
+            else
+            {
+                _phase = MappingPhase.Complete;
+                var elapsed = (DateTime.Now - _startTime).TotalSeconds;
+                Status = $"COMPLETE — {coverage:P1} coverage in {elapsed:F0}s";
+                Decision = $"Sub-zone complete ({ctx.Exploration.FailedRegions.Count} unreachable)";
+            }
+        }
+
         // =================================================================
         // Area Change Handling (hideout ↔ map transitions)
         // =================================================================
@@ -1039,6 +1009,7 @@ namespace AutoExile.Modes
                 ctx.Mechanics.Reset();
                 _pendingMechanic = null;
                 _mechanicActive = false;
+                _postMechanicSettle = false;
 
                 if (_mapCompleted)
                 {
@@ -1066,9 +1037,6 @@ namespace AutoExile.Modes
                 _portalKeyPressed = false;
                 _failedInteractables.Clear();
                 _visitedIconIds.Clear();
-                _bossKillVerified = false;
-                _bossKillCheckPositions = null;
-                _bossAreaArrivalTime = null;
                 InitMapState(ctx, gc);
             }
         }
@@ -1238,6 +1206,238 @@ namespace AutoExile.Modes
             };
         }
 
+        /// <summary>Map minimap icon name to mechanic name (as used by MapMechanicManager).</summary>
+        private static string? IconToMechanicName(string iconName)
+        {
+            return iconName switch
+            {
+                "UltimatumAltar" => "Ultimatum",
+                "RitualRune" or "RitualRuneFinished" => "Ritual",
+                "HarvestPortal" => "Harvest",
+                "Mirage" => "Wishes",
+                _ => null,
+            };
+        }
+
+        // =================================================================
+        // Mechanic Rush (tile-based map-wide detection + minimap icon fallback)
+        // =================================================================
+
+        /// <summary>
+        /// Process tile scan results to find Required mechanic targets.
+        /// Called lazily — needs both TileScan and Exploration initialized.
+        /// </summary>
+        private void ProcessTileScan(BotContext ctx)
+        {
+            if (_tileScanProcessed) return;
+            if (ctx.TileScan == null || !ctx.Exploration.IsInitialized) return;
+
+            var blob = ctx.Exploration.ActiveBlob;
+            if (blob == null) return;
+
+            _tileScanProcessed = true;
+            _tileMechanicTarget = null;
+            _tileMechanicName = "";
+
+            // Run blob-relative landmark scan (filters tiles to active blob, finds anomalies)
+            TileScanner.ScanBlobLandmarks(ctx.TileScan, ctx.TileMap, blob.WalkableCells);
+
+            ctx.Log($"[TileScan] Blob landmarks: {ctx.TileScan.Landmarks.Count} found");
+            foreach (var lm in ctx.TileScan.Landmarks)
+            {
+                ctx.Log($"[TileScan]   [{lm.Type}] {lm.DetailName}: {lm.TileCount}/{lm.TotalInBlob} tiles @ ({lm.CentroidGridPos.X:F0},{lm.CentroidGridPos.Y:F0})");
+            }
+
+            // Find rush target from landmarks: first Required mechanic landmark
+            foreach (var landmark in ctx.TileScan.Landmarks)
+            {
+                if (landmark.Type != LandmarkType.Mechanic) continue;
+
+                // Map detail name to mechanic name
+                var mechName = landmark.DetailName switch
+                {
+                    "ultimatum_altar" => "Ultimatum",
+                    "abyssfeature" => "Abyss",
+                    _ => null,
+                };
+                if (mechName == null) continue;
+
+                var mode = GetMechanicModeByName(mechName, ctx.Settings);
+                if (mode == "Skip") continue;
+                if (ctx.Mechanics.GetCompletionCount(mechName) > 0) continue;
+
+                ctx.Log($"[TileScan] Mechanic landmark: {mechName} at ({landmark.CentroidGridPos.X:F0},{landmark.CentroidGridPos.Y:F0})");
+
+                if (mode == "Required" && _tileMechanicTarget == null)
+                {
+                    _tileMechanicTarget = landmark.CentroidGridPos;
+                    _tileMechanicName = mechName;
+                }
+            }
+
+            // Also check map-wide DetectedMechanics for path-prefix mechanics (Harvest)
+            // that might not have detail name landmarks
+            foreach (var (mechName, info) in ctx.TileScan.DetectedMechanics)
+            {
+                if (_tileMechanicTarget != null) break; // already have a target
+                var mode = GetMechanicModeByName(mechName, ctx.Settings);
+                if (mode != "Required") continue;
+                if (ctx.Mechanics.GetCompletionCount(mechName) > 0) continue;
+
+                // Snap centroid to blob — Harvest tiles may be in a disconnected area
+                var snapped = ctx.Exploration.SnapToActiveBlob(info.CentroidGridPos);
+                if (snapped.HasValue)
+                {
+                    _tileMechanicTarget = snapped.Value;
+                    _tileMechanicName = mechName;
+                    ctx.Log($"[TileScan] Path-prefix mechanic: {mechName} snapped to ({snapped.Value.X:F0},{snapped.Value.Y:F0})");
+                }
+                else
+                {
+                    ctx.Log($"[TileScan] Path-prefix mechanic: {mechName} unreachable in active blob");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Get mechanic mode setting value by mechanic name (not icon name).
+        /// </summary>
+        private static string GetMechanicModeByName(string mechName, BotSettings settings)
+        {
+            return mechName switch
+            {
+                "Ultimatum" => settings.Mechanics.Ultimatum.Mode.Value,
+                "Harvest" => settings.Mechanics.Harvest.Mode.Value,
+                "Wishes" => settings.Mechanics.Wishes.Mode.Value,
+                "Essence" => settings.Mechanics.Essence.Mode.Value,
+                "Ritual" => settings.Mechanics.Ritual.Mode.Value,
+                _ => "Skip",
+            };
+        }
+
+        /// <summary>
+        /// Rush to Required mechanics. Two-phase approach:
+        /// 1. Tile-based (map-wide, instant): from TileScanResult at map load
+        /// 2. Minimap-icon fallback: for mechanics not detectable via tiles (Ritual, Wishes, Essence)
+        /// Returns true if rushing (caller should return from Tick).
+        /// </summary>
+        private bool TryMechanicRush(BotContext ctx, Vector2 playerGrid)
+        {
+            // Don't rush in sub-zones or when a mechanic is already active/pending
+            if (_isInSubZone || _mechanicActive || _pendingMechanic != null)
+            {
+                _mechanicRushTarget = null;
+                return false;
+            }
+
+            // ── Phase 1: Tile-based target (map-wide, known from load) ──
+            ProcessTileScan(ctx);
+
+            if (_tileMechanicTarget.HasValue)
+            {
+                // Clear if completed
+                if (ctx.Mechanics.GetCompletionCount(_tileMechanicName) > 0)
+                {
+                    ctx.Log($"[MechanicRush] Tile target {_tileMechanicName} completed — clearing");
+                    _tileMechanicTarget = null;
+                    _tileMechanicName = "";
+                    // Re-scan for next Required mechanic
+                    _tileScanProcessed = false;
+                    ProcessTileScan(ctx);
+                }
+            }
+
+            if (_tileMechanicTarget.HasValue)
+            {
+                var dist = Vector2.Distance(playerGrid, _tileMechanicTarget.Value);
+                if (dist < 40)
+                {
+                    // Close enough — entity detection will handle it
+                    _tileMechanicTarget = null;
+                }
+                else
+                {
+                    return RushToTarget(ctx, playerGrid, _tileMechanicTarget.Value, _tileMechanicName, "tile");
+                }
+            }
+
+            // ── Phase 2: Minimap icon fallback (for non-tile-detectable mechanics) ──
+            Vector2? bestTarget = null;
+            float bestDist = float.MaxValue;
+            string bestName = "";
+
+            foreach (var (id, icon) in ctx.MinimapIcons)
+            {
+                if (_visitedIconIds.Contains(id)) continue;
+
+                var mechSetting = GetMechanicSetting(icon.IconName, ctx.Settings);
+                if (mechSetting == null || mechSetting.Value != "Required") continue;
+
+                var mechName = IconToMechanicName(icon.IconName);
+                if (mechName != null && ctx.Mechanics.GetCompletionCount(mechName) > 0) continue;
+
+                // Skip if this mechanic is already handled by tile detection
+                if (mechName != null && ctx.TileScan?.DetectedMechanics.ContainsKey(mechName) == true) continue;
+
+                var dist = Vector2.Distance(playerGrid, icon.GridPos);
+                if (dist < 40) continue;
+
+                if (dist < bestDist)
+                {
+                    bestTarget = icon.GridPos;
+                    bestDist = dist;
+                    bestName = icon.IconName;
+                }
+            }
+
+            if (bestTarget.HasValue)
+                return RushToTarget(ctx, playerGrid, bestTarget.Value, bestName, "icon");
+
+            _mechanicRushTarget = null;
+            return false;
+        }
+
+        /// <summary>Navigate to a rush target. Shared by tile-based and icon-based rush.</summary>
+        private bool RushToTarget(BotContext ctx, Vector2 playerGrid, Vector2 target, string name, string source)
+        {
+            _mechanicRushTarget = target;
+            _mechanicRushName = name;
+
+            var dist = Vector2.Distance(playerGrid, target);
+
+            if (!ctx.Navigation.IsNavigating ||
+                (_navTarget.HasValue && Vector2.Distance(_navTarget.Value, target) > 30))
+            {
+                ctx.Navigation.Stop(ctx.Game);
+                if (ctx.Navigation.NavigateTo(ctx.Game, target))
+                {
+                    _navTarget = target;
+                    ctx.Log($"[MechanicRush] Rushing to {name} [{source}] at ({target.X:F0},{target.Y:F0}) dist={dist:F0}");
+                }
+                else
+                {
+                    // Diagnostic: why did pathfinding fail?
+                    var pfGrid = ctx.Game.IngameState?.Data?.RawPathfindingData;
+                    int pfValue = 0;
+                    if (pfGrid != null)
+                    {
+                        int tx = (int)target.X, ty = (int)target.Y;
+                        if (ty >= 0 && ty < pfGrid.Length && tx >= 0 && tx < pfGrid[ty].Length)
+                            pfValue = pfGrid[ty][tx];
+                    }
+                    var inBlob = ctx.Exploration.ActiveBlob?.WalkableCells.Contains(
+                        new Systems.Vector2i((int)target.X, (int)target.Y)) == true;
+                    ctx.Log($"[MechanicRush] FAILED path to {name} [{source}] at ({target.X:F0},{target.Y:F0}) dist={dist:F0} pf={pfValue} inBlob={inBlob} player=({playerGrid.X:F0},{playerGrid.Y:F0})");
+                    _mechanicRushTarget = null;
+                    return false;
+                }
+            }
+
+            Decision = $"Mechanic rush: {name} [{source}] ({dist:F0}g away)";
+            Status = $"Rushing to {name} — {dist:F0}g";
+            return true;
+        }
+
         /// <summary>
         /// Find the highest-priority unvisited minimap icon target.
         /// Required targets first, then optional. Skips icons in already-explored areas.
@@ -1342,118 +1542,85 @@ namespace AutoExile.Modes
         }
 
         // =================================================================
-        // Boss Kill Verification
+        // Map Completion Evaluation
         // =================================================================
 
         /// <summary>
-        /// Resolve boss tile positions from MapDatabase. Called lazily on first check.
+        /// Unified completion check — evaluates all conditions to determine if the map is done.
+        /// Replaces scattered inline checks at mechanic completion, coverage threshold, and no-targets paths.
         /// </summary>
-        private void ResolveBossKillPositions(BotContext ctx, GameController gc)
+        private MapCompletionStatus EvaluateCompletion(BotContext ctx, Vector2 playerGrid)
         {
-            if (_bossKillCheckPositions != null) return;
-            _bossKillCheckPositions = new List<Vector2>();
-
-            var areaName = gc.Area?.CurrentArea?.Name ?? "";
-            var bossTiles = ctx.MapDatabase.GetBossTiles(areaName);
-            if (bossTiles == null || bossTiles.Count == 0) return;
-
-            foreach (var tileKey in bossTiles)
+            // 0. Tile-absence intelligence: if ExitAfter mechanics are tile-detectable
+            //    and absent from tile scan, the map lacks them → treat as complete
+            //    Only applies inside maps — hideout/town tile scans don't have map mechanics
+            var isInMap = ctx.Game.Area?.CurrentArea != null &&
+                          !ctx.Game.Area.CurrentArea.IsHideout &&
+                          !ctx.Game.Area.CurrentArea.IsTown;
+            if (isInMap && _tileScanProcessed && ctx.TileScan != null &&
+                AreExitMechanicsAbsentFromTiles(ctx))
             {
-                var positions = ctx.TileMap.GetPositions(tileKey);
-                if (positions != null)
-                {
-                    foreach (var p in positions)
-                        _bossKillCheckPositions.Add(p + new Vector2(11.5f, 11.5f)); // tile center
-                }
+                return MapCompletionStatus.MechanicsDone;
             }
 
-            if (_bossKillCheckPositions.Count > 0)
-                ctx.Log($"[BossKill] Resolved {_bossKillCheckPositions.Count} boss check positions");
+            // 1. ExitAfter mechanics — highest priority exit trigger
+            if (ctx.Mechanics.AreExitMechanicsComplete(ctx.Settings) &&
+                !ctx.Mechanics.HasPendingMechanics())
+                return MapCompletionStatus.MechanicsDone;
+
+            // 2. Required mechanics still pending (detected but not done)
+            if (ctx.Mechanics.HasPendingMechanics())
+                return MapCompletionStatus.WaitingForMechanic;
+
+            // 3. Coverage check
+            var coverage = ctx.Exploration.ActiveBlobCoverage;
+            if (coverage < ctx.Settings.Mapping.MinCoverage.Value)
+                return MapCompletionStatus.Incomplete;
+
+            // 5. Any unexplored regions left?
+            var nextTarget = ctx.Exploration.GetNextExplorationTarget(playerGrid);
+            if (nextTarget.HasValue)
+                return MapCompletionStatus.Incomplete;
+
+            return MapCompletionStatus.FullyExplored;
         }
 
         /// <summary>
-        /// Check if the boss has been killed. Runs each tick when KillBoss is enabled.
-        /// Logic: player is within boss radius + dwell time elapsed + no alive unique monsters in radius.
+        /// Check if all ExitAfter mechanics are tile-detectable AND absent from the tile scan.
+        /// If so, this map definitely doesn't have them — no need to explore further.
+        /// Returns false if any ExitAfter mechanic is either not tile-detectable or is present in tiles.
         /// </summary>
-        private void TickBossKillCheck(BotContext ctx, GameController gc, Vector2 playerGrid)
+        private bool AreExitMechanicsAbsentFromTiles(BotContext ctx)
         {
-            if (_bossKillVerified) return;
+            bool anyExitAfter = false;
+            var tileScan = ctx.TileScan;
+            if (tileScan == null) return false;
 
-            // Lazy resolve boss positions
-            if (!ctx.TileMap.IsLoaded) return;
-            ResolveBossKillPositions(ctx, gc);
-            if (_bossKillCheckPositions == null || _bossKillCheckPositions.Count == 0)
+            foreach (var mechName in new[] { "Ultimatum", "Harvest", "Wishes", "Essence", "Ritual" })
             {
-                // No boss data — can't verify, treat as verified to not block completion
-                _bossKillVerified = true;
-                ctx.Log("[BossKill] No boss tile data — skipping verification");
-                return;
-            }
-
-            float bossRadius = ctx.Settings.Mapping.BossKillRadius.Value;
-
-            // Check if player is within radius of any boss tile
-            bool inBossArea = false;
-            foreach (var pos in _bossKillCheckPositions)
-            {
-                if (Vector2.Distance(playerGrid, pos) <= bossRadius)
+                var exitAfter = mechName switch
                 {
-                    inBossArea = true;
-                    break;
-                }
+                    "Ultimatum" => ctx.Settings.Mechanics.Ultimatum.ExitAfter.Value,
+                    "Harvest" => ctx.Settings.Mechanics.Harvest.ExitAfter.Value,
+                    "Wishes" => ctx.Settings.Mechanics.Wishes.ExitAfter.Value,
+                    "Essence" => ctx.Settings.Mechanics.Essence.ExitAfter.Value,
+                    "Ritual" => ctx.Settings.Mechanics.Ritual.ExitAfter.Value,
+                    _ => false,
+                };
+                if (!exitAfter) continue;
+                anyExitAfter = true;
+
+                // If this mechanic is NOT tile-detectable, we can't confirm absence
+                if (!TileScanner.TileDetectableMechanics.Contains(mechName))
+                    return false;
+
+                // If it IS tile-detectable and IS present → not absent
+                if (tileScan.DetectedMechanics.ContainsKey(mechName))
+                    return false;
             }
 
-            if (!inBossArea)
-            {
-                _bossAreaArrivalTime = null;
-                return;
-            }
-
-            // Start dwell timer
-            if (!_bossAreaArrivalTime.HasValue)
-            {
-                _bossAreaArrivalTime = DateTime.Now;
-                return;
-            }
-
-            // Wait for entities to load
-            if ((DateTime.Now - _bossAreaArrivalTime.Value).TotalSeconds < BossAreaDwellSeconds)
-                return;
-
-            // Check for alive unique monsters in boss radius
-            var bossEntry = ctx.MapDatabase.GetEntry(gc.Area?.CurrentArea?.Name ?? "");
-            var bossPath = bossEntry?.BossEntityPath;
-
-            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
-            {
-                if (entity.Type != EntityType.Monster) continue;
-                if (!entity.IsAlive || !entity.IsHostile) continue;
-                if (entity.Rarity != MonsterRarity.Unique) continue;
-
-                // Check if within boss radius
-                bool nearBoss = false;
-                foreach (var pos in _bossKillCheckPositions)
-                {
-                    if (Vector2.Distance(entity.GridPosNum, pos) <= bossRadius)
-                    {
-                        nearBoss = true;
-                        break;
-                    }
-                }
-                if (!nearBoss) continue;
-
-                // If we have a specific boss path, only match that
-                if (bossPath != null && !entity.Path.Contains(bossPath, StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                // Found alive unique in boss area — not killed yet
-                return;
-            }
-
-            // No alive uniques in boss area — boss killed
-            _bossKillVerified = true;
-            ctx.Log("[BossKill] Boss kill verified — no alive uniques in boss area");
-            Decision = "Boss killed!";
+            // Only return true if there were ExitAfter mechanics and all were absent
+            return anyExitAfter;
         }
 
         /// <summary>
@@ -1518,16 +1685,25 @@ namespace AutoExile.Modes
                 }
             }
 
-            // Crafting recipes (click to unlock)
-            if (settings.IsEnabled(settings.CraftingRecipes))
+            // IngameIcon interactables (crafting recipes, memory tears)
+            bool wantRecipes = settings.IsEnabled(settings.CraftingRecipes);
+            bool wantMemoryTears = settings.IsEnabled(settings.MemoryTears);
+            if (wantRecipes || wantMemoryTears)
             {
-                var radius = RadiusFor(settings.CraftingRecipes);
                 foreach (var entity in gc.EntityListWrapper.ValidEntitiesByType[EntityType.IngameIcon])
                 {
                     if (!entity.IsTargetable) continue;
                     if (_failedInteractables.Contains(entity.Id)) continue;
-                    if (!entity.Path.Contains("CraftingUnlocks/RecipeUnlock")) continue;
 
+                    ListNode? iconSetting = null;
+                    if (wantRecipes && entity.Path.Contains("CraftingUnlocks/RecipeUnlock"))
+                        iconSetting = settings.CraftingRecipes;
+                    else if (wantMemoryTears && entity.Path.Contains("MapAtlasMemory/"))
+                        iconSetting = settings.MemoryTears;
+
+                    if (iconSetting == null) continue;
+
+                    var radius = RadiusFor(iconSetting);
                     var dist = Vector2.Distance(playerGrid, new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y));
                     if (dist < bestDist && dist <= radius)
                     {
@@ -1715,7 +1891,6 @@ namespace AutoExile.Modes
             var phaseColor = _phase switch
             {
                 MappingPhase.InHideout => SharpDX.Color.CornflowerBlue,
-                MappingPhase.RushingBoss => SharpDX.Color.Gold,
                 MappingPhase.Fighting => SharpDX.Color.Red,
                 MappingPhase.Looting => SharpDX.Color.LimeGreen,
                 MappingPhase.Exploring => SharpDX.Color.Cyan,
@@ -1742,11 +1917,12 @@ namespace AutoExile.Modes
                 g.DrawBox(new SharpDX.RectangleF(hudX, hudY, barWidth, barHeight),
                     new SharpDX.Color(40, 40, 40, 200));
                 var fillWidth = barWidth * Math.Min(coverage, 1f);
-                var fillColor = coverage >= _minCoverage
+                var minCov = ctx.Settings.Mapping.MinCoverage.Value;
+                var fillColor = coverage >= minCov
                     ? new SharpDX.Color(0, 200, 0, 200)
                     : new SharpDX.Color(200, 200, 0, 200);
                 g.DrawBox(new SharpDX.RectangleF(hudX, hudY, fillWidth, barHeight), fillColor);
-                var targetX = hudX + barWidth * _minCoverage;
+                var targetX = hudX + barWidth * minCov;
                 g.DrawLine(new Vector2(targetX, hudY), new Vector2(targetX, hudY + barHeight), 2f, SharpDX.Color.White);
                 g.DrawText($"{coverage:P0}",
                     new Vector2(hudX + barWidth + 8, hudY - 1), SharpDX.Color.White);
@@ -1775,19 +1951,6 @@ namespace AutoExile.Modes
                 hudY += lineH;
             }
 
-            // Boss status (only when kill boss is enabled or rushing)
-            if (_bossTarget.HasValue)
-            {
-                var dist = Vector2.Distance(playerGrid, _bossTarget.Value);
-                g.DrawText($"Boss: {dist:F0}g away", new Vector2(hudX, hudY), SharpDX.Color.Gold);
-                hudY += lineH;
-            }
-            else if (ctx.Settings.Mapping.KillBoss.Value)
-            {
-                var bossColor = _bossKillVerified ? SharpDX.Color.LimeGreen : SharpDX.Color.OrangeRed;
-                g.DrawText(_bossKillVerified ? "Boss: KILLED" : "Boss: ALIVE", new Vector2(hudX, hudY), bossColor);
-                hudY += lineH;
-            }
 
             // Priority target
             if (_priorityTarget.HasValue)
@@ -1809,6 +1972,48 @@ namespace AutoExile.Modes
                 var mechList = string.Join(", ", ctx.Mechanics.CompletionCounts
                     .Select(kv => kv.Value > 1 ? $"{kv.Key} x{kv.Value}" : kv.Key));
                 g.DrawText($"Done: {mechList}", new Vector2(hudX, hudY), SharpDX.Color.DarkGreen);
+                hudY += lineH;
+            }
+
+            // Strategy state — show Required mechanic progress with tile intelligence
+            var stratParts = new List<string>();
+            foreach (var mechName in new[] { "Ultimatum", "Ritual", "Harvest", "Wishes" })
+            {
+                var modeSetting = mechName switch
+                {
+                    "Ultimatum" => ctx.Settings.Mechanics.Ultimatum.Mode,
+                    "Ritual" => ctx.Settings.Mechanics.Ritual.Mode,
+                    "Harvest" => ctx.Settings.Mechanics.Harvest.Mode,
+                    "Wishes" => ctx.Settings.Mechanics.Wishes.Mode,
+                    _ => null,
+                };
+                if (modeSetting?.Value != "Required") continue;
+
+                if (ctx.Mechanics.GetCompletionCount(mechName) > 0)
+                    stratParts.Add($"\u2714 {mechName}"); // ✔ done
+                else if (_tileMechanicTarget.HasValue && _tileMechanicName == mechName)
+                    stratParts.Add($"\u2192 {mechName} [tile]"); // → rushing via tile
+                else if (_mechanicRushTarget.HasValue && (IconToMechanicName(_mechanicRushName) == mechName || _mechanicRushName == mechName))
+                    stratParts.Add($"\u2192 {mechName}"); // → rushing via icon
+                else if (ctx.TileScan?.DetectedMechanics.ContainsKey(mechName) == true)
+                    stratParts.Add($"! {mechName} (unreachable)"); // detected but can't path
+                else if (_phase != MappingPhase.InHideout && _tileScanProcessed &&
+                         TileScanner.TileDetectableMechanics.Contains(mechName))
+                    stratParts.Add($"\u2717 {mechName} (absent)"); // ✗ not in this map
+                else
+                    stratParts.Add($"? {mechName}"); // unknown or in hideout
+            }
+            if (stratParts.Count > 0)
+            {
+                g.DrawText($"Strategy: {string.Join("  ", stratParts)}", new Vector2(hudX, hudY), SharpDX.Color.Yellow);
+                hudY += lineH;
+            }
+
+            // Mechanic rush target
+            if (_mechanicRushTarget.HasValue)
+            {
+                var rushDist = Vector2.Distance(playerGrid, _mechanicRushTarget.Value);
+                g.DrawText($"Rush: {_mechanicRushName} ({rushDist:F0}g)", new Vector2(hudX, hudY), SharpDX.Color.Orange);
                 hudY += lineH;
             }
 
@@ -1844,14 +2049,14 @@ namespace AutoExile.Modes
                 }
             }
 
-            // Boss target world marker
-            if (_bossTarget.HasValue)
+            // Mechanic rush target world marker
+            if (_mechanicRushTarget.HasValue)
             {
-                var bossWorld = Pathfinding.GridToWorld3D(gc, _bossTarget.Value);
-                g.DrawCircleInWorld(bossWorld, 60f, SharpDX.Color.Gold, 3f);
-                var bossScreen = cam.WorldToScreen(bossWorld);
-                if (bossScreen.X > -200 && bossScreen.X < 2400)
-                    g.DrawText("BOSS", bossScreen + new Vector2(-15, -20), SharpDX.Color.Gold);
+                var rushWorld = Pathfinding.GridToWorld3D(gc, _mechanicRushTarget.Value);
+                g.DrawCircleInWorld(rushWorld, 50f, SharpDX.Color.Orange, 3f);
+                var rushScreen = cam.WorldToScreen(rushWorld);
+                if (rushScreen.X > -200 && rushScreen.X < 2400)
+                    g.DrawText(_mechanicRushName, rushScreen + new Vector2(-25, -25), SharpDX.Color.Orange);
             }
 
             // Active mechanic overlay

@@ -1,6 +1,9 @@
 using ExileCore;
 using ExileCore.PoEMemory.MemoryObjects;
 using ExileCore.Shared;
+using ExileCore.Shared.Helpers;
+using GameOffsets;
+using GameOffsets.Native;
 using ImGuiNET;
 using AutoExile.Mechanics;
 using AutoExile.Modes;
@@ -327,12 +330,17 @@ namespace AutoExile
             _areaChangedAt = DateTime.Now;
             _tileMap.Clear();
             _tileMap.Load(GameController);
+            _ctx.TileScan = _tileMap.IsLoaded
+                ? TileScanner.ScanMapWide(_tileMap)
+                : null;
+            if (_ctx.TileScan != null)
+                LogMessage($"[TileScan] {currentArea}: {_ctx.TileScan.DetectedMechanics.Count} mechanics detected (map-wide)");
             _loot.ClearFailed();
             _combat.ClearUnreachable();
             _altarHandler.Reset();
             _lootTracker.OnAreaChanged();
             ClearMinimapIcons();
-            ScanMinimapIcons(forceFullLog: true);
+            ScanMinimapIcons();
 
             // Check if we have cached state for this area name AND matching hash
             // (returning from sub-zone back to the original map instance)
@@ -535,6 +543,8 @@ namespace AutoExile
                 mustLootRaw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                     .Where(s => s.Length > 0),
                 StringComparer.OrdinalIgnoreCase);
+            _loot.LabelToggleUnstick = Settings.Loot.LabelToggleUnstick.Value;
+            _loot.LabelToggleCooldownSeconds = Settings.Loot.LabelToggleCooldownSeconds.Value;
             _loot.PriceService = _ninjaPrice;
             _lootTracker.PriceService = _ninjaPrice;
 
@@ -744,7 +754,25 @@ namespace AutoExile
 
         public override void DrawSettings()
         {
-            base.DrawSettings();
+            // Only show Enable toggle and web config here.
+            // All other settings are managed via the web dashboard.
+            var enable = Settings.Enable.Value;
+            if (ImGui.Checkbox("Enable", ref enable))
+                Settings.Enable.Value = enable;
+
+            ImGui.Separator();
+            ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f), "All settings are managed via the web dashboard.");
+
+            // Web server config (these require plugin restart to change)
+            var webEnabled = Settings.WebUiEnabled.Value;
+            if (ImGui.Checkbox("Web UI Enabled", ref webEnabled))
+                Settings.WebUiEnabled.Value = webEnabled;
+            if (Settings.WebUiEnabled.Value)
+            {
+                var netAccess = Settings.WebUiNetworkAccess.Value;
+                if (ImGui.Checkbox("Network Access", ref netAccess))
+                    Settings.WebUiNetworkAccess.Value = netAccess;
+            }
 
             // Web UI link
             if (_webServer != null && _webServer.IsRunning)
@@ -754,370 +782,13 @@ namespace AutoExile
                 if (ImGui.SmallButton("Copy URL"))
                     ImGui.SetClipboardText(_webServer.Url);
             }
-
-            ImGui.Separator();
-            ImGui.Text($"Mode: {_mode.Name}");
-            ImGui.Text($"Running: {Settings.Running.Value}");
-
-            if (_mode == _debugMode && _debugMode != null)
+            else if (Settings.WebUiEnabled.Value)
             {
-                ImGui.Separator();
-                ImGui.Text("=== Debug Pathfinding ===");
-
-                if (ImGui.Button("Set Target (save current pos)"))
-                    _debugMode.SetTarget(_ctx);
-                ImGui.SameLine();
-                if (ImGui.Button("Navigate"))
-                    _debugMode.Navigate(_ctx);
-                ImGui.SameLine();
-                if (ImGui.Button("Stop"))
-                    _debugMode.StopNavigation(_ctx);
-
-                // Nav stats
-                if (_navigation.IsNavigating)
-                {
-                    ImGui.Text($"Waypoint: {_navigation.CurrentWaypointIndex + 1}/{_navigation.CurrentNavPath.Count}");
-                    if (_navigation.BlinkCount > 0)
-                        ImGui.Text($"Blinks in path: {_navigation.BlinkCount}");
-                }
-                ImGui.Text($"Last pathfind: {_navigation.LastPathfindMs}ms");
-
-                // Tile search
-                ImGui.Separator();
-                ImGui.Text($"=== Tile Navigation ({(_tileMap.IsLoaded ? _tileMap.LoadedArea : "not loaded")}, {_tileMap.TileCount} tiles) ===");
-
-                var tileSearch = _debugMode.TileSearchText;
-                if (ImGui.InputText("Tile search", ref tileSearch, 256))
-                    _debugMode.TileSearchText = tileSearch;
-
-                if (ImGui.Button("Search Tiles"))
-                    _debugMode.SearchTiles(_ctx);
-                ImGui.SameLine();
-                if (ImGui.Button("Navigate to Tile"))
-                    _debugMode.NavigateToTile(_ctx);
-
-                var results = _debugMode.TileSearchResults;
-                if (results.Count > 0)
-                {
-                    ImGui.BeginChild("TileResults", new Vector2(0, 150), ImGuiChildFlags.Border);
-                    var shown = 0;
-                    foreach (var (key, positions) in results)
-                    {
-                        if (shown >= 20) break;
-                        ImGui.Text($"{key} ({positions.Count} pos)");
-                        shown++;
-                    }
-                    if (results.Count > 20)
-                        ImGui.Text($"... and {results.Count - 20} more");
-                    ImGui.EndChild();
-                }
-
-                if (ImGui.Button("Reload TileMap"))
-                {
-                    _tileMap.Clear();
-                    _tileMap.Load(GameController);
-                }
-
-                // Interaction testing
-                ImGui.Separator();
-                ImGui.Text("=== Interaction Testing ===");
-
-                if (ImGui.Button("Click Nearest Chest"))
-                    _debugMode.InteractNearest(_ctx, "Chest");
-                ImGui.SameLine();
-                if (ImGui.Button("Click Nearest Shrine"))
-                    _debugMode.InteractNearest(_ctx, "Shrine");
-                ImGui.SameLine();
-                if (ImGui.Button("Click Nearest Any"))
-                    _debugMode.InteractNearest(_ctx, "");
-
-                if (ImGui.Button("Pickup Nearest Item"))
-                    _debugMode.PickupNearestItem(_ctx);
-                ImGui.SameLine();
-                if (ImGui.Button("Cancel Interaction"))
-                    _debugMode.CancelInteraction(_ctx);
-
-                if (_interaction.IsBusy)
-                    ImGui.Text($"Interaction: {_interaction.Status}");
-
-                // Loot testing
-                ImGui.Separator();
-                ImGui.Text("=== Loot System ===");
-                ImGui.Text($"Ninja bridge: {_loot.NinjaBridgeStatus}");
-
-                if (ImGui.Button("Scan Loot"))
-                    _debugMode.ScanLoot(_ctx);
-                ImGui.SameLine();
-                if (ImGui.Button("Pickup Next"))
-                    _debugMode.PickupNextLoot(_ctx);
-                ImGui.SameLine();
-                if (ImGui.Button("Loot All"))
-                    _debugMode.LootAll(_ctx);
-
-                var candidates = _loot.Candidates;
-                if (candidates.Count > 0)
-                {
-                    ImGui.BeginChild("LootCandidates", new Vector2(0, 150), ImGuiChildFlags.Border);
-                    foreach (var c in candidates)
-                    {
-                        var priceStr = c.ChaosValue > 0
-                            ? $" [{c.ChaosValue:F0}c, {c.InventorySlots}slot, {c.ChaosPerSlot:F1}c/s]"
-                            : $" [{c.InventorySlots}slot]";
-                        ImGui.Text($"{c.ItemName}{priceStr} (dist={c.Distance:F0})");
-                    }
-                    ImGui.EndChild();
-                }
-
-                if (!string.IsNullOrEmpty(_loot.LastSkipReason))
-                    ImGui.TextColored(new Vector4(1, 0.5f, 0, 1), _loot.LastSkipReason);
-
-                // Map device testing
-                ImGui.Separator();
-                ImGui.Text("=== Map Device ===");
-
-                if (ImGui.Button("Open Blight Map"))
-                    _debugMode.StartBlightMap(_ctx);
-                ImGui.SameLine();
-                if (ImGui.Button("Open Standard Map"))
-                    _debugMode.StartStandardMap(_ctx);
-                ImGui.SameLine();
-                if (ImGui.Button("Cancel##mapdevice"))
-                    _debugMode.CancelMapDevice(_ctx);
-
-                if (_mapDevice.IsBusy)
-                    ImGui.Text($"MapDevice: {_mapDevice.Phase} — {_mapDevice.Status}");
-
-                // Threat detection testing
-                ImGui.Separator();
-                ImGui.Text("=== Threat Detection ===");
-
-                ImGui.Text($"Status: {_threat.LastAction}");
-                ImGui.Text($"Casts detected: {_threat.CastsDetected} | Dodges triggered: {_threat.DodgesTriggered}");
-
-                if (_threat.TrackedMonsters.Count > 0)
-                {
-                    ImGui.BeginChild("ThreatMonsters", new Vector2(0, 120), ImGuiChildFlags.Border);
-                    foreach (var kv in _threat.TrackedMonsters)
-                    {
-                        var mt = kv.Value;
-                        var castInfo = mt.HasCast
-                            ? $" CASTING {mt.SkillName} stg={mt.AnimationStage} prog={mt.AnimationProgress:F2} in={mt.TimeRemainingMs:F0}ms dest=({mt.CastDestination.X:F0},{mt.CastDestination.Y:F0}){(mt.DodgeSignaled ? " [DODGED]" : "")}"
-                            : $" {mt.AnimationName}";
-                        var color = mt.HasCast
-                            ? (mt.DodgeSignaled ? new Vector4(1, 0.5f, 0, 1) : new Vector4(1, 1, 0, 1))
-                            : new Vector4(0.6f, 0.6f, 0.6f, 1);
-                        ImGui.TextColored(color, $"#{mt.EntityId} d={Vector2.Distance(mt.GridPos, new Vector2(GameController.Player.GridPosNum.X, GameController.Player.GridPosNum.Y)):F0}{castInfo}");
-                    }
-                    ImGui.EndChild();
-                }
-            }
-
-            if (_mode == _followerMode && _followerMode != null)
-            {
-                ImGui.Separator();
-                ImGui.Text("=== Follower Mode ===");
-
-                if (_navigation.IsNavigating)
-                {
-                    ImGui.Text($"Waypoint: {_navigation.CurrentWaypointIndex + 1}/{_navigation.CurrentNavPath.Count}");
-                    ImGui.Text($"Last pathfind: {_navigation.LastPathfindMs}ms");
-                }
-            }
-
-            if (_mode == _blightMode && _blightMode != null)
-            {
-                ImGui.Separator();
-                ImGui.Text("=== Blight Mode ===");
-                ImGui.Text($"Phase: {_blightMode.Phase}");
-                ImGui.Text($"Status: {_blightMode.StatusText}");
-
-                var state = _blightMode.State;
-                ImGui.Text($"Pump: {(state.PumpPosition.HasValue ? $"({state.PumpPosition.Value.X:F0}, {state.PumpPosition.Value.Y:F0})" : "not found")}");
-                ImGui.Text($"Encounter: active={state.IsEncounterActive} done={state.IsEncounterDone} timer={state.IsTimerDone}");
-                ImGui.Text($"Countdown: {state.CountdownText}");
-                ImGui.Text($"Chests: {state.ChestPositions.Count} | Towers: {state.KnownTowerEntityIds.Count}");
-                ImGui.Text($"Monsters: {state.AliveMonsterCount} {(state.PumpUnderAttack ? "PUMP DANGER!" : "")}");
-                ImGui.Text($"Lanes: {state.LaneDebug}");
-                ImGui.Text(state.FoundationDebug);
-
-                // Show cached foundation details (first 10)
-                int shown = 0;
-                foreach (var cf in state.CachedFoundations.Values)
-                {
-                    if (shown >= 10) break;
-                    ImGui.TextColored(
-                        cf.IsBuilt ? new Vector4(0.5f, 0.5f, 0.5f, 1) : new Vector4(0, 1, 0, 1),
-                        $"  F#{cf.EntityId}: built={cf.IsBuilt} vis={cf.IsVisible}");
-                    shown++;
-                }
-
-                var towerStatus = _blightMode.TowerActionStatus;
-                if (!string.IsNullOrEmpty(towerStatus))
-                    ImGui.Text($"Tower Action: {towerStatus}");
-            }
-
-            // Mapping mode status
-            if (_mode == _mappingMode && _mappingMode != null)
-            {
-                ImGui.Separator();
-                ImGui.Text("=== Mapping Mode ===");
-                ImGui.Text($"Phase: {_mappingMode.Phase}");
-                ImGui.Text(_mappingMode.Status);
-                ImGui.Text($"Decision: {_mappingMode.Decision}");
-                ImGui.Text($"Targets visited: {_mappingMode.ExploreTargetsVisited}");
-                var elapsed = (DateTime.Now - _mappingMode.StartTime).TotalSeconds;
-                ImGui.Text($"Elapsed: {elapsed:F0}s");
-            }
-
-            // Simulacrum mode status
-            if (_mode == _simulacrumMode && _simulacrumMode != null)
-            {
-                ImGui.Separator();
-                ImGui.Text("=== Simulacrum Mode ===");
-                ImGui.Text($"Phase: {_simulacrumMode.Phase}");
-                ImGui.Text($"Status: {_simulacrumMode.StatusText}");
-                ImGui.Text($"Decision: {_simulacrumMode.Decision}");
-
-                var simState = _simulacrumMode.State;
-                ImGui.Text($"Wave: {simState.CurrentWave}/15 {(simState.IsWaveActive ? "ACTIVE" : "idle")}");
-                ImGui.Text($"Monolith: {(simState.MonolithPosition.HasValue ? $"({simState.MonolithPosition.Value.X:F0}, {simState.MonolithPosition.Value.Y:F0})" : "not found")}");
-                ImGui.Text($"Stash: {(simState.StashPosition.HasValue ? "found" : "not found")} | Portal: {(simState.PortalPosition.HasValue ? "found" : "not found")}");
-                ImGui.Text($"Deaths: {simState.DeathCount}/{Settings.Simulacrum.MaxDeaths.Value} | Runs: {simState.RunsCompleted}");
-                if (simState.RunsCompleted > 0)
-                {
-                    var avgDur = simState.AverageRunDuration;
-                    ImGui.Text($"Avg: {avgDur.Minutes}m{avgDur.Seconds:D2}s/run | {simState.AverageWavesPerRun:F1} waves/run");
-                }
-            }
-
-            // Labyrinth mode status
-            if (_mode == _labyrinthMode && _labyrinthMode != null)
-            {
-                ImGui.Separator();
-                ImGui.Text("=== Labyrinth Mode ===");
-                ImGui.Text($"Phase: {_labyrinthMode.Phase}");
-                ImGui.Text($"Status: {_labyrinthMode.StatusText}");
-
-                var labState = _labyrinthMode.State;
-                ImGui.Text($"Izaro: {labState.IzaroEncounterCount}/3 | Zone: {labState.ZoneCount}");
-                ImGui.Text($"Deaths: {labState.DeathCount}/{Settings.Labyrinth.MaxDeaths.Value} | Runs: {labState.RunsCompleted}");
-                ImGui.Text($"Gems: {labState.GemsTransformed} | Profit: {labState.TotalProfit:F0}c");
-                ImGui.Text($"Selected gem: {labState.SelectedGemName ?? "none"}");
-                ImGui.Text($"Font: {(labState.HasFont ? "yes" : "no")} | Door: {(labState.HasIzaroDoor ? "yes" : "no")} | Izaro: {(labState.IsIzaroPresent ? "ALIVE" : "no")} | Portal: {(labState.HasReturnPortal ? "yes" : "no")}");
-                ImGui.Text($"Exits: {labState.ExitTransitions.Count} | Chests: {labState.ChestCount}");
-            }
-
-            // Game state dump
-            ImGui.Separator();
-            ImGui.Text("=== Game State Dump ===");
-            if (ImGui.Button("Dump (F6)"))
-                TriggerGameStateDump();
-            if (!string.IsNullOrEmpty(_dumpStatus))
-            {
-                ImGui.SameLine();
-                ImGui.Text(_dumpStatus);
-            }
-
-            // Combat system status (always visible)
-            ImGui.Separator();
-            ImGui.Text("=== Combat System ===");
-            ImGui.Text($"InCombat: {_combat.InCombat} | Monsters: {_combat.NearbyMonsterCount} | Target: {_combat.BestTarget?.RenderName ?? "none"}");
-            ImGui.Text($"HP: {_combat.HpPercent:P0} ES: {_combat.EsPercent:P0} Mana: {_combat.ManaPercent:P0}");
-            ImGui.Text($"Action: {_combat.LastAction} | Skill: {_combat.LastSkillAction}");
-            ImGui.Text($"Profile: {(_combat.Profile.Enabled ? _combat.Profile.Positioning.ToString() : "disabled")}");
-            if (_combat.NearestCorpse.HasValue)
-                ImGui.Text($"Nearest corpse: ({_combat.NearestCorpse.Value.X:F0},{_combat.NearestCorpse.Value.Y:F0})");
-
-            // Skill slot config display with scan buttons
-            int slotIdx = 0;
-            foreach (var cfg in Settings.Build.AllSkillSlots)
-            {
-                slotIdx++;
-                if (cfg.Key.Value == Keys.None) continue;
-                var crossStr = cfg.CanCrossTerrain.Value ? " [crosses terrain]" : "";
-                var buffStr = !string.IsNullOrEmpty(cfg.BuffDebuffName.Value) ? $" buff=\"{cfg.BuffDebuffName.Value}\"" : "";
-                ImGui.Text($"  Slot{slotIdx} [{cfg.Key.Value}]: {cfg.Role.Value} pri={cfg.Priority.Value}{crossStr}{buffStr}");
-                ImGui.SameLine();
-                if (ImGui.SmallButton($"Scan##{slotIdx}"))
-                    StartBuffScan(slotIdx - 1);
-            }
-
-            // Buff scanner UI
-            DrawBuffScannerUI();
-
-            // Quick combat test button (sets profile to Aggressive + enabled)
-            if (_mode == _debugMode)
-            {
-                if (!_combat.Profile.Enabled)
-                {
-                    if (ImGui.Button("Enable Combat (Aggressive)"))
-                        _combat.SetProfile(new Systems.CombatProfile { Enabled = true, Positioning = Systems.CombatPositioning.Aggressive });
-                    ImGui.SameLine();
-                    if (ImGui.Button("Enable Combat (Melee)"))
-                        _combat.SetProfile(new Systems.CombatProfile { Enabled = true, Positioning = Systems.CombatPositioning.Melee });
-                    ImGui.SameLine();
-                    if (ImGui.Button("Enable Combat (Ranged)"))
-                        _combat.SetProfile(new Systems.CombatProfile { Enabled = true, Positioning = Systems.CombatPositioning.Ranged });
-                }
-                else
-                {
-                    if (ImGui.Button("Disable Combat"))
-                        _combat.SetProfile(Systems.CombatProfile.Default);
-                }
-            }
-
-            // Exploration map status (always visible)
-            ImGui.Separator();
-            ImGui.Text("=== Exploration ===");
-            if (_exploration.IsInitialized)
-            {
-                var blob = _exploration.ActiveBlob;
-                ImGui.Text($"Blobs: {_exploration.TotalBlobCount} | Active: {_exploration.ActiveBlobIndex}");
-                ImGui.Text($"Total walkable cells: {_exploration.TotalWalkableCells}");
-                if (blob != null)
-                {
-                    ImGui.Text($"Coverage: {blob.Coverage:P1} ({blob.SeenCells.Count}/{blob.WalkableCells.Count})");
-                    ImGui.Text($"Regions: {blob.Regions.Count}");
-
-                    // Show top unexplored regions
-                    int regionShown = 0;
-                    foreach (var region in blob.Regions.OrderBy(r => r.ExploredRatio))
-                    {
-                        if (regionShown >= 5) break;
-                        if (region.ExploredRatio >= 0.8f) continue;
-                        ImGui.TextColored(
-                            new Vector4(1f, 1f - region.ExploredRatio, 0, 1),
-                            $"  R{region.Index}: {region.ExploredRatio:P0} ({region.CellCount} cells) @ ({region.Center.X:F0},{region.Center.Y:F0})");
-                        regionShown++;
-                    }
-                }
-
-                ImGui.Text($"Transitions: {_exploration.KnownTransitions.Count}");
-                foreach (var t in _exploration.KnownTransitions)
-                    ImGui.Text($"  {t.Name} @ ({t.GridPos.X:F0},{t.GridPos.Y:F0}) blob:{t.SourceBlobIndex}→{t.DestBlobIndex}");
-
-                ImGui.Text($"Last: {_exploration.LastAction}");
-
-                if (ImGui.Button("Reinitialize Exploration"))
-                {
-                    var terrainData = GameController.IngameState?.Data?.RawPathfindingData;
-                    var targetingData = GameController.IngameState?.Data?.RawTerrainTargetingData;
-                    if (terrainData != null && GameController.Player != null)
-                    {
-                        var pg = new Vector2(
-                            GameController.Player.GridPosNum.X,
-                            GameController.Player.GridPosNum.Y);
-                        _exploration.Initialize(terrainData, targetingData, pg,
-                            Settings.Build.BlinkRange.Value);
-                    }
-                }
-            }
-            else
-            {
-                ImGui.Text("Not initialized (waiting for area load)");
+                ImGui.TextColored(new Vector4(1f, 0.5f, 0.5f, 1f), "Web server not running — restart plugin");
             }
 
             ImGui.Separator();
+            ImGui.Text($"Mode: {_mode.Name} | Running: {Settings.Running.Value}");
         }
 
         // =================================================================
@@ -1363,28 +1034,23 @@ namespace AutoExile
         private DateTime _lastMinimapIconScan = DateTime.MinValue;
         private const int MinimapIconScanIntervalMs = 2000;
 
-        /// <summary>Discovered minimap icon positions, accessible by modes for navigation.</summary>
-        public IReadOnlyDictionary<long, MinimapIconEntry> KnownMinimapIcons => _knownMinimapIcons;
-
         /// <summary>
         /// Periodic scan of TileEntities for minimap icons. Runs every 2s during mapping.
         /// Tiles load at ~2x network bubble range (~360-400 grid units) as the player moves,
         /// so periodic scanning discovers mechanics well before the entity list does.
-        /// New discoveries are logged to console and appended to the persistent dump file.
         /// </summary>
-        private void ScanMinimapIcons(bool forceFullLog = false)
+        private void ScanMinimapIcons()
         {
             var gc = GameController;
             if (gc?.Player == null) return;
 
-            if (!forceFullLog && (DateTime.Now - _lastMinimapIconScan).TotalMilliseconds < MinimapIconScanIntervalMs)
+            if ((DateTime.Now - _lastMinimapIconScan).TotalMilliseconds < MinimapIconScanIntervalMs)
                 return;
             _lastMinimapIconScan = DateTime.Now;
 
             var tileEntities = gc.IngameState?.Data?.TileEntities;
             if (tileEntities == null) return;
 
-            int newCount = 0;
             foreach (var entity in tileEntities)
             {
                 if (entity?.Path == null) continue;
@@ -1394,7 +1060,7 @@ namespace AutoExile
                     var mic = entity.GetComponent<ExileCore.PoEMemory.Components.MinimapIcon>();
                     if (mic?.Name == null) continue;
 
-                    var entry = new MinimapIconEntry
+                    _knownMinimapIcons[entity.Id] = new MinimapIconEntry
                     {
                         EntityId = entity.Id,
                         IconName = mic.Name,
@@ -1402,67 +1068,15 @@ namespace AutoExile
                         GridPos = entity.GridPosNum,
                         EntityType = entity.Type.ToString(),
                     };
-                    _knownMinimapIcons[entity.Id] = entry;
-                    newCount++;
-
-                    if (!forceFullLog)
-                        LogMessage($"[MinimapIcons] New: {mic.Name} — {entity.Path} @ ({entry.GridPos.X:F0},{entry.GridPos.Y:F0})");
                 }
                 catch { }
             }
-
-            if (forceFullLog || newCount > 0)
-                DumpMinimapIconsToFile(gc, forceFullLog);
         }
 
-        /// <summary>
-        /// Clear known icons on area change so the next scan starts fresh.
-        /// </summary>
         private void ClearMinimapIcons()
         {
             _knownMinimapIcons.Clear();
             _lastMinimapIconScan = DateTime.MinValue;
-        }
-
-        private void DumpMinimapIconsToFile(GameController gc, bool logSummary)
-        {
-            var areaName = gc.Area?.CurrentArea?.Name ?? "Unknown";
-
-            if (logSummary)
-            {
-                var iconCounts = _knownMinimapIcons.Values
-                    .GroupBy(e => e.IconName)
-                    .OrderByDescending(g => g.Count());
-                LogMessage($"[MinimapIcons] {areaName}: {_knownMinimapIcons.Count} icons, {iconCounts.Count()} types");
-                foreach (var g in iconCounts)
-                    LogMessage($"  {g.Key} x{g.Count()} — {g.First().Path}");
-            }
-
-            try
-            {
-                var outputDir = Path.Combine(DirectoryFullName, "Dumps");
-                Directory.CreateDirectory(outputDir);
-                var outputPath = Path.Combine(outputDir, "MinimapIcons.jsonl");
-                var entry = new
-                {
-                    timestamp = DateTime.Now.ToString("o"),
-                    area = areaName,
-                    totalIcons = _knownMinimapIcons.Count,
-                    icons = _knownMinimapIcons.Values.Select(i => new
-                    {
-                        icon = i.IconName,
-                        path = i.Path,
-                        gridX = (int)i.GridPos.X,
-                        gridY = (int)i.GridPos.Y,
-                        type = i.EntityType,
-                    }).ToList(),
-                };
-                var json = System.Text.Json.JsonSerializer.Serialize(entry,
-                    new System.Text.Json.JsonSerializerOptions { WriteIndented = false });
-                var path = outputPath;
-                Task.Run(() => { try { File.AppendAllText(path, json + "\n"); } catch { } });
-            }
-            catch { }
         }
 
         public class MinimapIconEntry
@@ -2232,6 +1846,7 @@ namespace AutoExile
 
             LogMessage($"[AutoExile] Tile scan: {signatures.Count} signatures found in {areaName}");
             WriteTileSignatureLog();
+            WriteTileDump(areaName);
 
             // Save Unique + VeryRare signatures as boss tiles in the map database
             var bossTiles = signatures
@@ -2244,8 +1859,14 @@ namespace AutoExile
                 // Refresh the map list so ★ markers update
                 _mapListPopulated = false;
             }
+
         }
 
+        /// <summary>
+        /// Detect area transition tile clusters near the player.
+        /// Looks for detail names with 20-50 total occurrences where >=40% are near the player.
+        /// These concentrated medium-rarity tiles mark area transitions (e.g., "beachtownnorth").
+        /// </summary>
         private void WriteTileSignatureLog()
         {
             if (_tileSignatures.Count == 0) return;
@@ -2268,89 +1889,184 @@ namespace AutoExile
             LogMessage($"[AutoExile] Tile signatures written to {logPath}");
         }
 
-        private void RenderBossMarker()
+        /// <summary>
+        /// Dump complete tile grid data to JSON for offline analysis.
+        /// Runs on thread pool to avoid blocking the game tick.
+        /// Includes: every tile (position, detail name, path), tile name counts,
+        /// area transitions, player position, map dimensions.
+        /// </summary>
+        private void WriteTileDump(string areaName)
         {
             var gc = GameController;
-            if (gc?.Player == null) return;
+            if (gc?.Player == null || !_tileMap.IsLoaded) return;
 
-            var areaName = gc.Area?.CurrentArea?.Name ?? "";
-            if (string.IsNullOrEmpty(areaName)) return;
+            var terrain = gc.IngameState.Data.Terrain;
+            var memory = gc.Memory;
+            var numCols = (int)terrain.NumCols;
+            var numRows = (int)terrain.NumRows;
 
-            var bossTiles = _mapDatabase.GetBossTiles(areaName);
-            var rushEnabled = Settings.Mapping.RushBoss.Value;
+            TileStructure[] tileData;
+            try { tileData = memory.ReadStdVector<TileStructure>(terrain.TgtArray); }
+            catch { LogMessage("[AutoExile] TileDump: failed to read tile data"); return; }
+            if (tileData == null || tileData.Length == 0) return;
 
-            // Show status text regardless
-            var statusY = 130f;
-            if (rushEnabled)
+            var playerGrid = new System.Numerics.Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
+
+            // Read all tile names on the main thread (memory access required)
+            var tileEntries = new (string Detail, string Path)[tileData.Length];
+            for (int i = 0; i < tileData.Length; i++)
             {
-                if (bossTiles == null || bossTiles.Count == 0)
+                try
                 {
-                    Graphics.DrawText($"Boss Rush: ON — no tile data for '{areaName}'",
-                        new Vector2(100, statusY), SharpDX.Color.OrangeRed);
-                    return;
+                    var tgt = memory.Read<TgtTileStruct>(tileData[i].TgtFilePtr);
+                    tileEntries[i] = (
+                        memory.Read<TgtDetailStruct>(tgt.TgtDetailPtr).name.ToString(memory),
+                        tgt.TgtPath.ToString(memory)
+                    );
                 }
+                catch { tileEntries[i] = ("", ""); }
+            }
 
-                // Try to find boss position from tile map
-                if (!_tileMap.IsLoaded)
+            // Collect area transitions currently visible
+            var transitions = new List<(long Id, string Path, string Name, int X, int Y, bool Targetable)>();
+            foreach (var e in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (e.Type != ExileCore.Shared.Enums.EntityType.AreaTransition) continue;
+                transitions.Add((e.Id, e.Path ?? "", e.RenderName ?? "", (int)e.GridPosNum.X, (int)e.GridPosNum.Y, e.IsTargetable));
+            }
+
+            // Collect pathfinding walkable bounds (scan edges only for speed)
+            int pfMinX = int.MaxValue, pfMaxX = 0, pfMinY = int.MaxValue, pfMaxY = 0;
+            var pfGrid = gc.IngameState.Data.RawPathfindingData;
+            if (pfGrid != null)
+            {
+                for (int y = 0; y < pfGrid.Length; y++)
                 {
-                    Graphics.DrawText("Boss Rush: ON — tile map not loaded",
-                        new Vector2(100, statusY), SharpDX.Color.Yellow);
-                    return;
-                }
-
-                Vector2? bossPos = null;
-                string matchedKey = "";
-                var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
-
-                foreach (var key in bossTiles)
-                {
-                    var positions = _tileMap.GetPositions(key);
-                    if (positions != null && positions.Count > 0)
+                    var row = pfGrid[y];
+                    for (int x = 0; x < row.Length; x++)
                     {
-                        // Tile center offset
-                        bossPos = positions
-                            .OrderBy(p => Vector2.Distance(playerGrid, p))
-                            .First() + new Vector2(11.5f, 11.5f);
-                        matchedKey = key;
-                        break;
+                        if (row[x] > 0)
+                        {
+                            if (x < pfMinX) pfMinX = x;
+                            if (x > pfMaxX) pfMaxX = x;
+                            if (y < pfMinY) pfMinY = y;
+                            if (y > pfMaxY) pfMaxY = y;
+                        }
                     }
                 }
-
-                if (bossPos == null)
-                {
-                    var keyList = string.Join(", ", bossTiles.Select(k =>
-                    {
-                        var slash = k.LastIndexOf('/');
-                        return slash >= 0 ? k[(slash + 1)..] : k;
-                    }));
-                    Graphics.DrawText($"Boss Rush: ON — tile keys not found in this instance [{keyList}]",
-                        new Vector2(100, statusY), SharpDX.Color.OrangeRed);
-                    return;
-                }
-
-                // Draw status text
-                var dist = Vector2.Distance(playerGrid, bossPos.Value);
-                Graphics.DrawText($"Boss Rush: ON — ({bossPos.Value.X:F0}, {bossPos.Value.Y:F0}) dist={dist:F0}",
-                    new Vector2(100, statusY), SharpDX.Color.Gold);
-
-                // Draw world marker
-                var camera = gc.IngameState.Camera;
-                var bossWorld = Systems.Pathfinding.GridToWorld3D(gc, bossPos.Value);
-                Graphics.DrawCircleInWorld(bossWorld, 60f, SharpDX.Color.Gold, 3f);
-                Graphics.DrawCircleInWorld(bossWorld, 30f, SharpDX.Color.Gold, 2f);
-                var bossScreen = camera.WorldToScreen(bossWorld);
-                if (bossScreen.X > -200 && bossScreen.X < 2400)
-                {
-                    Graphics.DrawText($"BOSS ({dist:F0})", bossScreen + new Vector2(-25, -30), SharpDX.Color.Gold);
-                }
             }
-            else if (bossTiles != null && bossTiles.Count > 0)
+
+            var outputDir = Path.Combine(DirectoryFullName, "Dumps");
+            var scanTime = DateTime.Now;
+
+            // Write JSON on background thread
+            Task.Run(() =>
             {
-                // Not rushing but data exists — show subtle indicator
-                Graphics.DrawText($"Boss data available for {areaName} (rush disabled)",
-                    new Vector2(100, statusY), SharpDX.Color.DarkGray);
-            }
+                try
+                {
+                    Directory.CreateDirectory(outputDir);
+                    var filePath = Path.Combine(outputDir, $"TileDump_{areaName.Replace(" ", "_")}_{scanTime:yyyyMMdd_HHmmss}.json");
+
+                    using var stream = File.Create(filePath);
+                    using var writer = new System.Text.Json.Utf8JsonWriter(stream, new System.Text.Json.JsonWriterOptions { Indented = false });
+
+                    writer.WriteStartObject();
+
+                    // Header
+                    writer.WriteString("area", areaName);
+                    writer.WriteString("scanTime", scanTime.ToString("o"));
+                    writer.WriteNumber("playerX", (int)playerGrid.X);
+                    writer.WriteNumber("playerY", (int)playerGrid.Y);
+                    writer.WriteNumber("tileCols", numCols);
+                    writer.WriteNumber("tileRows", numRows);
+                    writer.WriteNumber("gridWidth", numCols * 23);
+                    writer.WriteNumber("gridHeight", numRows * 23);
+
+                    // Walkable bounds
+                    writer.WritePropertyName("walkableBounds");
+                    writer.WriteStartObject();
+                    writer.WriteNumber("minX", pfMinX == int.MaxValue ? 0 : pfMinX);
+                    writer.WriteNumber("maxX", pfMaxX);
+                    writer.WriteNumber("minY", pfMinY == int.MaxValue ? 0 : pfMinY);
+                    writer.WriteNumber("maxY", pfMaxY);
+                    writer.WriteEndObject();
+
+                    // Area transitions
+                    writer.WritePropertyName("areaTransitions");
+                    writer.WriteStartArray();
+                    foreach (var t in transitions)
+                    {
+                        writer.WriteStartObject();
+                        writer.WriteNumber("id", t.Id);
+                        writer.WriteString("path", t.Path);
+                        writer.WriteString("name", t.Name);
+                        writer.WriteNumber("gridX", t.X);
+                        writer.WriteNumber("gridY", t.Y);
+                        writer.WriteBoolean("targetable", t.Targetable);
+                        writer.WriteEndObject();
+                    }
+                    writer.WriteEndArray();
+
+                    // Tile name counts (detail names → count)
+                    var detailCounts = new Dictionary<string, int>();
+                    var pathCounts = new Dictionary<string, int>();
+                    foreach (var (detail, path) in tileEntries)
+                    {
+                        if (!string.IsNullOrEmpty(detail))
+                            detailCounts[detail] = detailCounts.GetValueOrDefault(detail) + 1;
+                        if (!string.IsNullOrEmpty(path))
+                            pathCounts[path] = pathCounts.GetValueOrDefault(path) + 1;
+                    }
+
+                    writer.WritePropertyName("detailCounts");
+                    writer.WriteStartObject();
+                    foreach (var kv in detailCounts.OrderBy(kv => kv.Value))
+                    {
+                        writer.WriteNumber(kv.Key, kv.Value);
+                    }
+                    writer.WriteEndObject();
+
+                    writer.WritePropertyName("pathCounts");
+                    writer.WriteStartObject();
+                    foreach (var kv in pathCounts.OrderBy(kv => kv.Value))
+                    {
+                        writer.WriteNumber(kv.Key, kv.Value);
+                    }
+                    writer.WriteEndObject();
+
+                    // Full tile grid: compact array [index, col, row, detailName, pathName]
+                    // Only include tiles with non-empty names
+                    writer.WritePropertyName("tiles");
+                    writer.WriteStartArray();
+                    for (int i = 0; i < tileEntries.Length; i++)
+                    {
+                        var (detail, path) = tileEntries[i];
+                        if (string.IsNullOrEmpty(detail) && string.IsNullOrEmpty(path)) continue;
+
+                        int col = i % numCols;
+                        int row = i / numCols;
+                        writer.WriteStartArray();
+                        writer.WriteNumberValue(col * 23); // gridX
+                        writer.WriteNumberValue(row * 23); // gridY
+                        writer.WriteStringValue(detail);
+                        writer.WriteStringValue(path);
+                        writer.WriteEndArray();
+                    }
+                    writer.WriteEndArray();
+
+                    writer.WriteEndObject();
+                    writer.Flush();
+
+                    LogMessage($"[AutoExile] Tile dump written: {filePath} ({new FileInfo(filePath).Length / 1024}KB)");
+                }
+                catch (Exception ex)
+                {
+                    LogMessage($"[AutoExile] TileDump write error: {ex.Message}");
+                }
+            });
         }
+
+        private void RenderBossMarker() { }
 
         private void RenderTileSignatures()
         {

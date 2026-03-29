@@ -891,6 +891,57 @@ namespace AutoExile.Systems
             return totalCells > 0 ? weightedSum / totalCells : null;
         }
 
+        /// <summary>
+        /// Snap a target grid position to the nearest walkable cell in the active blob.
+        /// Returns null if no walkable cell within maxDistance, meaning the target
+        /// is in an unreachable area (different blob / behind transition).
+        /// Uses region centers as a spatial index for efficiency.
+        /// </summary>
+        public Vector2? SnapToActiveBlob(Vector2 targetGridPos, float maxDistance = 80f)
+        {
+            var blob = ActiveBlob;
+            if (blob == null) return null;
+
+            var targetCell = new Vector2i((int)targetGridPos.X, (int)targetGridPos.Y);
+
+            // Fast path: target is already in active blob
+            if (blob.WalkableCells.Contains(targetCell))
+                return targetGridPos;
+
+            // Use region centers to narrow the search area
+            float bestDistSq = float.MaxValue;
+            Vector2i bestCell = default;
+            bool found = false;
+
+            float searchRadius = maxDistance + RegionChunkSize; // include regions whose cells might be within range
+
+            foreach (var region in blob.Regions)
+            {
+                if (Vector2.Distance(region.Center, targetGridPos) > searchRadius)
+                    continue;
+
+                foreach (var cell in region.Cells)
+                {
+                    var dx = cell.X - targetGridPos.X;
+                    var dy = cell.Y - targetGridPos.Y;
+                    var distSq = dx * dx + dy * dy;
+                    if (distSq < bestDistSq)
+                    {
+                        bestDistSq = distSq;
+                        bestCell = cell;
+                        found = true;
+                    }
+                }
+            }
+
+            if (!found) return null;
+
+            var actualDist = MathF.Sqrt(bestDistSq);
+            if (actualDist > maxDistance) return null;
+
+            return new Vector2(bestCell.X, bestCell.Y);
+        }
+
         public class Region
         {
             public int Index;

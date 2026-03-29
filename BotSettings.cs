@@ -280,15 +280,6 @@ namespace AutoExile
             [Menu("Portal Key", "Hotkey for portal scroll in-game. Used to open a portal when exiting maps.")]
             public HotkeyNode PortalKey { get; set; } = new HotkeyNode(Keys.F);
 
-            [Menu("Rush Boss", "Rush to boss room first using tile data (requires ★ supported map). Kills boss before exploring/clearing the rest of the map.")]
-            public ToggleNode RushBoss { get; set; } = new ToggleNode(false);
-
-            [Menu("Kill Boss", "Map not complete until boss is killed. Bot navigates to boss tiles and verifies kill. Requires ★ supported map with boss data.")]
-            public ToggleNode KillBoss { get; set; } = new ToggleNode(false);
-
-            [Menu("Boss Kill Radius", "Grid distance around boss tiles to check for unique monster kills.")]
-            public RangeNode<int> BossKillRadius { get; set; } = new RangeNode<int>(70, 30, 150);
-
             [Menu("Min Pack Density", "Minimum nearby monsters to interrupt exploration. Below this, skills fire while walking.")]
             public RangeNode<int> MinPackDensity { get; set; } = new RangeNode<int>(8, 1, 30);
 
@@ -297,6 +288,9 @@ namespace AutoExile
 
             [Menu("Max Detour Distance", "Max grid distance to chase a rare/unique from current path. Beyond this, keep exploring.")]
             public RangeNode<int> MaxDetourDistance { get; set; } = new RangeNode<int>(60, 10, 150);
+
+            [Menu("Min Coverage", "Minimum map exploration % before considering map complete. Set to 0 for pure mechanic farming (rush target → exit).")]
+            public RangeNode<float> MinCoverage { get; set; } = new RangeNode<float>(0.70f, 0f, 1f);
         }
 
         [Submenu(CollapsedByDefault = true)]
@@ -370,6 +364,14 @@ namespace AutoExile
 
             [Menu("Must-Loot Uniques", "Comma-separated unique item names to always pick up regardless of value filtering. Use the web UI to search and add from poe.ninja data.")]
             public TextNode MustLootUniques { get; set; } = new TextNode("");
+
+            // --- Label Toggle Unstick ---
+
+            [Menu("Label Toggle Unstick", "Press Z to cycle loot labels off/on when items exist but labels are stacked off-screen. Allows re-looting after explosions.")]
+            public ToggleNode LabelToggleUnstick { get; set; } = new ToggleNode(true);
+
+            [Menu("Label Toggle Cooldown (s)", "Minimum seconds between label toggle attempts.")]
+            public RangeNode<float> LabelToggleCooldownSeconds { get; set; } = new RangeNode<float>(5f, 2f, 30f);
 
             // --- Misc ---
 
@@ -615,6 +617,9 @@ namespace AutoExile
         [Submenu(CollapsedByDefault = true)]
         public class MechanicsSettings
         {
+            [Menu("Post-Mechanic Settle (s)", "Seconds to wait after a mechanic completes before moving on. Allows loot to drop and be picked up.")]
+            public RangeNode<float> PostMechanicSettleSeconds { get; set; } = new RangeNode<float>(5f, 0f, 30f);
+
             public UltimatumMechanicSettings Ultimatum { get; set; } = new UltimatumMechanicSettings();
             public HarvestMechanicSettings Harvest { get; set; } = new HarvestMechanicSettings();
             public WishesMechanicSettings Wishes { get; set; } = new WishesMechanicSettings();
@@ -649,6 +654,9 @@ namespace AutoExile
 
             [Menu("Crafting Recipes", "Ignore=skip, Optional=click when passing, Required=route toward.")]
             public ListNode CraftingRecipes { get; set; } = MakeInteractableMode();
+
+            [Menu("Memory Tears", "Ignore=skip, Optional=click when passing, Required=route toward. Loot drops ~3s after clicking.")]
+            public ListNode MemoryTears { get; set; } = MakeInteractableMode();
 
             /// <summary>Check if a setting is not Ignore (i.e., Optional or Required).</summary>
             public bool IsEnabled(ListNode setting) => setting.Value != "Ignore";
