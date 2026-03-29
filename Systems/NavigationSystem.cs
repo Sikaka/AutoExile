@@ -67,7 +67,7 @@ namespace AutoExile.Systems
         // Obstacle injection — modes can mark grid positions as blocked (e.g. locked puzzle doors)
         // NavigateTo patches these cells to 0 before running A*, without modifying game memory.
         private readonly List<Vector2> _blockedPositions = new();
-        private const int BlockedRadius = 3; // cells around each blocked position to zero out
+        private const int BlockedRadius = 7; // cells around each blocked position to zero out (covers full puzzle door gap including fringe)
 
         /// <summary>
         /// Set grid positions that A* should treat as impassable.
@@ -77,10 +77,59 @@ namespace AutoExile.Systems
         {
             _blockedPositions.Clear();
             _blockedPositions.AddRange(positions);
+
+            // If navigating and there are blocked positions, check if our path crosses any.
+            // Must check ALL cells along each path segment (not just waypoints) because
+            // path smoothing creates straight lines that skip over blocked areas.
+            if (IsNavigating && CurrentNavPath.Count > 0 && _blockedPositions.Count > 0)
+            {
+                for (int wi = CurrentWaypointIndex; wi < CurrentNavPath.Count - 1; wi++)
+                {
+                    var from = CurrentNavPath[wi].Position;
+                    var to = CurrentNavPath[wi + 1].Position;
+
+                    // Walk the line between waypoints and check each cell
+                    foreach (var bp in _blockedPositions)
+                    {
+                        // Quick bounds check — skip if segment is far from this blocked pos
+                        var minX = Math.Min(from.X, to.X) - BlockedRadius;
+                        var maxX = Math.Max(from.X, to.X) + BlockedRadius;
+                        var minY = Math.Min(from.Y, to.Y) - BlockedRadius;
+                        var maxY = Math.Max(from.Y, to.Y) + BlockedRadius;
+                        if (bp.X < minX || bp.X > maxX || bp.Y < minY || bp.Y > maxY)
+                            continue;
+
+                        // Bresenham line check
+                        int ax = (int)from.X, ay = (int)from.Y;
+                        int bx = (int)to.X, by = (int)to.Y;
+                        int dx = Math.Abs(bx - ax), dy = Math.Abs(by - ay);
+                        int sx = ax < bx ? 1 : -1, sy = ay < by ? 1 : -1;
+                        int err = dx - dy;
+                        int cx = ax, cy = ay;
+                        int bpx = (int)bp.X, bpy = (int)bp.Y;
+
+                        while (true)
+                        {
+                            if (Math.Abs(cx - bpx) <= BlockedRadius && Math.Abs(cy - bpy) <= BlockedRadius)
+                            {
+                                Stop(null);
+                                return;
+                            }
+                            if (cx == bx && cy == by) break;
+                            int e2 = 2 * err;
+                            if (e2 > -dy) { err -= dy; cx += sx; }
+                            if (e2 < dx) { err += dx; cy += sy; }
+                        }
+                    }
+                }
+            }
         }
 
         /// <summary>Clear all blocked positions.</summary>
         public void ClearBlockedPositions() => _blockedPositions.Clear();
+
+        /// <summary>Current blocked positions for debug rendering.</summary>
+        public IReadOnlyList<Vector2> BlockedPositions => _blockedPositions;
 
         // Position history — ring buffer of recent positions for backtrack recovery
         private const int PositionHistorySize = 20;      // ~10 seconds at 0.5s intervals

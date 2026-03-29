@@ -127,6 +127,15 @@ namespace AutoExile.Modes
         private const int MaxDoorClickAttempts = 4;
         private const float DoorRetryDelayMs = 1500f; // wait between door click attempts
 
+        // Puzzle switch/door mapping (learned per zone via before/after observation)
+        private readonly Dictionary<long, HashSet<long>> _switchToDoorMap = new();  // switch → doors it controls
+        private readonly Dictionary<long, long> _doorToSwitchMap = new();           // door → switch that controls it
+        private readonly Dictionary<long, HashSet<long>> _triedSwitchesForDoor = new(); // door → switches already tried
+        private long _pendingSwitchClickId;
+        private long _pendingBlockingDoorId;
+        private Dictionary<long, bool>? _doorStatesBeforeSwitch; // door ID → was targetable (before click)
+        private DateTime _switchClickTime = DateTime.MinValue;
+
         // Izaro fight state
         private bool _izaroWasSeen;
 
@@ -297,6 +306,23 @@ namespace AutoExile.Modes
                 ctx.Combat.Tick(ctx);
             }
 
+            // --- Blocked positions for puzzle doors (must run BEFORE interaction tick) ---
+            // Feed locked puzzle door positions to NavigationSystem so A* routes around them.
+            // Must be set before Interaction.Tick since it may call NavigateTo.
+            if (!inHideoutOrTown)
+            {
+                var blockedPositions = new List<Vector2>();
+                foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+                {
+                    if (entity.IsTargetable &&
+                        entity.Path?.Contains("Puzzle_Parts/Door_", StringComparison.Ordinal) == true)
+                    {
+                        blockedPositions.Add(new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y));
+                    }
+                }
+                ctx.Navigation.SetBlockedPositions(blockedPositions);
+            }
+
             // --- Interaction system (always tick) ---
             var interactionResult = ctx.Interaction.Tick(gc);
 
@@ -369,6 +395,12 @@ namespace AutoExile.Modes
             _failedDoorIds.Clear();
             _doorClickAttempts.Clear();
             _pendingDoorId = 0;
+            _switchToDoorMap.Clear();
+            _doorToSwitchMap.Clear();
+            _triedSwitchesForDoor.Clear();
+            _pendingSwitchClickId = 0;
+            _pendingBlockingDoorId = 0;
+            _doorStatesBeforeSwitch = null;
             _entryPosition = null;
             _entryTransitionIds.Clear();
             _izaroRetreated = false;
@@ -498,6 +530,151 @@ namespace AutoExile.Modes
         {
             return entity.IsTargetable &&
                    entity.Path?.Contains("Puzzle_Parts/Door_", StringComparison.Ordinal) == true;
+        }
+
+        // ── Puzzle switch/door helpers ──
+
+        /// <summary>Snapshot all puzzle door states (ID → IsTargetable) for before/after comparison.</summary>
+        private static Dictionary<long, bool> SnapshotDoorStates(GameController gc)
+        {
+            var snapshot = new Dictionary<long, bool>();
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (entity.Path?.Contains("Puzzle_Parts/Door_", StringComparison.Ordinal) == true)
+                    snapshot[entity.Id] = entity.IsTargetable;
+            }
+            return snapshot;
+        }
+
+        /// <summary>Compare current door states to the pre-click snapshot and record which doors changed.</summary>
+        private void LearnSwitchMapping(GameController gc, long switchId)
+        {
+            if (_doorStatesBeforeSwitch == null) return;
+
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (entity.Path?.Contains("Puzzle_Parts/Door_", StringComparison.Ordinal) != true) continue;
+
+                if (_doorStatesBeforeSwitch.TryGetValue(entity.Id, out var wasClosed))
+                {
+                    bool isClosed = entity.IsTargetable;
+                    if (wasClosed != isClosed)
+                    {
+                        if (!_switchToDoorMap.ContainsKey(switchId))
+                            _switchToDoorMap[switchId] = new HashSet<long>();
+                        _switchToDoorMap[switchId].Add(entity.Id);
+                        _doorToSwitchMap[entity.Id] = switchId;
+                        LabLog($"Learned: switch {switchId} controls door {entity.Id} at ({entity.GridPosNum.X:F0},{entity.GridPosNum.Y:F0}) — now {(isClosed ? "closed" : "open")}");
+                    }
+                }
+            }
+            _doorStatesBeforeSwitch = null;
+        }
+
+        /// <summary>Check if a switch is behind a locked door from the player's perspective.</summary>
+        private static bool IsSwitchBlockedByDoor(Vector2 playerPos, Vector2 switchPos, List<Vector2> lockedDoors)
+        {
+            var dist = Vector2.Distance(playerPos, switchPos);
+            foreach (var doorPos in lockedDoors)
+            {
+                var doorDist = Vector2.Distance(playerPos, doorPos);
+                if (doorDist < dist)
+                {
+                    var toSwitch = switchPos - playerPos;
+                    var toDoor = doorPos - playerPos;
+                    if (toSwitch.LengthSquared() > 0 && toDoor.LengthSquared() > 0 &&
+                        Vector2.Dot(Vector2.Normalize(toSwitch), Vector2.Normalize(toDoor)) > 0.7f)
+                        return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Find the best switch to open a specific blocking door.
+        /// Strategy: known mapping first → nearest untried → reset tried set.
+        /// </summary>
+        private Entity? FindBestSwitchForDoor(GameController gc, long blockingDoorId, Vector2 playerPos)
+        {
+            // Strategy 1: Known mapping — we already learned which switch controls this door
+            if (_doorToSwitchMap.TryGetValue(blockingDoorId, out var knownSwitchId))
+            {
+                // Verify the door is still closed
+                bool doorStillClosed = false;
+                foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+                {
+                    if (entity.Id == blockingDoorId && entity.IsTargetable)
+                    { doorStillClosed = true; break; }
+                }
+                if (!doorStillClosed) return null; // Door already open
+
+                foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+                {
+                    if (entity.Id == knownSwitchId && entity.IsTargetable)
+                    {
+                        LabLog($"Known switch {knownSwitchId} controls door {blockingDoorId}");
+                        return entity;
+                    }
+                }
+            }
+
+            // Strategy 2: Nearest untried, accessible switch
+            var triedSet = _triedSwitchesForDoor.GetValueOrDefault(blockingDoorId);
+
+            var lockedDoors = new List<Vector2>();
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (IsLockedPuzzleDoor(entity))
+                    lockedDoors.Add(new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y));
+            }
+
+            Entity? bestSwitch = null;
+            float bestDist = float.MaxValue;
+
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (!entity.IsTargetable) continue;
+                if (entity.Path?.Contains("Puzzle_Parts/Switch", StringComparison.Ordinal) != true) continue;
+
+                // Skip switches already tried for this door
+                if (triedSet != null && triedSet.Contains(entity.Id)) continue;
+
+                var switchPos = new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y);
+                var dist = Vector2.Distance(playerPos, switchPos);
+
+                if (IsSwitchBlockedByDoor(playerPos, switchPos, lockedDoors)) continue;
+
+                if (dist < bestDist)
+                {
+                    bestDist = dist;
+                    bestSwitch = entity;
+                }
+            }
+
+            // Strategy 3: All accessible switches tried — reset tried set for next attempt
+            if (bestSwitch == null && triedSet != null && triedSet.Count > 0)
+            {
+                LabLog($"All switches tried for door {blockingDoorId} — resetting tried set");
+                _triedSwitchesForDoor.Remove(blockingDoorId);
+            }
+
+            return bestSwitch;
+        }
+
+        /// <summary>Snapshot door states, record as tried, and click the switch.</summary>
+        private void ClickPuzzleSwitch(BotContext ctx, Entity switchEntity, long blockingDoorId)
+        {
+            _doorStatesBeforeSwitch = SnapshotDoorStates(ctx.Game);
+            _pendingSwitchClickId = switchEntity.Id;
+            _pendingBlockingDoorId = blockingDoorId;
+            _switchClickTime = DateTime.Now;
+
+            if (!_triedSwitchesForDoor.ContainsKey(blockingDoorId))
+                _triedSwitchesForDoor[blockingDoorId] = new HashSet<long>();
+            _triedSwitchesForDoor[blockingDoorId].Add(switchEntity.Id);
+
+            ctx.Interaction.InteractWithEntity(switchEntity, ctx.Navigation);
+            LabLog($"Clicking switch {switchEntity.Id} for door {blockingDoorId}");
         }
 
         /// <summary>
@@ -746,7 +923,35 @@ namespace AutoExile.Modes
         {
             var gc = ctx.Game;
 
-            // Find waypoint entity
+            // Hard gate: after any click in this phase, wait 1 second with NO inputs
+            if ((DateTime.Now - _waypointClickTime).TotalMilliseconds < 1000)
+            {
+                StatusText = "Waiting after click...";
+                return;
+            }
+
+            // Step 2: If world map is open, click Aspirant's Trial
+            var worldMap = gc.IngameState.IngameUi.WorldMap;
+            if (worldMap != null && worldMap.IsVisible)
+            {
+                _waypointClicked = false;
+                ClickAspirantTrialWaypoint(ctx, gc);
+                return;
+            }
+
+            // Step 1b: If we clicked the waypoint, poll for the world map to appear (up to 3s)
+            if (_waypointClicked)
+            {
+                if ((DateTime.Now - _waypointClickTime).TotalSeconds < 3.0)
+                {
+                    StatusText = "Waiting for waypoint map to open...";
+                    return; // no inputs — just wait
+                }
+                _waypointClicked = false;
+                LabLog("TravelToPlaza: waypoint map didn't open after 3s, retrying");
+            }
+
+            // Step 1a: Find and click the waypoint entity
             Entity? waypoint = null;
             foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
             {
@@ -763,29 +968,6 @@ namespace AutoExile.Modes
                 return;
             }
 
-            // Check if WorldMap is already open
-            var worldMap = gc.IngameState.IngameUi.WorldMap;
-            if (worldMap != null && worldMap.IsVisible)
-            {
-                _waypointClicked = false; // reset for next time
-                ClickAspirantTrialWaypoint(ctx, gc);
-                return;
-            }
-
-            // After clicking waypoint, wait for the map to open before clicking again
-            if (_waypointClicked)
-            {
-                if ((DateTime.Now - _waypointClickTime).TotalSeconds < 3.0)
-                {
-                    StatusText = "Waiting for waypoint map to open...";
-                    return;
-                }
-                // Map didn't open after 3s — retry
-                _waypointClicked = false;
-                LabLog("TravelToPlaza: waypoint map didn't open after 3s, retrying");
-            }
-
-            // Walk to and click the waypoint
             if (!ctx.Interaction.IsBusy)
             {
                 ctx.Interaction.InteractWithEntity(waypoint, ctx.Navigation);
@@ -801,18 +983,15 @@ namespace AutoExile.Modes
 
         private void ClickAspirantTrialWaypoint(BotContext ctx, GameController gc)
         {
-            if (!ModeHelpers.CanAct(_lastActionTime, ActionCooldownMs)) return;
+            // 1-second gate enforced by the caller — don't need CanAct here,
+            // but double-check anyway to prevent rapid re-clicks
+            if ((DateTime.Now - _waypointClickTime).TotalMilliseconds < 1000) return;
 
-            // Walk the WorldMap UI tree to find the Aspirant's Trial button
-            // From research: the waypoint nodes are at various indices in the tree
-            // We look for a node with text containing "Aspirant" or by PathFromRoot
             var worldMap = gc.IngameState.IngameUi.WorldMap;
             if (worldMap == null) return;
 
-            // Search through visible tab content for the Aspirant's Trial node
-            // The exact path may vary — try to find it by iterating visible elements
-            // PathFromRoot from research: (OpenLeftPanel/WorldMap)37->2->0->1->0->0->1->1->2->0->2->6
-            // Try to navigate this path
+            // Navigate the UI tree to the Aspirant's Trial waypoint node
+            // PathFromRoot: (OpenLeftPanel/WorldMap)37->2->0->1->0->0->1->1->2->0->2->6
             try
             {
                 Element node = worldMap;
@@ -832,8 +1011,9 @@ namespace AutoExile.Modes
 
                     if (BotInput.Click(absPos))
                     {
-                        _lastActionTime = DateTime.Now;
-                        StatusText = "Clicked Aspirant's Trial waypoint";
+                        _waypointClickTime = DateTime.Now; // 1-second gate starts
+                        StatusText = "Clicked Aspirant's Trial — waiting...";
+                        LabLog("TravelToPlaza: clicked Aspirant's Trial waypoint");
                     }
                     return;
                 }
@@ -1135,19 +1315,62 @@ namespace AutoExile.Modes
             var gc = ctx.Game;
             var settings = ctx.Settings.Labyrinth;
 
-            // Feed locked puzzle door positions to NavigationSystem so A* routes around them.
-            // These doors are invisible to the pathfinding grid but block player movement.
+            // (SetBlockedPositions for puzzle doors now runs in main Tick before Interaction.Tick)
+
+            // ── Puzzle door/switch handler ──
+            // Simple state machine: find blocking door → go to switch → click → verify → resume.
+            // This block handles the ENTIRE puzzle flow and returns early until resolved.
             {
-                var blockedPositions = new List<Vector2>();
-                foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+                var playerPosP = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
+
+                // Step 1: If we just clicked a switch, wait for interaction to finish then verify
+                if (_pendingSwitchClickId != 0)
                 {
-                    if (entity.IsTargetable &&
-                        entity.Path?.Contains("Puzzle_Parts/Door_", StringComparison.Ordinal) == true)
+                    if (ctx.Interaction.IsBusy)
                     {
-                        blockedPositions.Add(new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y));
+                        StatusText = "Clicking switch...";
+                        return; // wait for click to complete
                     }
+
+                    // Wait a moment for the game to update door states after the click
+                    if ((DateTime.Now - _switchClickTime).TotalMilliseconds < 1000)
+                    {
+                        StatusText = "Switch clicked — waiting for door state...";
+                        return;
+                    }
+
+                    // Click done — learn mapping and check result
+                    LearnSwitchMapping(gc, _pendingSwitchClickId);
+
+                    bool doorOpened = false;
+                    foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+                    {
+                        if (entity.Id == _pendingBlockingDoorId && !entity.IsTargetable)
+                        { doorOpened = true; break; }
+                    }
+
+                    if (doorOpened)
+                    {
+                        LabLog($"Door {_pendingBlockingDoorId} opened! Clearing failed regions.");
+                        ctx.Exploration.FailedRegions.Clear();
+                        _stuckCount = 0;
+                        _skippedClusters.Clear();
+                    }
+                    else
+                    {
+                        LabLog($"Door {_pendingBlockingDoorId} still closed after switch {_pendingSwitchClickId}");
+                    }
+
+                    _pendingSwitchClickId = 0;
+                    _pendingBlockingDoorId = 0;
+                    _switchClickTime = DateTime.Now; // cooldown before checking for doors again
+                    // Fall through to normal navigation — door may be open now
                 }
-                ctx.Navigation.SetBlockedPositions(blockedPositions);
+
+                // Step 2: Only try to solve puzzle doors when navigation is STUCK.
+                // Don't react to nearby doors proactively — A* can often route around them.
+                // The stuck handler below (stuck recovery section) will find a switch if needed.
+                // Here we only act if the bot has been stuck (3+ recoveries) near a locked door.
             }
 
             // Zone timeout
@@ -1182,176 +1405,35 @@ namespace AutoExile.Modes
                 return;
             }
 
-            // Proactively click doors and switches that are nearby AND reachable
-            // Only click if within interact range — let navigation handle routing to them
+            // Click regular doors (EntityType.Door) that are nearby and reachable
             {
                 var playerPos = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
                 var interactRange = ctx.Settings.InteractRadius.Value;
 
-                Entity? nearestInteractable = null;
-                float nearestDist = float.MaxValue;
-                string interactType = "";
-
                 foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
                 {
-                    if (!entity.IsTargetable) continue;
-                    var path = entity.Path;
-                    if (path == null) continue;
+                    if (!entity.IsTargetable || entity.Type != EntityType.Door) continue;
+                    if (_failedDoorIds.Contains(entity.Id)) continue;
+                    var dist = Vector2.Distance(playerPos, new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y));
+                    if (dist > interactRange) continue;
 
-                    bool isSwitch = path.Contains("Switch_", StringComparison.Ordinal)
-                        && path.Contains("Puzzle_Parts/", StringComparison.Ordinal);
-                    // Only click regular doors (EntityType.Door) — NOT Puzzle_Parts/Door_Closed
-                    // which require levers and can't be clicked directly
-                    bool isDoor = entity.Type == EntityType.Door;
-                    if (!isSwitch && !isDoor) continue;
+                    if ((DateTime.Now - _pendingDoorClickTime).TotalMilliseconds < DoorRetryDelayMs) break;
 
-                    var dist = Vector2.Distance(playerPos,
-                        new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y));
-
-                    // Only click things within interact range (we can actually reach them)
-                    // Skip doors we already tried and failed to open
-                    if (isDoor && _failedDoorIds.Contains(entity.Id)) continue;
-
-                    if (dist < interactRange && dist < nearestDist)
+                    _doorClickAttempts.TryGetValue(entity.Id, out var attempts);
+                    _doorClickAttempts[entity.Id] = attempts + 1;
+                    if (attempts + 1 >= MaxDoorClickAttempts)
                     {
-                        nearestDist = dist;
-                        nearestInteractable = entity;
-                        interactType = isSwitch ? "switch" : "door";
-                    }
-                }
-
-                if (nearestInteractable != null)
-                {
-                    if (interactType == "door")
-                    {
-                        // Check cooldown — don't spam-click doors
-                        if ((DateTime.Now - _pendingDoorClickTime).TotalMilliseconds < DoorRetryDelayMs)
-                        {
-                            StatusText = "Waiting to retry door...";
-                            // Don't return — let navigation continue while waiting
-                        }
-                        else
-                        {
-                            _doorClickAttempts.TryGetValue(nearestInteractable.Id, out var attempts);
-                            _doorClickAttempts[nearestInteractable.Id] = attempts + 1;
-
-                            if (attempts + 1 >= MaxDoorClickAttempts)
-                            {
-                                _failedDoorIds.Add(nearestInteractable.Id);
-                                LabLog($"Door {nearestInteractable.Id} blacklisted after {MaxDoorClickAttempts} attempts");
-                            }
-                            else
-                            {
-                                LabLog($"Clicking door attempt {attempts + 1}/{MaxDoorClickAttempts} (dist={nearestDist:F0})");
-                                ctx.Interaction.InteractWithEntity(nearestInteractable, requireProximity: false);
-                                _pendingDoorClickTime = DateTime.Now;
-                                StatusText = $"Opening door ({attempts + 1}/{MaxDoorClickAttempts})";
-                                return;
-                            }
-                        }
+                        _failedDoorIds.Add(entity.Id);
+                        LabLog($"Door {entity.Id} blacklisted after {MaxDoorClickAttempts} attempts");
                     }
                     else
                     {
-                        // Switches — click immediately
-                        LabLog($"Clicking switch (dist={nearestDist:F0})");
-                        ctx.Interaction.InteractWithEntity(nearestInteractable, requireProximity: false);
-                        StatusText = $"Clicking switch (dist: {nearestDist:F0})";
+                        ctx.Interaction.InteractWithEntity(entity, requireProximity: false);
+                        _pendingDoorClickTime = DateTime.Now;
+                        StatusText = $"Opening door ({attempts + 1}/{MaxDoorClickAttempts})";
                         return;
                     }
-                }
-            }
-
-            // Proactive locked door avoidance: if navigating and a locked puzzle door is near
-            // our remaining path waypoints, divert to an accessible switch before reaching it
-            if (ctx.Navigation.IsNavigating)
-            {
-                var playerPos3 = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
-                bool lockedDoorAhead = false;
-                var navPath = ctx.Navigation.CurrentNavPath;
-                var wpIndex = ctx.Navigation.CurrentWaypointIndex;
-                foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
-                {
-                    if (!IsLockedPuzzleDoor(entity)) continue;
-                    var doorPos = new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y);
-
-                    // Check if any remaining waypoint passes within 15 grid units of this door
-                    for (int wi = wpIndex; wi < navPath.Count; wi++)
-                    {
-                        if (Vector2.Distance(navPath[wi].Position, doorPos) < 15f)
-                        {
-                            lockedDoorAhead = true;
-                            break;
-                        }
-                    }
-                    if (lockedDoorAhead) break;
-                }
-
-                if (lockedDoorAhead)
-                {
-                    // Collect locked door positions to check if switches are behind them
-                    var lockedDoors = new List<Vector2>();
-                    foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
-                    {
-                        if (IsLockedPuzzleDoor(entity))
-                            lockedDoors.Add(new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y));
-                    }
-
-                    // Find nearest switch that's NOT behind a locked door
-                    Entity? divertSwitch = null;
-                    float divertDist = float.MaxValue;
-                    foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
-                    {
-                        if (!entity.IsTargetable) continue;
-                        if (entity.Path?.Contains("Switch_", StringComparison.Ordinal) != true) continue;
-                        var switchPos = new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y);
-                        var dist = Vector2.Distance(playerPos3, switchPos);
-
-                        // Check if any locked door is between us and this switch
-                        bool blocked = false;
-                        foreach (var doorPos in lockedDoors)
-                        {
-                            var doorDist = Vector2.Distance(playerPos3, doorPos);
-                            // Door is between us and switch if: door is closer than switch,
-                            // and door is roughly in the same direction as switch
-                            if (doorDist < dist)
-                            {
-                                var toSwitch = switchPos - playerPos3;
-                                var toDoor = doorPos - playerPos3;
-                                if (toSwitch.LengthSquared() > 0 && toDoor.LengthSquared() > 0)
-                                {
-                                    var dot = Vector2.Dot(
-                                        Vector2.Normalize(toSwitch),
-                                        Vector2.Normalize(toDoor));
-                                    // dot > 0.7 means within ~45 degrees — same direction
-                                    if (dot > 0.7f)
-                                    {
-                                        blocked = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        if (blocked) continue;
-                        if (dist < divertDist)
-                        {
-                            divertDist = dist;
-                            divertSwitch = entity;
-                        }
-                    }
-
-                    if (divertSwitch != null && !ctx.Interaction.IsBusy)
-                    {
-                        LabLog($"Locked door ahead — diverting to unblocked switch (dist={divertDist:F0})");
-                        ctx.Navigation.Stop(gc);
-                        ctx.Interaction.InteractWithEntity(divertSwitch, ctx.Navigation);
-                        StatusText = $"Locked door ahead — going to switch (dist: {divertDist:F0})";
-                        return;
-                    }
-                    else if (divertSwitch == null)
-                    {
-                        LabLog("Locked door ahead but no unblocked switches visible");
-                    }
+                    break;
                 }
             }
 
@@ -1723,7 +1805,7 @@ namespace AutoExile.Modes
                     if (d > 50f) continue;
                     if (entity.Type == EntityType.Door) nearDoors++;
                     if (p.Contains("Puzzle_Parts/Door_")) nearLockedDoors++;
-                    if (p.Contains("Switch_")) nearSwitches++;
+                    if (p.Contains("Puzzle_Parts/Switch")) nearSwitches++;
                 }
                 LabLog($"STUCK recovery #{_stuckCount} at ({stuckPos.X:F0},{stuckPos.Y:F0}) — nearby: doors={nearDoors} locked={nearLockedDoors} switches={nearSwitches} failedDoors={_failedDoorIds.Count}");
 
@@ -1735,49 +1817,40 @@ namespace AutoExile.Modes
                         stuckLockedDoors.Add(new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y));
                 }
 
-                // When stuck, try to find switches not blocked by locked doors
-                Entity? nearestSwitch = null;
-                float bestSwitchDist = float.MaxValue;
+                // When stuck, find the nearest locked door and use learned mappings to pick a switch
+                long stuckBlockingDoorId = 0;
+                float stuckDoorDist = float.MaxValue;
                 foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
                 {
-                    if (!entity.IsTargetable) continue;
-                    if (entity.Path?.Contains("Switch_", StringComparison.Ordinal) != true) continue;
-                    var switchPos = new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y);
-                    var dist = Vector2.Distance(stuckPos, switchPos);
-
-                    // Skip switches behind locked doors
-                    bool blocked = false;
-                    foreach (var doorPos in stuckLockedDoors)
-                    {
-                        var doorDist = Vector2.Distance(stuckPos, doorPos);
-                        if (doorDist < dist)
-                        {
-                            var toSwitch = switchPos - stuckPos;
-                            var toDoor = doorPos - stuckPos;
-                            if (toSwitch.LengthSquared() > 0 && toDoor.LengthSquared() > 0 &&
-                                Vector2.Dot(Vector2.Normalize(toSwitch), Vector2.Normalize(toDoor)) > 0.7f)
-                            {
-                                blocked = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (blocked) continue;
-
-                    if (dist < bestSwitchDist)
-                    {
-                        bestSwitchDist = dist;
-                        nearestSwitch = entity;
-                    }
+                    if (!IsLockedPuzzleDoor(entity)) continue;
+                    var d = Vector2.Distance(stuckPos, new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y));
+                    if (d < stuckDoorDist) { stuckDoorDist = d; stuckBlockingDoorId = entity.Id; }
                 }
+
+                var nearestSwitch = stuckBlockingDoorId != 0
+                    ? FindBestSwitchForDoor(gc, stuckBlockingDoorId, stuckPos)
+                    : null;
 
                 if (nearestSwitch != null && !ctx.Interaction.IsBusy)
                 {
-                    LabLog($"Stuck — navigating to switch (dist={bestSwitchDist:F0})");
+                    var bestSwitchDist = Vector2.Distance(stuckPos,
+                        new Vector2(nearestSwitch.GridPosNum.X, nearestSwitch.GridPosNum.Y));
+                    LabLog($"Stuck — switch {nearestSwitch.Id} for door {stuckBlockingDoorId} (dist={bestSwitchDist:F0})");
                     ctx.Navigation.Stop(gc);
-                    ctx.Interaction.InteractWithEntity(nearestSwitch, ctx.Navigation);
+                    ClickPuzzleSwitch(ctx, nearestSwitch, stuckBlockingDoorId);
                     StatusText = $"Stuck — going to switch (dist: {bestSwitchDist:F0})";
-                    _stuckCount = 0; // reset after taking action
+                    _stuckCount = 0;
+                }
+                else if (_stuckCount >= 3 && ctx.Navigation.IsNavigating)
+                {
+                    // Stuck 3+ times with no switch — mark the current exploration target
+                    // region as failed so ExplorationMap picks a different target.
+                    // This handles unreachable areas (pf=1 fringe corridors, etc.)
+                    ctx.Exploration.MarkRegionFailed(stuckPos);
+                    ctx.Navigation.Stop(gc);
+                    _stuckCount = 0;
+                    LabLog($"Stuck 3x — marking region near ({stuckPos.X:F0},{stuckPos.Y:F0}) as failed");
+                    StatusText = "Marking unreachable region — retargeting";
                 }
                 else if (_exitClusters != null && _stuckCount >= 3)
                 {
@@ -3208,6 +3281,15 @@ namespace AutoExile.Modes
                 hudY += lineH;
             }
 
+            // Puzzle door debug
+            var blockedCount = ctx.Navigation.BlockedPositions.Count;
+            if (blockedCount > 0 || _switchToDoorMap.Count > 0)
+            {
+                g.DrawText($"Blocked positions: {blockedCount} (radius={5}) | Mappings: {_switchToDoorMap.Count}",
+                    new Vector2(hudX, hudY), SharpDX.Color.OrangeRed);
+                hudY += lineH;
+            }
+
             // Entity status
             var entityInfo = new List<string>();
             if (_state.HasFont) entityInfo.Add("Font");
@@ -3248,6 +3330,41 @@ namespace AutoExile.Modes
                 var pos = Pathfinding.GridToWorld3D(gc, _state.IzaroPosition.Value);
                 g.DrawText("IZARO", cam.WorldToScreen(pos) + new Vector2(-18, -25), SharpDX.Color.Red);
                 g.DrawCircleInWorld(pos, 30f, SharpDX.Color.Red, 2f);
+            }
+
+            // Debug: Blocked positions (red boxes showing where A* treats as impassable)
+            foreach (var bp in ctx.Navigation.BlockedPositions)
+            {
+                var bpWorld = Pathfinding.GridToWorld3D(gc, bp);
+                var bpScreen = cam.WorldToScreen(bpWorld);
+                if (bpScreen.X < -200 || bpScreen.X > 2400) continue;
+                g.DrawCircleInWorld(bpWorld, 5f * 10.88f, SharpDX.Color.Red, 2f); // BlockedRadius * GridToWorld
+                g.DrawText("BLOCKED", bpScreen + new Vector2(-25, -15), SharpDX.Color.Red);
+            }
+
+            // Debug: Puzzle doors and switches
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (entity?.Path == null) continue;
+                if (!entity.Path.Contains("Puzzle_Parts/", StringComparison.Ordinal)) continue;
+
+                var ePos = Pathfinding.GridToWorld3D(gc, new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y));
+                var eScreen = cam.WorldToScreen(ePos);
+                if (eScreen.X < -200 || eScreen.X > 2400) continue;
+
+                if (entity.Path.Contains("Door_"))
+                {
+                    var doorColor = entity.IsTargetable ? SharpDX.Color.Red : SharpDX.Color.Green;
+                    var label = entity.IsTargetable ? "LOCKED" : "OPEN";
+                    g.DrawCircleInWorld(ePos, 15f, doorColor, 2f);
+                    g.DrawText(label, eScreen + new Vector2(-18, -25), doorColor);
+                }
+                else if (entity.Path.Contains("Switch"))
+                {
+                    var switchColor = entity.IsTargetable ? SharpDX.Color.Yellow : SharpDX.Color.DarkGray;
+                    g.DrawCircleInWorld(ePos, 10f, switchColor, 2f);
+                    g.DrawText("SWITCH", eScreen + new Vector2(-22, -25), switchColor);
+                }
             }
 
             // Izaro door
