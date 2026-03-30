@@ -7,6 +7,7 @@ using GameOffsets.Native;
 using ImGuiNET;
 using AutoExile.Mechanics;
 using AutoExile.Modes;
+using AutoExile.Modes.BossEncounters;
 using AutoExile.Systems;
 using AutoExile.WebServer;
 using System.IO;
@@ -68,13 +69,13 @@ namespace AutoExile
         public HeistState? HeistState => _heistMode?.State;
 
         // Mode references for ImGui buttons
-        private DebugPathfindingMode? _debugMode;
         private FollowerMode? _followerMode;
         private BlightMode? _blightMode;
         private MappingMode? _mappingMode;
         private SimulacrumMode? _simulacrumMode;
         private HeistMode? _heistMode;
         private LabyrinthMode? _labyrinthMode;
+        private BossMode? _bossMode;
 
         // Area change tracking for tile map reload
         private string _lastAreaName = "";
@@ -147,8 +148,6 @@ namespace AutoExile
             };
 
             RegisterMode(new IdleMode());
-            _debugMode = new DebugPathfindingMode();
-            RegisterMode(_debugMode);
             _followerMode = new FollowerMode();
             RegisterMode(_followerMode);
             _blightMode = new BlightMode();
@@ -161,6 +160,10 @@ namespace AutoExile
             RegisterMode(_heistMode);
             _labyrinthMode = new LabyrinthMode();
             RegisterMode(_labyrinthMode);
+            RegisterMode(new PathBenchmarkMode());
+            _bossMode = new BossMode();
+            _bossMode.Register(new KingEncounter());
+            RegisterMode(_bossMode);
 
             // Register in-map mechanics
             _mechanics.Register(new UltimatumMechanic());
@@ -168,6 +171,9 @@ namespace AutoExile
             _mechanics.Register(new WishesMechanic());
             _mechanics.Register(new EssenceMechanic());
             _mechanics.Register(new RitualMechanic());
+
+            // Populate boss type dropdown
+            Settings.Boss.BossType.SetListValues(_bossMode.EncounterNames.ToList());
 
             // Populate mode dropdown and restore saved selection
             // Save value before SetListValues — it resets Value to first item
@@ -225,6 +231,7 @@ namespace AutoExile
                 _webServer.LootTracker = _lootTracker;
                 _webServer.GemValuation = _gemValuation;
                 _webServer.ScanNearbyMonsters = ScanNearbyMonstersForWebUI;
+                _webServer.GetPlayerBuffs = GetPlayerBuffsForWebUI;
                 _webServer.Start();
             }
 
@@ -261,6 +268,25 @@ namespace AutoExile
                         _ => "Normal"
                     };
                     result.Add((name, rarity, dist));
+                }
+            }
+            catch { }
+            return result;
+        }
+
+        private List<string> GetPlayerBuffsForWebUI()
+        {
+            var result = new List<string>();
+            try
+            {
+                var gc = GameController;
+                if (gc?.Player == null || !gc.InGame) return result;
+                var buffs = gc.Player.Buffs;
+                if (buffs == null) return result;
+                foreach (var buff in buffs)
+                {
+                    if (!string.IsNullOrEmpty(buff.Name) && !result.Contains(buff.Name))
+                        result.Add(buff.Name);
                 }
             }
             catch { }
@@ -441,6 +467,7 @@ namespace AutoExile
             // Sync settings → systems
             _navigation.BlinkRange = Settings.Build.BlinkRange.Value;
             _navigation.DashMinDistance = Settings.Build.DashMinDistance.Value;
+            _navigation.PathMergeThreshold = Settings.Build.PathMergeThreshold.Value;
             BotInput.ActionCooldownMs = Settings.ActionCooldownMs.Value;
             BotInput.WindowRect = GameController.Window.GetWindowRectangleTimeCache;
 
@@ -595,13 +622,20 @@ namespace AutoExile
                 ?? (_mode as HeistMode)?.Phase.ToString()
                 ?? (_mode as LabyrinthMode)?.Phase.ToString()
                 ?? (_mode as FollowerMode)?.State.ToString()
+                ?? (_mode as PathBenchmarkMode)?.IsRunning.ToString()
+                ?? (_mode as BossMode)?.Phase.ToString()
                 ?? "",
                 (_mode as MappingMode)?.Decision
                 ?? (_mode as SimulacrumMode)?.Decision
                 ?? (_mode as HeistMode)?.Decision
                 ?? (_mode as FollowerMode)?.Decision
+                ?? (_mode as PathBenchmarkMode)?.Decision
+                ?? (_mode as BossMode)?.Decision
                 ?? "",
-                (_mode as MappingMode)?.Status ?? "",
+                (_mode as MappingMode)?.Status
+                ?? (_mode as PathBenchmarkMode)?.Status
+                ?? (_mode as BossMode)?.Status
+                ?? "",
                 _navigation, _interaction, _loot);
 
             // Only run full mode logic when running
@@ -1486,6 +1520,8 @@ namespace AutoExile
                     _heistMode.State.DeathCount++;
                 if (!_wasDead && _labyrinthMode != null)
                     _labyrinthMode.State.DeathCount++;
+                if (!_wasDead && _bossMode != null)
+                    _bossMode.IncrementDeathCount();
                 _wasDead = true;
 
                 // Click resurrect button

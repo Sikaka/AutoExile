@@ -18,6 +18,7 @@ namespace AutoExile.Systems
         private DateTime _phaseStartTime;
         private DateTime _lastActionTime;
         private Func<Element, bool>? _mapFilter;
+        private string? _inventoryFragmentPath; // fallback: right-click from inventory if stash has none
         private const float ActionCooldownMs = 400;
         private const float BasePhaseTimeoutSeconds = 30f;
         private const float BasePortalWaitTimeoutSeconds = 10f;
@@ -55,6 +56,13 @@ namespace AutoExile.Systems
         private bool _nodeSelected;
         private int _nodeClickAttempts;
 
+        // Inventory fragment fallback
+        private int _invOpenAttempts;
+        private const int MaxInvOpenAttempts = 5;
+
+        private bool CanAct() =>
+            BotInput.CanAct && (DateTime.Now - _lastActionTime).TotalMilliseconds >= ActionCooldownMs;
+
         // UI element indices for atlas panel
         // Map stash: atlas[3][0][1] — children are InventoryItem elements
         // Device slots: atlas[7][0][2] — 6 slots, occupied slot has ChildCount==2, child[1] is the item
@@ -74,12 +82,13 @@ namespace AutoExile.Systems
         /// The filter receives each InventoryItem element from the map stash
         /// and should return true for the desired map type.
         /// </summary>
-        public bool Start(Func<Element, bool> mapFilter)
+        public bool Start(Func<Element, bool> mapFilter, string? inventoryFragmentPath = null)
         {
             if (_phase != MapDevicePhase.Idle)
                 return false;
 
             _mapFilter = mapFilter;
+            _inventoryFragmentPath = inventoryFragmentPath;
             _phase = MapDevicePhase.NavigateToDevice;
             _phaseStartTime = DateTime.Now;
             _lastActionTime = DateTime.MinValue;
@@ -87,6 +96,7 @@ namespace AutoExile.Systems
             _bestDistSeen = float.MaxValue;
             _nodeSelected = false;
             _nodeClickAttempts = 0;
+            _invOpenAttempts = 0;
             Status = "Starting map creation";
             return true;
         }
@@ -97,6 +107,7 @@ namespace AutoExile.Systems
             Interaction?.Cancel(gc);
             _phase = MapDevicePhase.Idle;
             _mapFilter = null;
+            _inventoryFragmentPath = null;
             TargetMapName = null;
             MinMapTier = 0;
             Status = "Cancelled";
@@ -351,6 +362,60 @@ namespace AutoExile.Systems
 
                 targetMap = item;
                 break;
+            }
+
+            // Fallback: check player inventory for right-clickable fragments (boss invitations, etc.)
+            if (targetMap == null && _inventoryFragmentPath != null)
+            {
+                if (!CanAct()) return MapDeviceResult.InProgress;
+
+                // Ensure inventory panel is open
+                var invPanel = gc.IngameState.IngameUi.InventoryPanel;
+                if (invPanel == null || !invPanel.IsVisible)
+                {
+                    _invOpenAttempts++;
+                    if (_invOpenAttempts > MaxInvOpenAttempts)
+                    {
+                        Status = "[Select] Failed to open inventory panel";
+                        _phase = MapDevicePhase.Idle;
+                        return MapDeviceResult.Failed;
+                    }
+                    BotInput.PressKey(System.Windows.Forms.Keys.I);
+                    _lastActionTime = DateTime.Now;
+                    Status = $"[Select] Opening inventory (attempt {_invOpenAttempts})...";
+                    return MapDeviceResult.InProgress;
+                }
+
+                // Inventory is open — find and right-click a matching fragment
+                bool foundAny = false;
+                var invItems = gc.IngameState.ServerData?.PlayerInventories?[0]?.Inventory?.InventorySlotItems;
+                if (invItems != null)
+                {
+                    foreach (var slotItem in invItems)
+                    {
+                        var item = slotItem.Item;
+                        if (item?.Path == null) continue;
+                        if (!item.Path.Contains(_inventoryFragmentPath, StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        foundAny = true;
+                        var windowRect2 = gc.Window.GetWindowRectangle();
+                        var slotRect = slotItem.GetClientRect();
+                        var absPos2 = new Vector2(windowRect2.X + slotRect.Center.X,
+                            windowRect2.Y + slotRect.Center.Y);
+                        BotInput.RightClick(absPos2);
+                        _lastActionTime = DateTime.Now;
+                        Status = "[Select] Right-clicking fragment from inventory";
+                        return MapDeviceResult.InProgress;
+                    }
+                }
+
+                if (!foundAny)
+                {
+                    Status = $"[Select] No fragments in stash or inventory — out of {_inventoryFragmentPath}";
+                    _phase = MapDevicePhase.Idle;
+                    return MapDeviceResult.Failed;
+                }
             }
 
             if (targetMap == null)

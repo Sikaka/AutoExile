@@ -25,6 +25,12 @@ namespace AutoExile.Systems
         public int BlinkRange { get; set; } = 25; // max blink distance in grid cells
         public float BlinkCostPenalty { get; set; } = 30f; // only blink if walking detour > this
 
+        // Post-smooth merge pass — collapse close walk waypoints on stairs/gradients
+        public int PathMergeThreshold { get; set; } = 8; // 0 = disabled
+
+        // Relaxed pathing — flat-cost A* and permissive smoothing for tight corridors
+        public bool RelaxedPathing { get; set; }
+
         // Dash tracking — prevent spamming movement skills mid-animation
         private bool _dashActive;
         private DateTime _dashStartTime = DateTime.MinValue;
@@ -44,6 +50,16 @@ namespace AutoExile.Systems
 
         // For rendering compatibility — returns grid positions
         public List<Vector2> CurrentPath => CurrentNavPath.Select(w => w.Position).ToList();
+
+        /// <summary>
+        /// Replace the current nav path with a post-processed version (e.g., merge pass).
+        /// Only safe to call immediately after NavigateTo() before Tick() runs.
+        /// </summary>
+        public void ReplaceNavPath(List<NavWaypoint> newPath)
+        {
+            CurrentNavPath = newPath;
+            CurrentWaypointIndex = 0;
+        }
 
         // Stuck detection and recovery (all in grid units)
         private Vector2 _lastPosition; // grid coordinates
@@ -723,8 +739,11 @@ namespace AutoExile.Systems
 
             var sw = System.Diagnostics.Stopwatch.StartNew();
 
+            var relaxed = RelaxedPathing;
+            var minWalkable = relaxed ? 1 : 4;
+
             List<NavWaypoint> rawPath;
-            if (BlinkEnabled)
+            if (BlinkEnabled && !relaxed)
             {
                 var tgtGrid = gc.IngameState.Data.RawTerrainTargetingData;
                 rawPath = Pathfinding.FindPathWithBlinks(
@@ -741,7 +760,8 @@ namespace AutoExile.Systems
             }
             else
             {
-                var simplePath = Pathfinding.FindPath(pfGrid, playerGrid, gridTarget, maxNodes);
+                var simplePath = Pathfinding.FindPath(pfGrid, playerGrid, gridTarget, maxNodes,
+                    flatCost: relaxed);
                 rawPath = simplePath.Select(p => new NavWaypoint(p, WaypointAction.Walk)).ToList();
             }
 
@@ -751,7 +771,10 @@ namespace AutoExile.Systems
             if (rawPath.Count == 0)
                 return false;
 
-            CurrentNavPath = Pathfinding.SmoothNavPath(pfGrid, rawPath);
+            CurrentNavPath = Pathfinding.SmoothNavPath(pfGrid, rawPath, minWalkable);
+            if (PathMergeThreshold > 0)
+                CurrentNavPath = Pathfinding.MergeCloseWaypoints(pfGrid, CurrentNavPath,
+                    PathMergeThreshold, minWalkable);
             CurrentWaypointIndex = 0;
 
             // Forward-trim: skip walk waypoints the player has already passed.

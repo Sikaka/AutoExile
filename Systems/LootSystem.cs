@@ -49,6 +49,11 @@ namespace AutoExile.Systems
         /// <summary>Unique item names that bypass value filtering. Case-insensitive matching.</summary>
         public HashSet<string> MustLootUniques { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
+        // ── Must-loot items (any rarity — mode-specific whitelist) ──
+        /// <summary>Item label names to always pick up. Set by active mode (e.g., boss encounters).
+        /// Bypasses ALL value filtering. Case-insensitive substring match.</summary>
+        public HashSet<string> MustLootItems { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
         /// <summary>
         /// Callback fired when an item is skipped during scan (value filter, cooldown block, etc.)
         /// or when a pickup fails. Args: (itemName, reason, chaosValue).
@@ -175,6 +180,21 @@ namespace AutoExile.Systems
                     if (IgnoreQuestItems && itemEntity is { IsValid: true } &&
                         itemEntity.Path.Contains("/Quest", StringComparison.OrdinalIgnoreCase))
                         continue;
+
+                    // Must-loot items — mode whitelist, bypass all value filtering
+                    if (MustLootItems.Count > 0 && MustLootItems.Any(m =>
+                        itemName.Contains(m, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        _candidates.Add(new LootCandidate
+                        {
+                            Entity = worldItemEntity,
+                            ItemName = itemName,
+                            ChaosValue = 0,
+                            Distance = worldItemEntity.DistancePlayer,
+                        });
+                        LootableCount++;
+                        continue;
+                    }
 
                     // Use inner item for pricing/sizing, fall back to outer entity
                     var priceEntity = (itemEntity is { IsValid: true }) ? itemEntity : worldItemEntity;

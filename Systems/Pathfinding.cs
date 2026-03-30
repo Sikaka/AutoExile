@@ -73,9 +73,10 @@ namespace AutoExile.Systems
         /// All positions in grid coordinates.
         /// Returns a list of grid positions from start to goal, or empty if no path.
         /// </summary>
-        public static List<Vector2> FindPath(int[][] grid, Vector2 gridStart, Vector2 gridEnd, int maxNodes = 200000)
+        public static List<Vector2> FindPath(int[][] grid, Vector2 gridStart, Vector2 gridEnd,
+            int maxNodes = 200000, bool flatCost = false)
         {
-            var result = FindPathInternal(grid, null, gridStart, gridEnd, 0, 0, maxNodes);
+            var result = FindPathInternal(grid, null, gridStart, gridEnd, 0, 0, maxNodes, flatCost);
             return result.Select(w => w.Position).ToList();
         }
 
@@ -105,7 +106,7 @@ namespace AutoExile.Systems
             int[][] pfGrid, int[][]? tgtGrid,
             Vector2 gridStart, Vector2 gridEnd,
             int blinkRange, float blinkCostPenalty,
-            int maxNodes)
+            int maxNodes, bool flatCost = false)
         {
             var sx = (int)gridStart.X;
             var sy = (int)gridStart.Y;
@@ -168,7 +169,7 @@ namespace AutoExile.Systems
                         continue;
                     }
 
-                    var moveCost = baseCost * (6 - cellValue);
+                    var moveCost = flatCost ? baseCost : baseCost * (6 - cellValue);
                     var tentativeG = currentG + moveCost;
                     var key = (nx, ny);
 
@@ -291,7 +292,8 @@ namespace AutoExile.Systems
         /// the player approaches from a few cells back, giving clean blink line-up.
         /// All positions in grid coordinates.
         /// </summary>
-        public static List<NavWaypoint> SmoothNavPath(int[][] grid, List<NavWaypoint> path)
+        public static List<NavWaypoint> SmoothNavPath(int[][] grid, List<NavWaypoint> path,
+            int minWalkable = 4)
         {
             if (path.Count <= 2)
                 return path;
@@ -312,7 +314,7 @@ namespace AutoExile.Systems
                     {
                         var segment = path.GetRange(segStart, segEnd - segStart)
                             .Select(w => w.Position).ToList();
-                        var smoothed = SmoothPath(grid, segment);
+                        var smoothed = SmoothPath(grid, segment, minWalkable);
                         result.AddRange(smoothed.Select(p => new NavWaypoint(p, WaypointAction.Walk)));
                     }
                     else if (segEnd > segStart)
@@ -392,7 +394,7 @@ namespace AutoExile.Systems
         /// where cursor-based movement can clip obstacles.
         /// All positions in grid coordinates.
         /// </summary>
-        public static List<Vector2> SmoothPath(int[][] grid, List<Vector2> path)
+        public static List<Vector2> SmoothPath(int[][] grid, List<Vector2> path, int minWalkable = 4)
         {
             if (path.Count <= 2)
                 return path;
@@ -414,7 +416,7 @@ namespace AutoExile.Systems
                     if (Vector2.Distance(path[current], path[i]) > maxSegmentLength)
                         continue;
 
-                    if (HasLineOfSight(grid, path[current], path[i], rows, cols))
+                    if (HasLineOfSight(grid, path[current], path[i], rows, cols, minWalkable))
                     {
                         farthest = i;
                         break;
@@ -429,6 +431,77 @@ namespace AutoExile.Systems
         }
 
         /// <summary>
+        /// Merge pass: collapse consecutive walk waypoints that are close together.
+        /// Keeps first, last, and blink waypoints. For walk segments, skips intermediate
+        /// waypoints when the accumulated distance from the last kept waypoint is below
+        /// the merge threshold AND there's walkable LOS (at relaxed >= 3 threshold) to
+        /// the next candidate. This eliminates micro-stutter on stairs/gradients where
+        /// the primary smoother's >= 4 LOS check fails.
+        /// </summary>
+        public static List<NavWaypoint> MergeCloseWaypoints(int[][] grid, List<NavWaypoint> path,
+            float mergeThreshold = 8f, int minWalkable = 3)
+        {
+            if (path.Count <= 2) return path;
+
+            var rows = grid.Length;
+            var cols = rows > 0 ? grid[0].Length : 0;
+            var result = new List<NavWaypoint> { path[0] };
+
+            for (int i = 1; i < path.Count; i++)
+            {
+                var wp = path[i];
+                var prev = result[result.Count - 1];
+                var isLast = i == path.Count - 1;
+
+                // Always keep blink waypoints and the final waypoint
+                if (wp.Action == WaypointAction.Blink || isLast)
+                {
+                    result.Add(wp);
+                    continue;
+                }
+
+                // Always keep waypoint before a blink (approach point)
+                if (i + 1 < path.Count && path[i + 1].Action == WaypointAction.Blink)
+                {
+                    result.Add(wp);
+                    continue;
+                }
+
+                var dist = Vector2.Distance(prev.Position, wp.Position);
+
+                // If close to last kept waypoint, try to skip it
+                if (dist < mergeThreshold)
+                {
+                    // Check if we have relaxed LOS to the NEXT waypoint we'd keep
+                    // (look ahead to find it — either next far-enough wp, blink, or end)
+                    var lookAhead = FindNextKeepCandidate(path, i + 1, prev.Position, mergeThreshold);
+                    if (lookAhead < path.Count &&
+                        HasLineOfSight(grid, prev.Position, path[lookAhead].Position, rows, cols, minWalkable))
+                    {
+                        continue; // skip this close waypoint
+                    }
+                }
+
+                result.Add(wp);
+            }
+
+            return result;
+        }
+
+        /// <summary>Find the next waypoint index that would be kept (far enough, blink, or end).</summary>
+        private static int FindNextKeepCandidate(List<NavWaypoint> path, int startIdx,
+            Vector2 anchor, float mergeThreshold)
+        {
+            for (int i = startIdx; i < path.Count; i++)
+            {
+                if (path[i].Action == WaypointAction.Blink) return i;
+                if (i == path.Count - 1) return i;
+                if (Vector2.Distance(anchor, path[i].Position) >= mergeThreshold) return i;
+            }
+            return path.Count;
+        }
+
+        /// <summary>
         /// Check walkable line of sight between two grid positions.
         /// Returns true if all cells along the Bresenham line have pathfinding value >= 4
         /// (no walls or fringe cells). Uses the pathfinding grid, NOT the targeting grid.
@@ -436,10 +509,11 @@ namespace AutoExile.Systems
         public static bool HasLineOfSight(int[][] pfGrid, Vector2 gridA, Vector2 gridB)
         {
             if (pfGrid == null || pfGrid.Length == 0) return false;
-            return HasLineOfSight(pfGrid, gridA, gridB, pfGrid.Length, pfGrid[0].Length);
+            return HasLineOfSight(pfGrid, gridA, gridB, pfGrid.Length, pfGrid[0].Length, 4);
         }
 
-        private static bool HasLineOfSight(int[][] grid, Vector2 a, Vector2 b, int rows, int cols)
+        private static bool HasLineOfSight(int[][] grid, Vector2 a, Vector2 b, int rows, int cols,
+            int minWalkable = 4)
         {
             var ax = (int)a.X;
             var ay = (int)a.Y;
@@ -455,12 +529,9 @@ namespace AutoExile.Systems
             var cx = ax;
             var cy = ay;
 
-            // Require pf >= 4 for LOS — ensures clearance from walls.
-            // Value 3 (mid-gradient) is too close to walls for direct cursor movement
-            // since the player has width and would clip narrow corridors.
             while (cx != bx || cy != by)
             {
-                if (cx < 0 || cx >= cols || cy < 0 || cy >= rows || grid[cy][cx] < 4)
+                if (cx < 0 || cx >= cols || cy < 0 || cy >= rows || grid[cy][cx] < minWalkable)
                     return false;
 
                 var e2 = 2 * err;

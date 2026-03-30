@@ -200,7 +200,7 @@ tr:hover td { background:var(--surface2); }
         <select id="modeSelect" class="mode-select">
           <option>Idle</option><option>Mapping</option><option>Simulacrum</option>
           <option>Blight</option><option>Heist</option><option>Labyrinth</option>
-          <option>Follower</option><option>DebugPathfinding</option>
+          <option>Follower</option><option>Boss</option><option>Path Benchmark</option>
         </select>
         <button class="btn primary" onclick="sendCmd('start')">Start</button>
         <button class="btn danger" onclick="sendCmd('stop')">Stop</button>
@@ -804,7 +804,7 @@ const SKILL_TYPES = {
   warcry:   { label:'Warcry', role:'Enemy', fields:['priority','minNearbyEnemies','minCastIntervalMs'], defaults:{priority:4, minNearbyEnemies:3} },
   summon:   { label:'Summon / Minion', role:'Self', fields:['priority'], defaults:{priority:5, summonRecast:true} },
   corpse:   { label:'Corpse Skill', role:'Corpse', fields:['priority','buffDebuffName'], defaults:{priority:5, onlyWhenBuffMissing:true} },
-  totem:    { label:'Totem', role:'Enemy', fields:['priority','maxTargetRange'], defaults:{priority:6} },
+  totem:    { label:'Totem', role:'Enemy', fields:['priority','minNearbyEnemies','maxTargetRange'], defaults:{priority:6, summonRecast:true, minNearbyEnemies:1} },
   custom:   { label:'Custom', role:null, fields:['role','priority','canCrossTerrain','targetFilter','maxTargetRange','minNearbyEnemies','minCastIntervalMs','onlyWhenBuffMissing','buffDebuffName','onlyOnLowLife','summonRecast'], defaults:{} },
 };
 
@@ -843,6 +843,7 @@ function typeFromConfig(prefix) {
   if (role === 'MovementSkill') return 'blink';
   if (role === 'Corpse') return 'corpse';
   if (role === 'Enemy') {
+    if (S[prefix+'.summonRecast']?.value) return 'totem';
     if (S[prefix+'.onlyWhenBuffMissing']?.value) return 'curse';
     return 'attack';
   }
@@ -892,7 +893,7 @@ function renderAllSettings() {
 
   // Build tab
   const build = makeTabContent('build', true);
-  addSection(build, 'Movement', [['build.blinkRange'],['build.dashMinDistance','0 = disable dash-for-speed']]);
+  addSection(build, 'Movement', [['build.blinkRange'],['build.dashMinDistance','0 = disable dash-for-speed'],['build.pathMergeThreshold','0 = disabled']]);
   addSection(build, 'Combat', [['build.defaultPositioning'],['build.fightRange'],['build.combatRange'],
     ['build.guardHpThreshold'],['build.guardEsThreshold'],['build.vaalMinMonsters'],['build.summonExpectedCount']]);
   build.appendChild(buildEnemyBlacklist());
@@ -929,6 +930,7 @@ function renderAllSettings() {
     ['labyrinth.maxDeaths'],['labyrinth.settleSeconds']]);
   addSection(modes, 'Simulacrum', [['simulacrum.maxDeaths'],['simulacrum.minWaveDelaySeconds'],
     ['simulacrum.waveTimeoutMinutes'],['simulacrum.stashItemThreshold']]);
+  addSection(modes, 'Boss', [['boss.bossType'],['boss.maxDeaths'],['boss.lootSweepTimeoutSeconds'],['boss.portalKey']]);
   addSection(modes, 'Follower', [['follower.leaderName'],['follower.followDistance'],['follower.stopDistance'],
     ['follower.followThroughTransitions'],['follower.enableCombat'],['follower.enableLoot'],['follower.lootNearLeaderOnly']]);
 
@@ -1197,21 +1199,15 @@ function changeSkillType(prefix, newType, configIdx) {
     updateSetting(`${prefix}.role`, typeDef.role);
   }
 
-  // Reset all condition fields to safe defaults, then apply type defaults
+  // Merge resets with type defaults — defaults override resets, single write per key
   const resets = {
     priority: 5, canCrossTerrain: false, onlyWhenBuffMissing: false,
     onlyOnLowLife: false, summonRecast: false, minNearbyEnemies: 0,
     minCastIntervalMs: 0, maxTargetRange: 0,
   };
-  for (const [k, v] of Object.entries(resets)) {
+  const merged = { ...resets, ...(typeDef.defaults || {}) };
+  for (const [k, v] of Object.entries(merged)) {
     if (S[`${prefix}.${k}`]) updateSetting(`${prefix}.${k}`, v);
-  }
-
-  // Apply type-specific defaults
-  if (typeDef.defaults) {
-    for (const [k, v] of Object.entries(typeDef.defaults)) {
-      if (S[`${prefix}.${k}`]) updateSetting(`${prefix}.${k}`, v);
-    }
   }
 
   // Re-render the fields for this type
@@ -1379,6 +1375,59 @@ async function setAltarMod(modId, weight, inputEl) {
   } catch {}
 }
 
+async function scanPlayerBuffs(settingKey) {
+  const inputId = 'input-' + settingKey.replace(/\./g, '-');
+  const input = document.getElementById(inputId);
+  const btn = input?.parentNode?.querySelector('button');
+  if (btn) btn.textContent = 'Scanning...';
+
+  try {
+    const resp = await fetch('/api/player-buffs');
+    const buffs = await resp.json();
+    if (!Array.isArray(buffs) || buffs.length === 0) {
+      if (btn) btn.textContent = 'No buffs found';
+      setTimeout(() => { if (btn) btn.textContent = 'Scan Buffs'; }, 2000);
+      return;
+    }
+
+    // Remove existing dropdown if any
+    const existing = input?.parentNode?.querySelector('.buff-dropdown');
+    if (existing) existing.remove();
+
+    const dropdown = document.createElement('div');
+    dropdown.className = 'buff-dropdown';
+    dropdown.style.cssText = 'position:absolute;z-index:100;background:var(--bg-card);border:1px solid var(--border);border-radius:4px;max-height:200px;overflow-y:auto;width:300px;box-shadow:0 4px 12px rgba(0,0,0,0.3)';
+
+    for (const name of buffs) {
+      const item = document.createElement('div');
+      item.textContent = name;
+      item.style.cssText = 'padding:4px 8px;cursor:pointer;font-size:12px';
+      item.onmouseenter = () => item.style.background = 'var(--bg-hover, #333)';
+      item.onmouseleave = () => item.style.background = '';
+      item.onclick = () => {
+        if (input) input.value = name;
+        updateSetting(settingKey, name);
+        dropdown.remove();
+      };
+      dropdown.appendChild(item);
+    }
+
+    input.parentNode.style.position = 'relative';
+    input.parentNode.appendChild(dropdown);
+
+    // Close on click outside
+    const close = (e) => { if (!dropdown.contains(e.target) && e.target !== btn) { dropdown.remove(); document.removeEventListener('click', close); } };
+    setTimeout(() => document.addEventListener('click', close), 0);
+
+    if (btn) btn.textContent = `${buffs.length} buffs`;
+    setTimeout(() => { if (btn) btn.textContent = 'Scan Buffs'; }, 3000);
+  } catch(e) {
+    console.error('Buff scan failed:', e);
+    if (btn) btn.textContent = 'Error';
+    setTimeout(() => { if (btn) btn.textContent = 'Scan Buffs'; }, 2000);
+  }
+}
+
 function buildField(key, entry, note) {
   const row = document.createElement('div'); row.className='setting-row'; row.dataset.key=key;
   let input = '';
@@ -1404,7 +1453,11 @@ function buildField(key, entry, note) {
       break;
     }
     case 'text':
-      input = `<input type="text" value="${esc(entry.value||'')}" onchange="updateSetting('${key}',this.value)">`;
+      if (key.endsWith('.buffDebuffName')) {
+        input = `<div style="display:flex;gap:4px;align-items:center;flex:1"><input type="text" value="${esc(entry.value||'')}" onchange="updateSetting('${key}',this.value)" style="flex:1" id="input-${key.replace(/\./g,'-')}"><button onclick="scanPlayerBuffs('${key}')" style="white-space:nowrap">Scan Buffs</button></div>`;
+      } else {
+        input = `<input type="text" value="${esc(entry.value||'')}" onchange="updateSetting('${key}',this.value)">`;
+      }
       break;
     case 'hotkey':
       input = `<span class="hotkey-badge">${esc(entry.value||'')}</span>`;

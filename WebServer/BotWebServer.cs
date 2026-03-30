@@ -42,6 +42,9 @@ namespace AutoExile.WebServer
         /// <summary>Delegate to scan nearby hostile monsters. Returns (RenderName, Rarity, GridDistance) tuples. Set by BotCore.</summary>
         public Func<List<(string Name, string Rarity, float Distance)>>? ScanNearbyMonsters { get; set; }
 
+        /// <summary>Delegate to read current player buff names. Set by BotCore.</summary>
+        public Func<List<string>>? GetPlayerBuffs { get; set; }
+
         // Cached terrain data — pushed from BotCore on area change
         private volatile MapTerrainData? _cachedTerrain;
         private long _cachedTerrainAreaHash;
@@ -266,6 +269,9 @@ namespace AutoExile.WebServer
                         break;
                     case "/api/nearby-monsters" when method == "GET":
                         await HandleNearbyMonsters(resp);
+                        break;
+                    case "/api/player-buffs" when method == "GET":
+                        await HandlePlayerBuffs(resp);
                         break;
 
                     default:
@@ -707,6 +713,28 @@ namespace AutoExile.WebServer
                     .ToList();
 
                 await ServeJson(resp, grouped);
+            }
+            catch (Exception ex)
+            {
+                resp.StatusCode = 500;
+                await ServeJson(resp, new { error = ex.Message });
+            }
+        }
+
+        private async Task HandlePlayerBuffs(HttpListenerResponse resp)
+        {
+            var getter = GetPlayerBuffs;
+            if (getter == null)
+            {
+                resp.StatusCode = 503;
+                await ServeJson(resp, new { error = "Not available (bot not running)" });
+                return;
+            }
+
+            try
+            {
+                var buffs = getter();
+                await ServeJson(resp, buffs.OrderBy(b => b).ToList());
             }
             catch (Exception ex)
             {

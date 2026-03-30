@@ -100,6 +100,10 @@ namespace AutoExile
 
         public MechanicsSettings Mechanics { get; set; } = new MechanicsSettings();
 
+        // --- Boss Mode ---
+
+        public BossSettings Boss { get; set; } = new BossSettings();
+
         // =====================================================================
         // Submenu classes
         // =====================================================================
@@ -114,6 +118,9 @@ namespace AutoExile
 
             [Menu("Dash Min Distance", "Min straight-line grid distance ahead before using dash for speed. Too low and dash animation lock is slower than walking. 0 = disable dash-for-speed.")]
             public RangeNode<int> DashMinDistance { get; set; } = new RangeNode<int>(60, 0, 200);
+
+            [Menu("Path Merge Threshold", "Merge consecutive walk waypoints closer than this (grid units). Reduces micro-stutter on stairs/gradients. 0 = disabled. Higher = smoother but may clip tight corners.")]
+            public RangeNode<int> PathMergeThreshold { get; set; } = new RangeNode<int>(8, 0, 20);
 
             // ── Skill Slots ──
             // Configure each skill on your bar: what key it's bound to, what role it plays,
@@ -377,6 +384,22 @@ namespace AutoExile
 
             [Menu("Stash Cooldown (ms)", "Delay between each Ctrl+click when stashing items.")]
             public RangeNode<int> StashItemCooldownMs { get; set; } = new RangeNode<int>(450, 200, 1000);
+        }
+
+        [Submenu(CollapsedByDefault = true)]
+        public class BossSettings
+        {
+            [Menu("Boss Type", "Which boss encounter to farm.")]
+            public ListNode BossType { get; set; } = new ListNode();
+
+            [Menu("Max Deaths", "Abandon run after this many deaths.")]
+            public RangeNode<int> MaxDeaths { get; set; } = new RangeNode<int>(3, 1, 10);
+
+            [Menu("Loot Sweep Timeout (s)", "Max seconds picking up loot after boss kill.")]
+            public RangeNode<float> LootSweepTimeoutSeconds { get; set; } = new RangeNode<float>(15f, 5f, 60f);
+
+            [Menu("Portal Key", "Hotkey for portal scroll to exit boss zone.")]
+            public HotkeyNode PortalKey { get; set; } = new HotkeyNode(Keys.F);
         }
 
         [Submenu(CollapsedByDefault = true)]
