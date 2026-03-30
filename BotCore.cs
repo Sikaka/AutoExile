@@ -818,7 +818,13 @@ namespace AutoExile
             }
             else if (Settings.WebUiEnabled.Value)
             {
-                ImGui.TextColored(new Vector4(1f, 0.5f, 0.5f, 1f), "Web server not running — restart plugin");
+                var errorDetail = _webServer?.LastError;
+                if (!string.IsNullOrEmpty(errorDetail))
+                    ImGui.TextColored(new Vector4(1f, 0.5f, 0.5f, 1f), $"Web server failed: {errorDetail}");
+                else if (_webServer == null)
+                    ImGui.TextColored(new Vector4(1f, 0.5f, 0.5f, 1f), "Web server not created — check WebUiEnabled setting, restart plugin");
+                else
+                    ImGui.TextColored(new Vector4(1f, 0.5f, 0.5f, 1f), "Web server not running — restart plugin");
             }
 
             ImGui.Separator();

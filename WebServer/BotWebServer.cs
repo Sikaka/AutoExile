@@ -18,7 +18,7 @@ namespace AutoExile.WebServer
         private CancellationTokenSource? _cts;
         private Task? _listenTask;
         private Task? _broadcastTask;
-        private readonly int _port;
+        private int _port;
         private readonly bool _networkAccess;
         private readonly Action<string> _log;
 
@@ -86,42 +86,94 @@ namespace AutoExile.WebServer
         {
             if (IsRunning) return;
 
-            try
+            // Try primary port, then fallback ports if in use
+            var portsToTry = new[] { _port, _port + 1, _port + 2 };
+
+            foreach (var port in portsToTry)
             {
-                _cts = new CancellationTokenSource();
-                _listener = new HttpListener();
-
-                // Start with localhost only — always works without admin/netsh
-                _listener.Prefixes.Add($"http://localhost:{_port}/");
-                _listener.Prefixes.Add($"http://127.0.0.1:{_port}/");
-                _listener.Start();
-
-                _log($"Web server started at {Url}");
-
-                // Try adding network access after localhost is already running
-                if (_networkAccess)
+                try
                 {
-                    try
+                    _cts = new CancellationTokenSource();
+                    _listener = new HttpListener();
+
+                    // Always start with localhost only — works without admin/netsh
+                    _listener.Prefixes.Add($"http://localhost:{port}/");
+                    _listener.Prefixes.Add($"http://127.0.0.1:{port}/");
+
+                    // Add network prefix BEFORE Start() if requested — adding after Start()
+                    // can crash the listener on some Windows configurations
+                    if (_networkAccess)
                     {
-                        _listener.Prefixes.Add($"http://+:{_port}/");
-                        _log("Network access enabled (http://+:{_port}/)");
+                        try
+                        {
+                            _listener.Prefixes.Add($"http://+:{port}/");
+                        }
+                        catch (Exception ex)
+                        {
+                            _log($"Network access prefix failed (need admin or netsh urlacl): {ex.Message}");
+                        }
                     }
-                    catch (Exception ex)
+
+                    _listener.Start();
+                    _port = port; // update in case we fell back to an alternate port
+                    _log($"Web server started at http://localhost:{port}/");
+
+                    _listenTask = Task.Run(() => ListenLoop(_cts.Token));
+                    _broadcastTask = Task.Run(() => BroadcastLoop(_cts.Token));
+                    LastError = null;
+                    return;
+                }
+                catch (HttpListenerException hlex)
+                {
+                    _log($"Web server failed on port {port}: {hlex.Message} (ErrorCode={hlex.ErrorCode})");
+                    _listener?.Close();
+                    _listener = null;
+                    _cts?.Dispose();
+                    _cts = null;
+
+                    // If network access caused the failure, retry localhost-only
+                    if (_networkAccess && hlex.ErrorCode == 5) // Access denied
                     {
-                        _log($"Network access failed (need admin or netsh urlacl): {ex.Message}");
-                        _log("Web server still running on localhost.");
+                        _log("Retrying without network access...");
+                        try
+                        {
+                            _cts = new CancellationTokenSource();
+                            _listener = new HttpListener();
+                            _listener.Prefixes.Add($"http://localhost:{port}/");
+                            _listener.Prefixes.Add($"http://127.0.0.1:{port}/");
+                            _listener.Start();
+                            _port = port;
+                            _log($"Web server started at http://localhost:{port}/ (localhost only)");
+                            _listenTask = Task.Run(() => ListenLoop(_cts.Token));
+                            _broadcastTask = Task.Run(() => BroadcastLoop(_cts.Token));
+                            LastError = null;
+                            return;
+                        }
+                        catch
+                        {
+                            _listener?.Close();
+                            _listener = null;
+                            _cts?.Dispose();
+                            _cts = null;
+                        }
                     }
                 }
+                catch (Exception ex)
+                {
+                    _log($"Web server failed on port {port}: {ex.GetType().Name}: {ex.Message}");
+                    _listener?.Close();
+                    _listener = null;
+                    _cts?.Dispose();
+                    _cts = null;
+                }
+            }
 
-                _listenTask = Task.Run(() => ListenLoop(_cts.Token));
-                _broadcastTask = Task.Run(() => BroadcastLoop(_cts.Token));
-            }
-            catch (Exception ex)
-            {
-                _log($"Web server failed to start: {ex.Message}");
-                _listener = null;
-            }
+            LastError = $"All ports failed ({string.Join(", ", portsToTry)})";
+            _log($"Web server: {LastError}. Check if another process uses these ports.");
         }
+
+        /// <summary>Last startup error message, if any. Displayed in ImGui when server isn't running.</summary>
+        public string? LastError { get; private set; }
 
         public void Stop()
         {
@@ -166,10 +218,15 @@ namespace AutoExile.WebServer
                     _ = Task.Run(() => HandleRequest(ctx, ct), ct);
                 }
                 catch (OperationCanceledException) { break; }
-                catch (HttpListenerException) { break; }
+                catch (HttpListenerException hlex)
+                {
+                    _log($"Web server listener stopped: {hlex.Message} (ErrorCode={hlex.ErrorCode})");
+                    LastError = $"Listener crashed: {hlex.Message}";
+                    break;
+                }
                 catch (Exception ex)
                 {
-                    _log($"Web server error: {ex.Message}");
+                    _log($"Web server error: {ex.GetType().Name}: {ex.Message}");
                 }
             }
         }
