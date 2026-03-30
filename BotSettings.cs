@@ -400,6 +400,9 @@ namespace AutoExile
 
             [Menu("Portal Key", "Hotkey for portal scroll to exit boss zone.")]
             public HotkeyNode PortalKey { get; set; } = new HotkeyNode(Keys.F);
+
+            [Menu("Key Drop Value (chaos)", "Assumed chaos value per key drop for profit tracking. Set to the average unidentified value of the target item.")]
+            public RangeNode<int> KeyDropChaosValue { get; set; } = new RangeNode<int>(15, 0, 500);
         }
 
         [Submenu(CollapsedByDefault = true)]

@@ -38,7 +38,10 @@ namespace AutoExile.Modes
         private string _lastAreaName = "";
         private int _deathCount;
         private int _runsCompleted;
-        private int _targetItemsLooted; // count of must-loot items picked up across all runs
+        private int _targetItemsLooted;
+        private DateTime _sessionStartTime;
+        private DateTime _runStartTime;
+        private double _totalRunTimeMs;   // cumulative run time across completed runs
 
         // ── Exit map state ──
         private bool _portalKeyPressed;
@@ -47,6 +50,17 @@ namespace AutoExile.Modes
         public string Status { get; private set; } = "";
         public string Decision { get; private set; } = "";
         public BossPhase Phase => _phase;
+
+        // ── Stats (for web UI) ──
+        public int RunsCompleted => _runsCompleted;
+        public int Deaths => _deathCount;
+        public int TargetItemsLooted => _targetItemsLooted;
+        public double AvgRunTimeSeconds => _runsCompleted > 0 ? (_totalRunTimeMs / _runsCompleted) / 1000.0 : 0;
+        public double RunsPerDrop => _targetItemsLooted > 0 ? (double)_runsCompleted / _targetItemsLooted : 0;
+        public double SessionSeconds => (DateTime.Now - _sessionStartTime).TotalSeconds;
+        public DateTime RunStartTime => _runStartTime;
+        public double ChaosPerHour(int keyDropValue) =>
+            SessionSeconds > 60 ? _targetItemsLooted * keyDropValue / (SessionSeconds / 3600.0) : 0;
 
         public enum BossPhase
         {
@@ -91,8 +105,12 @@ namespace AutoExile.Modes
 
             _deathCount = 0;
             _runsCompleted = 0;
+            _targetItemsLooted = 0;
+            _totalRunTimeMs = 0;
             _mapCompleted = false;
             _portalKeyPressed = false;
+            _sessionStartTime = DateTime.Now;
+            _runStartTime = DateTime.Now;
 
             if (gc.Area.CurrentArea.IsHideout || gc.Area.CurrentArea.IsTown)
             {
@@ -145,8 +163,23 @@ namespace AutoExile.Modes
                 ctx.Navigation.RelaxedPathing = false;
             }
 
-            // Tick interaction system
+            // Tick interaction system + track target item pickups across all phases
+            var hadPendingLoot = _lootTracker.HasPending;
+            var pendingLootName = _lootTracker.PendingItemName;
             var interactionResult = ctx.Interaction.Tick(gc);
+            _lootTracker.HandleResult(interactionResult, ctx);
+
+            if (hadPendingLoot && interactionResult == InteractionResult.Succeeded)
+            {
+                // Check if this was a target item
+                if (_activeEncounter?.MustLootItems is { Count: > 0 } mustLoot &&
+                    !string.IsNullOrEmpty(pendingLootName) &&
+                    mustLoot.Any(m => pendingLootName.Contains(m, StringComparison.OrdinalIgnoreCase)))
+                {
+                    _targetItemsLooted++;
+                    ctx.Log($"[Boss] Target item looted: {pendingLootName} (total: {_targetItemsLooted})");
+                }
+            }
 
             switch (_phase)
             {
@@ -247,6 +280,7 @@ namespace AutoExile.Modes
                     _mapCompleted = true;
                     _phase = BossPhase.ExitMap;
                     _phaseStartTime = DateTime.Now;
+                    _exitPortalAttempts = 0;
                     ctx.Log($"[Boss] {_activeEncounter.Name} failed — exiting");
                     break;
             }
@@ -264,6 +298,7 @@ namespace AutoExile.Modes
             {
                 _phase = BossPhase.ExitMap;
                 _phaseStartTime = DateTime.Now;
+                _exitPortalAttempts = 0;
                 ctx.Log("[Boss] Loot sweep timeout — exiting");
                 return;
             }
@@ -275,25 +310,15 @@ namespace AutoExile.Modes
                 _lastLootScan = DateTime.Now;
             }
 
-            // Handle pending pickup results
+            // Handle pending pickup
             if (ctx.Interaction.IsBusy)
             {
-                var hadPending = _lootTracker.HasPending;
-                var pendingName = _lootTracker.PendingItemName;
-                _lootTracker.HandleResult(interactionResult, ctx);
-                if (hadPending && interactionResult == InteractionResult.Succeeded)
+                if (interactionResult == InteractionResult.Succeeded)
                 {
-                    // Track must-loot items (e.g., Prismatic Jewel)
-                    if (_activeEncounter?.MustLootItems is { Count: > 0 } mustLoot &&
-                        mustLoot.Any(m => pendingName.Contains(m, StringComparison.OrdinalIgnoreCase)))
-                    {
-                        _targetItemsLooted++;
-                        ctx.Log($"[Boss] Target item looted: {pendingName} (total: {_targetItemsLooted})");
-                    }
                     ctx.Loot.Scan(gc);
                     _lastLootScan = DateTime.Now;
                 }
-                Status = $"Looting: {pendingName}";
+                Status = $"Looting: {_lootTracker.PendingItemName}";
                 return;
             }
 
@@ -325,10 +350,13 @@ namespace AutoExile.Modes
             // No more loot — exit
             _phase = BossPhase.ExitMap;
             _phaseStartTime = DateTime.Now;
+            _exitPortalAttempts = 0;
             ctx.Log("[Boss] Loot sweep done — exiting");
         }
 
         // ── Exit map ──
+
+        private int _exitPortalAttempts;
 
         private void TickExitMap(BotContext ctx, GameController gc)
         {
@@ -357,9 +385,22 @@ namespace AutoExile.Modes
             var portal = FindExitPortal(gc);
             if (portal != null)
             {
-                if (!ctx.Interaction.IsBusy)
-                    ctx.Interaction.InteractWithEntity(portal, ctx.Navigation);
-                Status = $"Clicking exit portal ({ctx.Interaction.Status})";
+                if (ctx.Interaction.IsBusy)
+                {
+                    Status = $"Clicking exit portal ({ctx.Interaction.Status})";
+                    return;
+                }
+
+                // Check if previous attempt failed
+                if (!string.IsNullOrEmpty(ctx.Interaction.LastFailReason))
+                {
+                    _exitPortalAttempts++;
+                    ctx.Log($"[Boss] Portal click failed: {ctx.Interaction.LastFailReason} (attempt {_exitPortalAttempts})");
+                }
+
+                // Retry — start new interaction
+                ctx.Interaction.InteractWithEntity(portal, ctx.Navigation);
+                Status = $"Clicking exit portal (attempt {_exitPortalAttempts + 1})";
                 return;
             }
 
@@ -416,10 +457,12 @@ namespace AutoExile.Modes
             {
                 if (_mapCompleted)
                 {
+                    _totalRunTimeMs += (DateTime.Now - _runStartTime).TotalMilliseconds;
                     _runsCompleted++;
                     _mapCompleted = false;
+                    _runStartTime = DateTime.Now;
                     StartHideoutFlow(ctx);
-                    ctx.Log($"[Boss] Run {_runsCompleted} complete — starting next");
+                    ctx.Log($"[Boss] Run {_runsCompleted} complete ({AvgRunTimeSeconds:F0}s avg) — starting next");
                 }
                 else if (_deathCount > 0 && _deathCount < ctx.Settings.Boss.MaxDeaths.Value)
                 {
@@ -430,7 +473,9 @@ namespace AutoExile.Modes
                 }
                 else if (_deathCount >= ctx.Settings.Boss.MaxDeaths.Value)
                 {
+                    _totalRunTimeMs += (DateTime.Now - _runStartTime).TotalMilliseconds;
                     _runsCompleted++;
+                    _runStartTime = DateTime.Now;
                     StartHideoutFlow(ctx);
                     ctx.Log("[Boss] Too many deaths — starting new run");
                 }

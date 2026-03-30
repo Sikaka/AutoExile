@@ -1011,6 +1011,17 @@ namespace AutoExile
                         && _simulacrumMode.Phase >= SimPhase.FindMonolith && _simulacrumMode.Phase <= SimPhase.ExitMap
                         ? (DateTime.Now - _simulacrumMode.State.RunStartedAt).ToString(@"m\:ss") : "",
 
+                    // Boss stats
+                    BossRuns = _bossMode?.RunsCompleted ?? 0,
+                    BossDeaths = _bossMode?.Deaths ?? 0,
+                    BossDrops = _bossMode?.TargetItemsLooted ?? 0,
+                    BossAvgRunTime = Sanitize((float)(_bossMode?.AvgRunTimeSeconds ?? 0)),
+                    BossRunsPerDrop = Sanitize((float)(_bossMode?.RunsPerDrop ?? 0)),
+                    BossChaosPerHour = Sanitize((float)(_bossMode?.ChaosPerHour(Settings.Boss.KeyDropChaosValue.Value) ?? 0)),
+                    BossRunTime = _bossMode != null && _mode == _bossMode
+                        && _bossMode.Phase >= BossMode.BossPhase.InBossZone && _bossMode.Phase <= BossMode.BossPhase.ExitMap
+                        ? (DateTime.Now - _bossMode.RunStartTime).ToString(@"m\:ss") : "",
+
                     // Labyrinth stats
                     LabIzaroEncounters = _labyrinthMode?.State.IzaroEncounterCount ?? 0,
                     LabDeaths = _labyrinthMode?.State.DeathCount ?? 0,
@@ -1506,7 +1517,10 @@ namespace AutoExile
 
         // Death tracking for revive
         private bool _wasDead;
+        private DateTime _deathTime;
+        private int _reviveDelayMs;
         private DateTime _lastReviveClickAt = DateTime.MinValue;
+        private readonly Random _rng = new();
 
         private bool HandleInterrupts()
         {
@@ -1528,9 +1542,16 @@ namespace AutoExile
                     _labyrinthMode.State.DeathCount++;
                 if (!_wasDead && _bossMode != null)
                     _bossMode.IncrementDeathCount();
+                if (!_wasDead)
+                    _deathTime = DateTime.Now;
                 _wasDead = true;
 
-                // Click resurrect button
+                // Click resurrect button (brief delay after death to avoid instant clicks)
+                var reviveDelayMs = _reviveDelayMs == 0
+                    ? _reviveDelayMs = 500 + _rng.Next(500) // randomize 500-1000ms on first death
+                    : _reviveDelayMs;
+                if ((DateTime.Now - _deathTime).TotalMilliseconds < reviveDelayMs)
+                    return false;
                 if (BotInput.CanAct && (DateTime.Now - _lastReviveClickAt).TotalMilliseconds > 1000)
                 {
                     try
@@ -1555,6 +1576,7 @@ namespace AutoExile
             }
 
             _wasDead = false;
+            _reviveDelayMs = 0; // re-randomize on next death
             return true;
         }
 

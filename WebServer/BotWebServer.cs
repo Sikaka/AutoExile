@@ -892,6 +892,15 @@ namespace AutoExile.WebServer
         public string SimAvgRunTime { get; init; } = "";
         public string SimRunTime { get; init; } = "";
 
+        // Boss stats (populated only when mode is Boss)
+        public int BossRuns { get; init; }
+        public int BossDeaths { get; init; }
+        public int BossDrops { get; init; }
+        public float BossAvgRunTime { get; init; }
+        public float BossRunsPerDrop { get; init; }
+        public float BossChaosPerHour { get; init; }
+        public string BossRunTime { get; init; } = "";
+
         // Labyrinth stats (populated only when mode is Labyrinth)
         public int LabIzaroEncounters { get; init; }
         public int LabDeaths { get; init; }

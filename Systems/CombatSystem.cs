@@ -179,31 +179,36 @@ namespace AutoExile.Systems
             RefreshSkillBar(gc, settings);
 
             // Flasks (always check, even out of combat)
+            // Only one input per tick — prevent concurrent async input tasks
             TickFlasks(gc, settings);
+            if (!BotInput.CanAct) return false;
 
             // Self-cast skills (buffs, guards, summons) fire regardless of InCombat.
             // They don't move the cursor, so they're safe during navigation/interaction.
             // Targeted skills still require InCombat (monsters in range + reachable).
             bool usedSkill = TickSelfSkills(gc, settings);
+            if (usedSkill) return true; // gate consumed, don't fire more this tick
 
             if (!InCombat)
             {
-                LastAction = usedSkill ? LastAction : "no threats";
-                return usedSkill;
+                LastAction = "no threats";
+                return false;
             }
 
             // Execute targeted skills (Enemy/Corpse roles need combat context)
-            usedSkill |= TickSkills(gc, settings);
+            if (!BotInput.CanAct) return false;
+            usedSkill = TickSkills(gc, settings);
+            if (usedSkill) return true;
 
             // Track attack connectivity — detect unreachable monsters
             TickAttackConnectivity(gc);
 
             // Positioning — uses cursor + move key (same as NavigationSystem)
             // Suppressed when another system is navigating (e.g. loot pickup)
-            if (!SuppressPositioning)
+            if (!SuppressPositioning && BotInput.CanAct)
                 TickPositioning(ctx);
 
-            return usedSkill;
+            return false;
         }
 
         /// <summary>Reset state (call on mode exit).</summary>

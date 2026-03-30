@@ -275,6 +275,18 @@ tr:hover td { background:var(--surface2); }
         <div class="stat"><div class="stat-label">Selected</div><div id="labSelectedGem" class="stat-value" style="font-size:12px">-</div></div>
       </div>
     </div>
+    <div id="bossCard" class="card" style="display:none">
+      <h2>Boss Farm</h2>
+      <div class="status-grid">
+        <div class="stat"><div class="stat-label">Runs</div><div id="bossRuns" class="stat-value accent">0</div></div>
+        <div class="stat"><div class="stat-label">Deaths</div><div id="bossDeaths" class="stat-value">0</div></div>
+        <div class="stat"><div class="stat-label">Run Time</div><div id="bossRunTime" class="stat-value" style="font-size:16px">--</div></div>
+        <div class="stat"><div class="stat-label">Key Drops</div><div id="bossDrops" class="stat-value orange">0</div></div>
+        <div class="stat"><div class="stat-label">Runs/Drop</div><div id="bossRunsPerDrop" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Avg Run</div><div id="bossAvgRun" class="stat-value" style="font-size:16px">--</div></div>
+        <div class="stat"><div class="stat-label">Chaos/hr</div><div id="bossChaosHr" class="stat-value orange">0</div></div>
+      </div>
+    </div>
   </div>
 
   <div class="card">
@@ -453,6 +465,23 @@ function updateDashboard(s) {
     document.getElementById('labSelectedGem').textContent = s.labSelectedGem || '-';
   } else {
     labCard.style.display = 'none';
+  }
+
+  // Boss stats — show card only when mode is Boss
+  const bossCard = document.getElementById('bossCard');
+  if (s.mode === 'Boss') {
+    bossCard.style.display = '';
+    document.getElementById('bossRuns').textContent = s.bossRuns;
+    document.getElementById('bossDeaths').textContent = s.bossDeaths;
+    document.getElementById('bossDeaths').style.color = s.bossDeaths > 0 ? '#ff4444' : '';
+    document.getElementById('bossRunTime').textContent = s.bossRunTime || '--';
+    document.getElementById('bossDrops').textContent = s.bossDrops;
+    document.getElementById('bossDrops').style.color = s.bossDrops > 0 ? '#4CAF50' : '';
+    document.getElementById('bossRunsPerDrop').textContent = s.bossRunsPerDrop > 0 ? s.bossRunsPerDrop.toFixed(1) : '-';
+    document.getElementById('bossAvgRun').textContent = s.bossAvgRunTime > 0 ? Math.round(s.bossAvgRunTime) + 's' : '--';
+    document.getElementById('bossChaosHr').textContent = s.bossChaosPerHour > 0 ? Math.round(s.bossChaosPerHour) + 'c' : '0';
+  } else {
+    bossCard.style.display = 'none';
   }
 
   const sel = document.getElementById('modeSelect');
@@ -930,7 +959,7 @@ function renderAllSettings() {
     ['labyrinth.maxDeaths'],['labyrinth.settleSeconds']]);
   addSection(modes, 'Simulacrum', [['simulacrum.maxDeaths'],['simulacrum.minWaveDelaySeconds'],
     ['simulacrum.waveTimeoutMinutes'],['simulacrum.stashItemThreshold']]);
-  addSection(modes, 'Boss', [['boss.bossType'],['boss.maxDeaths'],['boss.lootSweepTimeoutSeconds'],['boss.portalKey']]);
+  addSection(modes, 'Boss', [['boss.bossType'],['boss.maxDeaths'],['boss.lootSweepTimeoutSeconds'],['boss.portalKey'],['boss.keyDropChaosValue']]);
   addSection(modes, 'Follower', [['follower.leaderName'],['follower.followDistance'],['follower.stopDistance'],
     ['follower.followThroughTransitions'],['follower.enableCombat'],['follower.enableLoot'],['follower.lootNearLeaderOnly']]);
 
