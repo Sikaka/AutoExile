@@ -60,6 +60,9 @@ namespace AutoExile.Systems
         private int _invOpenAttempts;
         private const int MaxInvOpenAttempts = 5;
 
+        // Portal spawn settle
+        private DateTime? _portalFirstSeenAt;
+
         private bool CanAct() =>
             BotInput.CanAct && (DateTime.Now - _lastActionTime).TotalMilliseconds >= ActionCooldownMs;
 
@@ -97,6 +100,7 @@ namespace AutoExile.Systems
             _nodeSelected = false;
             _nodeClickAttempts = 0;
             _invOpenAttempts = 0;
+            _portalFirstSeenAt = null;
             Status = "Starting map creation";
             return true;
         }
@@ -574,8 +578,23 @@ namespace AutoExile.Systems
             var portal = FindNearestPortal(gc);
             if (portal != null)
             {
+                // Wait 1s after first portal appears for all 6 to spawn,
+                // so we can pick the best (southmost) one
+                if (!_portalFirstSeenAt.HasValue)
+                {
+                    _portalFirstSeenAt = DateTime.Now;
+                    Status = "Portals appearing — waiting for all to spawn...";
+                    return MapDeviceResult.InProgress;
+                }
+                if ((DateTime.Now - _portalFirstSeenAt.Value).TotalMilliseconds < 1000)
+                {
+                    Status = "Portals appearing — waiting for all to spawn...";
+                    return MapDeviceResult.InProgress;
+                }
+
                 _phase = MapDevicePhase.EnterPortal;
                 _phaseStartTime = DateTime.Now;
+                _portalFirstSeenAt = null;
                 Status = "Portals found — entering";
                 return MapDeviceResult.InProgress;
             }
@@ -684,8 +703,9 @@ namespace AutoExile.Systems
 
         private Entity? FindNearestPortal(GameController gc)
         {
+            // Prefer lowest grid Y (south on screen / behind map device in isometric view).
             Entity? best = null;
-            float bestDist = float.MaxValue;
+            float bestY = float.MaxValue;
 
             foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
             {
@@ -693,9 +713,9 @@ namespace AutoExile.Systems
                     continue;
                 if (!entity.IsTargetable)
                     continue;
-                if (entity.DistancePlayer < bestDist)
+                if (entity.GridPosNum.Y < bestY)
                 {
-                    bestDist = entity.DistancePlayer;
+                    bestY = entity.GridPosNum.Y;
                     best = entity;
                 }
             }

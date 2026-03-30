@@ -819,10 +819,10 @@ namespace AutoExile.Systems
                     return false;
             }
 
-            // Summon recast — skip if enough minions deployed
+            // Summon recast — skip if enough minions deployed nearby
             if (entry.SummonRecast && entry.Skill != null)
             {
-                if (!ShouldResummon(entry.Skill, settings))
+                if (!ShouldResummon(entry.Skill, entry.Role, settings))
                     return false;
             }
 
@@ -929,13 +929,40 @@ namespace AutoExile.Systems
         // Summon checking
         // ═══════════════════════════════════════════════════
 
-        private bool ShouldResummon(ActorSkill skill, BotSettings.BuildSettings settings)
+        private bool ShouldResummon(ActorSkill skill, SkillRole role, BotSettings.BuildSettings settings)
         {
             try
             {
                 var deployed = skill.DeployedObjects;
                 if (deployed == null) return true;
-                return deployed.Count < settings.SummonExpectedCount.Value;
+
+                var expected = settings.SummonExpectedCount.Value;
+
+                // Below count — always resummon
+                if (deployed.Count < expected)
+                    return true;
+
+                // At cap — for targeted summons (totems/ballistae), check if ALL
+                // are near the combat target. If any are out of range, recast to
+                // place fresh totems on top of the current target.
+                if (role == SkillRole.Enemy)
+                {
+                    var referencePos = BestTarget?.GridPosNum ?? PackCenter;
+                    float effectiveRange = settings.CombatRange.Value;
+                    foreach (var d in deployed)
+                    {
+                        try
+                        {
+                            if (d.Entity != null &&
+                                Vector2.Distance(d.Entity.GridPosNum, referencePos) > effectiveRange)
+                                return true; // at least one totem is out of range — recast
+                        }
+                        catch { }
+                    }
+                    return false; // all totems are in range
+                }
+
+                return false;
             }
             catch
             {

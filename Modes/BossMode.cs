@@ -208,35 +208,50 @@ namespace AutoExile.Modes
 
         // ── Hideout ──
 
-        private void StartHideoutFlow(BotContext ctx)
+        private void StartHideoutFlow(BotContext ctx, bool resetRun = true)
         {
             _phase = BossPhase.InHideout;
             _phaseStartTime = DateTime.Now;
             _mapCompleted = false;
             _portalKeyPressed = false;
-            _deathCount = 0;
-            _activeEncounter?.Reset();
-            ctx.Loot.MustLootItems.Clear();
 
-            // Stash filter: keep boss fragments in inventory, stash everything else
-            Func<ExileCore.PoEMemory.MemoryObjects.ServerInventory.InventSlotItem, bool>? stashFilter = null;
-            if (_activeEncounter!.InventoryFragmentPath != null)
+            // Re-read boss type selection (user may have changed it between runs)
+            var selectedName = ctx.Settings.Boss.BossType.Value;
+            if (!string.IsNullOrEmpty(selectedName) && _encounters.TryGetValue(selectedName, out var newEncounter))
             {
-                var fragPath = _activeEncounter.InventoryFragmentPath;
-                stashFilter = item =>
+                if (_activeEncounter != newEncounter)
                 {
-                    // Return true = stash this item, false = keep it
-                    var path = item.Item?.Path;
-                    if (path != null && path.Contains(fragPath, StringComparison.OrdinalIgnoreCase))
-                        return false; // keep fragments
-                    return true; // stash everything else
-                };
+                    ctx.Log($"[Boss] Switched encounter: {_activeEncounter?.Name} → {newEncounter.Name}");
+                    _activeEncounter = newEncounter;
+                    resetRun = true; // force reset when switching encounters
+                }
             }
 
-            _hideoutFlow.Start(_activeEncounter.MapFilter,
-                stashItemFilter: stashFilter,
+            if (resetRun)
+            {
+                _deathCount = 0;
+                _activeEncounter?.Reset();
+            }
+            ctx.Loot.MustLootItems.Clear();
+
+            _hideoutFlow.Start(_activeEncounter!.MapFilter,
+                stashItemFilter: GetStashFilter(),
                 inventoryFragmentPath: _activeEncounter.InventoryFragmentPath);
             Status = $"Hideout — preparing {_activeEncounter.Name}";
+        }
+
+        /// <summary>Stash filter that keeps boss fragments in inventory.</summary>
+        private Func<ExileCore.PoEMemory.MemoryObjects.ServerInventory.InventSlotItem, bool>? GetStashFilter()
+        {
+            if (_activeEncounter?.InventoryFragmentPath == null) return null;
+            var fragPath = _activeEncounter.InventoryFragmentPath;
+            return item =>
+            {
+                var path = item.Item?.Path;
+                if (path != null && path.Contains(fragPath, StringComparison.OrdinalIgnoreCase))
+                    return false; // keep fragments
+                return true; // stash everything else
+            };
         }
 
         private void TickHideout(BotContext ctx)
@@ -246,9 +261,7 @@ namespace AutoExile.Modes
 
             if (signal == HideoutSignal.PortalTimeout)
             {
-                _phase = BossPhase.InHideout;
-                _phaseStartTime = DateTime.Now;
-                _hideoutFlow.Start(_activeEncounter!.MapFilter);
+                StartHideoutFlow(ctx, resetRun: false);
                 Status = "No portal found — retrying";
             }
         }
@@ -344,6 +357,16 @@ namespace AutoExile.Modes
             if (ctx.Loot.ShouldToggleLabels(gc))
             {
                 ctx.Loot.StartLabelToggle(gc);
+                return;
+            }
+
+            // Wait for loot to drop — don't exit until at least half the timeout has passed
+            // (labels need time to appear after boss death)
+            var sweepElapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
+            var minWait = Math.Min(timeout / 2, 3);
+            if (sweepElapsed < minWait)
+            {
+                Status = $"Waiting for loot ({sweepElapsed:F1}s / {timeout:F0}s)";
                 return;
             }
 

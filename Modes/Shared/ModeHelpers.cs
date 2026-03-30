@@ -12,18 +12,20 @@ namespace AutoExile.Modes.Shared
     public static class ModeHelpers
     {
         /// <summary>
-        /// Find the nearest targetable TownPortal entity.
+        /// Find the best targetable TownPortal entity.
+        /// Prefers the portal with lowest grid Y (south on screen / behind map device in isometric view).
+        /// This avoids portals that visually block the map device.
         /// </summary>
         public static Entity? FindNearestPortal(GameController gc)
         {
             Entity? best = null;
-            float bestDist = float.MaxValue;
+            float bestY = float.MaxValue;
             foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
             {
                 if (entity.Type != EntityType.TownPortal || !entity.IsTargetable) continue;
-                if (entity.DistancePlayer < bestDist)
+                if (entity.GridPosNum.Y < bestY)
                 {
-                    bestDist = entity.DistancePlayer;
+                    bestY = entity.GridPosNum.Y;
                     best = entity;
                 }
             }

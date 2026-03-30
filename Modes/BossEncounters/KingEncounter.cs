@@ -311,13 +311,6 @@ namespace AutoExile.Modes.BossEncounters
 
         private BossEncounterResult TickWaitingForLoot()
         {
-            var elapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
-            if (elapsed < 5)
-            {
-                Status = $"Waiting for loot ({elapsed:F1}s / 5s)";
-                return BossEncounterResult.InProgress;
-            }
-
             Status = "Boss complete!";
             return BossEncounterResult.Complete;
         }

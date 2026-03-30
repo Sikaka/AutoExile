@@ -163,6 +163,7 @@ namespace AutoExile
             RegisterMode(new PathBenchmarkMode());
             _bossMode = new BossMode();
             _bossMode.Register(new KingEncounter());
+            _bossMode.Register(new OshabiEncounter());
             RegisterMode(_bossMode);
 
             // Register in-map mechanics
