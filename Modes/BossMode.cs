@@ -278,7 +278,8 @@ namespace AutoExile.Modes
                 dumpTabName: string.IsNullOrWhiteSpace(bossSettings.DumpTabName.Value) ? null : bossSettings.DumpTabName.Value,
                 resourceTabName: string.IsNullOrWhiteSpace(bossSettings.ResourceTabName.Value) ? null : bossSettings.ResourceTabName.Value,
                 withdrawFragmentPath: _activeEncounter.InventoryFragmentPath,
-                fragmentStock: bossSettings.FragmentStock.Value);
+                fragmentStock: bossSettings.FragmentStock.Value,
+                minFragments: _activeEncounter.FragmentCost);
             Status = $"Hideout — preparing {_activeEncounter.Name}";
         }
 

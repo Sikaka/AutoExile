@@ -27,6 +27,7 @@ namespace AutoExile.Modes.Shared
         private string? _resourceTabName;
         private string? _withdrawFragmentPath;
         private int _fragmentStock; // target number of fragments to maintain in inventory
+        private int _minFragments; // minimum fragments needed to open (0 = any amount works)
 
         private const float BasePortalTimeoutSeconds = 15f;
         private const float MapDeviceRetrySeconds = 10f;
@@ -46,7 +47,8 @@ namespace AutoExile.Modes.Shared
             string? dumpTabName = null,
             string? resourceTabName = null,
             string? withdrawFragmentPath = null,
-            int fragmentStock = 0)
+            int fragmentStock = 0,
+            int minFragments = 1)
         {
             _mapFilter = mapFilter;
             _stashItemFilter = stashItemFilter;
@@ -58,6 +60,7 @@ namespace AutoExile.Modes.Shared
             _resourceTabName = resourceTabName;
             _withdrawFragmentPath = withdrawFragmentPath;
             _fragmentStock = fragmentStock;
+            _minFragments = minFragments;
             _phase = HideoutPhase.Settle;
             _phaseStartTime = DateTime.Now;
             Status = "Hideout — settling";
@@ -107,6 +110,7 @@ namespace AutoExile.Modes.Shared
             _resourceTabName = null;
             _withdrawFragmentPath = null;
             _fragmentStock = 0;
+            _minFragments = 1;
             Status = "";
         }
 
@@ -125,16 +129,17 @@ namespace AutoExile.Modes.Shared
             int fragmentsInInventory = StashSystem.CountInventoryItems(ctx.Game, _withdrawFragmentPath);
             int lootItems = StashSystem.CountNonMatchingItems(ctx.Game, _withdrawFragmentPath);
 
-            // Only withdraw when completely out of fragments — don't top up each run
+            // Only withdraw when below minimum needed — don't top up each run
             bool usesFragments = !string.IsNullOrEmpty(_withdrawFragmentPath);
+            int minNeeded = _minFragments > 0 ? _minFragments : 1;
             bool canWithdraw = usesFragments
                 && !string.IsNullOrEmpty(_resourceTabName)
                 && _fragmentStock > 0;
-            bool needWithdraw = canWithdraw && fragmentsInInventory == 0;
+            bool needWithdraw = canWithdraw && fragmentsInInventory < minNeeded;
             int withdrawNeeded = needWithdraw ? _fragmentStock : 0;
 
-            // No fragments and no way to get more — signal stop (only for modes that use fragments)
-            if (usesFragments && fragmentsInInventory == 0 && !canWithdraw)
+            // Not enough fragments and no way to get more — signal stop (only for modes that use fragments)
+            if (usesFragments && fragmentsInInventory < minNeeded && !canWithdraw)
             {
                 Status = "No fragments in inventory";
                 _phase = HideoutPhase.Idle;
@@ -179,13 +184,14 @@ namespace AutoExile.Modes.Shared
                 case StashResult.Succeeded:
                 case StashResult.Failed:
                 {
-                    // Verify we have fragments before proceeding to map device (only for modes that use fragments)
+                    // Verify we have enough fragments before proceeding to map device
                     if (!string.IsNullOrEmpty(_withdrawFragmentPath) && !string.IsNullOrEmpty(_resourceTabName))
                     {
                         int frags = StashSystem.CountInventoryItems(ctx.Game, _withdrawFragmentPath);
-                        if (frags == 0)
+                        int needed = _minFragments > 0 ? _minFragments : 1;
+                        if (frags < needed)
                         {
-                            Status = "Out of fragments — stopping";
+                            Status = $"Not enough fragments ({frags}/{needed}) — stopping";
                             _phase = HideoutPhase.Idle;
                             return HideoutSignal.NoFragments;
                         }

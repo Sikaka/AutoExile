@@ -31,6 +31,9 @@ namespace AutoExile.Modes.BossEncounters
         /// Null = stash only.</summary>
         string? InventoryFragmentPath => null;
 
+        /// <summary>Number of fragments consumed per map open. Used to stop when inventory is insufficient.</summary>
+        int FragmentCost => 1;
+
         /// <summary>Item names to always pick up during this encounter, regardless of value.
         /// Substring match, case-insensitive. Empty = no overrides.</summary>
         IReadOnlyList<string> MustLootItems => Array.Empty<string>();

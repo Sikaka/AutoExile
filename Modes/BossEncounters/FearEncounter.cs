@@ -44,6 +44,7 @@ namespace AutoExile.Modes.BossEncounters
         };
 
         public string? InventoryFragmentPath => FragmentPath;
+        public int FragmentCost => 4;
 
         // Suppress combat during approach — traps hit terrain if cast from entrance side
         public bool SuppressCombat => _phase == FearPhase.Approaching;
