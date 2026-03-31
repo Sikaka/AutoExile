@@ -54,6 +54,9 @@ namespace AutoExile.Modes.BossEncounters
             "Sacred Crystallised Lifeforce",
         };
 
+        // No combat at all during spawner click — combat moves cursor and character
+        public bool SuppressCombat => _phase == OshabiPhase.ClickSpawner;
+
         // Suppress repositioning while waiting for boss — stay near spawn and stack abilities
         public bool SuppressCombatPositioning => _phase == OshabiPhase.WaitForBoss;
         public bool RelaxedPathing => false;
@@ -64,13 +67,14 @@ namespace AutoExile.Modes.BossEncounters
         private Entity? _bossEntity;
         private bool _bossWasAlive;
         private bool _spawnerClicked;
-        private Vector2? _spawnWaitPos;
         private DateTime _arrivedAtStart = DateTime.MinValue;
+        private bool _hasSettled;
         private int _spawnerClickAttempts;
         private DateTime _lastSpawnerClickTime;
         private const float SpawnerClickCooldownMs = 1000;
         private const int MaxSpawnerClickAttempts = 10;
-        private const float SpawnerApproachDist = 35f; // get this close before clicking
+        private const float SpawnerApproachDist = 8f; // must be very close before clicking label
+        private const float SettleTimeMs = 500f;
 
         private enum OshabiPhase
         {
@@ -100,8 +104,8 @@ namespace AutoExile.Modes.BossEncounters
             _bossEntity = null;
             _bossWasAlive = false;
             _spawnerClicked = false;
-            _spawnWaitPos = null;
             _arrivedAtStart = DateTime.MinValue;
+            _hasSettled = false;
             _spawnerClickAttempts = 0;
             _lastSpawnerClickTime = DateTime.MinValue;
             Status = "Entered Sacred Grove — looking for Heart of the Grove";
@@ -214,11 +218,6 @@ namespace AutoExile.Modes.BossEncounters
 
             var treeGrid = new Vector2(soulTree.GridPosNum.X, soulTree.GridPosNum.Y);
 
-            if (!_spawnWaitPos.HasValue)
-            {
-                _spawnWaitPos = StartPosition;
-            }
-
             // If we clicked and the tree is no longer targetable — click worked!
             if (_spawnerClicked && !soulTreeTargetable)
             {
@@ -237,6 +236,7 @@ namespace AutoExile.Modes.BossEncounters
                 if (!ctx.Navigation.IsNavigating)
                     ctx.Navigation.NavigateTo(gc, StartPosition);
                 _arrivedAtStart = DateTime.MinValue;
+                _hasSettled = false;
                 Status = $"Walking to start position ({distToStart:F0}g)";
                 return BossEncounterResult.InProgress;
             }
@@ -246,13 +246,38 @@ namespace AutoExile.Modes.BossEncounters
             {
                 ctx.Navigation.Stop(gc);
                 _arrivedAtStart = DateTime.Now;
+                _hasSettled = false;
                 Status = "Arrived — settling before click";
                 return BossEncounterResult.InProgress;
             }
-            if (_arrivedAtStart != DateTime.MinValue &&
-                (DateTime.Now - _arrivedAtStart).TotalMilliseconds < 500)
+
+            // Start settle timer if not yet started (handles case where player spawns close)
+            if (_arrivedAtStart == DateTime.MinValue)
             {
-                Status = "Settling...";
+                _arrivedAtStart = DateTime.Now;
+                _hasSettled = false;
+            }
+
+            if (!_hasSettled)
+            {
+                var settleElapsed = (DateTime.Now - _arrivedAtStart).TotalMilliseconds;
+                if (settleElapsed < SettleTimeMs)
+                {
+                    Status = $"Settling ({settleElapsed:F0}/{SettleTimeMs:F0}ms)";
+                    return BossEncounterResult.InProgress;
+                }
+                _hasSettled = true;
+                ctx.Log("[Oshabi] Settled — ready to click spawner");
+            }
+
+            // Re-check distance after settle — player may have drifted from dash momentum
+            if (distToStart > SpawnerApproachDist)
+            {
+                _hasSettled = false;
+                _arrivedAtStart = DateTime.MinValue;
+                if (!ctx.Navigation.IsNavigating)
+                    ctx.Navigation.NavigateTo(gc, StartPosition);
+                Status = $"Drifted after settle ({distToStart:F0}g) — repositioning";
                 return BossEncounterResult.InProgress;
             }
 
@@ -315,8 +340,11 @@ namespace AutoExile.Modes.BossEncounters
                     _spawnerClicked = true;
                     _spawnerClickAttempts++;
                     _lastSpawnerClickTime = DateTime.Now;
+                    // Reset settle — click causes walk-toward, must re-settle before retrying
+                    _hasSettled = false;
+                    _arrivedAtStart = DateTime.MinValue;
                     Status = $"Clicking Heart of the Grove (attempt {_spawnerClickAttempts})";
-                    ctx.Log($"[Oshabi] Click attempt {_spawnerClickAttempts} at ({rect.Center.X:F0},{rect.Center.Y:F0})");
+                    ctx.Log($"[Oshabi] Click attempt {_spawnerClickAttempts} at ({clickPos.X:F0},{clickPos.Y:F0})");
                 }
                 else
                 {
@@ -356,48 +384,15 @@ namespace AutoExile.Modes.BossEncounters
                 return BossEncounterResult.InProgress;
             }
 
-            // Stay near the spawn point — midpoint between Soul Tree and portal
+            // Hold at start position while waiting for boss to spawn
             var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
-            if (_spawnWaitPos.HasValue)
-            {
-                var distToWait = Vector2.Distance(playerGrid, _spawnWaitPos.Value);
-                if (distToWait > 15 && !ctx.Navigation.IsNavigating)
-                {
-                    ctx.Navigation.NavigateTo(gc, _spawnWaitPos.Value);
-                }
-            }
-            else
-            {
-                // Calculate wait position — find Soul Tree and portal, use midpoint
-                Vector2? treePos = null;
-                Vector2? portalPos = null;
-                foreach (var e in gc.EntityListWrapper.ValidEntitiesByType[EntityType.MiscellaneousObjects])
-                {
-                    if (e.Path.Contains(SoulTreePath) && e.IsTargetable)
-                        treePos = new Vector2(e.GridPosNum.X, e.GridPosNum.Y);
-                }
-                var portal = FindPortal(gc);
-                if (portal != null)
-                    portalPos = new Vector2(portal.GridPosNum.X, portal.GridPosNum.Y);
-
-                if (treePos.HasValue && portalPos.HasValue)
-                    _spawnWaitPos = (treePos.Value + portalPos.Value) / 2;
-                else if (treePos.HasValue)
-                    _spawnWaitPos = treePos.Value; // fallback: near tree
-            }
+            var distToStart = Vector2.Distance(playerGrid, StartPosition);
+            if (distToStart > 10 && !ctx.Navigation.IsNavigating)
+                ctx.Navigation.NavigateTo(gc, StartPosition);
 
             var elapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
             Status = $"Waiting for Oshabi to spawn ({elapsed:F0}s) — holding position";
             return BossEncounterResult.InProgress;
-        }
-
-        private Entity? FindPortal(GameController gc)
-        {
-            foreach (var e in gc.EntityListWrapper.ValidEntitiesByType[EntityType.TownPortal])
-            {
-                if (e.IsTargetable) return e;
-            }
-            return null;
         }
 
         private BossEncounterResult TickFighting(BotContext ctx, GameController gc, Vector2 playerGrid)
@@ -437,8 +432,8 @@ namespace AutoExile.Modes.BossEncounters
                 var bossGrid = new Vector2(_bossEntity.GridPosNum.X, _bossEntity.GridPosNum.Y);
                 var dist = Vector2.Distance(playerGrid, bossGrid);
 
-                // Always follow Oshabi — loot drops where she dies
-                if (dist > 30 && !ctx.Navigation.IsNavigating)
+                // Stay on top of Oshabi — totems need proximity, loot drops where she dies
+                if (dist > 15 && !ctx.Navigation.IsNavigating)
                     ctx.Navigation.NavigateTo(gc, bossGrid);
 
                 Status = $"Fighting Oshabi — dist={dist:F0}";
@@ -539,7 +534,8 @@ namespace AutoExile.Modes.BossEncounters
             _bossEntity = null;
             _bossWasAlive = false;
             _spawnerClicked = false;
-            _spawnWaitPos = null;
+            _arrivedAtStart = DateTime.MinValue;
+            _hasSettled = false;
             _spawnerClickAttempts = 0;
             _lastSpawnerClickTime = DateTime.MinValue;
             Status = "";

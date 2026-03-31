@@ -959,7 +959,9 @@ function renderAllSettings() {
     ['labyrinth.maxDeaths'],['labyrinth.settleSeconds']]);
   addSection(modes, 'Simulacrum', [['simulacrum.maxDeaths'],['simulacrum.minWaveDelaySeconds'],
     ['simulacrum.waveTimeoutMinutes'],['simulacrum.stashItemThreshold']]);
-  addSection(modes, 'Boss', [['boss.bossType'],['boss.maxDeaths'],['boss.lootSweepTimeoutSeconds'],['boss.portalKey'],['boss.keyDropChaosValue']]);
+  addSection(modes, 'Boss', [['boss.bossType'],['boss.maxDeaths'],['boss.lootSweepTimeoutSeconds'],
+    ['boss.dumpTabName'],['boss.resourceTabName'],['boss.fragmentStock'],['boss.stashItemThreshold'],
+    ['boss.portalKey'],['boss.keyDropChaosValue']]);
   addSection(modes, 'Follower', [['follower.leaderName'],['follower.followDistance'],['follower.stopDistance'],
     ['follower.followThroughTransitions'],['follower.enableCombat'],['follower.enableLoot'],['follower.lootNearLeaderOnly']]);
 

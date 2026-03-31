@@ -428,6 +428,9 @@ namespace AutoExile
             if (!_mapListPopulated)
                 PopulateMapList();
 
+            // Sync stash tab names into settings dropdowns when stash is visible
+            SyncStashTabNames();
+
             // Toggle running hotkey is now in Render() so it's never blocked by early returns.
 
             // An async action is in flight (cursor settle, key hold).
@@ -1831,6 +1834,49 @@ namespace AutoExile
             {
                 LogMessage($"[AutoExile] Map list population failed: {ex.Message}");
             }
+        }
+
+        // =================================================================
+        // Stash Tab Name Sync
+        // =================================================================
+
+        private IList<string>? _lastStashTabNames;
+
+        private void SyncStashTabNames()
+        {
+            try
+            {
+                var stashEl = GameController.IngameState?.IngameUi?.StashElement;
+                if (stashEl?.IsVisible != true) return;
+
+                var names = stashEl.AllStashNames;
+                if (names == null || names.Count == 0) return;
+
+                // Only update when the list actually changes
+                if (_lastStashTabNames != null && _lastStashTabNames.Count == names.Count)
+                {
+                    bool same = true;
+                    for (int i = 0; i < names.Count; i++)
+                    {
+                        if (names[i] != _lastStashTabNames[i]) { same = false; break; }
+                    }
+                    if (same) return;
+                }
+                _lastStashTabNames = names.ToList();
+
+                // Build option list: empty string first (= "use current tab" / "disabled")
+                var options = new List<string> { "" };
+                options.AddRange(names);
+
+                // Update Boss tab dropdowns — save/restore current values
+                var savedDump = Settings.Boss.DumpTabName.Value;
+                var savedResource = Settings.Boss.ResourceTabName.Value;
+                Settings.Boss.DumpTabName.SetListValues(options);
+                Settings.Boss.ResourceTabName.SetListValues(options);
+                Settings.Boss.DumpTabName.Value = options.Contains(savedDump) ? savedDump : "";
+                Settings.Boss.ResourceTabName.Value = options.Contains(savedResource) ? savedResource : "";
+            }
+            catch { /* stash API can throw during zone transitions */ }
         }
 
         // =================================================================

@@ -31,6 +31,9 @@ namespace AutoExile.Systems
         // Relaxed pathing — flat-cost A* and permissive smoothing for tight corridors
         public bool RelaxedPathing { get; set; }
 
+        // Walk only — suppress dash-for-speed and blink gap crossing. Move Only key only.
+        public bool WalkOnly { get; set; }
+
         // Dash tracking — prevent spamming movement skills mid-animation
         private bool _dashActive;
         private DateTime _dashStartTime = DateTime.MinValue;
@@ -483,7 +486,7 @@ namespace AutoExile.Systems
                 }
 
                 // Try dash-for-speed on long straight segments (not in town — skills don't work there)
-                if (inTown || !TryDashForSpeed(gc, playerGrid, windowRect))
+                if (inTown || WalkOnly || !TryDashForSpeed(gc, playerGrid, windowRect))
                     ExecuteWalk(screenPos, windowRect);
             }
         }

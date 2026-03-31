@@ -41,6 +41,9 @@ namespace AutoExile.Modes.BossEncounters
         /// <summary>Per-tick encounter logic. Returns Complete when boss is dead.</summary>
         BossEncounterResult Tick(BotContext ctx);
 
+        /// <summary>True to suppress ALL combat (no skills, no positioning). Use during pre-fight setup.</summary>
+        bool SuppressCombat => false;
+
         /// <summary>True to suppress combat positioning (don't chase packs). Skills still fire.</summary>
         bool SuppressCombatPositioning => false;
 

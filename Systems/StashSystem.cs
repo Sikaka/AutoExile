@@ -47,6 +47,23 @@ namespace AutoExile.Systems
         /// </summary>
         public Func<ServerInventory.InventSlotItem, bool>? ItemFilter { get; set; }
 
+        /// <summary>Tab name to switch to before storing items. Null = use current tab.</summary>
+        public string? StoreTabName { get; set; }
+
+        /// <summary>Tab name to switch to for withdrawing fragments. Null = skip withdraw.</summary>
+        public string? WithdrawTabName { get; set; }
+
+        /// <summary>Entity path substring of fragment to withdraw from stash.</summary>
+        public string? WithdrawFragmentPath { get; set; }
+
+        /// <summary>How many fragments to withdraw (ctrl+clicks). Each click withdraws one stack unit.</summary>
+        public int WithdrawCount { get; set; }
+
+        // Tab switching state
+        private string? _pendingTabSwitch;
+        private StashPhase _afterTabSwitch;
+        private int _withdrawsRemaining;
+
         // Incubator state
         private bool _cursorHasIncubator;
         private int _incubatorsApplied;
@@ -70,6 +87,10 @@ namespace AutoExile.Systems
             _consecutiveFailures = 0;
             _cursorHasIncubator = false;
             _incubatorsApplied = 0;
+            _pendingTabSwitch = null;
+            _afterTabSwitch = StashPhase.Idle;
+
+            _withdrawsRemaining = 0;
             Status = "Starting stash interaction";
             return true;
         }
@@ -79,6 +100,11 @@ namespace AutoExile.Systems
             nav?.Stop(gc);
             _phase = StashPhase.Idle;
             ItemFilter = null;
+            StoreTabName = null;
+            WithdrawTabName = null;
+            WithdrawFragmentPath = null;
+            WithdrawCount = 0;
+            _pendingTabSwitch = null;
             Status = "Cancelled";
         }
 
@@ -101,6 +127,9 @@ namespace AutoExile.Systems
             {
                 StashPhase.NavigateToStash => TickNavigate(gc, nav),
                 StashPhase.OpenStash => TickOpenStash(gc),
+                StashPhase.SwitchToWithdrawTab => TickSwitchTab(gc),
+                StashPhase.WithdrawItems => TickWithdrawItems(gc),
+                StashPhase.SwitchToStoreTab => TickSwitchTab(gc),
                 StashPhase.StoreItems => TickStoreItems(gc),
                 StashPhase.ApplyIncubators => TickApplyIncubators(gc),
                 StashPhase.CloseStash => TickCloseStash(gc),
@@ -113,9 +142,8 @@ namespace AutoExile.Systems
             // Check if stash is already open
             if (gc.IngameState.IngameUi.StashElement?.IsVisible == true)
             {
-                _phase = StashPhase.StoreItems;
-                _phaseStartTime = DateTime.Now;
-                Status = "Stash already open — storing items";
+                EnterFirstStashPhase(gc);
+                Status = "Stash already open";
                 return StashResult.InProgress;
             }
 
@@ -170,13 +198,56 @@ namespace AutoExile.Systems
             return StashResult.InProgress;
         }
 
+        /// <summary>Decide what to do first once stash is open.</summary>
+        private void EnterFirstStashPhase(GameController gc)
+        {
+            // Withdraw fragments first (if configured)
+            if (!string.IsNullOrEmpty(WithdrawTabName) && !string.IsNullOrEmpty(WithdrawFragmentPath) && WithdrawCount > 0)
+            {
+                _pendingTabSwitch = WithdrawTabName;
+                _afterTabSwitch = StashPhase.WithdrawItems;
+    
+                _phase = StashPhase.SwitchToWithdrawTab;
+                _phaseStartTime = DateTime.Now;
+                _withdrawsRemaining = WithdrawCount;
+                Status = $"Switching to {WithdrawTabName} tab for fragments";
+                return;
+            }
+
+            EnterStorePhase(gc);
+        }
+
+        private void EnterStorePhase(GameController gc)
+        {
+            // Switch to store tab if configured and not already on it
+            if (!string.IsNullOrEmpty(StoreTabName))
+            {
+                var stash = gc.IngameState?.IngameUi?.StashElement;
+                var names = stash?.AllStashNames;
+                var currentIdx = stash?.IndexVisibleStash ?? -1;
+                if (names != null && currentIdx >= 0 && currentIdx < names.Count
+                    && !names[currentIdx].Equals(StoreTabName, StringComparison.OrdinalIgnoreCase))
+                {
+                    _pendingTabSwitch = StoreTabName;
+                    _afterTabSwitch = StashPhase.StoreItems;
+        
+                    _phase = StashPhase.SwitchToStoreTab;
+                    _phaseStartTime = DateTime.Now;
+                    Status = $"Switching to {StoreTabName} tab for storing";
+                    return;
+                }
+            }
+
+            _phase = StashPhase.StoreItems;
+            _phaseStartTime = DateTime.Now;
+            Status = "Storing items";
+        }
+
         private StashResult TickOpenStash(GameController gc)
         {
             if (gc.IngameState.IngameUi.StashElement?.IsVisible == true)
             {
-                _phase = StashPhase.StoreItems;
-                _phaseStartTime = DateTime.Now;
-                Status = "Stash opened — storing items";
+                EnterFirstStashPhase(gc);
                 return StashResult.InProgress;
             }
 
@@ -195,6 +266,141 @@ namespace AutoExile.Systems
             }
             _lastActionTime = DateTime.Now;
             Status = "Clicking stash";
+            return StashResult.InProgress;
+        }
+
+        private const float TabSwitchSettleMs = 200f;
+
+        private StashResult TickSwitchTab(GameController gc)
+        {
+            var stashEl = gc.IngameState.IngameUi.StashElement;
+            if (stashEl?.IsVisible != true)
+            {
+                Status = "Stash closed during tab switch";
+                _phase = StashPhase.Idle;
+                return StashResult.Failed;
+            }
+
+            if (string.IsNullOrEmpty(_pendingTabSwitch))
+            {
+                _phase = _afterTabSwitch;
+                _phaseStartTime = DateTime.Now;
+                return StashResult.InProgress;
+            }
+
+            // Find target tab index by name
+            var names = stashEl.AllStashNames;
+            int targetIdx = -1;
+            if (names != null)
+            {
+                for (int i = 0; i < names.Count; i++)
+                {
+                    if (names[i].Equals(_pendingTabSwitch, StringComparison.OrdinalIgnoreCase))
+                    {
+                        targetIdx = i;
+                        break;
+                    }
+                }
+            }
+
+            if (targetIdx < 0)
+            {
+                Status = $"Tab '{_pendingTabSwitch}' not found";
+                _phase = StashPhase.Idle;
+                return StashResult.Failed;
+            }
+
+            var currentIdx = stashEl.IndexVisibleStash;
+
+            // Already on the right tab?
+            if (currentIdx == targetIdx)
+            {
+                _pendingTabSwitch = null;
+                _phase = _afterTabSwitch;
+                _phaseStartTime = DateTime.Now;
+                Status = $"On tab '{names[targetIdx]}'";
+                return StashResult.InProgress;
+            }
+
+            // Tab switch timeout
+            if ((DateTime.Now - _phaseStartTime).TotalSeconds > 15)
+            {
+                Status = $"Tab switch timeout — wanted '{_pendingTabSwitch}' (on {currentIdx})";
+                _phase = StashPhase.Idle;
+                return StashResult.Failed;
+            }
+
+            // Settle delay after each arrow press
+            if ((DateTime.Now - _lastActionTime).TotalMilliseconds < TabSwitchSettleMs)
+                return StashResult.InProgress;
+
+            // Press left or right arrow to move toward target tab
+            if (!BotInput.CanAct) return StashResult.InProgress;
+
+            var key = currentIdx < targetIdx ? Keys.Right : Keys.Left;
+            BotInput.PressKey(key);
+            _lastActionTime = DateTime.Now;
+            var delta = targetIdx - currentIdx;
+            Status = $"Switching tab → '{_pendingTabSwitch}' ({Math.Abs(delta)} away)";
+            return StashResult.InProgress;
+        }
+
+        private StashResult TickWithdrawItems(GameController gc)
+        {
+            var stashEl = gc.IngameState.IngameUi.StashElement;
+            if (stashEl?.IsVisible != true)
+            {
+                Status = "Stash closed during withdraw";
+                _phase = StashPhase.Idle;
+                return StashResult.Failed;
+            }
+
+            if (_withdrawsRemaining <= 0 || string.IsNullOrEmpty(WithdrawFragmentPath))
+            {
+                // Done withdrawing — proceed to store phase
+                EnterStorePhase(gc);
+                return StashResult.InProgress;
+            }
+
+            // Find the fragment in the visible stash tab
+            var items = stashEl.VisibleStash?.VisibleInventoryItems;
+            if (items == null)
+            {
+                Status = "No items visible in withdraw tab";
+                EnterStorePhase(gc);
+                return StashResult.InProgress;
+            }
+
+            ExileCore.PoEMemory.MemoryObjects.Entity? fragmentItem = null;
+            SharpDX.RectangleF fragmentRect = default;
+            foreach (var item in items)
+            {
+                var entity = item.Entity;
+                if (entity?.Path?.Contains(WithdrawFragmentPath, StringComparison.OrdinalIgnoreCase) == true)
+                {
+                    fragmentItem = entity;
+                    fragmentRect = item.GetClientRect();
+                    break;
+                }
+            }
+
+            if (fragmentItem == null)
+            {
+                Status = $"Fragment '{WithdrawFragmentPath}' not found in stash";
+                EnterStorePhase(gc);
+                return StashResult.InProgress;
+            }
+
+            // Ctrl+click to withdraw one unit
+            var windowRect = gc.Window.GetWindowRectangle();
+            var absPos = new Vector2(windowRect.X + fragmentRect.Center.X, windowRect.Y + fragmentRect.Center.Y);
+            if (BotInput.CanAct)
+            {
+                BotInput.CtrlClick(absPos);
+                _lastActionTime = DateTime.Now;
+                _withdrawsRemaining--;
+                Status = $"Withdrawing fragment ({_withdrawsRemaining} remaining)";
+            }
             return StashResult.InProgress;
         }
 
@@ -294,6 +500,39 @@ namespace AutoExile.Systems
         {
             var items = GetInventorySlotItems(gc);
             return items != null && items.Count > 0;
+        }
+
+        /// <summary>
+        /// Count inventory items matching a path substring.
+        /// </summary>
+        public static int CountInventoryItems(GameController gc, string? pathSubstring)
+        {
+            var items = GetInventorySlotItems(gc);
+            if (items == null || string.IsNullOrEmpty(pathSubstring)) return 0;
+            int count = 0;
+            foreach (var item in items)
+            {
+                if (item.Item?.Path?.Contains(pathSubstring, StringComparison.OrdinalIgnoreCase) == true)
+                    count++;
+            }
+            return count;
+        }
+
+        /// <summary>
+        /// Count inventory items that do NOT match a path substring (i.e., non-fragment loot items).
+        /// </summary>
+        public static int CountNonMatchingItems(GameController gc, string? pathSubstring)
+        {
+            var items = GetInventorySlotItems(gc);
+            if (items == null) return 0;
+            if (string.IsNullOrEmpty(pathSubstring)) return items.Count;
+            int count = 0;
+            foreach (var item in items)
+            {
+                if (item.Item?.Path?.Contains(pathSubstring, StringComparison.OrdinalIgnoreCase) != true)
+                    count++;
+            }
+            return count;
         }
 
         /// <summary>
@@ -657,7 +896,10 @@ namespace AutoExile.Systems
         Idle,
         NavigateToStash,
         OpenStash,
+        SwitchToStoreTab,
         StoreItems,
+        SwitchToWithdrawTab,
+        WithdrawItems,
         ApplyIncubators,
         CloseStash,
     }

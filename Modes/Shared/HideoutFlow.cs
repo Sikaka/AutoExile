@@ -22,6 +22,11 @@ namespace AutoExile.Modes.Shared
         private string? _targetMapName;
         private string? _inventoryFragmentPath;
         private int _minMapTier;
+        private int _stashItemThreshold; // only stash when item count >= this (0 = always stash)
+        private string? _dumpTabName;
+        private string? _resourceTabName;
+        private string? _withdrawFragmentPath;
+        private int _fragmentStock; // target number of fragments to maintain in inventory
 
         private const float SettleSeconds = 3f;
         private const float BasePortalTimeoutSeconds = 15f;
@@ -37,13 +42,23 @@ namespace AutoExile.Modes.Shared
         public void Start(Func<Element, bool> mapFilter,
             Func<ServerInventory.InventSlotItem, bool>? stashItemFilter = null,
             string? targetMapName = null, int minMapTier = 0,
-            string? inventoryFragmentPath = null)
+            string? inventoryFragmentPath = null,
+            int stashItemThreshold = 0,
+            string? dumpTabName = null,
+            string? resourceTabName = null,
+            string? withdrawFragmentPath = null,
+            int fragmentStock = 0)
         {
             _mapFilter = mapFilter;
             _stashItemFilter = stashItemFilter;
             _targetMapName = targetMapName;
             _inventoryFragmentPath = inventoryFragmentPath;
             _minMapTier = minMapTier;
+            _stashItemThreshold = stashItemThreshold;
+            _dumpTabName = dumpTabName;
+            _resourceTabName = resourceTabName;
+            _withdrawFragmentPath = withdrawFragmentPath;
+            _fragmentStock = fragmentStock;
             _phase = HideoutPhase.Settle;
             _phaseStartTime = DateTime.Now;
             Status = "Hideout — settling";
@@ -88,6 +103,11 @@ namespace AutoExile.Modes.Shared
             _targetMapName = null;
             _inventoryFragmentPath = null;
             _minMapTier = 0;
+            _stashItemThreshold = 0;
+            _dumpTabName = null;
+            _resourceTabName = null;
+            _withdrawFragmentPath = null;
+            _fragmentStock = 0;
             Status = "";
         }
 
@@ -102,14 +122,44 @@ namespace AutoExile.Modes.Shared
                 return HideoutSignal.InProgress;
             }
 
-            // Check if we have items to stash (respecting filter)
+            // Count fragments and non-fragment loot in inventory
+            int fragmentsInInventory = StashSystem.CountInventoryItems(ctx.Game, _withdrawFragmentPath);
+            int lootItems = StashSystem.CountNonMatchingItems(ctx.Game, _withdrawFragmentPath);
+
+            // Only withdraw when completely out of fragments — don't top up each run
+            bool canWithdraw = !string.IsNullOrEmpty(_resourceTabName)
+                && !string.IsNullOrEmpty(_withdrawFragmentPath)
+                && _fragmentStock > 0;
+            bool needWithdraw = canWithdraw && fragmentsInInventory == 0;
+            int withdrawNeeded = needWithdraw ? _fragmentStock : 0;
+
+            // No fragments and no way to get more — signal stop
+            if (fragmentsInInventory == 0 && !canWithdraw)
+            {
+                Status = "No fragments in inventory";
+                _phase = HideoutPhase.Idle;
+                return HideoutSignal.NoFragments;
+            }
+
+            // Stash loot only if non-fragment items exceed threshold
+            bool needStore = false;
             if (StashSystem.HasStashableItems(ctx.Game, _stashItemFilter))
+                needStore = _stashItemThreshold <= 0 || lootItems >= _stashItemThreshold;
+
+            if (needWithdraw || needStore)
             {
                 _phase = HideoutPhase.Stash;
                 _phaseStartTime = DateTime.Now;
-                ctx.Stash.ItemFilter = _stashItemFilter;
+                ctx.Stash.ItemFilter = needStore ? _stashItemFilter : (_ => false);
+                ctx.Stash.StoreTabName = needStore ? _dumpTabName : null;
+                ctx.Stash.WithdrawTabName = needWithdraw ? _resourceTabName : null;
+                ctx.Stash.WithdrawFragmentPath = needWithdraw ? _withdrawFragmentPath : null;
+                ctx.Stash.WithdrawCount = withdrawNeeded;
                 ctx.Stash.Start();
-                Status = "Stashing inventory items";
+                var parts = new List<string>();
+                if (needWithdraw) parts.Add($"withdraw {withdrawNeeded} fragments");
+                if (needStore) parts.Add($"stash {lootItems} loot items");
+                Status = string.Join(" & ", parts);
                 return HideoutSignal.InProgress;
             }
 
@@ -127,17 +177,28 @@ namespace AutoExile.Modes.Shared
             switch (result)
             {
                 case StashResult.Succeeded:
-                    Status = $"Stashed {ctx.Stash.ItemsStored} items — opening map";
-                    _phase = HideoutPhase.OpenMap;
-                    _phaseStartTime = DateTime.Now;
-                    StartMapDevice(ctx);
-                    break;
                 case StashResult.Failed:
-                    Status = $"Stash failed: {ctx.Stash.Status} — opening map anyway";
+                {
+                    // Verify we have fragments before proceeding to map device
+                    if (!string.IsNullOrEmpty(_withdrawFragmentPath))
+                    {
+                        int frags = StashSystem.CountInventoryItems(ctx.Game, _withdrawFragmentPath);
+                        if (frags == 0)
+                        {
+                            Status = "Out of fragments — stopping";
+                            _phase = HideoutPhase.Idle;
+                            return HideoutSignal.NoFragments;
+                        }
+                    }
+
+                    Status = result == StashResult.Succeeded
+                        ? $"Stash done ({ctx.Stash.ItemsStored} stored) — opening map"
+                        : $"Stash issue: {ctx.Stash.Status} — opening map anyway";
                     _phase = HideoutPhase.OpenMap;
                     _phaseStartTime = DateTime.Now;
                     StartMapDevice(ctx);
                     break;
+                }
                 default:
                     Status = $"Stashing: {ctx.Stash.Status}";
                     break;
@@ -245,5 +306,6 @@ namespace AutoExile.Modes.Shared
     {
         InProgress,
         PortalTimeout,
+        NoFragments,
     }
 }

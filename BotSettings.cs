@@ -396,7 +396,19 @@ namespace AutoExile
             public RangeNode<int> MaxDeaths { get; set; } = new RangeNode<int>(3, 1, 10);
 
             [Menu("Loot Sweep Timeout (s)", "Max seconds picking up loot after boss kill.")]
-            public RangeNode<float> LootSweepTimeoutSeconds { get; set; } = new RangeNode<float>(15f, 5f, 60f);
+            public RangeNode<float> LootSweepTimeoutSeconds { get; set; } = new RangeNode<float>(5f, 3f, 60f);
+
+            [Menu("Stash When Items >=", "Only stash between runs when inventory has at least this many items. 0 = always stash.")]
+            public RangeNode<int> StashItemThreshold { get; set; } = new RangeNode<int>(10, 0, 30);
+
+            [Menu("Dump Tab", "Stash tab to deposit loot into. Empty = use current tab.")]
+            public ListNode DumpTabName { get; set; } = new ListNode { Value = "Dump" };
+
+            [Menu("Resource Tab", "Stash tab to withdraw fragments from. Empty = skip withdrawal.")]
+            public ListNode ResourceTabName { get; set; } = new ListNode { Value = "Fragment" };
+
+            [Menu("Fragment Stock", "Keep this many fragments in inventory. Withdraws from resource tab to maintain stock.")]
+            public RangeNode<int> FragmentStock { get; set; } = new RangeNode<int>(20, 1, 60);
 
             [Menu("Portal Key", "Hotkey for portal scroll to exit boss zone.")]
             public HotkeyNode PortalKey { get; set; } = new HotkeyNode(Keys.F);

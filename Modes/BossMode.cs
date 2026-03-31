@@ -36,6 +36,7 @@ namespace AutoExile.Modes
         // ── Run state ──
         private bool _mapCompleted;
         private string _lastAreaName = "";
+        private string _lastBossType = "";
         private int _deathCount;
         private int _runsCompleted;
         private int _targetItemsLooted;
@@ -92,6 +93,7 @@ namespace AutoExile.Modes
 
             // Resolve selected encounter
             var selectedName = ctx.Settings.Boss.BossType.Value;
+            _lastBossType = selectedName ?? "";
             if (string.IsNullOrEmpty(selectedName) || !_encounters.TryGetValue(selectedName, out _activeEncounter))
             {
                 _activeEncounter = _encounters.Values.FirstOrDefault();
@@ -140,6 +142,21 @@ namespace AutoExile.Modes
             var gc = ctx.Game;
             if (gc?.Player == null) return;
 
+            // Detect boss type change mid-session (user changed setting while paused or between runs)
+            var currentBossType = ctx.Settings.Boss.BossType.Value ?? "";
+            if (currentBossType != _lastBossType && !string.IsNullOrEmpty(currentBossType)
+                && (_phase == BossPhase.InHideout || _phase == BossPhase.Idle))
+            {
+                ctx.Log($"[Boss] Boss type changed: {_lastBossType} → {currentBossType}");
+                _lastBossType = currentBossType;
+                if (gc.Area.CurrentArea.IsHideout || gc.Area.CurrentArea.IsTown)
+                {
+                    ModeHelpers.CancelAllSystems(ctx);
+                    _hideoutFlow.Cancel();
+                    StartHideoutFlow(ctx);
+                }
+            }
+
             // Area change detection
             var currentArea = gc.Area?.CurrentArea?.Name ?? "";
             if (currentArea != _lastAreaName && !string.IsNullOrEmpty(currentArea))
@@ -148,8 +165,12 @@ namespace AutoExile.Modes
                 OnAreaChanged(ctx, currentArea);
             }
 
-            // Combat — suppress positioning in maze/loot but still fire skills at nearby enemies
-            if (_phase == BossPhase.InBossZone || _phase == BossPhase.LootSweep)
+            // Walk-only mode during pre-fight setup — no dash, no combat, just move-only key
+            ctx.Navigation.WalkOnly = _activeEncounter?.SuppressCombat == true;
+
+            // Combat — skip entirely when encounter says so (pre-fight setup), suppress positioning in maze/loot
+            if ((_phase == BossPhase.InBossZone || _phase == BossPhase.LootSweep)
+                && _activeEncounter?.SuppressCombat != true)
             {
                 var suppressPos = _activeEncounter?.SuppressCombatPositioning == true
                     || _phase == BossPhase.LootSweep;
@@ -234,9 +255,15 @@ namespace AutoExile.Modes
             }
             ctx.Loot.MustLootItems.Clear();
 
+            var bossSettings = ctx.Settings.Boss;
             _hideoutFlow.Start(_activeEncounter!.MapFilter,
                 stashItemFilter: GetStashFilter(),
-                inventoryFragmentPath: _activeEncounter.InventoryFragmentPath);
+                inventoryFragmentPath: _activeEncounter.InventoryFragmentPath,
+                stashItemThreshold: bossSettings.StashItemThreshold.Value,
+                dumpTabName: string.IsNullOrWhiteSpace(bossSettings.DumpTabName.Value) ? null : bossSettings.DumpTabName.Value,
+                resourceTabName: string.IsNullOrWhiteSpace(bossSettings.ResourceTabName.Value) ? null : bossSettings.ResourceTabName.Value,
+                withdrawFragmentPath: _activeEncounter.InventoryFragmentPath,
+                fragmentStock: bossSettings.FragmentStock.Value);
             Status = $"Hideout — preparing {_activeEncounter.Name}";
         }
 
@@ -259,10 +286,17 @@ namespace AutoExile.Modes
             var signal = _hideoutFlow.Tick(ctx);
             Status = _hideoutFlow.Status;
 
-            if (signal == HideoutSignal.PortalTimeout)
+            switch (signal)
             {
-                StartHideoutFlow(ctx, resetRun: false);
-                Status = "No portal found — retrying";
+                case HideoutSignal.PortalTimeout:
+                    StartHideoutFlow(ctx, resetRun: false);
+                    Status = "No portal found — retrying";
+                    break;
+                case HideoutSignal.NoFragments:
+                    _phase = BossPhase.Done;
+                    Status = $"Out of fragments — {_runsCompleted} runs completed";
+                    ctx.Log("[Boss] No fragments available — stopping");
+                    break;
             }
         }
 
@@ -360,13 +394,12 @@ namespace AutoExile.Modes
                 return;
             }
 
-            // Wait for loot to drop — don't exit until at least half the timeout has passed
-            // (labels need time to appear after boss death)
+            // Wait for loot to drop — labels need time to appear after boss death
             var sweepElapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
-            var minWait = Math.Min(timeout / 2, 3);
-            if (sweepElapsed < minWait)
+            var remaining = timeout - sweepElapsed;
+            if (remaining > 0)
             {
-                Status = $"Waiting for loot ({sweepElapsed:F1}s / {timeout:F0}s)";
+                Status = $"Waiting for loot drops ({remaining:F1}s remaining)";
                 return;
             }
 
