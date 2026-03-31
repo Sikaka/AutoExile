@@ -42,7 +42,8 @@ namespace AutoExile.Systems
         /// </summary>
         public void RecordTick(GameController gc, string modeName, string modePhase,
             string modeDecision, string modeStatus, NavigationSystem nav,
-            InteractionSystem? interaction = null, LootSystem? loot = null)
+            InteractionSystem? interaction = null, LootSystem? loot = null,
+            ThreatSystem? threat = null)
         {
             _tickNumber++;
 
@@ -64,7 +65,7 @@ namespace AutoExile.Systems
                     if (entity.DistancePlayer > 80) continue;
 
                     var ePos = entity.GridPosNum;
-                    var threat = new ThreatSnapshot
+                    var snap = new ThreatSnapshot
                     {
                         EntityId = entity.Id,
                         Path = entity.Path?.Split('/').LastOrDefault() ?? "",
@@ -80,14 +81,26 @@ namespace AutoExile.Systems
                         var actor = entity.GetComponent<Actor>();
                         if (actor != null)
                         {
-                            threat.IsAttacking = actor.isAttacking;
-                            threat.IsMoving = actor.isMoving;
-                            threat.Action = actor.Action.ToString();
+                            snap.IsAttacking = actor.isAttacking;
+                            snap.IsMoving = actor.isMoving;
+                            snap.Action = actor.Action.ToString();
+
+                            // For unique/rare: capture animation data for dodge troubleshooting
+                            if (entity.Rarity >= ExileCore.Shared.Enums.MonsterRarity.Rare)
+                            {
+                                snap.Animation = actor.Animation.ToString();
+                                snap.SkillName = actor.CurrentAction?.Skill?.Name ?? "";
+                                var ctrl = actor.AnimationController;
+                                snap.AnimProgress = ctrl?.AnimationProgress ?? 0;
+                                snap.AnimStage = ctrl?.CurrentAnimationStage ?? 0;
+                                snap.DestX = actor.CurrentAction?.DestinationX ?? 0;
+                                snap.DestY = actor.CurrentAction?.DestinationY ?? 0;
+                            }
                         }
                     }
                     catch { }
 
-                    threats.Add(threat);
+                    threats.Add(snap);
                     if (threats.Count >= 20) break; // cap to avoid perf issues
                 }
             }
@@ -139,6 +152,15 @@ namespace AutoExile.Systems
                 LootCandidateCount = loot?.LootableCount ?? 0,
                 LootFailedCount = loot?.FailedCount ?? 0,
                 LootHasNearby = loot?.HasLootNearby ?? false,
+
+                // Dodge state
+                DodgeUrgent = threat?.DodgeUrgent ?? false,
+                DodgeSkill = threat?.ThreatSkillName ?? "",
+                DodgeProgress = threat?.ThreatProgress ?? 0,
+                DodgeTracked = threat?.TrackedMonsters.Count ?? 0,
+                DodgeCastsDetected = threat?.CastsDetected ?? 0,
+                DodgesTriggered = threat?.DodgesTriggered ?? 0,
+                ThreatStatus = threat?.LastAction ?? "",
             };
 
             _buffer[_writeIndex] = snapshot;
@@ -148,6 +170,17 @@ namespace AutoExile.Systems
             // Auto-dump triggers
             CheckTriggers(gc, hpPercent, player.IsAlive, nav);
             _lastHpPercent = hpPercent;
+        }
+
+        /// <summary>
+        /// Update dodge action on the current tick's snapshot (called after mode ticking).
+        /// </summary>
+        public void SetDodgeAction(string action)
+        {
+            if (_count == 0 || string.IsNullOrEmpty(action)) return;
+            var idx = (_writeIndex - 1 + BufferSize) % BufferSize;
+            if (_buffer[idx] != null)
+                _buffer[idx].DodgeAction = action;
         }
 
         /// <summary>
@@ -282,6 +315,16 @@ namespace AutoExile.Systems
         public int LootCandidateCount { get; set; }
         public int LootFailedCount { get; set; }
         public bool LootHasNearby { get; set; }
+
+        // Dodge / Threat
+        public bool DodgeUrgent { get; set; }
+        public string DodgeSkill { get; set; } = "";
+        public float DodgeProgress { get; set; }
+        public int DodgeTracked { get; set; }
+        public int DodgeCastsDetected { get; set; }
+        public int DodgesTriggered { get; set; }
+        public string ThreatStatus { get; set; } = "";
+        public string DodgeAction { get; set; } = ""; // set by BossMode.TryDodge
     }
 
     public class ThreatSnapshot
@@ -295,6 +338,14 @@ namespace AutoExile.Systems
         public bool IsAttacking { get; set; }
         public bool IsMoving { get; set; }
         public string Action { get; set; } = "";
+
+        // Animation detail (unique/rare only)
+        public string Animation { get; set; } = "";
+        public string SkillName { get; set; } = "";
+        public float AnimProgress { get; set; }
+        public int AnimStage { get; set; }
+        public float DestX { get; set; }
+        public float DestY { get; set; }
     }
 
     public class RecordingDump

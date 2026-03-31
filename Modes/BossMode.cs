@@ -46,6 +46,12 @@ namespace AutoExile.Modes
 
         // ── Exit map state ──
         private bool _portalKeyPressed;
+        private Vector2? _entryPortalPos; // cached on zone entry so we can navigate back
+
+        // ── Dodge ──
+        private DateTime _lastDodgeTime = DateTime.MinValue;
+        /// <summary>Last dodge result for recording — cleared each tick, set by TryDodge.</summary>
+        public string LastDodgeAction { get; private set; } = "";
 
         // ── Status ──
         public string Status { get; private set; } = "";
@@ -172,12 +178,21 @@ namespace AutoExile.Modes
             if ((_phase == BossPhase.InBossZone || _phase == BossPhase.LootSweep)
                 && _activeEncounter?.SuppressCombat != true)
             {
-                var suppressPos = _activeEncounter?.SuppressCombatPositioning == true
-                    || _phase == BossPhase.LootSweep;
-                ctx.Combat.SuppressPositioning = suppressPos;
-                ctx.Navigation.RelaxedPathing = _activeEncounter?.RelaxedPathing == true;
-                ctx.Combat.Tick(ctx);
-                ctx.Combat.SuppressPositioning = false;
+                // Dodge BEFORE combat — dodge signal only lasts 1 tick.
+                // If dodge fires, skip combat entirely this tick to prevent async cursor races.
+                LastDodgeAction = "";
+                TryDodge(ctx);
+                bool dodged = LastDodgeAction.StartsWith("blinked");
+
+                if (!dodged)
+                {
+                    var suppressPos = _activeEncounter?.SuppressCombatPositioning == true
+                        || _phase == BossPhase.LootSweep;
+                    ctx.Combat.SuppressPositioning = suppressPos;
+                    ctx.Navigation.RelaxedPathing = _activeEncounter?.RelaxedPathing == true;
+                    ctx.Combat.Tick(ctx);
+                    ctx.Combat.SuppressPositioning = false;
+                }
             }
             else
             {
@@ -357,6 +372,10 @@ namespace AutoExile.Modes
                 _lastLootScan = DateTime.Now;
             }
 
+            var sweepElapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
+            var remaining = timeout - sweepElapsed;
+            var countdown = $"({remaining:F0}s left)";
+
             // Handle pending pickup
             if (ctx.Interaction.IsBusy)
             {
@@ -365,7 +384,7 @@ namespace AutoExile.Modes
                     ctx.Loot.Scan(gc);
                     _lastLootScan = DateTime.Now;
                 }
-                Status = $"Looting: {_lootTracker.PendingItemName}";
+                Status = $"Looting: {_lootTracker.PendingItemName} {countdown}";
                 return;
             }
 
@@ -376,7 +395,7 @@ namespace AutoExile.Modes
                 if (candidate != null && ctx.Interaction.IsBusy)
                 {
                     _lootTracker.SetPending(candidate.Entity.Id, candidate.ItemName, candidate.ChaosValue);
-                    Status = $"Looting: {candidate.ItemName}";
+                    Status = $"Looting: {candidate.ItemName} {countdown}";
                     return;
                 }
             }
@@ -385,7 +404,7 @@ namespace AutoExile.Modes
             if (ctx.Loot.TogglePhase != LootSystem.LabelTogglePhase.Idle)
             {
                 ctx.Loot.TickLabelToggle(gc);
-                Status = $"Label toggle: {ctx.Loot.ToggleStatus}";
+                Status = $"Label toggle: {ctx.Loot.ToggleStatus} {countdown}";
                 return;
             }
             if (ctx.Loot.ShouldToggleLabels(gc))
@@ -395,11 +414,9 @@ namespace AutoExile.Modes
             }
 
             // Wait for loot to drop — labels need time to appear after boss death
-            var sweepElapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
-            var remaining = timeout - sweepElapsed;
             if (remaining > 0)
             {
-                Status = $"Waiting for loot drops ({remaining:F1}s remaining)";
+                Status = $"Waiting for loot drops {countdown}";
                 return;
             }
 
@@ -419,12 +436,14 @@ namespace AutoExile.Modes
             if (gc.Area.CurrentArea.IsHideout)
                 return;
 
-            if ((DateTime.Now - _phaseStartTime).TotalSeconds > 30)
+            var exitElapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
+            if (exitElapsed > 30)
             {
                 _phase = BossPhase.Done;
                 Status = "Exit timeout";
                 return;
             }
+            var exitCountdown = $"({30 - exitElapsed:F0}s left)";
 
             if (!ModeHelpers.CanAct(_lastActionTime, MajorActionCooldownMs)) return;
 
@@ -443,7 +462,7 @@ namespace AutoExile.Modes
             {
                 if (ctx.Interaction.IsBusy)
                 {
-                    Status = $"Clicking exit portal ({ctx.Interaction.Status})";
+                    Status = $"Clicking exit portal ({ctx.Interaction.Status}) {exitCountdown}";
                     return;
                 }
 
@@ -456,22 +475,35 @@ namespace AutoExile.Modes
 
                 // Retry — start new interaction
                 ctx.Interaction.InteractWithEntity(portal, ctx.Navigation);
-                Status = $"Clicking exit portal (attempt {_exitPortalAttempts + 1})";
+                Status = $"Clicking exit portal (attempt {_exitPortalAttempts + 1}) {exitCountdown}";
                 return;
             }
 
-            // No existing portal — open one with portal key
+            // No portal found nearby — navigate back to cached entry position
+            if (_entryPortalPos.HasValue)
+            {
+                var distToEntry = Vector2.Distance(gc.Player.GridPosNum, _entryPortalPos.Value);
+                if (distToEntry > 30)
+                {
+                    if (!ctx.Navigation.IsNavigating)
+                        ctx.Navigation.NavigateTo(gc, _entryPortalPos.Value);
+                    Status = $"Returning to entry portal ({distToEntry:F0}g away) {exitCountdown}";
+                    return;
+                }
+            }
+
+            // At entry position but still no portal — open one with portal key
             if (!_portalKeyPressed)
             {
                 var portalKey = ctx.Settings.Boss.PortalKey.Value;
                 BotInput.PressKey(portalKey);
                 _portalKeyPressed = true;
                 _lastActionTime = DateTime.Now;
-                Status = "Opening portal...";
+                Status = $"Opening portal... {exitCountdown}";
                 return;
             }
 
-            Status = "Waiting for portal...";
+            Status = $"Waiting for portal... {exitCountdown}";
         }
 
         /// <summary>
@@ -499,6 +531,63 @@ namespace AutoExile.Modes
                 }
             }
             return best;
+        }
+
+        // ── Dodge ──
+
+        private void TryDodge(BotContext ctx)
+        {
+            var threatSettings = ctx.Settings.Threat;
+            if (!threatSettings.AutoDodge.Value) return;
+            if (!ctx.Threat.DodgeUrgent)  return;
+
+            if ((DateTime.Now - _lastDodgeTime).TotalMilliseconds < threatSettings.DodgeCooldownMs.Value)
+            {
+                LastDodgeAction = $"skip:cooldown for:{ctx.Threat.ThreatSkillName}";
+                return;
+            }
+            // Find a ready movement skill (blink/dash) — don't check CanAct, dodge bypasses gate
+            MovementSkillInfo? blinkSkill = null;
+            foreach (var ms in ctx.Navigation.MovementSkills)
+            {
+                if (!ms.IsReady) continue;
+                if (ms.MinCastIntervalMs > 0 &&
+                    (DateTime.Now - ms.LastUsedAt).TotalMilliseconds < ms.MinCastIntervalMs)
+                    continue;
+                blinkSkill = ms;
+                break;
+            }
+            if (blinkSkill == null)
+            {
+                LastDodgeAction = $"skip:no_blink for:{ctx.Threat.ThreatSkillName}";
+                return;
+            }
+
+            // Aim perpendicular to attack vector
+            var gc = ctx.Game;
+            var playerGrid = gc.Player.GridPosNum;
+            var dodgeTarget = playerGrid + ctx.Threat.DodgeDirection * threatSettings.DodgeDistance.Value;
+            var screenPos = Pathfinding.GridToScreen(gc, dodgeTarget);
+            var windowRect = gc.Window.GetWindowRectangle();
+
+            if (screenPos.X <= 0 || screenPos.X >= windowRect.Width ||
+                screenPos.Y <= 0 || screenPos.Y >= windowRect.Height)
+            {
+                LastDodgeAction = $"skip:offscreen for:{ctx.Threat.ThreatSkillName}";
+                return;
+            }
+
+            var absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
+            if (BotInput.ForceCursorPressKey(absPos, blinkSkill.Key))
+            {
+                _lastDodgeTime = DateTime.Now;
+                LastDodgeAction = $"blinked:{blinkSkill.Key} for:{ctx.Threat.ThreatSkillName} prog:{ctx.Threat.ThreatProgress:F2}";
+                ctx.Log($"[Boss] Dodge! {LastDodgeAction}");
+            }
+            else
+            {
+                LastDodgeAction = $"skip:input_rejected for:{ctx.Threat.ThreatSkillName}";
+            }
         }
 
         // ── Area change ──
@@ -542,7 +631,38 @@ namespace AutoExile.Modes
             }
             else
             {
-                // Entered boss zone
+                // Entered boss zone — cache entry portal position before moving away
+                _entryPortalPos = null;
+                foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+                {
+                    if (entity.Type == EntityType.TownPortal && entity.IsTargetable)
+                    {
+                        _entryPortalPos = entity.GridPosNum;
+                        ctx.Log($"[Boss] Cached entry portal at grid ({entity.GridPosNum.X:F0},{entity.GridPosNum.Y:F0})");
+                        break;
+                    }
+                }
+                // Also check AreaTransition portals (e.g. MemoryBossPortal)
+                if (_entryPortalPos == null)
+                {
+                    foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+                    {
+                        if (entity.Type == EntityType.AreaTransition && entity.IsTargetable &&
+                            entity.Path?.Contains("Portal", StringComparison.OrdinalIgnoreCase) == true)
+                        {
+                            _entryPortalPos = entity.GridPosNum;
+                            ctx.Log($"[Boss] Cached entry transition at grid ({entity.GridPosNum.X:F0},{entity.GridPosNum.Y:F0})");
+                            break;
+                        }
+                    }
+                }
+                // Fallback: cache player spawn position (portal is always near spawn)
+                if (_entryPortalPos == null)
+                {
+                    _entryPortalPos = gc.Player.GridPosNum;
+                    ctx.Log($"[Boss] No portal found — cached spawn position ({gc.Player.GridPosNum.X:F0},{gc.Player.GridPosNum.Y:F0})");
+                }
+
                 _activeEncounter?.OnEnterZone(ctx);
                 _phase = BossPhase.InBossZone;
                 _phaseStartTime = DateTime.Now;

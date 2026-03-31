@@ -60,6 +60,9 @@ namespace AutoExile
         [Menu("Interact Radius", "Grid distance at which the bot can click entities, items, stash, map device, etc.")]
         public RangeNode<int> InteractRadius { get; set; } = new RangeNode<int>(20, 10, 80);
 
+        [Menu("Area Settle Time (s)", "Seconds to wait after zone transitions (entering maps, returning to hideout) before acting. Allows entities and game state to stabilize.")]
+        public RangeNode<float> AreaSettleSeconds { get; set; } = new RangeNode<float>(3f, 1f, 10f);
+
         // --- Build (player setup: movement, skills, combat, flasks) ---
 
         public BuildSettings Build { get; set; } = new BuildSettings();
@@ -270,6 +273,9 @@ namespace AutoExile
 
             [Menu("Min Cast Interval (ms)", "Minimum time between casts of this skill in milliseconds. 0=no limit. Prevents debuffs from overriding primary attacks.")]
             public RangeNode<int> MinCastIntervalMs { get; set; } = new RangeNode<int>(0, 0, 10000);
+
+            [Menu("Require Targetable", "Only cast when the target is targetable (not invulnerable/phasing). Useful for debuffs, totems, or skills you don't want wasted on immune targets.")]
+            public ToggleNode RequireTargetable { get; set; } = new ToggleNode(false);
 
             [Menu("Buff/Debuff Name", "Name to match in buff list (substring, case-insensitive). Used with OnlyWhenBuffMissing to check player buffs or target debuffs. Use Scan to discover.")]
             public TextNode BuffDebuffName { get; set; } = new TextNode("");
@@ -546,9 +552,6 @@ namespace AutoExile
 
             [Menu("Max Deaths", "Abandon run after this many deaths.")]
             public RangeNode<int> MaxDeaths { get; set; } = new RangeNode<int>(1, 0, 5);
-
-            [Menu("Settle Time (s)", "Seconds to wait after zone transitions before acting.")]
-            public RangeNode<float> SettleSeconds { get; set; } = new RangeNode<float>(2f, 0.5f, 5f);
 
             [Menu("Prefer Same Type", "Prefer 'same type' transforms over 'same colour' when available.")]
             public ToggleNode PreferSameType { get; set; } = new ToggleNode(true);

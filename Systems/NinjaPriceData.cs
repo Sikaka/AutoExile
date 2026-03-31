@@ -28,7 +28,7 @@ namespace AutoExile.Systems
     {
         // Currency-style endpoints (exchange API)
         Currency, Fragment, DivinationCard, Essence, Scarab, Oil, Fossil, Resonator,
-        DeliriumOrb, Artifact, Tattoo, Omen, KalguuranRune, AllflameEmber, DjinnCoin,
+        DeliriumOrb, Artifact, Tattoo, Omen, KalguuranRune, AllflameEmber, DjinnCoin, Astrolabe,
         // Item-style endpoints (itemoverview API)
         UniqueJewel, UniqueArmour, UniqueWeapon, UniqueAccessory, UniqueFlask, UniqueMap,
         SkillGem, ClusterJewel, Map, BlightedMap, BlightRavagedMap, Invitation,

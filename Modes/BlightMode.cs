@@ -531,7 +531,7 @@ namespace AutoExile.Modes
                 return;
             }
 
-            if ((DateTime.Now - _phaseStartTime).TotalSeconds < 2)
+            if ((DateTime.Now - _phaseStartTime).TotalSeconds < ctx.Settings.AreaSettleSeconds.Value)
             {
                 StatusText = "Waiting before fast-forward...";
                 return;

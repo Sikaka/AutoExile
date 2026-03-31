@@ -308,8 +308,8 @@ namespace AutoExile.Modes
             var gc = ctx.Game;
             var elapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
 
-            // Wait 2s for entity list to settle after zone load
-            if (elapsed < 2)
+            // Wait for entity list to settle after zone load
+            if (elapsed < ctx.Settings.AreaSettleSeconds.Value)
             {
                 StatusText = "Searching for monolith...";
                 return;

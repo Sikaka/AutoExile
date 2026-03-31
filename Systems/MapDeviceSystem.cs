@@ -682,20 +682,28 @@ namespace AutoExile.Systems
         {
             Entity? fallback = null;
 
-            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            try
             {
-                if (!entity.IsTargetable)
-                    continue;
+                foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+                {
+                    if (!entity.IsTargetable)
+                        continue;
 
-                // Primary: RenderName exactly "Map Device" — works for standard and variant devices
-                // (variant decorative piece is "Map Device 1", so exact match avoids it)
-                if (entity.RenderName == "Map Device")
-                    return entity;
+                    // Primary: RenderName exactly "Map Device" — works for standard and variant devices
+                    // (variant decorative piece is "Map Device 1", so exact match avoids it)
+                    if (entity.RenderName == "Map Device")
+                        return entity;
 
-                // Fallback: standard map device by path (legacy detection)
-                if (fallback == null && entity.Type == EntityType.IngameIcon &&
-                    entity.Path != null && entity.Path.Contains("MappingDevice"))
-                    fallback = entity;
+                    // Fallback: standard map device by path (legacy detection)
+                    if (fallback == null && entity.Type == EntityType.IngameIcon &&
+                        entity.Path != null && entity.Path.Contains("MappingDevice"))
+                        fallback = entity;
+                }
+            }
+            catch (IndexOutOfRangeException)
+            {
+                // ExileCore entity component dictionary can race during entity load/unload — retry next tick
+                return null;
             }
 
             return fallback;

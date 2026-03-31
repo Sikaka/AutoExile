@@ -77,7 +77,7 @@ namespace AutoExile.Modes
         private MechanicsSnapshot? _parentMechanicsSnapshot;
         private DateTime? _zoneSettleUntil;   // block actions until terrain/entities settle after hash change
         private bool _zoneSettleExplorationDone; // exploration reinitialized after settle
-        private const float ZoneSettleSeconds = 3f;
+        // Zone settle now driven by ctx.Settings.AreaSettleSeconds
 
         // ── Stats ──
         private DateTime _startTime;
@@ -393,12 +393,13 @@ namespace AutoExile.Modes
                     _visitedIconIds.Clear();
 
                     // Start settle timer — block actions until terrain/entities load
-                    _zoneSettleUntil = DateTime.Now.AddSeconds(ZoneSettleSeconds);
+                    var settleTime = ctx.Settings.AreaSettleSeconds.Value;
+                    _zoneSettleUntil = DateTime.Now.AddSeconds(settleTime);
                     _zoneSettleExplorationDone = false;
                     _phase = MappingPhase.Exploring;
                     Status = "Zone transition — settling...";
 
-                    ctx.Log($"[Mapping] Zone settle started ({ZoneSettleSeconds}s)");
+                    ctx.Log($"[Mapping] Zone settle started ({settleTime}s)");
                 }
                 _lastZoneHash = currentHash;
             }
@@ -515,12 +516,13 @@ namespace AutoExile.Modes
                     _exploreTargetsVisited = 0;
                     _navFailures = 0;
                     _visitedIconIds.Clear();
-                    _zoneSettleUntil = DateTime.Now.AddSeconds(ZoneSettleSeconds);
+                    var wishSettleTime = ctx.Settings.AreaSettleSeconds.Value;
+                    _zoneSettleUntil = DateTime.Now.AddSeconds(wishSettleTime);
                     _zoneSettleExplorationDone = false;
                     _phase = MappingPhase.Exploring;
                     var entryHash = gc.IngameState?.Data?.CurrentAreaHash ?? 0;
                     Status = $"Entered wish zone — settling... hash={entryHash} parent={_parentZoneHash}";
-                    ctx.Log($"[Mapping] Wish zone settle started ({ZoneSettleSeconds}s) hash={entryHash} parent={_parentZoneHash}");
+                    ctx.Log($"[Mapping] Wish zone settle started ({wishSettleTime}s) hash={entryHash} parent={_parentZoneHash}");
                     return;
                 }
 

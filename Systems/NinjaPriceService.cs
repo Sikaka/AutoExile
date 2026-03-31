@@ -70,6 +70,7 @@ namespace AutoExile.Systems
             { NinjaPriceCategory.KalguuranRune, "Runegraft" },
             { NinjaPriceCategory.AllflameEmber, "AllflameEmber" },
             { NinjaPriceCategory.DjinnCoin, "DjinnCoin" },
+            { NinjaPriceCategory.Astrolabe, "Astrolabe" },
         };
 
         private static readonly Dictionary<NinjaPriceCategory, string> ItemEndpoints = new()
@@ -582,6 +583,8 @@ namespace AutoExile.Systems
             // Path-based checks first (most specific)
             if (path.StartsWith("Metadata/Items/Currency/Runegraft", StringComparison.Ordinal))
                 return NinjaPriceCategory.KalguuranRune;
+            if (path.StartsWith("Metadata/Items/Currency/Astrolabe", StringComparison.Ordinal))
+                return NinjaPriceCategory.Astrolabe;
             if (path.StartsWith("Metadata/Items/MapFragments/", StringComparison.Ordinal) &&
                 path.EndsWith("AllflamePack", StringComparison.Ordinal))
                 return NinjaPriceCategory.AllflameEmber;

@@ -441,6 +441,19 @@ namespace AutoExile.Systems
             return true;
         }
 
+        /// <summary>Force cursor+key press, bypassing the input gate. For dodge — survival trumps input cadence.</summary>
+        public static bool ForceCursorPressKey(Vector2 absPos, Keys key)
+        {
+            if (!ClampToWindow(ref absPos)) { LogAction("ForceCursorPressKey", absPos, key, false); return false; }
+            var moveMs = EstimateMoveMs(absPos);
+            var settle = RandSettle();
+            var hold = RandHold();
+            NextActionAt = DateTime.Now.AddMilliseconds(moveMs + settle + hold + ActionCooldownMs);
+            _ = DoCursorPressKey(absPos, key, settle, hold);
+            LogAction("ForceCursorPressKey", absPos, key, true);
+            return true;
+        }
+
         private static async Task DoCursorPressKey(Vector2 absPos, Keys key, int settleMs, int holdMs)
         {
             await MoveCursorTo(absPos);

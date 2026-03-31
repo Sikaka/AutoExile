@@ -619,6 +619,7 @@ namespace AutoExile.Systems
                     SummonRecast = slotConfig.SummonRecast.Value,
                     BuffDebuffName = slotConfig.BuffDebuffName.Value ?? "",
                     MinCastIntervalMs = slotConfig.MinCastIntervalMs.Value,
+                    RequireTargetable = slotConfig.RequireTargetable.Value,
                 };
 
                 // Auto-detect properties from skill stats
@@ -771,6 +772,10 @@ namespace AutoExile.Systems
             // Per-skill cast interval — prevents debuffs from overriding primary attacks
             if (entry.MinCastIntervalMs > 0 &&
                 (DateTime.Now - entry.LastCastAt).TotalMilliseconds < entry.MinCastIntervalMs)
+                return false;
+
+            // Require targetable — skip if target is invulnerable/untargetable
+            if (entry.RequireTargetable && BestTarget != null && !BestTarget.IsTargetable)
                 return false;
 
             // Target filter — restrict to certain rarities
@@ -994,8 +999,8 @@ namespace AutoExile.Systems
                 return;
             }
 
-            // Utility flasks (use in combat when available)
-            if (InCombat)
+            // Utility flasks (use in combat when nearby enemies are targetable)
+            if (InCombat && BestTarget?.IsTargetable == true)
             {
                 for (int i = 0; i < 5; i++)
                 {
@@ -1322,6 +1327,7 @@ namespace AutoExile.Systems
             public bool SummonRecast;
             public string BuffDebuffName = "";
             public int MinCastIntervalMs;
+            public bool RequireTargetable;
             public DateTime LastCastAt = DateTime.MinValue;
         }
     }

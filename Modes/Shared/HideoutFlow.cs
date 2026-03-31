@@ -28,7 +28,6 @@ namespace AutoExile.Modes.Shared
         private string? _withdrawFragmentPath;
         private int _fragmentStock; // target number of fragments to maintain in inventory
 
-        private const float SettleSeconds = 3f;
         private const float BasePortalTimeoutSeconds = 15f;
         private const float MapDeviceRetrySeconds = 10f;
         private const float ActionCooldownMs = 500f;
@@ -116,7 +115,7 @@ namespace AutoExile.Modes.Shared
         private HideoutSignal TickSettle(BotContext ctx)
         {
             var elapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
-            if (elapsed < SettleSeconds)
+            if (elapsed < ctx.Settings.AreaSettleSeconds.Value)
             {
                 Status = $"Hideout — waiting for game state ({elapsed:F1}s)";
                 return HideoutSignal.InProgress;

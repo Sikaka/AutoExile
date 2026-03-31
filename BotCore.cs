@@ -81,7 +81,7 @@ namespace AutoExile
         private string _lastAreaName = "";
         private long _lastAreaHash;
         private DateTime _areaChangedAt = DateTime.MinValue;
-        private const float AreaSettleSeconds = 3f;
+        private float AreaSettleSeconds => Settings.AreaSettleSeconds.Value;
 
         // Cross-zone state cache (e.g., Wishes portal round-trip)
         // Keyed by area name — when returning to same-named area, restore cached state
@@ -164,6 +164,7 @@ namespace AutoExile
             _bossMode = new BossMode();
             _bossMode.Register(new KingEncounter());
             _bossMode.Register(new OshabiEncounter());
+            _bossMode.Register(new FearEncounter());
             RegisterMode(_bossMode);
 
             // Register in-map mechanics
@@ -640,7 +641,7 @@ namespace AutoExile
                 ?? (_mode as PathBenchmarkMode)?.Status
                 ?? (_mode as BossMode)?.Status
                 ?? "",
-                _navigation, _interaction, _loot);
+                _navigation, _interaction, _loot, _threat);
 
             // Only run full mode logic when running
             if (!Settings.Running)
@@ -656,6 +657,9 @@ namespace AutoExile
             if ((DateTime.Now - _areaChangedAt).TotalSeconds < AreaSettleSeconds)
                 return base.Tick();
 
+            // Tick threat detection (dodge signals consumed by modes)
+            _threat.Tick(GameController);
+
             // Sync follower settings
             if (_followerMode != null)
             {
@@ -670,6 +674,10 @@ namespace AutoExile
 
             // Let the active mode decide what to do (may set up navigation paths)
             _mode.Tick(_ctx);
+
+            // Record dodge action (set during mode tick, after recorder snapshot)
+            if (_mode is BossMode bm && !string.IsNullOrEmpty(bm.LastDodgeAction))
+                _recorder.SetDodgeAction(bm.LastDodgeAction);
 
             // Navigation ticks AFTER mode — mode sets up/updates paths, then nav executes movement.
             // This prevents stale walk commands: the walk command always targets the current path,

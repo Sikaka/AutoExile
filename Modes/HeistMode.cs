@@ -198,8 +198,8 @@ namespace AutoExile.Modes
 
         private void TickInitializing(BotContext ctx, GameController gc)
         {
-            // Wait 2 seconds for entities to settle after zone load
-            if ((DateTime.Now - _phaseStartTime).TotalSeconds < 2)
+            // Wait for entities to settle after zone load
+            if ((DateTime.Now - _phaseStartTime).TotalSeconds < ctx.Settings.AreaSettleSeconds.Value)
             {
                 _status = "Initializing... waiting for entities";
                 Decision = "init_wait";

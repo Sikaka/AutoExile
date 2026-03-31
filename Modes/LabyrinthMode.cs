@@ -221,7 +221,7 @@ namespace AutoExile.Modes
             _hoverIndex = -1;
             _scannedGems.Clear();
             _lootTracker.Reset();
-            _settleUntil = DateTime.Now.AddSeconds(ctx.Settings.Labyrinth.SettleSeconds.Value);
+            _settleUntil = DateTime.Now.AddSeconds(ctx.Settings.AreaSettleSeconds.Value);
 
             ModeHelpers.EnableDefaultCombat(ctx);
 
@@ -429,7 +429,7 @@ namespace AutoExile.Modes
 
             // Save exit memory if dirty
             SaveExitMemory();
-            _settleUntil = DateTime.Now.AddSeconds(ctx.Settings.Labyrinth.SettleSeconds.Value);
+            _settleUntil = DateTime.Now.AddSeconds(ctx.Settings.AreaSettleSeconds.Value);
 
             var gc = ctx.Game;
             bool isHideout = gc.Area.CurrentArea.IsHideout;

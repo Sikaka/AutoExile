@@ -172,6 +172,7 @@ namespace AutoExile.Systems
                     mt.HasCast = true;
                     mt.DodgeSignaled = false;
                     mt.CastStartTime = DateTime.Now;
+                    // DestinationX/Y are grid coordinates
                     mt.CastDestination = new Vector2(
                         currentAction?.DestinationX ?? 0,
                         currentAction?.DestinationY ?? 0);
@@ -193,13 +194,19 @@ namespace AutoExile.Systems
                 }
 
                 mt.PrevSkillName = skillName;
-                mt.PrevProgress = progress;
+                // Only update PrevProgress during active skills — non-skill animations
+                // (stance changes, transitions) would overwrite it with low values,
+                // breaking the "progress reset" re-cast detection for same-skill repeats.
+                if (!string.IsNullOrEmpty(skillName))
+                    mt.PrevProgress = progress;
 
                 // ── Evaluate dodge need ──
                 if (mt.HasCast && !mt.DodgeSignaled && !SafeAnimations.Contains(animName))
                 {
-                    // Only dodge in the valid window: after dest locks, before damage fires
-                    if (progress >= DodgeMinProgress && progress <= DodgeMaxProgress)
+                    // Dodge as late as possible — wait until progress reaches DodgeMaxProgress
+                    // so the blink happens right before damage, not at the start of the windup.
+                    // DodgeMinProgress is the earliest we trust the destination is locked.
+                    if (progress >= DodgeMaxProgress)
                     {
                         var destDist = Vector2.Distance(mt.CastDestination, playerGrid);
                         if (destDist < DodgeTriggerDistance)

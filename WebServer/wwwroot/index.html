@@ -824,17 +824,17 @@ let activeSettingsTab = 'build';
 const SKILL_TYPES = {
   disabled: { label:'Disabled', role:'Disabled', fields:[] },
   move:     { label:'Move Only', role:'PrimaryMovement', fields:[] },
-  attack:   { label:'Attack', role:'Enemy', fields:['priority','targetFilter','maxTargetRange','minCastIntervalMs'], defaults:{priority:8} },
+  attack:   { label:'Attack', role:'Enemy', fields:['priority','targetFilter','maxTargetRange','minCastIntervalMs','requireTargetable'], defaults:{priority:8} },
   blink:    { label:'Blink / Dash', role:'MovementSkill', fields:['canCrossTerrain','minCastIntervalMs'], defaults:{canCrossTerrain:true} },
-  curse:    { label:'Curse / Debuff', role:'Enemy', fields:['priority','minCastIntervalMs','buffDebuffName'], defaults:{priority:3, onlyWhenBuffMissing:true, minCastIntervalMs:5000} },
+  curse:    { label:'Curse / Debuff', role:'Enemy', fields:['priority','minCastIntervalMs','requireTargetable','buffDebuffName'], defaults:{priority:3, onlyWhenBuffMissing:true, minCastIntervalMs:5000} },
   buff:     { label:'Buff', role:'Self', fields:['priority','buffDebuffName'], defaults:{priority:5, onlyWhenBuffMissing:true} },
   guard:    { label:'Guard', role:'Self', fields:['priority'], defaults:{priority:7, onlyOnLowLife:true} },
   vaal:     { label:'Vaal Skill', role:'Self', fields:['priority','minNearbyEnemies'], defaults:{priority:6, minNearbyEnemies:5} },
-  warcry:   { label:'Warcry', role:'Enemy', fields:['priority','minNearbyEnemies','minCastIntervalMs'], defaults:{priority:4, minNearbyEnemies:3} },
+  warcry:   { label:'Warcry', role:'Enemy', fields:['priority','minNearbyEnemies','minCastIntervalMs','requireTargetable'], defaults:{priority:4, minNearbyEnemies:3} },
   summon:   { label:'Summon / Minion', role:'Self', fields:['priority'], defaults:{priority:5, summonRecast:true} },
   corpse:   { label:'Corpse Skill', role:'Corpse', fields:['priority','buffDebuffName'], defaults:{priority:5, onlyWhenBuffMissing:true} },
-  totem:    { label:'Totem', role:'Enemy', fields:['priority','minNearbyEnemies','maxTargetRange'], defaults:{priority:6, summonRecast:true, minNearbyEnemies:1} },
-  custom:   { label:'Custom', role:null, fields:['role','priority','canCrossTerrain','targetFilter','maxTargetRange','minNearbyEnemies','minCastIntervalMs','onlyWhenBuffMissing','buffDebuffName','onlyOnLowLife','summonRecast'], defaults:{} },
+  totem:    { label:'Totem', role:'Enemy', fields:['priority','minNearbyEnemies','maxTargetRange','requireTargetable'], defaults:{priority:6, summonRecast:true, minNearbyEnemies:1} },
+  custom:   { label:'Custom', role:null, fields:['role','priority','canCrossTerrain','targetFilter','maxTargetRange','minNearbyEnemies','minCastIntervalMs','onlyWhenBuffMissing','buffDebuffName','onlyOnLowLife','summonRecast','requireTargetable'], defaults:{} },
 };
 
 // Curse keywords for auto-detection
@@ -1068,7 +1068,7 @@ function renderAllSettings() {
 
   // Advanced tab
   const adv = makeTabContent('advanced');
-  addSection(adv, 'General', [['actionCooldownMs'],['extraLatencyMs'],['maxClickAttempts'],['interactRadius'],['autoLevelGems'],['autoApplyIncubators'],['debugIncubatorOverlay']]);
+  addSection(adv, 'General', [['actionCooldownMs'],['extraLatencyMs'],['maxClickAttempts'],['interactRadius'],['areaSettleSeconds'],['autoLevelGems'],['autoApplyIncubators'],['debugIncubatorOverlay']]);
   addSection(adv, 'Threat Detection', [['threat.enabled'],['threat.monitorRares'],['threat.autoDodge'],
     ['threat.threatRadius'],['threat.dodgeTriggerDistance'],['threat.dodgeDistance'],
     ['threat.dodgeMinProgress'],['threat.dodgeMaxProgress'],['threat.dodgeCooldownMs']]);
@@ -1197,7 +1197,7 @@ function renderSkillsSection() {
       const roleRow = buildField(`${prefix}.role`, S[`${prefix}.role`]);
       body.appendChild(roleRow);
       const allFields = ['priority','canCrossTerrain','targetFilter','maxTargetRange','minNearbyEnemies',
-        'minCastIntervalMs','onlyWhenBuffMissing','buffDebuffName','onlyOnLowLife','summonRecast'];
+        'minCastIntervalMs','onlyWhenBuffMissing','buffDebuffName','onlyOnLowLife','summonRecast','requireTargetable'];
       for (const f of allFields) {
         const entry = S[`${prefix}.${f}`]; if (!entry) continue;
         body.appendChild(buildField(`${prefix}.${f}`, entry));
@@ -1233,7 +1233,7 @@ function changeSkillType(prefix, newType, configIdx) {
   // Merge resets with type defaults — defaults override resets, single write per key
   const resets = {
     priority: 5, canCrossTerrain: false, onlyWhenBuffMissing: false,
-    onlyOnLowLife: false, summonRecast: false, minNearbyEnemies: 0,
+    onlyOnLowLife: false, summonRecast: false, requireTargetable: false, minNearbyEnemies: 0,
     minCastIntervalMs: 0, maxTargetRange: 0,
   };
   const merged = { ...resets, ...(typeDef.defaults || {}) };
