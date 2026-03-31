@@ -127,14 +127,15 @@ namespace AutoExile.Modes.Shared
             int lootItems = StashSystem.CountNonMatchingItems(ctx.Game, _withdrawFragmentPath);
 
             // Only withdraw when completely out of fragments — don't top up each run
-            bool canWithdraw = !string.IsNullOrEmpty(_resourceTabName)
-                && !string.IsNullOrEmpty(_withdrawFragmentPath)
+            bool usesFragments = !string.IsNullOrEmpty(_withdrawFragmentPath);
+            bool canWithdraw = usesFragments
+                && !string.IsNullOrEmpty(_resourceTabName)
                 && _fragmentStock > 0;
             bool needWithdraw = canWithdraw && fragmentsInInventory == 0;
             int withdrawNeeded = needWithdraw ? _fragmentStock : 0;
 
-            // No fragments and no way to get more — signal stop
-            if (fragmentsInInventory == 0 && !canWithdraw)
+            // No fragments and no way to get more — signal stop (only for modes that use fragments)
+            if (usesFragments && fragmentsInInventory == 0 && !canWithdraw)
             {
                 Status = "No fragments in inventory";
                 _phase = HideoutPhase.Idle;
@@ -179,8 +180,8 @@ namespace AutoExile.Modes.Shared
                 case StashResult.Succeeded:
                 case StashResult.Failed:
                 {
-                    // Verify we have fragments before proceeding to map device
-                    if (!string.IsNullOrEmpty(_withdrawFragmentPath))
+                    // Verify we have fragments before proceeding to map device (only for modes that use fragments)
+                    if (!string.IsNullOrEmpty(_withdrawFragmentPath) && !string.IsNullOrEmpty(_resourceTabName))
                     {
                         int frags = StashSystem.CountInventoryItems(ctx.Game, _withdrawFragmentPath);
                         if (frags == 0)
