@@ -1490,9 +1490,20 @@ function buildField(key, entry, note) {
         input = `<input type="text" value="${esc(entry.value||'')}" onchange="updateSetting('${key}',this.value)">`;
       }
       break;
-    case 'hotkey':
-      input = `<span class="hotkey-badge">${esc(entry.value||'')}</span>`;
+    case 'hotkey': {
+      const commonKeys = ['None','F1','F2','F3','F4','F5','F6','F7','F8','F9','F10','F11','F12',
+        'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
+        'D0','D1','D2','D3','D4','D5','D6','D7','D8','D9',
+        'Insert','Delete','Home','End','PageUp','PageDown',
+        'Up','Down','Left','Right','Space','Tab','Escape',
+        'OemTilde','OemMinus','OemPlus','OemOpenBrackets','OemCloseBrackets','OemPipe','OemSemicolon','OemQuotes','OemComma','OemPeriod','OemQuestion'];
+      const curVal = entry.value || '';
+      const opts = commonKeys.map(k => `<option value="${k}" ${k===curVal?'selected':''}>${k}</option>`).join('');
+      // If current value isn't in common list, prepend it
+      const extra = commonKeys.includes(curVal) ? '' : `<option value="${esc(curVal)}" selected>${esc(curVal)}</option>`;
+      input = `<select onchange="updateSetting('${key}',this.value)">${extra}${opts}</select>`;
       break;
+    }
     default:
       input = `<span class="hotkey-badge">${esc(String(entry.value||''))}</span>`;
   }

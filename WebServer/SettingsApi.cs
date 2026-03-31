@@ -223,7 +223,6 @@ namespace AutoExile.WebServer
                     Description = desc,
                     Type = "hotkey",
                     Value = valueProp?.GetValue(node)?.ToString() ?? "",
-                    ReadOnly = true,
                 };
             }
 
@@ -276,9 +275,18 @@ namespace AutoExile.WebServer
                     return (true, "");
                 }
 
-                // HotkeyNode — read-only from web
+                // HotkeyNode — parse Keys enum from string
                 if (nodeType.Name.Contains("HotkeyNode"))
-                    return (false, "Hotkey settings are read-only from web UI");
+                {
+                    var keyStr = value.GetString() ?? "";
+                    if (Enum.TryParse<System.Windows.Forms.Keys>(keyStr, true, out var parsedKey))
+                    {
+                        var valueProp2 = nodeType.GetProperty("Value");
+                        valueProp2?.SetValue(node, parsedKey);
+                        return (true, "");
+                    }
+                    return (false, $"Unknown key: '{keyStr}'");
+                }
 
                 return (false, $"Unsupported node type: {nodeType.Name}");
             }
