@@ -6,7 +6,6 @@ An ExileCore plugin that automates Path of Exile farming. Run maps, farm bosses,
 
 ### Requirements
 - [ExileApi](https://github.com/exApiTools/ExileApi-Compiled/) (latest version)
-- [Get-Chaos-Value](https://github.com/DetectiveSquirrel/Get-Chaos-Value) plugin for item pricing (recommended)
 
 ### Installation
 
