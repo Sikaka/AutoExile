@@ -14,16 +14,16 @@ An ExileCore plugin that automates Path of Exile farming. Run maps, farm bosses,
 2. Go to the **Plugin Updater** → **Add** tab
 3. Paste the repository URL and click **Clone**:
 
-![Plugin Updater](images/Install%20via%20Plugin%20Updator.png)
+![Plugin Updater](images/install-plugin-updater.png)
 
 The updater will download, compile, and keep the plugin up to date automatically.
 
 ### First-Time Setup
 
-1. Open the web dashboard (default: `http://localhost:5000`) or use the ExileCore settings panel
+1. Open the web dashboard at `http://localhost:9876` or use the ExileCore settings panel
 2. Configure your **Build Settings** — set your movement key, assign skill slots, and configure flasks
 3. Pick a farming mode and configure its settings
-4. Press **F5** in-game to start the bot
+4. Press **Insert** in-game to start the bot
 
 ## Farming Modes
 
@@ -51,7 +51,7 @@ Automated map farming with exploration, combat, and looting. Currently supports 
 
 AutoExile includes a built-in web server that lets you monitor and control the bot from any browser, including your phone. View live status, change settings, and check session stats without alt-tabbing.
 
-The dashboard is available at `http://localhost:5000` by default (configurable port). Enable network access in settings to connect from other devices on your network.
+The dashboard is available at `http://localhost:9876` by default (port is configurable). Enable network access in settings to connect from other devices on your network.
 
 ## Configuration
 
@@ -62,7 +62,7 @@ All settings are managed through the web dashboard or ExileCore's settings panel
 - **Mode Settings** — Each farming mode has its own section with mode-specific options
 - **Boss** — Boss type selection, fragment stock, stash tab names, loot sweep timeout, max deaths
 
-![Boss Mode Configuration](images/Configure%20Boss%20Mode.png)
+![Boss Mode Configuration](images/configure-boss-mode.png)
 
 Each skill slot supports conditions like buff/debuff checks, enemy count thresholds, rarity filters, and range limits. Use the built-in **Buff Scanner** to discover buff names from live gameplay.
 
@@ -70,19 +70,18 @@ Each skill slot supports conditions like buff/debuff checks, enemy count thresho
 
 | Key | Action |
 |---|---|
-| F5 | Start / Pause / Resume the bot |
+| Insert | Start / Pause / Resume the bot |
 | F6 | Dump game state (terrain, exploration, pathfinding) to image + JSON |
+| F7 | Dump recording |
 
 Hotkeys are rebindable through settings.
 
 ## Building from Source
 
-If you want to build manually instead of using the plugin updater:
+For contributors who want to build manually instead of using the plugin updater:
 
 ```
 dotnet build
 ```
 
-Copy `AutoExile.dll` from the build output to your ExileCore plugins directory. Reload plugins in ExileCore if the DLL is locked.
-
-Targets .NET 10.0 (Windows). ExileCore reference DLLs are included in `Resources/`.
+Targets .NET 10.0 (Windows).
