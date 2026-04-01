@@ -14,7 +14,7 @@ An ExileCore plugin that automates Path of Exile farming. Run maps, farm bosses,
 2. Go to the **Plugin Updater** → **Add** tab
 3. Paste the repository URL and click **Clone**:
 
-![Plugin Updater](images/install-plugin-updater.png)
+![Plugin Updater](Images/install-plugin-updater.png)
 
 The updater will download, compile, and keep the plugin up to date automatically.
 
@@ -62,7 +62,7 @@ All settings are managed through the web dashboard or ExileCore's settings panel
 - **Mode Settings** — Each farming mode has its own section with mode-specific options
 - **Boss** — Boss type selection, fragment stock, stash tab names, loot sweep timeout, max deaths
 
-![Boss Mode Configuration](images/configure-boss-mode.png)
+![Boss Mode Configuration](Images/configure-boss-mode.png)
 
 Each skill slot supports conditions like buff/debuff checks, enemy count thresholds, rarity filters, and range limits. Use the built-in **Buff Scanner** to discover buff names from live gameplay.
 
