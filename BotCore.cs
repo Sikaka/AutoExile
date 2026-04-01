@@ -48,6 +48,7 @@ namespace AutoExile
         private NinjaPriceService _ninjaPrice = new();
         private GemValuationService _gemValuation = new();
         private BotRecorder _recorder = new();
+        private BossFightRecorder _mavenRecorder = new();
         private BotWebServer? _webServer;
         private DataStore? _dataStore;
         private ConfigManager? _configManager;
@@ -122,6 +123,7 @@ namespace AutoExile
             Name = "AutoExile";
             Instance = this;
             _recorder.SetOutputDir(Path.Combine(DirectoryFullName, "Recordings"));
+            _mavenRecorder.Initialize(DirectoryFullName);
             _ninjaPrice.Initialize(DirectoryFullName, msg => LogMessage($"[AutoExile] NinjaPrice: {msg}"));
             _mapDatabase = new MapDatabase(msg => LogMessage($"[AutoExile] {msg}"));
             _mapDatabase.Initialize(DirectoryFullName);
@@ -165,6 +167,7 @@ namespace AutoExile
             _bossMode.Register(new KingEncounter());
             _bossMode.Register(new OshabiEncounter());
             _bossMode.Register(new FearEncounter());
+            _bossMode.Register(new MavenEncounter());
             RegisterMode(_bossMode);
 
             // Register in-map mechanics
@@ -659,6 +662,9 @@ namespace AutoExile
 
             // Tick threat detection (dodge signals consumed by modes)
             _threat.Tick(GameController);
+
+            // Maven fight recorder — always runs, independent of bot mode
+            _mavenRecorder.Tick(GameController);
 
             // Sync follower settings
             if (_followerMode != null)

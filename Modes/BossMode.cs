@@ -457,6 +457,24 @@ namespace AutoExile.Modes
                 return;
             }
 
+            // Descension altar panel — click the X button instead of Escape (Escape opens pause menu)
+            var ascPanel = gc.IngameState.IngameUi.AscendancySelectPanel;
+            if (ascPanel?.IsVisible == true)
+            {
+                // Close button is at [0][1] in the panel child tree
+                var closeBtn = ascPanel.GetChildAtIndex(0)?.GetChildAtIndex(1);
+                if (closeBtn?.IsVisible == true)
+                {
+                    var rect = closeBtn.GetClientRect();
+                    var windowRect = gc.Window.GetWindowRectangle();
+                    var absPos = new Vector2(windowRect.X + rect.Center.X, windowRect.Y + rect.Center.Y);
+                    BotInput.Click(absPos);
+                    _lastActionTime = DateTime.Now;
+                    ctx.Log("[Boss] Closing descension altar panel (misclick)");
+                }
+                return;
+            }
+
             // Try existing portals first (boss zones have pre-placed exit portals like RitualBossPortal)
             var portal = FindExitPortal(gc);
             if (portal != null)

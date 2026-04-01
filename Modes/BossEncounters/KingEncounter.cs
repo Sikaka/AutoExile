@@ -68,6 +68,8 @@ namespace AutoExile.Modes.BossEncounters
         private KingPhase _phase = KingPhase.Idle;
         private DateTime _phaseStartTime;
         private Entity? _bossEntity;
+        private Vector2? _bossDeathPos;
+        private DateTime _lastLootScan;
         private bool _mazeVisited;
         private bool _bossWasAlive;
         private int _exploreFails;
@@ -170,7 +172,7 @@ namespace AutoExile.Modes.BossEncounters
                 case KingPhase.InMaze:
                     return TickMaze(ctx, gc, playerGrid);
                 case KingPhase.WaitingForLoot:
-                    return TickWaitingForLoot();
+                    return TickWaitingForLoot(ctx, gc, playerGrid);
                 default:
                     return BossEncounterResult.InProgress;
             }
@@ -225,6 +227,7 @@ namespace AutoExile.Modes.BossEncounters
             if (_bossEntity != null && _bossEntity.IsAlive)
             {
                 var bossGrid = new Vector2(_bossEntity.GridPosNum.X, _bossEntity.GridPosNum.Y);
+                _bossDeathPos = bossGrid;
                 var dist = Vector2.Distance(playerGrid, bossGrid);
 
                 if (dist > 30 && !ctx.Navigation.IsNavigating)
@@ -309,10 +312,63 @@ namespace AutoExile.Modes.BossEncounters
             return BossEncounterResult.InProgress;
         }
 
-        private BossEncounterResult TickWaitingForLoot()
+        private BossEncounterResult TickWaitingForLoot(BotContext ctx, GameController gc, Vector2 playerGrid)
         {
-            Status = "Boss complete!";
-            return BossEncounterResult.Complete;
+            var timeout = ctx.Settings.Boss.LootSweepTimeoutSeconds.Value;
+            var elapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
+
+            if (elapsed > timeout)
+            {
+                ctx.Log("[King] Loot sweep timeout — signaling Complete");
+                return BossEncounterResult.Complete;
+            }
+
+            var remaining = timeout - elapsed;
+            var countdown = $"({remaining:F0}s left)";
+
+            // Navigate to boss death position
+            if (_bossDeathPos.HasValue)
+            {
+                var distToLoot = Vector2.Distance(playerGrid, _bossDeathPos.Value);
+                if (distToLoot > 15 && !ctx.Navigation.IsNavigating)
+                    ctx.Navigation.NavigateTo(gc, _bossDeathPos.Value);
+            }
+
+            if ((DateTime.Now - _lastLootScan).TotalMilliseconds >= 500)
+            {
+                ctx.Loot.Scan(gc);
+                _lastLootScan = DateTime.Now;
+            }
+
+            if (ctx.Interaction.IsBusy)
+            {
+                Status = $"Picking up loot {countdown}";
+                return BossEncounterResult.InProgress;
+            }
+
+            if (ctx.Loot.HasLootNearby)
+            {
+                var (_, candidate) = ctx.Loot.PickupNext(ctx.Interaction, ctx.Navigation);
+                if (candidate != null)
+                {
+                    Status = $"Looting: {candidate.ItemName} {countdown}";
+                    return BossEncounterResult.InProgress;
+                }
+            }
+
+            if (ctx.Loot.TogglePhase != LootSystem.LabelTogglePhase.Idle)
+            {
+                ctx.Loot.TickLabelToggle(gc);
+                return BossEncounterResult.InProgress;
+            }
+            if (ctx.Loot.ShouldToggleLabels(gc))
+            {
+                ctx.Loot.StartLabelToggle(gc);
+                return BossEncounterResult.InProgress;
+            }
+
+            Status = $"Waiting for loot {countdown}";
+            return BossEncounterResult.InProgress;
         }
 
         private Entity? FindBoss(GameController gc)
@@ -459,6 +515,8 @@ namespace AutoExile.Modes.BossEncounters
             _exploreFails = 0;
             _lastPlayerGrid = Vector2.Zero;
             _mazeDieSkillUsed = false;
+            _bossDeathPos = null;
+            _lastLootScan = DateTime.MinValue;
             Status = "";
         }
     }

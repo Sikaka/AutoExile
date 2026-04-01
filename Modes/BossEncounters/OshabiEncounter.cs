@@ -71,6 +71,8 @@ namespace AutoExile.Modes.BossEncounters
         private bool _hasSettled;
         private int _spawnerClickAttempts;
         private DateTime _lastSpawnerClickTime;
+        private Vector2? _bossDeathPos;
+        private DateTime _lastLootScan;
         private const float SpawnerClickCooldownMs = 1000;
         private const int MaxSpawnerClickAttempts = 10;
         private const float SpawnerApproachDist = 8f; // must be very close before clicking label
@@ -147,7 +149,7 @@ namespace AutoExile.Modes.BossEncounters
                 case OshabiPhase.Fighting:
                     return TickFighting(ctx, gc, playerGrid);
                 case OshabiPhase.WaitingForLoot:
-                    return TickWaitingForLoot();
+                    return TickWaitingForLoot(ctx, gc, playerGrid);
                 default:
                     return BossEncounterResult.InProgress;
             }
@@ -430,6 +432,7 @@ namespace AutoExile.Modes.BossEncounters
             if (_bossEntity != null && _bossEntity.IsAlive)
             {
                 var bossGrid = new Vector2(_bossEntity.GridPosNum.X, _bossEntity.GridPosNum.Y);
+                _bossDeathPos = bossGrid; // continuously cache for loot nav
                 var dist = Vector2.Distance(playerGrid, bossGrid);
 
                 // Stay on top of Oshabi — totems need proximity, loot drops where she dies
@@ -447,12 +450,63 @@ namespace AutoExile.Modes.BossEncounters
             return BossEncounterResult.InProgress;
         }
 
-        private BossEncounterResult TickWaitingForLoot()
+        private BossEncounterResult TickWaitingForLoot(BotContext ctx, GameController gc, Vector2 playerGrid)
         {
-            // Return Complete immediately — BossMode's LootSweep handles the
-            // settle time (configured via LootSweepTimeoutSeconds setting)
-            Status = "Oshabi complete!";
-            return BossEncounterResult.Complete;
+            var timeout = ctx.Settings.Boss.LootSweepTimeoutSeconds.Value;
+            var elapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
+
+            if (elapsed > timeout)
+            {
+                Status = "Loot sweep done";
+                ctx.Log("[Oshabi] Loot sweep timeout — signaling Complete");
+                return BossEncounterResult.Complete;
+            }
+
+            var remaining = timeout - elapsed;
+            var countdown = $"({remaining:F0}s left)";
+
+            // Navigate to boss death position (loot drops where boss died)
+            var lootPos = _bossDeathPos ?? StartPosition;
+            var distToLoot = Vector2.Distance(playerGrid, lootPos);
+            if (distToLoot > 15 && !ctx.Navigation.IsNavigating)
+                ctx.Navigation.NavigateTo(gc, lootPos);
+
+            // Scan for loot
+            if ((DateTime.Now - _lastLootScan).TotalMilliseconds >= 500)
+            {
+                ctx.Loot.Scan(gc);
+                _lastLootScan = DateTime.Now;
+            }
+
+            if (ctx.Interaction.IsBusy)
+            {
+                Status = $"Picking up loot {countdown}";
+                return BossEncounterResult.InProgress;
+            }
+
+            if (ctx.Loot.HasLootNearby)
+            {
+                var (_, candidate) = ctx.Loot.PickupNext(ctx.Interaction, ctx.Navigation);
+                if (candidate != null)
+                {
+                    Status = $"Looting: {candidate.ItemName} {countdown}";
+                    return BossEncounterResult.InProgress;
+                }
+            }
+
+            if (ctx.Loot.TogglePhase != LootSystem.LabelTogglePhase.Idle)
+            {
+                ctx.Loot.TickLabelToggle(gc);
+                return BossEncounterResult.InProgress;
+            }
+            if (ctx.Loot.ShouldToggleLabels(gc))
+            {
+                ctx.Loot.StartLabelToggle(gc);
+                return BossEncounterResult.InProgress;
+            }
+
+            Status = $"Waiting for loot {countdown}";
+            return BossEncounterResult.InProgress;
         }
 
         private Entity? FindBoss(GameController gc)
@@ -538,6 +592,8 @@ namespace AutoExile.Modes.BossEncounters
             _hasSettled = false;
             _spawnerClickAttempts = 0;
             _lastSpawnerClickTime = DateTime.MinValue;
+            _bossDeathPos = null;
+            _lastLootScan = DateTime.MinValue;
             Status = "";
         }
     }

@@ -69,6 +69,13 @@ namespace AutoExile.Systems
         /// </summary>
         public bool SuppressTargetedSkills { get; set; }
 
+        /// <summary>
+        /// When true, boss is invulnerable (e.g. boss_life_bar=0 during emergence cinematic).
+        /// Suppresses utility flask usage to avoid wasting charges. Skills still fire (traps pre-lay).
+        /// Set by boss encounters that detect invulnerability via StateMachine.
+        /// </summary>
+        public bool BossInvulnerable { get; set; }
+
         /// <summary>Debug: last skill execution detail.</summary>
         public string LastSkillAction { get; private set; } = "";
 
@@ -999,8 +1006,8 @@ namespace AutoExile.Systems
                 return;
             }
 
-            // Utility flasks (use in combat when nearby enemies are targetable)
-            if (InCombat && BestTarget?.IsTargetable == true)
+            // Utility flasks (use in combat when nearby enemies are targetable and damageable)
+            if (InCombat && BestTarget?.IsTargetable == true && !BossInvulnerable)
             {
                 for (int i = 0; i < 5; i++)
                 {
