@@ -76,6 +76,12 @@ Each skill slot supports conditions like buff/debuff checks, enemy count thresho
 
 Hotkeys are rebindable through settings.
 
+## Community
+
+Join the [Discord](https://discord.gg/jTQSWdmsh) to help test new features, share feedback, and follow development progress. You'll also find documentation on the AI-assisted development process behind the project.
+
+Note: This is a testing and feedback channel, not a tech support helpdesk.
+
 ## Building from Source
 
 For contributors who want to build manually instead of using the plugin updater:
