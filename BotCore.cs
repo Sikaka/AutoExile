@@ -163,6 +163,7 @@ namespace AutoExile
             _labyrinthMode = new LabyrinthMode();
             RegisterMode(_labyrinthMode);
             RegisterMode(new PathBenchmarkMode());
+            RegisterMode(new LegionResetterMode());
             _bossMode = new BossMode();
             _bossMode.Register(new KingEncounter());
             _bossMode.Register(new OshabiEncounter());

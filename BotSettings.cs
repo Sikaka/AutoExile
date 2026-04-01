@@ -95,6 +95,10 @@ namespace AutoExile
 
         public LabyrinthSettings Labyrinth { get; set; } = new LabyrinthSettings();
 
+        // --- 5-Way Resetter (mode-specific) ---
+
+        public LegionResetterSettings LegionResetter { get; set; } = new LegionResetterSettings();
+
         // --- Threat / Dodge ---
 
         public ThreatSettings Threat { get; set; } = new ThreatSettings();
@@ -1008,6 +1012,22 @@ namespace AutoExile
 
             [Menu("Dodge Cooldown (ms)", "Minimum time between dodge movements.")]
             public RangeNode<int> DodgeCooldownMs { get; set; } = new RangeNode<int>(500, 100, 2000);
+        }
+
+        [Submenu(CollapsedByDefault = true)]
+        public class LegionResetterSettings
+        {
+            [Menu("Idle Position X", "Grid X to stand at while waiting for leader. Use 'Set' button to capture current position.")]
+            public RangeNode<int> IdlePositionX { get; set; } = new RangeNode<int>(608, 0, 2000);
+
+            [Menu("Idle Position Y", "Grid Y to stand at while waiting for leader.")]
+            public RangeNode<int> IdlePositionY { get; set; } = new RangeNode<int>(611, 0, 2000);
+
+            [Menu("Leader Attack Threshold (s)", "How long the leader must attack continuously before we start the circle dance. Prevents false starts from misclicks.")]
+            public RangeNode<float> LeaderAttackThresholdSeconds { get; set; } = new RangeNode<float>(2f, 0.5f, 10f);
+
+            [Menu("Spawn Delay (s)", "How long to stand in the circle before dashing out. ~3s for standard spawn trigger.")]
+            public RangeNode<float> SpawnDelaySeconds { get; set; } = new RangeNode<float>(3f, 1f, 10f);
         }
 
     }
