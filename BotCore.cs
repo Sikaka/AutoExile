@@ -169,6 +169,7 @@ namespace AutoExile
             _bossMode.Register(new OshabiEncounter());
             _bossMode.Register(new FearEncounter());
             _bossMode.Register(new MavenEncounter());
+            _bossMode.Register(new SareshEncounter());
             RegisterMode(_bossMode);
 
             // Register in-map mechanics
@@ -178,8 +179,11 @@ namespace AutoExile
             _mechanics.Register(new EssenceMechanic());
             _mechanics.Register(new RitualMechanic());
 
-            // Populate boss type dropdown
+            // Populate boss type dropdown — save/restore value since SetListValues resets it
+            var savedBossType = Settings.Boss.BossType.Value;
             Settings.Boss.BossType.SetListValues(_bossMode.EncounterNames.ToList());
+            if (!string.IsNullOrEmpty(savedBossType) && _bossMode.EncounterNames.Contains(savedBossType))
+                Settings.Boss.BossType.Value = savedBossType;
 
             // Populate mode dropdown and restore saved selection
             // Save value before SetListValues — it resets Value to first item

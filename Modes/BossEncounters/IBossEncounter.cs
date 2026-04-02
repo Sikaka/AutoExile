@@ -50,6 +50,10 @@ namespace AutoExile.Modes.BossEncounters
         /// <summary>True to suppress combat positioning (don't chase packs). Skills still fire.</summary>
         bool SuppressCombatPositioning => false;
 
+        /// <summary>True to suppress auto-dodge blinks. Use when retreating to a safe position —
+        /// dodge blinks disrupt navigation and can fling the player in the wrong direction.</summary>
+        bool SuppressDodge => false;
+
         /// <summary>True to use flat-cost A* and relaxed smoothing (tight corridors like mazes).</summary>
         bool RelaxedPathing => false;
 

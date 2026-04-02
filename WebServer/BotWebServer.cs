@@ -331,6 +331,26 @@ namespace AutoExile.WebServer
                         await HandlePlayerBuffs(resp);
                         break;
 
+                    // Presets
+                    case "/api/presets" when method == "GET":
+                        await ServeJson(resp, ConfigManager?.ListPresets() ?? new List<string>());
+                        break;
+                    case "/api/presets/save" when method == "POST":
+                        await HandlePresetSave(req, resp);
+                        break;
+                    case "/api/presets/load" when method == "POST":
+                        await HandlePresetLoad(req, resp);
+                        break;
+                    case "/api/presets/delete" when method == "POST":
+                        await HandlePresetDelete(req, resp);
+                        break;
+                    case "/api/presets/export" when method == "GET":
+                        await HandlePresetExport(req, resp);
+                        break;
+                    case "/api/presets/import" when method == "POST":
+                        await HandlePresetImport(req, resp);
+                        break;
+
                     default:
                         resp.StatusCode = 404;
                         await WriteString(resp, "Not found");
@@ -350,6 +370,90 @@ namespace AutoExile.WebServer
             {
                 try { resp.Close(); } catch { }
             }
+        }
+
+        // ====================================================================
+        // Presets
+        // ====================================================================
+
+        private async Task HandlePresetSave(HttpListenerRequest req, HttpListenerResponse resp)
+        {
+            var body = await ReadBody(req);
+            var data = JsonSerializer.Deserialize<JsonElement>(body);
+            var name = data.GetProperty("name").GetString() ?? "";
+            if (string.IsNullOrWhiteSpace(name) || Settings == null || ConfigManager == null)
+            {
+                resp.StatusCode = 400;
+                await ServeJson(resp, new { error = "Invalid name or settings not available" });
+                return;
+            }
+            ConfigManager.SavePreset(Settings, name);
+            await ServeJson(resp, new { ok = true });
+        }
+
+        private async Task HandlePresetLoad(HttpListenerRequest req, HttpListenerResponse resp)
+        {
+            var body = await ReadBody(req);
+            var data = JsonSerializer.Deserialize<JsonElement>(body);
+            var name = data.GetProperty("name").GetString() ?? "";
+            if (string.IsNullOrWhiteSpace(name) || Settings == null || ConfigManager == null)
+            {
+                resp.StatusCode = 400;
+                await ServeJson(resp, new { error = "Invalid name" });
+                return;
+            }
+            var ok = ConfigManager.LoadPreset(Settings, name);
+            if (!ok) { resp.StatusCode = 404; await ServeJson(resp, new { error = "Preset not found" }); return; }
+            await ServeJson(resp, new { ok = true });
+        }
+
+        private async Task HandlePresetDelete(HttpListenerRequest req, HttpListenerResponse resp)
+        {
+            var body = await ReadBody(req);
+            var data = JsonSerializer.Deserialize<JsonElement>(body);
+            var name = data.GetProperty("name").GetString() ?? "";
+            if (string.IsNullOrWhiteSpace(name) || ConfigManager == null)
+            {
+                resp.StatusCode = 400;
+                await ServeJson(resp, new { error = "Invalid name" });
+                return;
+            }
+            var ok = ConfigManager.DeletePreset(name);
+            if (!ok) { resp.StatusCode = 404; await ServeJson(resp, new { error = "Preset not found" }); return; }
+            await ServeJson(resp, new { ok = true });
+        }
+
+        private async Task HandlePresetExport(HttpListenerRequest req, HttpListenerResponse resp)
+        {
+            var name = req.QueryString["name"] ?? "";
+            if (string.IsNullOrWhiteSpace(name) || ConfigManager == null)
+            {
+                resp.StatusCode = 400;
+                await WriteString(resp, "Invalid name");
+                return;
+            }
+            var json = ConfigManager.ExportPreset(name);
+            if (json == null) { resp.StatusCode = 404; await WriteString(resp, "Not found"); return; }
+            resp.ContentType = "application/json";
+            resp.AddHeader("Content-Disposition", $"attachment; filename=\"{name}.json\"");
+            await WriteString(resp, json);
+        }
+
+        private async Task HandlePresetImport(HttpListenerRequest req, HttpListenerResponse resp)
+        {
+            var body = await ReadBody(req);
+            var data = JsonSerializer.Deserialize<JsonElement>(body);
+            var name = data.GetProperty("name").GetString() ?? "";
+            var json = data.GetProperty("json").GetString() ?? "";
+            if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(json) || ConfigManager == null)
+            {
+                resp.StatusCode = 400;
+                await ServeJson(resp, new { error = "Invalid data" });
+                return;
+            }
+            var ok = ConfigManager.ImportPreset(name, json);
+            if (!ok) { resp.StatusCode = 400; await ServeJson(resp, new { error = "Invalid JSON" }); return; }
+            await ServeJson(resp, new { ok = true });
         }
 
         // ====================================================================

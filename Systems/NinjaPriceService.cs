@@ -358,7 +358,10 @@ namespace AutoExile.Systems
                 {
                     var prices = _prices;
                     if (!prices.TryGetValue(cat, out var byName)) continue;
-                    if (!byName.TryGetValue(name, out var entries)) continue;
+                    // Try exact match, then "The " prefix (art mapping sometimes omits "The")
+                    if (!byName.TryGetValue(name, out var entries))
+                        if (!byName.TryGetValue("The " + name, out entries))
+                            continue;
 
                     foreach (var entry in entries)
                     {

@@ -575,9 +575,22 @@ namespace AutoExile.Systems
 
             var maxValue = priceResult.MaxChaosValue;
 
-            // If we can't price it, don't skip (might be valuable)
+            // If we can't price it: check if art mapping has candidates.
+            // If art resolved to known names but none have ninja prices, the item is unlisted junk — skip it.
+            // Only keep "might be valuable" for items with NO art mapping entry (truly unknown).
             if (maxValue <= 0)
-                return false;
+            {
+                if (!mods.Identified && PriceService != null)
+                {
+                    var candidates = PriceService.GetCandidateNames(entity);
+                    if (candidates.Count > 0)
+                    {
+                        LastSkipReason = $"Skipped '{itemName}' (art mapped to {string.Join(", ", candidates)} but no ninja price)";
+                        return true; // Known art, no price = junk
+                    }
+                }
+                return false; // Unknown art = might be valuable
+            }
 
             // Flat value check — use max (optimistic: don't skip if it could be valuable)
             if (maxValue < MinUniqueChaosValue)

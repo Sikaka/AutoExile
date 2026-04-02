@@ -180,9 +180,14 @@ namespace AutoExile.Modes
             {
                 // Dodge BEFORE combat — dodge signal only lasts 1 tick.
                 // If dodge fires, skip combat entirely this tick to prevent async cursor races.
+                // Encounters can suppress dodge during retreat phases where blinks would disrupt nav.
                 LastDodgeAction = "";
-                TryDodge(ctx);
-                bool dodged = LastDodgeAction.StartsWith("blinked");
+                bool dodged = false;
+                if (_activeEncounter?.SuppressDodge != true)
+                {
+                    TryDodge(ctx);
+                    dodged = LastDodgeAction.StartsWith("blinked");
+                }
 
                 if (!dodged)
                 {

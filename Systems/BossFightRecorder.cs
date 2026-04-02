@@ -21,6 +21,7 @@ namespace AutoExile.Systems
         {
             "Absence of Mercy and Empathy",  // Maven
             "Moment of Trauma",              // Incarnation of Fear
+            "The Black Barya",               // Saresh (Faridun League)
         };
 
         private StreamWriter? _log;

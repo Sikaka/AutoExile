@@ -22,7 +22,11 @@ namespace AutoExile.Modes.Shared
             float bestY = float.MaxValue;
             foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
             {
-                if (entity.Type != EntityType.TownPortal || !entity.IsTargetable) continue;
+                if (!entity.IsTargetable) continue;
+                // Standard TownPortal entities OR Effect-type MTX portals (e.g. Black Barya's SandHourglass)
+                var isTownPortal = entity.Type == EntityType.TownPortal;
+                var isMtxPortal = entity.Path.Contains("Town_Portals", StringComparison.OrdinalIgnoreCase);
+                if (!isTownPortal && !isMtxPortal) continue;
                 if (entity.GridPosNum.Y < bestY)
                 {
                     bestY = entity.GridPosNum.Y;

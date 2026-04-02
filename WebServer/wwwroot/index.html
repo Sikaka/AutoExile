@@ -6,170 +6,211 @@
 <title>AutoExile Dashboard</title>
 <style>
 :root {
-  --bg: #0f1117; --surface: #1a1d27; --surface2: #242836; --border: #2e3347;
-  --text: #e1e4ed; --text-dim: #8b90a5; --accent: #6c8cff; --green: #4ade80;
-  --red: #f87171; --orange: #fb923c; --yellow: #fbbf24;
+  --bg: #0c0e14; --surface: #151822; --surface2: #1e2230; --border: #282d3e;
+  --text: #d8dce8; --text-dim: #6b7394; --accent: #5b7fff; --accent-glow: rgba(91,127,255,.15);
+  --green: #3dd68c; --red: #ef5f5f; --orange: #f0923a; --yellow: #e8b931;
+  --surface-highlight: #232840;
 }
 * { margin:0; padding:0; box-sizing:border-box; }
-body { font-family:'Segoe UI',system-ui,sans-serif; background:var(--bg); color:var(--text); min-height:100vh; }
+body { font-family:'Segoe UI',system-ui,-apple-system,sans-serif; background:var(--bg); color:var(--text); min-height:100vh; -webkit-font-smoothing:antialiased; }
 
-/* Header + Tabs */
-.header { background:var(--surface); border-bottom:1px solid var(--border); padding:12px 24px; display:flex; align-items:center; justify-content:space-between; }
-.header h1 { font-size:20px; font-weight:600; color:var(--accent); }
+/* ---- Header ---- */
+.header { background:linear-gradient(180deg, var(--surface) 0%, var(--bg) 100%); border-bottom:1px solid var(--border); padding:14px 28px; display:flex; align-items:center; justify-content:space-between; }
+.header h1 { font-size:18px; font-weight:700; letter-spacing:1.5px; text-transform:uppercase; color:var(--accent); text-shadow:0 0 20px var(--accent-glow); }
 .header-right { display:flex; align-items:center; gap:12px; }
-.connection-badge { font-size:12px; padding:4px 10px; border-radius:12px; background:var(--surface2); border:1px solid var(--border); }
-.connection-badge.ok { border-color:var(--green); color:var(--green); }
-.connection-badge.err { border-color:var(--red); color:var(--red); }
+.connection-badge { font-size:11px; padding:4px 12px; border-radius:10px; background:var(--surface2); border:1px solid var(--border); font-weight:500; letter-spacing:.3px; transition:all .3s; }
+.connection-badge.ok { border-color:var(--green); color:var(--green); box-shadow:0 0 8px rgba(61,214,140,.15); }
+.connection-badge.err { border-color:var(--red); color:var(--red); box-shadow:0 0 8px rgba(239,95,95,.1); }
 
-.tabs { display:flex; background:var(--surface); border-bottom:1px solid var(--border); padding:0 24px; }
-.tab { padding:12px 20px; cursor:pointer; color:var(--text-dim); border-bottom:2px solid transparent; transition:all .15s; font-size:14px; }
-.tab:hover { color:var(--text); }
-.tab.active { color:var(--accent); border-bottom-color:var(--accent); }
+/* ---- Main Tabs ---- */
+.tabs { display:flex; background:var(--surface); border-bottom:1px solid var(--border); padding:0 28px; gap:2px; }
+.tab { padding:11px 22px; cursor:pointer; color:var(--text-dim); border-bottom:2px solid transparent; transition:all .2s; font-size:13px; font-weight:500; letter-spacing:.4px; text-transform:uppercase; }
+.tab:hover { color:var(--text); background:rgba(255,255,255,.02); }
+.tab.active { color:var(--accent); border-bottom-color:var(--accent); background:rgba(91,127,255,.04); }
 
-.tab-content { display:none; }
+.tab-content { display:none; animation:fadeIn .2s ease; }
 .tab-content.active { display:block; }
+@keyframes fadeIn { from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:translateY(0)} }
 
 .main { max-width:1200px; margin:0 auto; padding:24px; }
 
-/* Cards */
-.card { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:20px; margin-bottom:16px; }
-.card h2 { font-size:14px; text-transform:uppercase; letter-spacing:.5px; color:var(--text-dim); margin-bottom:16px; }
-.grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+/* ---- Cards ---- */
+.card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:20px; margin-bottom:14px; transition:border-color .2s; }
+.card:hover { border-color:#353b54; }
+.card h2 { font-size:11px; text-transform:uppercase; letter-spacing:1.2px; color:var(--text-dim); margin-bottom:14px; font-weight:600; }
+.grid2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
 
-/* Stats */
-.status-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(160px,1fr)); gap:12px; }
-.stat { background:var(--surface2); padding:12px 16px; border-radius:6px; }
-.stat-label { font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--text-dim); margin-bottom:4px; }
-.stat-value { font-size:20px; font-weight:600; }
+/* Mode-specific cards get an accent border top */
+#simCard, #labCard, #bossCard { border-top:2px solid var(--accent); }
+
+/* ---- Stats ---- */
+.status-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:10px; }
+.stat { background:var(--surface2); padding:12px 14px; border-radius:8px; border:1px solid transparent; transition:all .2s; }
+.stat:hover { border-color:var(--border); background:var(--surface-highlight); }
+.stat-label { font-size:10px; text-transform:uppercase; letter-spacing:.8px; color:var(--text-dim); margin-bottom:5px; font-weight:500; }
+.stat-value { font-size:20px; font-weight:700; letter-spacing:-.3px; }
 .green { color:var(--green); } .red { color:var(--red); } .orange { color:var(--orange); } .yellow { color:var(--yellow); } .accent { color:var(--accent); }
 
-/* Bars */
-.bar-container { margin-bottom:10px; }
-.bar-label { display:flex; justify-content:space-between; font-size:12px; margin-bottom:4px; color:var(--text-dim); }
-.bar { height:8px; background:var(--surface2); border-radius:4px; overflow:hidden; }
-.bar-fill { height:100%; border-radius:4px; transition:width .3s; }
-.bar-fill.hp { background:var(--red); } .bar-fill.es { background:var(--accent); } .bar-fill.mana { background:#818cf8; }
+/* ---- Bars ---- */
+.bar-container { margin-bottom:12px; }
+.bar-label { display:flex; justify-content:space-between; font-size:11px; margin-bottom:5px; color:var(--text-dim); font-weight:500; letter-spacing:.3px; }
+.bar { height:6px; background:var(--surface2); border-radius:3px; overflow:hidden; }
+.bar-fill { height:100%; border-radius:3px; transition:width .3s ease; }
+.bar-fill.hp { background:linear-gradient(90deg,#c94040,var(--red)); }
+.bar-fill.es { background:linear-gradient(90deg,#4060cc,var(--accent)); }
+.bar-fill.mana { background:linear-gradient(90deg,#5858b8,#818cf8); }
 
-/* Controls */
-.controls { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
-.btn { padding:10px 24px; border:1px solid var(--border); border-radius:6px; background:var(--surface2); color:var(--text); font-size:14px; cursor:pointer; transition:all .15s; }
-.btn:hover { border-color:var(--accent); background:#2a2e42; }
-.btn.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
-.btn.primary:hover { background:#5a7aee; }
-.btn.danger { border-color:var(--red); color:var(--red); }
-.btn.danger:hover { background:rgba(248,113,113,.1); }
-.mode-select { padding:10px 16px; background:var(--surface2); border:1px solid var(--border); border-radius:6px; color:var(--text); font-size:14px; }
+/* ---- Controls ---- */
+.controls { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+.btn { padding:8px 20px; border:1px solid var(--border); border-radius:6px; background:var(--surface2); color:var(--text); font-size:13px; font-weight:500; cursor:pointer; transition:all .2s; letter-spacing:.2px; }
+.btn:hover { border-color:var(--accent); background:var(--surface-highlight); box-shadow:0 0 12px var(--accent-glow); }
+.btn:active { transform:scale(.97); }
+.btn.primary { background:var(--accent); color:#fff; border-color:var(--accent); box-shadow:0 2px 12px var(--accent-glow); }
+.btn.primary:hover { background:#4a6ef0; box-shadow:0 4px 20px rgba(91,127,255,.3); }
+.btn.danger { border-color:rgba(239,95,95,.4); color:var(--red); }
+.btn.danger:hover { background:rgba(239,95,95,.08); border-color:var(--red); }
+.mode-select { padding:8px 14px; background:var(--surface2); border:1px solid var(--border); border-radius:6px; color:var(--text); font-size:13px; cursor:pointer; transition:border-color .2s; }
+.mode-select:hover, .mode-select:focus { border-color:var(--accent); outline:none; }
 
-.bot-status { display:flex; align-items:center; gap:12px; font-size:24px; font-weight:700; }
-.status-dot { width:12px; height:12px; border-radius:50%; background:var(--red); }
-.status-dot.running { background:var(--green); animation:pulse 2s infinite; }
-.status-dot.paused { background:var(--yellow); }
-@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
+.bot-status { display:flex; align-items:center; gap:12px; font-size:22px; font-weight:700; letter-spacing:-.2px; }
+.status-dot { width:10px; height:10px; border-radius:50%; background:var(--red); transition:all .3s; box-shadow:0 0 6px rgba(239,95,95,.3); }
+.status-dot.running { background:var(--green); animation:pulseGlow 2s ease-in-out infinite; box-shadow:0 0 8px rgba(61,214,140,.4); }
+.status-dot.paused { background:var(--yellow); box-shadow:0 0 6px rgba(232,185,49,.3); animation:none; }
+@keyframes pulseGlow { 0%,100%{opacity:1;box-shadow:0 0 8px rgba(61,214,140,.4)} 50%{opacity:.6;box-shadow:0 0 14px rgba(61,214,140,.6)} }
 
-/* Log */
-.log-area { font-family:'Cascadia Code','Fira Code',monospace; font-size:12px; background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:12px; max-height:200px; overflow-y:auto; color:var(--text-dim); line-height:1.6; }
-.log-area .decision { color:var(--yellow); } .log-area .status { color:var(--text); } .log-area .time { color:var(--text-dim); }
+/* ---- Activity Log ---- */
+.log-area { font-family:'Cascadia Code','Fira Code','SF Mono',monospace; font-size:11px; background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:14px; max-height:220px; overflow-y:auto; color:var(--text-dim); line-height:1.7; margin-top:8px; }
+.log-area .decision { color:var(--yellow); } .log-area .status { color:var(--text); } .log-area .time { color:var(--text-dim); opacity:.6; }
+.log-area::-webkit-scrollbar { width:4px; } .log-area::-webkit-scrollbar-track { background:transparent; } .log-area::-webkit-scrollbar-thumb { background:var(--border); border-radius:2px; }
 
-/* Settings */
+/* ---- Settings ---- */
 .settings-group { margin-bottom:24px; }
-.settings-group h3 { font-size:16px; font-weight:600; margin-bottom:12px; padding-bottom:8px; border-bottom:1px solid var(--border); color:var(--text); cursor:pointer; user-select:none; }
+.settings-group h3 { font-size:15px; font-weight:600; margin-bottom:12px; padding-bottom:8px; border-bottom:1px solid var(--border); color:var(--text); cursor:pointer; user-select:none; transition:color .15s; }
 .settings-group h3:hover { color:var(--accent); }
-.settings-group h3::before { content:''; display:inline-block; width:0; height:0; border-left:6px solid var(--text-dim); border-top:4px solid transparent; border-bottom:4px solid transparent; margin-right:8px; transition:transform .2s; }
+.settings-group h3::before { content:''; display:inline-block; width:0; height:0; border-left:5px solid var(--text-dim); border-top:3.5px solid transparent; border-bottom:3.5px solid transparent; margin-right:8px; transition:transform .2s; }
 .settings-group h3.open::before { transform:rotate(90deg); }
 .settings-body { display:none; }
 .settings-body.open { display:block; }
 
-.setting-row { display:flex; justify-content:space-between; align-items:center; padding:8px 12px; border-radius:6px; transition:background .15s; }
+.setting-row { display:flex; justify-content:space-between; align-items:center; padding:9px 14px; border-radius:8px; transition:background .15s; }
 .setting-row:hover { background:var(--surface2); }
 .setting-info { flex:1; min-width:0; }
-.setting-label { font-size:14px; font-weight:500; }
-.setting-desc { display:block; font-size:11px; color:var(--text-dim); margin-top:2px; }
+.setting-label { font-size:13px; font-weight:500; }
+.setting-desc { display:block; font-size:10px; color:var(--text-dim); margin-top:2px; line-height:1.4; }
 .setting-control { flex-shrink:0; margin-left:16px; }
-.setting-control input[type=number] { width:100px; padding:6px 10px; background:var(--surface2); border:1px solid var(--border); border-radius:4px; color:var(--text); font-size:14px; }
-.setting-control input[type=text] { width:200px; padding:6px 10px; background:var(--surface2); border:1px solid var(--border); border-radius:4px; color:var(--text); font-size:14px; }
-.setting-control select { padding:6px 10px; background:var(--surface2); border:1px solid var(--border); border-radius:4px; color:var(--text); font-size:14px; }
+.setting-control input[type=number] { width:100px; padding:6px 10px; background:var(--surface2); border:1px solid var(--border); border-radius:6px; color:var(--text); font-size:13px; transition:border-color .2s; }
+.setting-control input[type=text] { width:200px; padding:6px 10px; background:var(--surface2); border:1px solid var(--border); border-radius:6px; color:var(--text); font-size:13px; transition:border-color .2s; }
+.setting-control select { padding:6px 10px; background:var(--surface2); border:1px solid var(--border); border-radius:6px; color:var(--text); font-size:13px; cursor:pointer; transition:border-color .2s; }
+.setting-control input:focus, .setting-control select:focus { border-color:var(--accent); outline:none; box-shadow:0 0 0 2px var(--accent-glow); }
 
 /* Toggle switch */
-.switch { position:relative; display:inline-block; width:44px; height:24px; }
+.switch { position:relative; display:inline-block; width:40px; height:22px; }
 .switch input { opacity:0; width:0; height:0; }
-.slider { position:absolute; cursor:pointer; inset:0; background:var(--surface2); border:1px solid var(--border); border-radius:24px; transition:.2s; }
-.slider::before { content:''; position:absolute; height:18px; width:18px; left:2px; bottom:2px; background:var(--text-dim); border-radius:50%; transition:.2s; }
-input:checked + .slider { background:var(--accent); border-color:var(--accent); }
-input:checked + .slider::before { transform:translateX(20px); background:#fff; }
+.slider { position:absolute; cursor:pointer; inset:0; background:var(--surface2); border:1px solid var(--border); border-radius:22px; transition:all .25s; }
+.slider::before { content:''; position:absolute; height:16px; width:16px; left:2px; bottom:2px; background:var(--text-dim); border-radius:50%; transition:all .25s; }
+input:checked + .slider { background:var(--accent); border-color:var(--accent); box-shadow:0 0 10px var(--accent-glow); }
+input:checked + .slider::before { transform:translateX(18px); background:#fff; }
 
-.hotkey-badge { display:inline-block; padding:4px 10px; background:var(--surface2); border:1px solid var(--border); border-radius:4px; font-size:12px; color:var(--text-dim); font-family:monospace; }
+.hotkey-badge { display:inline-block; padding:3px 8px; background:var(--surface2); border:1px solid var(--border); border-radius:4px; font-size:11px; color:var(--text-dim); font-family:'Cascadia Code','Fira Code',monospace; letter-spacing:.3px; }
 
-.subgroup { margin-left:20px; border-left:2px solid var(--border); padding-left:16px; margin-bottom:12px; }
-.subgroup h4 { font-size:13px; font-weight:600; color:var(--text-dim); margin-bottom:8px; cursor:pointer; user-select:none; }
+.subgroup { margin-left:18px; border-left:2px solid var(--border); padding-left:16px; margin-bottom:14px; }
+.subgroup h4 { font-size:12px; font-weight:600; color:var(--text-dim); margin-bottom:8px; cursor:pointer; user-select:none; letter-spacing:.3px; transition:color .15s; }
 .subgroup h4:hover { color:var(--accent); }
 
 /* Range slider + number combo */
 .range-control { display:flex; align-items:center; gap:10px; }
-.range-slider { -webkit-appearance:none; appearance:none; width:160px; height:6px; background:var(--surface2); border-radius:3px; outline:none; }
-.range-slider::-webkit-slider-thumb { -webkit-appearance:none; width:16px; height:16px; border-radius:50%; background:var(--accent); cursor:pointer; border:2px solid var(--surface); }
-.range-slider::-moz-range-thumb { width:14px; height:14px; border-radius:50%; background:var(--accent); cursor:pointer; border:2px solid var(--surface); }
-.range-number { width:72px; padding:4px 8px; background:var(--surface2); border:1px solid var(--border); border-radius:4px; color:var(--text); font-size:13px; text-align:center; }
-.range-suffix { font-size:11px; color:var(--text-dim); min-width:20px; }
+.range-slider { -webkit-appearance:none; appearance:none; width:140px; height:4px; background:var(--surface2); border-radius:2px; outline:none; transition:background .2s; }
+.range-slider:hover { background:var(--border); }
+.range-slider::-webkit-slider-thumb { -webkit-appearance:none; width:14px; height:14px; border-radius:50%; background:var(--accent); cursor:pointer; border:2px solid var(--surface); box-shadow:0 0 6px var(--accent-glow); transition:box-shadow .2s; }
+.range-slider::-webkit-slider-thumb:hover { box-shadow:0 0 12px rgba(91,127,255,.4); }
+.range-slider::-moz-range-thumb { width:12px; height:12px; border-radius:50%; background:var(--accent); cursor:pointer; border:2px solid var(--surface); }
+.range-number { width:68px; padding:4px 8px; background:var(--surface2); border:1px solid var(--border); border-radius:5px; color:var(--text); font-size:12px; text-align:center; transition:border-color .2s; }
+.range-number:focus { border-color:var(--accent); outline:none; }
+.range-suffix { font-size:10px; color:var(--text-dim); min-width:20px; }
 
 /* Settings sub-tabs */
 .settings-tabs { display:flex; gap:6px; margin-bottom:16px; flex-wrap:wrap; }
-.settings-tab { padding:8px 18px; border-radius:6px; cursor:pointer; font-size:13px; font-weight:500; background:var(--surface2); border:1px solid var(--border); color:var(--text-dim); transition:all .15s; }
-.settings-tab:hover { color:var(--text); border-color:var(--accent); }
-.settings-tab.active { background:var(--accent); border-color:var(--accent); color:#fff; }
+.settings-tab { padding:7px 16px; border-radius:6px; cursor:pointer; font-size:12px; font-weight:600; background:var(--surface2); border:1px solid var(--border); color:var(--text-dim); transition:all .2s; letter-spacing:.3px; text-transform:uppercase; }
+.settings-tab:hover { color:var(--text); border-color:var(--accent); background:var(--surface-highlight); }
+.settings-tab.active { background:var(--accent); border-color:var(--accent); color:#fff; box-shadow:0 2px 10px var(--accent-glow); }
 .settings-tab-content { display:none; }
-.settings-tab-content.active { display:block; }
+.settings-tab-content.active { display:block; animation:fadeIn .15s ease; }
 
-/* Compact checklist grid (heist rewards etc.) */
-.check-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:6px; }
-.check-item { display:flex; align-items:center; gap:8px; padding:6px 10px; border-radius:4px; font-size:13px; background:var(--surface2); }
+/* Compact checklist grid */
+.check-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(160px,1fr)); gap:6px; }
+.check-item { display:flex; align-items:center; gap:8px; padding:7px 10px; border-radius:6px; font-size:12px; background:var(--surface2); border:1px solid transparent; transition:border-color .15s; }
+.check-item:hover { border-color:var(--border); }
 .check-item label { cursor:pointer; user-select:none; }
-.check-item input[type=checkbox] { accent-color:var(--accent); width:16px; height:16px; cursor:pointer; }
+.check-item input[type=checkbox] { accent-color:var(--accent); width:15px; height:15px; cursor:pointer; }
 
 /* Tower config table */
-.tower-table { width:100%; font-size:13px; }
-.tower-table th { text-align:center; padding:6px 8px; font-size:11px; font-weight:500; }
+.tower-table { width:100%; font-size:12px; border-spacing:0; }
+.tower-table th { text-align:center; padding:8px; font-size:10px; font-weight:600; letter-spacing:.5px; text-transform:uppercase; color:var(--text-dim); }
 .tower-table td { text-align:center; padding:6px 4px; }
 .tower-table td:first-child { text-align:left; font-weight:500; }
 .tower-table input[type=range] { width:80px; }
-.tower-table select { padding:2px 6px; background:var(--surface2); border:1px solid var(--border); border-radius:3px; color:var(--text); font-size:12px; }
+.tower-table select { padding:3px 6px; background:var(--surface2); border:1px solid var(--border); border-radius:4px; color:var(--text); font-size:11px; }
 
 /* Section divider within a tab */
-.section-divider { font-size:12px; text-transform:uppercase; letter-spacing:1px; color:var(--text-dim); padding:12px 0 8px; border-bottom:1px solid var(--border); margin:16px 0 8px; }
+.section-divider { font-size:10px; text-transform:uppercase; letter-spacing:1.5px; color:var(--text-dim); padding:14px 0 8px; border-bottom:1px solid var(--border); margin:20px 0 10px; font-weight:600; }
 
-.save-flash { position:fixed; bottom:24px; right:24px; padding:10px 20px; background:var(--green); color:#000; border-radius:6px; font-weight:600; opacity:0; transition:opacity .3s; pointer-events:none; z-index:100; }
-.save-flash.show { opacity:1; }
+/* Presets bar */
+.presets-bar { display:flex; align-items:center; gap:8px; margin-bottom:14px; flex-wrap:wrap; padding:10px 14px; background:var(--surface); border:1px solid var(--border); border-radius:8px; }
+.presets-bar .presets-label { font-size:10px; color:var(--text-dim); font-weight:600; letter-spacing:1px; text-transform:uppercase; }
+.presets-bar select { padding:5px 10px; background:var(--surface2); border:1px solid var(--border); border-radius:5px; color:var(--text); font-size:12px; min-width:140px; cursor:pointer; }
+.presets-bar select:focus { border-color:var(--accent); outline:none; }
+
+/* Search bar */
+.search-bar { position:relative; margin-bottom:14px; }
+.search-bar input { width:100%; padding:10px 16px 10px 38px; background:var(--surface); border:1px solid var(--border); border-radius:8px; color:var(--text); font-size:13px; outline:none; transition:border-color .2s, box-shadow .2s; }
+.search-bar input:focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-glow); }
+.search-bar input::placeholder { color:var(--text-dim); }
+.search-bar .search-icon { position:absolute; left:12px; top:50%; transform:translateY(-50%); color:var(--text-dim); font-size:14px; pointer-events:none; }
+.search-bar .search-clear { position:absolute; right:8px; top:50%; transform:translateY(-50%); background:none; border:none; color:var(--text-dim); cursor:pointer; font-size:16px; display:none; padding:4px 8px; transition:color .15s; }
+.search-bar .search-clear:hover { color:var(--text); }
+
+/* Save flash */
+.save-flash { position:fixed; bottom:24px; right:24px; padding:10px 20px; background:var(--green); color:#0c0e14; border-radius:8px; font-weight:600; font-size:13px; opacity:0; transition:opacity .3s, transform .3s; pointer-events:none; z-index:100; transform:translateY(8px); box-shadow:0 4px 16px rgba(61,214,140,.25); }
+.save-flash.show { opacity:1; transform:translateY(0); }
 
 /* History tables */
-table { width:100%; border-collapse:collapse; font-size:13px; }
-th { text-align:left; padding:8px 12px; border-bottom:2px solid var(--border); color:var(--text-dim); font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
-td { padding:8px 12px; border-bottom:1px solid var(--border); }
+table { width:100%; border-collapse:collapse; font-size:12px; }
+th { text-align:left; padding:10px 12px; border-bottom:1px solid var(--border); color:var(--text-dim); font-size:10px; text-transform:uppercase; letter-spacing:.8px; font-weight:600; }
+td { padding:9px 12px; border-bottom:1px solid rgba(40,45,62,.5); }
 tr:hover td { background:var(--surface2); }
-.empty-state { padding:40px; text-align:center; color:var(--text-dim); }
+.empty-state { padding:48px; text-align:center; color:var(--text-dim); font-size:13px; }
 
-.history-tabs { display:flex; gap:8px; margin-bottom:16px; }
-.history-tab { padding:6px 16px; border-radius:4px; cursor:pointer; font-size:13px; background:var(--surface2); border:1px solid var(--border); color:var(--text-dim); }
-.history-tab.active { background:var(--accent); border-color:var(--accent); color:#fff; }
-
-/* Map */
+.history-tabs { display:flex; gap:6px; margin-bottom:16px; }
+.history-tab { padding:7px 16px; border-radius:6px; cursor:pointer; font-size:12px; font-weight:500; background:var(--surface2); border:1px solid var(--border); color:var(--text-dim); transition:all .2s; }
+.history-tab:hover { border-color:var(--accent); color:var(--text); }
+.history-tab.active { background:var(--accent); border-color:var(--accent); color:#fff; box-shadow:0 2px 10px var(--accent-glow); }
 
 /* Tag list editor */
-.tag-list { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px; min-height:30px; }
-.tag-item { display:inline-flex; align-items:center; gap:4px; padding:4px 10px; background:var(--surface2); border:1px solid var(--border); border-radius:16px; font-size:13px; }
-.tag-item .tag-remove { cursor:pointer; color:var(--text-dim); font-size:16px; line-height:1; padding:0 2px; border:none; background:none; }
+.tag-list { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px; min-height:30px; }
+.tag-item { display:inline-flex; align-items:center; gap:4px; padding:4px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:20px; font-size:12px; transition:border-color .15s; }
+.tag-item:hover { border-color:var(--accent); }
+.tag-item .tag-remove { cursor:pointer; color:var(--text-dim); font-size:14px; line-height:1; padding:0 2px; border:none; background:none; transition:color .15s; }
 .tag-item .tag-remove:hover { color:var(--red); }
-.tag-item .tag-value { color:var(--text-dim); font-size:11px; margin-left:2px; }
+.tag-item .tag-value { color:var(--text-dim); font-size:10px; margin-left:2px; }
 .tag-add-row { display:flex; gap:8px; align-items:center; position:relative; }
-.tag-add-row input { flex:1; padding:6px 10px; background:var(--surface2); border:1px solid var(--border); border-radius:4px; color:var(--text); font-size:13px; }
-.tag-add-row button { padding:6px 14px; background:var(--accent); border:none; border-radius:4px; color:#fff; font-size:13px; cursor:pointer; white-space:nowrap; }
-.tag-add-row button:hover { background:#5a7aee; }
-.autocomplete-dropdown { position:absolute; top:100%; left:0; right:60px; background:var(--surface); border:1px solid var(--border); border-radius:6px; max-height:200px; overflow-y:auto; z-index:50; margin-top:4px; display:none; }
+.tag-add-row input { flex:1; padding:7px 10px; background:var(--surface2); border:1px solid var(--border); border-radius:6px; color:var(--text); font-size:12px; transition:border-color .2s; }
+.tag-add-row input:focus { border-color:var(--accent); outline:none; }
+.tag-add-row button { padding:7px 14px; background:var(--accent); border:none; border-radius:6px; color:#fff; font-size:12px; font-weight:500; cursor:pointer; white-space:nowrap; transition:all .2s; }
+.tag-add-row button:hover { background:#4a6ef0; box-shadow:0 2px 8px var(--accent-glow); }
+.autocomplete-dropdown { position:absolute; top:100%; left:0; right:60px; background:var(--surface); border:1px solid var(--border); border-radius:8px; max-height:200px; overflow-y:auto; z-index:50; margin-top:4px; display:none; box-shadow:0 8px 24px rgba(0,0,0,.3); }
 .autocomplete-dropdown.show { display:block; }
-.autocomplete-item { padding:8px 12px; cursor:pointer; display:flex; justify-content:space-between; font-size:13px; }
+.autocomplete-item { padding:9px 14px; cursor:pointer; display:flex; justify-content:space-between; font-size:12px; transition:background .1s; }
 .autocomplete-item:hover { background:var(--surface2); }
-.autocomplete-item .ac-value { color:var(--yellow); font-size:12px; }
-.autocomplete-item .ac-cat { color:var(--text-dim); font-size:11px; margin-left:8px; }
+.autocomplete-item .ac-value { color:var(--yellow); font-size:11px; }
+.autocomplete-item .ac-cat { color:var(--text-dim); font-size:10px; margin-left:8px; }
 
-@media (max-width:768px) { .grid2{grid-template-columns:1fr} .main{padding:12px} }
+/* Scrollbar styling */
+::-webkit-scrollbar { width:6px; height:6px; }
+::-webkit-scrollbar-track { background:transparent; }
+::-webkit-scrollbar-thumb { background:var(--border); border-radius:3px; }
+::-webkit-scrollbar-thumb:hover { background:#3a4060; }
+
+@media (max-width:768px) { .grid2{grid-template-columns:1fr} .main{padding:14px} .header{padding:12px 16px} .tabs{padding:0 16px} }
 </style>
 </head>
 <body>
@@ -210,13 +251,63 @@ tr:hover td { background:var(--surface2); }
   </div>
 
   <!-- Minimap -->
-  <div class="card" style="padding:0;overflow:hidden;position:relative">
-    <canvas id="minimapCanvas" style="width:100%;height:280px;display:block;background:#0a0a0f"></canvas>
-    <div style="position:absolute;top:8px;right:8px;display:flex;gap:4px">
-      <button class="btn" style="padding:4px 10px;font-size:14px" onclick="minimapScale*=1.3;renderMinimap()">+</button>
-      <button class="btn" style="padding:4px 10px;font-size:14px" onclick="minimapScale*=0.77;renderMinimap()">-</button>
+  <div class="card" style="padding:0;overflow:hidden;position:relative;border-radius:10px">
+    <canvas id="minimapCanvas" style="width:100%;height:300px;display:block;background:#080a10"></canvas>
+    <div style="position:absolute;top:10px;right:10px;display:flex;gap:4px">
+      <button class="btn" style="padding:4px 10px;font-size:13px;background:rgba(30,34,48,.85);backdrop-filter:blur(4px)" onclick="minimapScale*=1.3;renderMinimap()">+</button>
+      <button class="btn" style="padding:4px 10px;font-size:13px;background:rgba(30,34,48,.85);backdrop-filter:blur(4px)" onclick="minimapScale*=0.77;renderMinimap()">&minus;</button>
+      <button class="btn" style="padding:4px 10px;font-size:11px;background:rgba(30,34,48,.85);backdrop-filter:blur(4px)" onclick="toggleMapLegend()">?</button>
     </div>
-    <div id="minimapInfo" style="position:absolute;bottom:6px;left:8px;font-size:10px;color:var(--text-dim);background:rgba(15,17,23,.7);padding:2px 6px;border-radius:3px">No terrain</div>
+    <div id="minimapPhase" style="position:absolute;top:10px;left:10px;font-size:10px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;color:var(--accent);background:rgba(12,14,20,.85);padding:4px 12px;border-radius:5px;border:1px solid var(--border);display:none;backdrop-filter:blur(4px)"></div>
+    <div id="minimapLegend" style="position:absolute;top:40px;right:10px;font-size:10px;color:var(--text-dim);background:rgba(12,14,20,.92);padding:10px 14px;border-radius:8px;border:1px solid var(--border);display:none;line-height:2;backdrop-filter:blur(4px)">
+      <div><span style="color:#3dd68c">&#9679;</span> Player</div>
+      <div><span style="color:#ef5f5f">&#9679;</span> Monster</div>
+      <div><span style="color:#e8b931">&#9679;</span> Rare / Chest</div>
+      <div><span style="color:#c084fc">&#9679;</span> Unique / Special</div>
+      <div><span style="color:#22d3ee">&#9679;</span> Altar</div>
+      <div><span style="color:#60a5fa">&#9679;</span> Objective</div>
+      <div><span style="color:#f472b6">&#9679;</span> NPC</div>
+      <div><span style="color:#86efac">&#9679;</span> Portal</div>
+      <div><span style="color:#f0923a">&mdash;</span> Walk path</div>
+      <div><span style="color:#e879f9">- -</span> Blink path</div>
+    </div>
+    <div id="minimapInfo" style="position:absolute;bottom:8px;left:10px;font-size:10px;color:var(--text-dim);background:rgba(12,14,20,.75);padding:3px 10px;border-radius:4px;font-family:'Cascadia Code','Fira Code',monospace;letter-spacing:.3px">No terrain</div>
+  </div>
+
+  <!-- Mode-specific cards (prominent position) -->
+  <div id="simCard" class="card" style="display:none">
+    <h2>Simulacrum</h2>
+    <div class="status-grid">
+      <div class="stat"><div class="stat-label">Wave</div><div id="simWave" class="stat-value accent">-</div></div>
+      <div class="stat"><div class="stat-label">Deaths</div><div id="simDeaths" class="stat-value">0</div></div>
+      <div class="stat"><div class="stat-label">Run Time</div><div id="simRunTime" class="stat-value" style="font-size:16px">--</div></div>
+      <div class="stat"><div class="stat-label">Total Runs</div><div id="simRuns" class="stat-value accent">0</div></div>
+      <div class="stat"><div class="stat-label">Avg Waves</div><div id="simAvgWaves" class="stat-value orange">-</div></div>
+      <div class="stat"><div class="stat-label">Avg Run Time</div><div id="simAvgRunTime" class="stat-value" style="font-size:16px">--</div></div>
+    </div>
+  </div>
+  <div id="labCard" class="card" style="display:none">
+    <h2>Labyrinth</h2>
+    <div class="status-grid">
+      <div class="stat"><div class="stat-label">Izaro</div><div id="labIzaro" class="stat-value accent">0/3</div></div>
+      <div class="stat"><div class="stat-label">Deaths</div><div id="labDeaths" class="stat-value">0</div></div>
+      <div class="stat"><div class="stat-label">Runs</div><div id="labRuns" class="stat-value accent">0</div></div>
+      <div class="stat"><div class="stat-label">Gems</div><div id="labGems" class="stat-value">0</div></div>
+      <div class="stat"><div class="stat-label">Profit</div><div id="labProfit" class="stat-value orange">0c</div></div>
+      <div class="stat"><div class="stat-label">Selected</div><div id="labSelectedGem" class="stat-value" style="font-size:12px">-</div></div>
+    </div>
+  </div>
+  <div id="bossCard" class="card" style="display:none">
+    <h2>Boss Farm</h2>
+    <div class="status-grid">
+      <div class="stat"><div class="stat-label">Runs</div><div id="bossRuns" class="stat-value accent">0</div></div>
+      <div class="stat"><div class="stat-label">Deaths</div><div id="bossDeaths" class="stat-value">0</div></div>
+      <div class="stat"><div class="stat-label">Run Time</div><div id="bossRunTime" class="stat-value" style="font-size:16px">--</div></div>
+      <div class="stat"><div class="stat-label">Key Drops</div><div id="bossDrops" class="stat-value orange">0</div></div>
+      <div class="stat"><div class="stat-label">Runs/Drop</div><div id="bossRunsPerDrop" class="stat-value">-</div></div>
+      <div class="stat"><div class="stat-label">Avg Run</div><div id="bossAvgRun" class="stat-value" style="font-size:16px">--</div></div>
+      <div class="stat"><div class="stat-label">Chaos/hr</div><div id="bossChaosHr" class="stat-value orange">0</div></div>
+    </div>
   </div>
 
   <div class="grid2">
@@ -236,7 +327,7 @@ tr:hover td { background:var(--surface2); }
         <div class="stat"><div class="stat-label">Navigation</div><div id="navStatus" class="stat-value" style="font-size:14px">Idle</div></div>
       </div>
     </div>
-    <div class="card">
+    <div id="explorationCard" class="card">
       <h2>Exploration</h2>
       <div class="status-grid">
         <div class="stat"><div class="stat-label">Coverage</div><div id="coverage" class="stat-value green">0%</div></div>
@@ -244,53 +335,19 @@ tr:hover td { background:var(--surface2); }
       </div>
     </div>
     <div class="card">
-      <h2 style="display:flex;align-items:center;gap:12px">Loot Tracker <button onclick="resetLootStats()" style="font-size:12px;padding:3px 10px;background:#c44;border:none;color:#fff;border-radius:4px;cursor:pointer">Reset</button></h2>
+      <h2 style="display:flex;align-items:center;gap:10px">Loot Tracker <button onclick="resetLootStats()" class="btn danger" style="font-size:10px;padding:2px 10px;text-transform:uppercase;letter-spacing:.5px">Reset</button></h2>
       <div class="status-grid">
         <div class="stat"><div class="stat-label">Session Div</div><div id="sessionDiv" class="stat-value yellow">0</div></div>
         <div class="stat"><div class="stat-label">Div / Hour</div><div id="divPerHour" class="stat-value orange">0</div></div>
         <div class="stat"><div class="stat-label">Items Looted</div><div id="itemsLooted" class="stat-value accent">0</div></div>
-        <div class="stat"><div class="stat-label">Maps Done</div><div id="mapsCompleted" class="stat-value accent">0</div></div>
+        <div id="statMapsDone" class="stat"><div class="stat-label">Maps Done</div><div id="mapsCompleted" class="stat-value accent">0</div></div>
         <div class="stat"><div class="stat-label">Session Time</div><div id="sessionTime" class="stat-value" style="font-size:16px">--</div></div>
         <div class="stat"><div class="stat-label">Loot Nearby</div><div id="lootNearby" class="stat-value accent">0</div></div>
       </div>
     </div>
-    <div id="simCard" class="card" style="display:none">
-      <h2>Simulacrum</h2>
-      <div class="status-grid">
-        <div class="stat"><div class="stat-label">Wave</div><div id="simWave" class="stat-value accent">-</div></div>
-        <div class="stat"><div class="stat-label">Deaths</div><div id="simDeaths" class="stat-value">0</div></div>
-        <div class="stat"><div class="stat-label">Run Time</div><div id="simRunTime" class="stat-value" style="font-size:16px">--</div></div>
-        <div class="stat"><div class="stat-label">Total Runs</div><div id="simRuns" class="stat-value accent">0</div></div>
-        <div class="stat"><div class="stat-label">Avg Waves</div><div id="simAvgWaves" class="stat-value orange">-</div></div>
-        <div class="stat"><div class="stat-label">Avg Run Time</div><div id="simAvgRunTime" class="stat-value" style="font-size:16px">--</div></div>
-      </div>
-    </div>
-    <div id="labCard" class="card" style="display:none">
-      <h2>Labyrinth</h2>
-      <div class="status-grid">
-        <div class="stat"><div class="stat-label">Izaro</div><div id="labIzaro" class="stat-value accent">0/3</div></div>
-        <div class="stat"><div class="stat-label">Deaths</div><div id="labDeaths" class="stat-value">0</div></div>
-        <div class="stat"><div class="stat-label">Runs</div><div id="labRuns" class="stat-value accent">0</div></div>
-        <div class="stat"><div class="stat-label">Gems</div><div id="labGems" class="stat-value">0</div></div>
-        <div class="stat"><div class="stat-label">Profit</div><div id="labProfit" class="stat-value orange">0c</div></div>
-        <div class="stat"><div class="stat-label">Selected</div><div id="labSelectedGem" class="stat-value" style="font-size:12px">-</div></div>
-      </div>
-    </div>
-    <div id="bossCard" class="card" style="display:none">
-      <h2>Boss Farm</h2>
-      <div class="status-grid">
-        <div class="stat"><div class="stat-label">Runs</div><div id="bossRuns" class="stat-value accent">0</div></div>
-        <div class="stat"><div class="stat-label">Deaths</div><div id="bossDeaths" class="stat-value">0</div></div>
-        <div class="stat"><div class="stat-label">Run Time</div><div id="bossRunTime" class="stat-value" style="font-size:16px">--</div></div>
-        <div class="stat"><div class="stat-label">Key Drops</div><div id="bossDrops" class="stat-value orange">0</div></div>
-        <div class="stat"><div class="stat-label">Runs/Drop</div><div id="bossRunsPerDrop" class="stat-value">-</div></div>
-        <div class="stat"><div class="stat-label">Avg Run</div><div id="bossAvgRun" class="stat-value" style="font-size:16px">--</div></div>
-        <div class="stat"><div class="stat-label">Chaos/hr</div><div id="bossChaosHr" class="stat-value orange">0</div></div>
-      </div>
-    </div>
   </div>
 
-  <div class="card">
+  <div id="labGemCard" class="card" style="display:none">
     <h2>Lab Gem Valuation</h2>
     <p style="color:#888;font-size:12px;margin:0 0 8px">Expected value of Divine Font transformation per gem. Excludes corrupted (lvl 21 / 21+ quality).</p>
     <button class="btn" onclick="loadGemReport()" style="margin-bottom:8px">Load / Refresh</button>
@@ -299,8 +356,8 @@ tr:hover td { background:var(--surface2); }
   </div>
 
   <div class="card">
-    <h2>Activity</h2>
-    <div id="logArea" class="log-area">Waiting for connection...</div>
+    <h2 style="cursor:pointer;user-select:none;display:flex;align-items:center;gap:6px" onclick="toggleActivityLog()"><span id="logToggle" style="display:inline-block;transition:transform .2s ease;font-size:8px;color:var(--text-dim)">&#9654;</span>Activity Log</h2>
+    <div id="logArea" class="log-area" style="display:none">Waiting for connection...</div>
   </div>
 </div>
 </div>
@@ -308,13 +365,34 @@ tr:hover td { background:var(--surface2); }
 <!-- ==================== SETTINGS ==================== -->
 <div id="tab-settings" class="tab-content">
 <div class="main">
-  <div class="settings-tabs">
-    <div class="settings-tab active" onclick="switchSettingsTab('build')">Build</div>
-    <div class="settings-tab" onclick="switchSettingsTab('loot')">Loot</div>
-    <div class="settings-tab" onclick="switchSettingsTab('modes')">Modes</div>
-    <div class="settings-tab" onclick="switchSettingsTab('mechanics')">Mechanics</div>
-    <div class="settings-tab" onclick="switchSettingsTab('advanced')">Advanced</div>
+  <!-- Presets bar -->
+  <div id="presetsBar" class="presets-bar">
+    <span class="presets-label">Presets</span>
+    <select id="presetSelect">
+      <option value="">-- Select Preset --</option>
+    </select>
+    <button class="btn" style="padding:5px 12px;font-size:11px" onclick="loadPreset()">Load</button>
+    <button class="btn" style="padding:5px 12px;font-size:11px" onclick="savePreset()">Save</button>
+    <button class="btn danger" style="padding:5px 12px;font-size:11px" onclick="deletePreset()">Delete</button>
+    <span style="flex:1"></span>
+    <button class="btn" style="padding:5px 12px;font-size:11px" onclick="exportPreset()">Export</button>
+    <button class="btn" style="padding:5px 12px;font-size:11px" onclick="importPreset()">Import</button>
+    <input type="file" id="presetFileInput" accept=".json" style="display:none" onchange="handlePresetFile(event)">
   </div>
+  <!-- Search bar -->
+  <div class="search-bar">
+    <input id="settingsSearch" type="text" placeholder="Search all settings..." oninput="onSettingsSearch(this.value)">
+    <span class="search-icon">&#128269;</span>
+    <button id="searchClear" class="search-clear" onclick="clearSettingsSearch()">&times;</button>
+  </div>
+  <div id="settingsTabBar" class="settings-tabs">
+    <div class="settings-tab active" data-tab="mode" onclick="switchSettingsTab('mode')"><span id="modeTabLabel">Mode</span></div>
+    <div class="settings-tab" data-tab="build" onclick="switchSettingsTab('build')">Build</div>
+    <div class="settings-tab" data-tab="loot" onclick="switchSettingsTab('loot')">Loot</div>
+    <div class="settings-tab" data-tab="all" onclick="switchSettingsTab('all')">All Settings</div>
+    <div class="settings-tab" data-tab="advanced" onclick="switchSettingsTab('advanced')">Advanced</div>
+  </div>
+  <div id="settingsSearchResults" style="display:none"></div>
   <div id="settingsContainer"><div class="empty-state">Loading settings...</div></div>
 </div>
 </div>
@@ -485,6 +563,27 @@ function updateDashboard(s) {
     bossCard.style.display = 'none';
   }
 
+  // Conditional dashboard visibility based on mode
+  const noExplore = ['Simulacrum','5-Way Resetter','Follower','Path Benchmark','Idle'];
+  document.getElementById('explorationCard').style.display = noExplore.includes(s.mode) ? 'none' : '';
+  document.getElementById('statMapsDone').style.display = s.mode === 'Mapping' ? '' : 'none';
+  document.getElementById('labGemCard').style.display = s.mode === 'Labyrinth' ? '' : 'none';
+
+  // Minimap phase overlay
+  const phaseEl = document.getElementById('minimapPhase');
+  if (s.phase) { phaseEl.textContent = s.phase; phaseEl.style.display = ''; }
+  else { phaseEl.style.display = 'none'; }
+
+  // Track mode changes and update settings mode tab
+  if (s.mode && s.mode !== currentBotMode) {
+    currentBotMode = s.mode;
+    document.getElementById('modeTabLabel').textContent = s.mode === 'Idle' ? 'Mode' : s.mode;
+    if (settingsLoaded && activeSettingsTab === 'mode') {
+      const modeTab = document.getElementById('stab-mode');
+      if (modeTab) { modeTab.innerHTML = ''; renderModeTab(modeTab, currentBotMode); }
+    }
+  }
+
   const sel = document.getElementById('modeSelect');
   if (!sel.matches(':focus')) { for(let o of sel.options) if(o.value===s.mode){sel.value=s.mode;break;} }
 
@@ -504,6 +603,19 @@ function addLog(cls,text) {
 }
 
 function esc(t) { return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function toggleMapLegend() {
+  const el = document.getElementById('minimapLegend');
+  el.style.display = el.style.display === 'none' ? '' : 'none';
+}
+
+function toggleActivityLog() {
+  const log = document.getElementById('logArea');
+  const arrow = document.getElementById('logToggle');
+  const open = log.style.display === 'none';
+  log.style.display = open ? '' : 'none';
+  arrow.style.transform = open ? 'rotate(90deg)' : '';
+}
 
 // ==================== TAG LIST EDITOR ====================
 // Generic tag list for comma-separated TextNode settings
@@ -898,9 +1010,26 @@ const HEIST_REWARDS = [
 
 const TOWER_TYPES = ['chilling','fireball','empowering','seismic','minion','shockNova'];
 
+// Mode-to-settings mapping for the Active Mode tab
+const MODE_SETTINGS = {
+  Mapping:     { sections: ['mapping'], mechanics: ['interactables','ultimatum','harvest','wishes','essence','ritual','eldritchAltar'] },
+  Simulacrum:  { sections: ['simulacrum'], mechanics: [] },
+  Blight:      { sections: ['blight'], mechanics: [] },
+  Heist:       { sections: ['heist'], mechanics: [] },
+  Labyrinth:   { sections: ['labyrinth'], mechanics: [] },
+  Boss:        { sections: ['boss'], mechanics: [] },
+  Follower:    { sections: ['follower'], mechanics: [] },
+  '5-Way Resetter': { sections: ['legionResetter'], mechanics: [] },
+};
+
+let currentBotMode = 'Idle';
+
 function switchSettingsTab(name) {
   activeSettingsTab = name;
-  document.querySelectorAll('.settings-tab').forEach(t => t.classList.toggle('active', t.textContent.toLowerCase() === name));
+  document.querySelectorAll('#settingsTabBar .settings-tab').forEach(t => {
+    const tabName = t.getAttribute('data-tab') || t.textContent.toLowerCase().replace(/\s+/g,'');
+    t.classList.toggle('active', tabName === name);
+  });
   document.querySelectorAll('.settings-tab-content').forEach(c => c.classList.remove('active'));
   const el = document.getElementById('stab-'+name);
   if (el) el.classList.add('active');
@@ -912,17 +1041,173 @@ async function loadSettings() {
     S = await r.json();
     renderAllSettings();
     settingsLoaded = true;
+    refreshPresetList();
   } catch(e) {
     document.getElementById('settingsContainer').innerHTML = `<div class="empty-state">Failed to load: ${e.message}</div>`;
   }
+}
+
+function renderModeTab(container, modeName) {
+  const cfg = MODE_SETTINGS[modeName];
+  if (!cfg) {
+    container.innerHTML = '<div class="empty-state">Select a farming mode to see its settings</div>';
+    return;
+  }
+
+  // Mode-specific settings
+  for (const section of cfg.sections) {
+    if (section === 'mapping') {
+      addSection(container, 'Mapping', [['mapping.mapName'],['mapping.minMapTier'],['mapping.portalKey'],
+        ['mapping.minPackDensity'],['mapping.detourForRares'],['mapping.maxDetourDistance']]);
+    } else if (section === 'simulacrum') {
+      addSection(container, 'Simulacrum', [['simulacrum.maxDeaths'],['simulacrum.minWaveDelaySeconds'],
+        ['simulacrum.waveTimeoutMinutes'],['simulacrum.stashItemThreshold']]);
+    } else if (section === 'blight') {
+      const blightDiv = document.createElement('div');
+      const blightTitle = document.createElement('div'); blightTitle.className='section-divider'; blightTitle.textContent='Blight'; blightDiv.appendChild(blightTitle);
+      addFieldsTo(blightDiv, [['blight.ignoreCurrency'],['blight.towerBuildRadius'],['blight.towerBuildCooldownMs'],
+        ['blight.towerClickCooldownMs'],['blight.towerApproachDistance'],
+        ['blight.sweepDelayAfterTimerSeconds'],['blight.sweepTimeoutSeconds'],
+        ['blight.sweepPumpReturnSeconds'],['blight.sweepPumpRadius']]);
+      const towerLabel = document.createElement('div'); towerLabel.className='section-divider'; towerLabel.textContent='Tower Priorities'; blightDiv.appendChild(towerLabel);
+      blightDiv.appendChild(renderTowerTable());
+      container.appendChild(blightDiv);
+    } else if (section === 'heist') {
+      const heistDiv = document.createElement('div');
+      const heistTitle = document.createElement('div'); heistTitle.className='section-divider'; heistTitle.textContent='Heist'; heistDiv.appendChild(heistTitle);
+      addFieldsTo(heistDiv, [['heist.alertThreshold'],['heist.maxChestDetour'],['heist.openRewardChests'],
+        ['heist.companionWaitTimeout'],['heist.companionRetryDelay']]);
+      const rewardLabel = document.createElement('div'); rewardLabel.className='section-divider'; rewardLabel.textContent='Reward Types'; heistDiv.appendChild(rewardLabel);
+      const grid = document.createElement('div'); grid.className='check-grid';
+      for (const [key, label] of HEIST_REWARDS) {
+        const entry = S[key]; if (!entry) continue;
+        const item = document.createElement('div'); item.className='check-item';
+        item.innerHTML = `<input type="checkbox" ${entry.value?'checked':''} onchange="updateSetting('${key}',this.checked)"><label>${esc(label)}</label>`;
+        grid.appendChild(item);
+      }
+      heistDiv.appendChild(grid);
+      container.appendChild(heistDiv);
+    } else if (section === 'labyrinth') {
+      addSection(container, 'Labyrinth', [['labyrinth.difficulty'],['labyrinth.maxRuns'],
+        ['labyrinth.minExpectedProfit'],['labyrinth.keepThreshold'],['labyrinth.preferSameType'],
+        ['labyrinth.openRewardChests'],['labyrinth.zoneTimeoutSeconds'],['labyrinth.izaroTimeoutSeconds'],
+        ['labyrinth.maxDeaths'],['labyrinth.settleSeconds']]);
+    } else if (section === 'boss') {
+      addSection(container, 'Boss', [['boss.bossType'],['boss.maxDeaths'],['boss.lootSweepTimeoutSeconds'],
+        ['boss.dumpTabName'],['boss.resourceTabName'],['boss.fragmentStock'],['boss.stashItemThreshold'],
+        ['boss.portalKey'],['boss.keyDropChaosValue']]);
+    } else if (section === 'follower') {
+      addSection(container, 'Follower', [['follower.leaderName'],['follower.followDistance'],['follower.stopDistance'],
+        ['follower.followThroughTransitions'],['follower.enableCombat'],['follower.enableLoot'],['follower.lootNearLeaderOnly']]);
+    }
+  }
+
+  // Mechanics relevant to this mode
+  for (const mech of cfg.mechanics) {
+    renderMechanicSection(container, mech);
+  }
+
+  // Link to full settings
+  const link = document.createElement('div');
+  link.style.cssText = 'text-align:center;padding:16px;';
+  link.innerHTML = '<a href="#" style="color:var(--accent);font-size:13px" onclick="event.preventDefault();switchSettingsTab(\'all\')">View all settings &rarr;</a>';
+  container.appendChild(link);
+}
+
+function renderMechanicSection(container, mech) {
+  if (mech === 'interactables') {
+    addSection(container, 'Interactables', [
+      ['mechanics.interactables.shrines'],['mechanics.interactables.strongboxes'],
+      ['mechanics.interactables.djinnCaches'],['mechanics.interactables.heistCaches'],
+      ['mechanics.interactables.craftingRecipes'],['mechanics.interactables.memoryTears']]);
+  } else if (mech === 'ultimatum') {
+    addSection(container, 'Ultimatum', [['mechanics.ultimatum.mode'],['mechanics.ultimatum.exitAfter'],
+      ['mechanics.ultimatum.doSurvive'],['mechanics.ultimatum.doKillEnemies'],
+      ['mechanics.ultimatum.doDefendAltar'],['mechanics.ultimatum.doStandInCircles'],
+      ['mechanics.ultimatum.maxWaves'],['mechanics.ultimatum.dangerThreshold'],
+      ['mechanics.ultimatum.minSecureValue'],['mechanics.ultimatum.orbitRadius']]);
+    renderUltimatumModsExpander(container);
+  } else if (mech === 'harvest') {
+    addSection(container, 'Harvest', [['mechanics.harvest.mode'],['mechanics.harvest.exitAfter'],['mechanics.harvest.preferredColour'],
+      ['mechanics.harvest.colourPreferenceBonus'],['mechanics.harvest.normalWeight'],
+      ['mechanics.harvest.magicWeight'],['mechanics.harvest.rareWeight'],
+      ['mechanics.harvest.wildMultiplier'],['mechanics.harvest.vividMultiplier'],
+      ['mechanics.harvest.primalMultiplier'],['mechanics.harvest.lootSweepSeconds']]);
+  } else if (mech === 'wishes') {
+    addSection(container, 'Wishes', [['mechanics.wishes.mode'],['mechanics.wishes.exitAfter'],['mechanics.wishes.preferredWish'],
+      ['mechanics.wishes.lootSweepSeconds']]);
+  } else if (mech === 'essence') {
+    addSection(container, 'Essence', [['mechanics.essence.mode'],['mechanics.essence.exitAfter'],['mechanics.essence.minEssenceTier'],
+      ['mechanics.essence.corruptEssences'],['mechanics.essence.lootSweepSeconds']]);
+  } else if (mech === 'ritual') {
+    addSection(container, 'Ritual', [['mechanics.ritual.mode'],['mechanics.ritual.exitAfter'],
+      ['mechanics.ritual.lootSweepSeconds']]);
+  } else if (mech === 'eldritchAltar') {
+    addSection(container, 'Eldritch Altars', [['mechanics.eldritchAltar.enabled'],['mechanics.eldritchAltar.minScoreThreshold']]);
+    renderAltarModsExpander(container);
+  }
+}
+
+function renderUltimatumModsExpander(parent) {
+  const ultModDiv = document.createElement('div');
+  const ultModTitle = document.createElement('div'); ultModTitle.className='section-divider'; ultModTitle.style.cursor='pointer';
+  ultModTitle.textContent='\u25b6 Modifier Danger Rankings (click to expand)';
+  ultModDiv.appendChild(ultModTitle);
+  const ultModContent = document.createElement('div'); ultModContent.style.display='none';
+  const ultModDesc = document.createElement('div'); ultModDesc.style.cssText='color:var(--text-dim);font-size:12px;margin-bottom:8px;';
+  ultModDesc.textContent='Rate each modifier. SKIP = never accept this mod (forfeit rewards instead).';
+  ultModContent.appendChild(ultModDesc);
+  const ultModFilter = document.createElement('input'); ultModFilter.type='text'; ultModFilter.placeholder='Filter mods...';
+  ultModFilter.style.cssText='width:100%;padding:4px 8px;margin-bottom:6px;background:var(--bg-darker);border:1px solid var(--border);color:var(--text);border-radius:4px;';
+  ultModContent.appendChild(ultModFilter);
+  const ultModBody = document.createElement('div');
+  ultModContent.appendChild(ultModBody);
+  ultModDiv.appendChild(ultModContent);
+  parent.appendChild(ultModDiv);
+  let loaded = false;
+  ultModTitle.addEventListener('click', () => {
+    const open = ultModContent.style.display !== 'none';
+    ultModContent.style.display = open ? 'none' : '';
+    ultModTitle.textContent = (open ? '\u25b6' : '\u25bc') + ' Modifier Danger Rankings';
+    if (!loaded) { loadUltimatumMods(ultModBody, ultModFilter); loaded = true; }
+  });
+}
+
+function renderAltarModsExpander(parent) {
+  const altarModDiv = document.createElement('div');
+  const altarModTitle = document.createElement('div'); altarModTitle.className='section-divider'; altarModTitle.style.cursor='pointer';
+  altarModTitle.textContent = '\u25b6 Altar Mod Weights'; altarModDiv.appendChild(altarModTitle);
+  const altarModContent = document.createElement('div'); altarModContent.style.display='none';
+  const altarModFilter = document.createElement('input'); altarModFilter.type='text'; altarModFilter.placeholder='Filter mods...';
+  altarModFilter.style.cssText='width:100%;padding:8px;margin:8px 0;background:var(--surface2);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:13px;';
+  altarModContent.appendChild(altarModFilter);
+  const altarModBody = document.createElement('div'); altarModBody.style.maxHeight='400px'; altarModBody.style.overflowY='auto';
+  altarModContent.appendChild(altarModBody);
+  altarModDiv.appendChild(altarModContent);
+  parent.appendChild(altarModDiv);
+  let loaded = false;
+  altarModTitle.addEventListener('click', () => {
+    const open = altarModContent.style.display !== 'none';
+    altarModContent.style.display = open ? 'none' : '';
+    altarModTitle.textContent = (open ? '\u25b6' : '\u25bc') + ' Altar Mod Weights';
+    if (!loaded) { loadAltarMods(altarModBody, altarModFilter); loaded = true; }
+  });
 }
 
 function renderAllSettings() {
   const c = document.getElementById('settingsContainer');
   c.innerHTML = '';
 
+  // Update mode tab label
+  document.getElementById('modeTabLabel').textContent = currentBotMode === 'Idle' ? 'Mode' : currentBotMode;
+
+  // Mode tab
+  const modeTab = makeTabContent('mode', activeSettingsTab === 'mode');
+  renderModeTab(modeTab, currentBotMode);
+  c.appendChild(modeTab);
+
   // Build tab
-  const build = makeTabContent('build', true);
+  const build = makeTabContent('build', activeSettingsTab === 'build');
   addSection(build, 'Movement', [['build.blinkRange'],['build.dashMinDistance','0 = disable dash-for-speed'],['build.pathMergeThreshold','0 = disabled']]);
   addSection(build, 'Combat', [['build.defaultPositioning'],['build.fightRange'],['build.combatRange'],
     ['build.guardHpThreshold'],['build.guardEsThreshold'],['build.vaalMinMonsters'],['build.summonExpectedCount']]);
@@ -933,7 +1218,7 @@ function renderAllSettings() {
   c.appendChild(build);
 
   // Loot tab
-  const loot = makeTabContent('loot');
+  const loot = makeTabContent('loot', activeSettingsTab === 'loot');
   addSection(loot, 'Unique Filtering', [['loot.skipLowValueUniques'],
     {key:'loot.minUniqueChaosValue', showIf:'loot.skipLowValueUniques'},
     {key:'loot.minChaosPerSlot', note:'0 = disabled'}]);
@@ -950,125 +1235,20 @@ function renderAllSettings() {
   addSection(loot, 'Other', [['loot.ignoreQuestItems'],['loot.labelToggleUnstick'],['loot.labelToggleCooldownSeconds'],['loot.stashItemCooldownMs']]);
   c.appendChild(loot);
 
-  // Modes tab
-  const modes = makeTabContent('modes');
-  addSection(modes, 'Mapping', [['mapping.mapName'],['mapping.minMapTier'],['mapping.portalKey'],
-    ['mapping.minPackDensity'],['mapping.detourForRares'],['mapping.maxDetourDistance']]);
-  addSection(modes, 'Labyrinth', [['labyrinth.difficulty'],['labyrinth.maxRuns'],
-    ['labyrinth.minExpectedProfit'],['labyrinth.keepThreshold'],['labyrinth.preferSameType'],
-    ['labyrinth.openRewardChests'],['labyrinth.zoneTimeoutSeconds'],['labyrinth.izaroTimeoutSeconds'],
-    ['labyrinth.maxDeaths'],['labyrinth.settleSeconds']]);
-  addSection(modes, 'Simulacrum', [['simulacrum.maxDeaths'],['simulacrum.minWaveDelaySeconds'],
-    ['simulacrum.waveTimeoutMinutes'],['simulacrum.stashItemThreshold']]);
-  addSection(modes, 'Boss', [['boss.bossType'],['boss.maxDeaths'],['boss.lootSweepTimeoutSeconds'],
-    ['boss.dumpTabName'],['boss.resourceTabName'],['boss.fragmentStock'],['boss.stashItemThreshold'],
-    ['boss.portalKey'],['boss.keyDropChaosValue']]);
-  addSection(modes, 'Follower', [['follower.leaderName'],['follower.followDistance'],['follower.stopDistance'],
-    ['follower.followThroughTransitions'],['follower.enableCombat'],['follower.enableLoot'],['follower.lootNearLeaderOnly']]);
-
-  // Heist with reward checklist
-  const heistDiv = document.createElement('div');
-  const heistTitle = document.createElement('div'); heistTitle.className='section-divider'; heistTitle.textContent='Heist'; heistDiv.appendChild(heistTitle);
-  addFieldsTo(heistDiv, [['heist.alertThreshold'],['heist.maxChestDetour'],['heist.openRewardChests'],
-    ['heist.companionWaitTimeout'],['heist.companionRetryDelay']]);
-  // Reward checklist
-  const rewardLabel = document.createElement('div'); rewardLabel.className='section-divider'; rewardLabel.textContent='Reward Types'; heistDiv.appendChild(rewardLabel);
-  const grid = document.createElement('div'); grid.className='check-grid';
-  for (const [key, label] of HEIST_REWARDS) {
-    const entry = S[key]; if (!entry) continue;
-    const item = document.createElement('div'); item.className='check-item';
-    item.innerHTML = `<input type="checkbox" ${entry.value?'checked':''} onchange="updateSetting('${key}',this.checked)"><label>${esc(label)}</label>`;
-    grid.appendChild(item);
+  // All Settings tab (everything in one place for power users)
+  const all = makeTabContent('all', activeSettingsTab === 'all');
+  const allModesHeader = document.createElement('div'); allModesHeader.className='section-divider'; allModesHeader.textContent='All Modes'; allModesHeader.style.fontSize='14px'; allModesHeader.style.fontWeight='700';
+  all.appendChild(allModesHeader);
+  for (const modeName of Object.keys(MODE_SETTINGS)) {
+    renderModeTab(all, modeName);
+    // Remove the "view all" link from each embedded mode section
+    const links = all.querySelectorAll('a[onclick*="switchSettingsTab"]');
+    links.forEach(l => l.closest('div[style*="text-align:center"]')?.remove());
   }
-  heistDiv.appendChild(grid);
-  modes.appendChild(heistDiv);
-
-  // Blight with tower table
-  const blightDiv = document.createElement('div');
-  const blightTitle = document.createElement('div'); blightTitle.className='section-divider'; blightTitle.textContent='Blight'; blightDiv.appendChild(blightTitle);
-  addFieldsTo(blightDiv, [['blight.ignoreCurrency'],['blight.towerBuildRadius'],['blight.towerBuildCooldownMs'],
-    ['blight.towerClickCooldownMs'],['blight.towerApproachDistance'],
-    ['blight.sweepDelayAfterTimerSeconds'],['blight.sweepTimeoutSeconds'],
-    ['blight.sweepPumpReturnSeconds'],['blight.sweepPumpRadius']]);
-  // Tower config table
-  const towerLabel = document.createElement('div'); towerLabel.className='section-divider'; towerLabel.textContent='Tower Priorities'; blightDiv.appendChild(towerLabel);
-  blightDiv.appendChild(renderTowerTable());
-  modes.appendChild(blightDiv);
-  c.appendChild(modes);
-
-  // Mechanics tab
-  const mech = makeTabContent('mechanics');
-  addSection(mech, 'Interactables', [
-    ['mechanics.interactables.shrines'],['mechanics.interactables.strongboxes'],
-    ['mechanics.interactables.djinnCaches'],['mechanics.interactables.heistCaches'],
-    ['mechanics.interactables.craftingRecipes'],['mechanics.interactables.memoryTears']]);
-  addSection(mech, 'Ultimatum', [['mechanics.ultimatum.mode'],['mechanics.ultimatum.exitAfter'],
-    ['mechanics.ultimatum.doSurvive'],['mechanics.ultimatum.doKillEnemies'],
-    ['mechanics.ultimatum.doDefendAltar'],['mechanics.ultimatum.doStandInCircles'],
-    ['mechanics.ultimatum.maxWaves'],['mechanics.ultimatum.dangerThreshold'],
-    ['mechanics.ultimatum.minSecureValue'],['mechanics.ultimatum.orbitRadius']]);
-
-  // Ultimatum modifier danger rankings (custom API, not standard settings)
-  const ultModDiv = document.createElement('div');
-  const ultModTitle = document.createElement('div'); ultModTitle.className='section-divider'; ultModTitle.style.cursor='pointer';
-  ultModTitle.textContent='▶ Modifier Danger Rankings (click to expand)';
-  ultModDiv.appendChild(ultModTitle);
-  const ultModContent = document.createElement('div'); ultModContent.style.display='none';
-  const ultModDesc = document.createElement('div'); ultModDesc.style.cssText='color:var(--text-dim);font-size:12px;margin-bottom:8px;';
-  ultModDesc.textContent='Rate each modifier. SKIP = never accept this mod (forfeit rewards instead).';
-  ultModContent.appendChild(ultModDesc);
-  const ultModFilter = document.createElement('input'); ultModFilter.type='text'; ultModFilter.placeholder='Filter mods...';
-  ultModFilter.style.cssText='width:100%;padding:4px 8px;margin-bottom:6px;background:var(--bg-darker);border:1px solid var(--border);color:var(--text);border-radius:4px;';
-  ultModContent.appendChild(ultModFilter);
-  const ultModBody = document.createElement('div'); ultModBody.id='ultModBody';
-  ultModContent.appendChild(ultModBody);
-  ultModDiv.appendChild(ultModContent);
-  mech.appendChild(ultModDiv);
-  let ultModLoaded = false;
-  ultModTitle.addEventListener('click', () => {
-    const open = ultModContent.style.display !== 'none';
-    ultModContent.style.display = open ? 'none' : '';
-    ultModTitle.textContent = (open ? '▶' : '▼') + ' Modifier Danger Rankings';
-    if (!ultModLoaded) { loadUltimatumMods(ultModBody, ultModFilter); ultModLoaded = true; }
-  });
-
-  addSection(mech, 'Harvest', [['mechanics.harvest.mode'],['mechanics.harvest.exitAfter'],['mechanics.harvest.preferredColour'],
-    ['mechanics.harvest.colourPreferenceBonus'],['mechanics.harvest.normalWeight'],
-    ['mechanics.harvest.magicWeight'],['mechanics.harvest.rareWeight'],
-    ['mechanics.harvest.wildMultiplier'],['mechanics.harvest.vividMultiplier'],
-    ['mechanics.harvest.primalMultiplier'],['mechanics.harvest.lootSweepSeconds']]);
-  addSection(mech, 'Wishes', [['mechanics.wishes.mode'],['mechanics.wishes.exitAfter'],['mechanics.wishes.preferredWish'],
-    ['mechanics.wishes.lootSweepSeconds']]);
-  addSection(mech, 'Essence', [['mechanics.essence.mode'],['mechanics.essence.exitAfter'],['mechanics.essence.minEssenceTier'],
-    ['mechanics.essence.corruptEssences'],['mechanics.essence.lootSweepSeconds']]);
-  addSection(mech, 'Ritual', [['mechanics.ritual.mode'],['mechanics.ritual.exitAfter'],
-    ['mechanics.ritual.lootSweepSeconds']]);
-  addSection(mech, 'Eldritch Altars', [['mechanics.eldritchAltar.enabled'],['mechanics.eldritchAltar.minScoreThreshold']]);
-
-  // Eldritch Altar mod weight editor (custom API, not standard settings)
-  const altarModDiv = document.createElement('div');
-  const altarModTitle = document.createElement('div'); altarModTitle.className='section-divider'; altarModTitle.style.cursor='pointer';
-  altarModTitle.textContent = '\u25b6 Altar Mod Weights'; altarModDiv.appendChild(altarModTitle);
-  const altarModContent = document.createElement('div'); altarModContent.style.display='none';
-  const altarModFilter = document.createElement('input'); altarModFilter.type='text'; altarModFilter.placeholder='Filter mods...';
-  altarModFilter.style.cssText='width:100%;padding:8px;margin:8px 0;background:var(--surface2);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:13px;';
-  altarModContent.appendChild(altarModFilter);
-  const altarModBody = document.createElement('div'); altarModBody.style.maxHeight='400px'; altarModBody.style.overflowY='auto';
-  altarModContent.appendChild(altarModBody);
-  altarModDiv.appendChild(altarModContent);
-  mech.appendChild(altarModDiv);
-  let altarModLoaded = false;
-  altarModTitle.addEventListener('click', () => {
-    const open = altarModContent.style.display !== 'none';
-    altarModContent.style.display = open ? 'none' : '';
-    altarModTitle.textContent = (open ? '\u25b6' : '\u25bc') + ' Altar Mod Weights';
-    if (!altarModLoaded) { loadAltarMods(altarModBody, altarModFilter); altarModLoaded = true; }
-  });
-
-  c.appendChild(mech);
+  c.appendChild(all);
 
   // Advanced tab
-  const adv = makeTabContent('advanced');
+  const adv = makeTabContent('advanced', activeSettingsTab === 'advanced');
   addSection(adv, 'General', [['actionCooldownMs'],['extraLatencyMs'],['maxClickAttempts'],['interactRadius'],['areaSettleSeconds'],['autoLevelGems'],['autoApplyIncubators'],['debugIncubatorOverlay']]);
   addSection(adv, 'Threat Detection', [['threat.enabled'],['threat.monitorRares'],['threat.autoDodge'],
     ['threat.threatRadius'],['threat.dodgeTriggerDistance'],['threat.dodgeDistance'],
@@ -1533,6 +1713,186 @@ function flashSave() {
   const el = document.getElementById('saveFlash');
   el.classList.add('show');
   setTimeout(()=>el.classList.remove('show'), 1500);
+}
+
+// ==================== SETTINGS SEARCH ====================
+let searchTimer = null;
+
+function onSettingsSearch(query) {
+  clearTimeout(searchTimer);
+  const clearBtn = document.getElementById('searchClear');
+  clearBtn.style.display = query ? '' : 'none';
+
+  if (!query || query.length < 2) {
+    clearSettingsSearch();
+    return;
+  }
+
+  searchTimer = setTimeout(() => {
+    const results = document.getElementById('settingsSearchResults');
+    const container = document.getElementById('settingsContainer');
+    const tabBar = document.getElementById('settingsTabBar');
+    const q = query.toLowerCase();
+
+    // Find matching settings
+    const matches = [];
+    for (const [key, entry] of Object.entries(S)) {
+      const matchLabel = (entry.label || '').toLowerCase().includes(q);
+      const matchDesc = (entry.description || '').toLowerCase().includes(q);
+      const matchKey = key.toLowerCase().includes(q);
+      if (matchLabel || matchDesc || matchKey) {
+        matches.push({ key, entry });
+      }
+    }
+
+    // Group by first key segment
+    const groups = {};
+    for (const m of matches) {
+      const group = m.key.split('.')[0];
+      const groupLabel = group.charAt(0).toUpperCase() + group.slice(1);
+      if (!groups[groupLabel]) groups[groupLabel] = [];
+      groups[groupLabel].push(m);
+    }
+
+    // Render
+    results.innerHTML = '';
+    if (matches.length === 0) {
+      results.innerHTML = '<div class="empty-state">No settings match your search</div>';
+    } else {
+      const countEl = document.createElement('div');
+      countEl.style.cssText = 'font-size:12px;color:var(--text-dim);margin-bottom:12px';
+      countEl.textContent = `${matches.length} result${matches.length !== 1 ? 's' : ''}`;
+      results.appendChild(countEl);
+
+      for (const [groupName, items] of Object.entries(groups)) {
+        const section = document.createElement('div');
+        section.className = 'settings-group';
+        const title = document.createElement('div');
+        title.className = 'section-divider';
+        title.textContent = groupName;
+        section.appendChild(title);
+
+        for (const { key, entry } of items) {
+          section.appendChild(buildField(key, entry));
+        }
+        results.appendChild(section);
+      }
+    }
+
+    tabBar.style.display = 'none';
+    container.style.display = 'none';
+    results.style.display = '';
+  }, 150);
+}
+
+function clearSettingsSearch() {
+  document.getElementById('settingsSearch').value = '';
+  document.getElementById('searchClear').style.display = 'none';
+  document.getElementById('settingsSearchResults').style.display = 'none';
+  document.getElementById('settingsContainer').style.display = '';
+  document.getElementById('settingsTabBar').style.display = '';
+}
+
+// ==================== PRESETS ====================
+async function refreshPresetList() {
+  try {
+    const r = await fetch('/api/presets');
+    const names = await r.json();
+    const sel = document.getElementById('presetSelect');
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">-- Select Preset --</option>';
+    for (const name of names) {
+      const opt = document.createElement('option');
+      opt.value = name; opt.textContent = name;
+      sel.appendChild(opt);
+    }
+    if (cur && names.includes(cur)) sel.value = cur;
+  } catch {}
+}
+
+async function savePreset() {
+  const name = prompt('Preset name:');
+  if (!name || !name.trim()) return;
+  try {
+    const r = await fetch('/api/presets/save', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({name: name.trim()})
+    });
+    if (r.ok) { flashSave(); await refreshPresetList(); document.getElementById('presetSelect').value = name.trim(); }
+    else { const d = await r.json(); alert('Save failed: ' + (d.error || r.status)); }
+  } catch(e) { alert('Save failed: ' + e.message); }
+}
+
+async function loadPreset() {
+  const name = document.getElementById('presetSelect').value;
+  if (!name) { alert('Select a preset first'); return; }
+  if (!confirm(`Load preset "${name}"? This will overwrite your current settings.`)) return;
+  try {
+    const r = await fetch('/api/presets/load', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({name})
+    });
+    if (r.ok) {
+      flashSave();
+      // Reload settings to reflect changes
+      settingsLoaded = false;
+      await loadSettings();
+    } else { const d = await r.json(); alert('Load failed: ' + (d.error || r.status)); }
+  } catch(e) { alert('Load failed: ' + e.message); }
+}
+
+async function deletePreset() {
+  const name = document.getElementById('presetSelect').value;
+  if (!name) { alert('Select a preset first'); return; }
+  if (!confirm(`Delete preset "${name}"?`)) return;
+  try {
+    const r = await fetch('/api/presets/delete', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({name})
+    });
+    if (r.ok) { await refreshPresetList(); }
+    else { const d = await r.json(); alert('Delete failed: ' + (d.error || r.status)); }
+  } catch(e) { alert('Delete failed: ' + e.message); }
+}
+
+async function exportPreset() {
+  const name = document.getElementById('presetSelect').value;
+  if (!name) { alert('Select a preset to export'); return; }
+  try {
+    const r = await fetch(`/api/presets/export?name=${encodeURIComponent(name)}`);
+    if (!r.ok) { alert('Export failed'); return; }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = name + '.json'; a.click();
+    URL.revokeObjectURL(url);
+  } catch(e) { alert('Export failed: ' + e.message); }
+}
+
+function importPreset() {
+  document.getElementById('presetFileInput').click();
+}
+
+async function handlePresetFile(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  event.target.value = ''; // reset for re-import
+  const name = prompt('Preset name:', file.name.replace(/\.json$/i, ''));
+  if (!name || !name.trim()) return;
+  try {
+    const json = await file.text();
+    // Validate JSON
+    JSON.parse(json);
+    const r = await fetch('/api/presets/import', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({name: name.trim(), json})
+    });
+    if (r.ok) {
+      flashSave();
+      await refreshPresetList();
+      document.getElementById('presetSelect').value = name.trim();
+    } else { const d = await r.json(); alert('Import failed: ' + (d.error || r.status)); }
+  } catch(e) { alert('Invalid JSON file: ' + e.message); }
 }
 
 // ==================== HISTORY ====================

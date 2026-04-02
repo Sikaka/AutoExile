@@ -709,26 +709,8 @@ namespace AutoExile.Systems
             return fallback;
         }
 
-        private Entity? FindNearestPortal(GameController gc)
-        {
-            // Prefer lowest grid Y (south on screen / behind map device in isometric view).
-            Entity? best = null;
-            float bestY = float.MaxValue;
-
-            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
-            {
-                if (entity.Type != EntityType.TownPortal)
-                    continue;
-                if (!entity.IsTargetable)
-                    continue;
-                if (entity.GridPosNum.Y < bestY)
-                {
-                    bestY = entity.GridPosNum.Y;
-                    best = entity;
-                }
-            }
-            return best;
-        }
+        private Entity? FindNearestPortal(GameController gc) =>
+            Modes.Shared.ModeHelpers.FindNearestPortal(gc);
 
         private bool IsMapInDevice(Element atlas)
         {
