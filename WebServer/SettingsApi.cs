@@ -106,6 +106,25 @@ namespace AutoExile.WebServer
             }
         }
 
+        /// <summary>Navigate the settings tree by dot-separated path and return the node object.</summary>
+        public static object? FindNode(BotSettings settings, string path)
+        {
+            try
+            {
+                var parts = path.Split('.');
+                object current = settings;
+                for (int i = 0; i < parts.Length - 1; i++)
+                {
+                    var prop = FindProperty(current.GetType(), parts[i]);
+                    if (prop == null) return null;
+                    current = prop.GetValue(current)!;
+                }
+                var targetProp = FindProperty(current.GetType(), parts[^1]);
+                return targetProp?.GetValue(current);
+            }
+            catch { return null; }
+        }
+
         // ================================================================
         // Serialization helpers
         // ================================================================

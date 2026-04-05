@@ -64,6 +64,9 @@ namespace AutoExile.Modes.BossEncounters
         private const float MazeXThreshold = 600f;
         private const float TeleportDetectDistance = 200f;
 
+        // Boss always spawns at this fixed position
+        private static readonly Vector2 BossSpawnPos = new(300f, 542f);
+
         // ── State ──
         private KingPhase _phase = KingPhase.Idle;
         private DateTime _phaseStartTime;
@@ -194,25 +197,23 @@ namespace AutoExile.Modes.BossEncounters
                 return BossEncounterResult.InProgress;
             }
 
-            if (!ctx.Navigation.IsNavigating)
+            // Nav directly to boss spawn — position is fixed, no need to explore.
+            // Combat system handles engagement distance and positioning once in range.
+            var distToBoss = Vector2.Distance(playerGrid, BossSpawnPos);
+
+            if (distToBoss > 10 && !ctx.Navigation.IsNavigating)
             {
-                var target = ctx.Exploration.GetNextExplorationTarget(playerGrid);
-                if (target.HasValue)
+                if (!ctx.Navigation.NavigateTo(gc, BossSpawnPos))
                 {
-                    if (!ctx.Navigation.NavigateTo(gc, target.Value))
-                    {
-                        _exploreFails++;
-                        ctx.Exploration.MarkRegionFailed(target.Value);
-                        if (_exploreFails > 10)
-                            return BossEncounterResult.Failed;
-                    }
+                    _exploreFails++;
+                    if (_exploreFails > 10)
+                        return BossEncounterResult.Failed;
                 }
             }
 
-            var coverage = ctx.Exploration.ActiveBlobCoverage;
             Status = _phase == KingPhase.ReturnedToArena
-                ? $"Back in arena — exploring ({coverage:P0})"
-                : $"Walking to center ({coverage:P0})";
+                ? $"Back in arena — moving to boss ({distToBoss:F0}g)"
+                : $"Moving to boss ({distToBoss:F0}g)";
             return BossEncounterResult.InProgress;
         }
 
@@ -230,7 +231,8 @@ namespace AutoExile.Modes.BossEncounters
                 _bossDeathPos = bossGrid;
                 var dist = Vector2.Distance(playerGrid, bossGrid);
 
-                if (dist > 30 && !ctx.Navigation.IsNavigating)
+                // Only close if outside combat range — combat system handles positioning within range
+                if (dist > ctx.Settings.Build.CombatRange.Value && !ctx.Navigation.IsNavigating)
                     ctx.Navigation.NavigateTo(gc, bossGrid);
 
                 Status = $"Fighting {_bossEntity.RenderName} — dist={dist:F0}";

@@ -197,6 +197,10 @@ namespace AutoExile.Modes
                     ctx.Navigation.RelaxedPathing = _activeEncounter?.RelaxedPathing == true;
                     ctx.Combat.Tick(ctx);
                     ctx.Combat.SuppressPositioning = false;
+
+                    // Combat wants to reposition (LOS blocked or aggressive chase) — A* pathfind there
+                    if (ctx.Combat.WantsToMove && !ctx.Navigation.IsNavigating && !ctx.Interaction.IsBusy)
+                        ctx.Navigation.NavigateTo(ctx.Game, ctx.Combat.MoveTargetGrid);
                 }
             }
             else

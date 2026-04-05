@@ -92,6 +92,9 @@ namespace AutoExile.Systems
         private readonly List<LootCandidate> _candidates = new();
         public IReadOnlyList<LootCandidate> Candidates => _candidates;
 
+        // Cached GC reference from last Scan() for overlap checks in PickupNext
+        private GameController? _gameController;
+
         // Debug: schedule a delayed dump when specific items are seen on the ground
         /// <summary>
         /// When non-null, BotCore should fire both game state + recorder dumps at this time.
@@ -130,6 +133,7 @@ namespace AutoExile.Systems
         {
             _failedEntities.Clear();
             _loggedSkipIds.Clear();
+            _scanCache.Clear();
         }
 
         /// <summary>
@@ -138,8 +142,22 @@ namespace AutoExile.Systems
         /// Always sorts by distance (nearest first) for efficient pathing.
         /// Call each tick when not busy to get fresh data.
         /// </summary>
+        // ── Scan result cache: avoid re-reading components for items we've already evaluated ──
+        // Keyed by entity ID. Cleared on area change. Items don't change once on the ground.
+        private readonly Dictionary<long, CachedScanResult> _scanCache = new(128);
+
+        private struct CachedScanResult
+        {
+            public bool ShouldLoot;
+            public double ChaosValue;
+            public int InventorySlots;
+            public double ChaosPerSlot;
+            public string ItemName;
+        }
+
         public void Scan(GameController gc)
         {
+            _gameController = gc;
             _candidates.Clear();
             HasLootNearby = false;
             LootableCount = 0;
@@ -167,87 +185,44 @@ namespace AutoExile.Systems
 
                     var itemName = label.Label.Text ?? "?";
 
-                    // Get the actual item entity inside the WorldItem container
-                    Entity? itemEntity = null;
-                    if (worldItemEntity.TryGetComponent<WorldItem>(out var worldItem))
-                        itemEntity = worldItem.ItemEntity;
-
                     // Skip gold — auto-pickup on walk-over, no click needed
                     if (itemName.EndsWith(" Gold"))
                         continue;
 
-                    // Skip quest items (heist quest contracts, etc.)
-                    if (IgnoreQuestItems && itemEntity is { IsValid: true } &&
-                        itemEntity.Path.Contains("/Quest", StringComparison.OrdinalIgnoreCase))
+                    // ── Check scan cache: skip component reads for already-evaluated items ──
+                    if (_scanCache.TryGetValue(worldItemEntity.Id, out var cached))
+                    {
+                        if (cached.ShouldLoot)
+                        {
+                            _candidates.Add(new LootCandidate
+                            {
+                                Entity = worldItemEntity,
+                                ItemName = cached.ItemName,
+                                Distance = worldItemEntity.DistancePlayer,
+                                ChaosValue = cached.ChaosValue,
+                                InventorySlots = cached.InventorySlots,
+                                ChaosPerSlot = cached.ChaosPerSlot,
+                            });
+                        }
                         continue;
+                    }
 
-                    // Must-loot items — mode whitelist, bypass all value filtering
-                    if (MustLootItems.Count > 0 && MustLootItems.Any(m =>
-                        itemName.Contains(m, StringComparison.OrdinalIgnoreCase)))
+                    // ── First time seeing this item — evaluate with full component reads ──
+                    var evaluated = EvaluateItem(gc, worldItemEntity, itemName);
+                    _scanCache[worldItemEntity.Id] = evaluated;
+
+                    if (evaluated.ShouldLoot)
                     {
                         _candidates.Add(new LootCandidate
                         {
                             Entity = worldItemEntity,
-                            ItemName = itemName,
-                            ChaosValue = 0,
+                            ItemName = evaluated.ItemName,
                             Distance = worldItemEntity.DistancePlayer,
+                            ChaosValue = evaluated.ChaosValue,
+                            InventorySlots = evaluated.InventorySlots,
+                            ChaosPerSlot = evaluated.ChaosPerSlot,
                         });
-                        LootableCount++;
-                        continue;
                     }
-
-                    // Use inner item for pricing/sizing, fall back to outer entity
-                    var priceEntity = (itemEntity is { IsValid: true }) ? itemEntity : worldItemEntity;
-
-                    // Check if this is a unique we should skip
-                    var priceResult = GetPriceResult(gc, priceEntity);
-                    var chaosValue = priceResult.MaxChaosValue; // Use max for loot decisions
-
-                    // Voices has a huge price range (1-passive is 150x rarer than 3-passive).
-                    // Divide max by 150 to approximate expected value rather than best-case.
-                    if (priceResult.DetailsId.Contains("voices", StringComparison.OrdinalIgnoreCase))
-                        chaosValue = priceResult.MaxChaosValue / 150.0;
-                    var invSlots = GetInventorySlots(priceEntity);
-                    var chaosPerSlot = invSlots > 0 ? chaosValue / invSlots : chaosValue;
-
-                    if (SkipLowValueUniques && ShouldSkipUnique(priceEntity, priceResult, chaosPerSlot, itemName))
-                    {
-                        LogSkipEvent(worldItemEntity.Id, itemName, LastSkipReason, chaosValue);
-                        continue;
-                    }
-
-                    // Cluster jewel value filter
-                    if (FilterClusterJewels && MinClusterJewelChaosValue > 0 &&
-                        IsNonUniqueClusterJewel(priceEntity, itemName) &&
-                        ShouldSkipClusterJewel(priceResult, itemName))
-                    {
-                        LogSkipEvent(worldItemEntity.Id, itemName, LastSkipReason, chaosValue);
-                        continue;
-                    }
-
-                    // Skill gem value filter
-                    if (FilterSkillGems && IsSkillGem(priceEntity) && ShouldSkipGem(priceEntity, priceResult, itemName))
-                    {
-                        LogSkipEvent(worldItemEntity.Id, itemName, LastSkipReason, chaosValue);
-                        continue;
-                    }
-
-                    // Synthesised implicit whitelist filter
-                    if (FilterSynthesisedItems && ShouldSkipSynthesised(priceEntity, itemName))
-                    {
-                        LogSkipEvent(worldItemEntity.Id, itemName, LastSkipReason, chaosValue);
-                        continue;
-                    }
-
-                    _candidates.Add(new LootCandidate
-                    {
-                        Entity = worldItemEntity,
-                        ItemName = itemName,
-                        Distance = worldItemEntity.DistancePlayer,
-                        ChaosValue = chaosValue,
-                        InventorySlots = invSlots,
-                        ChaosPerSlot = chaosPerSlot,
-                    });
                 }
 
                 // Always sort nearest first — efficient pathing beats value optimization
@@ -257,6 +232,80 @@ namespace AutoExile.Systems
                 HasLootNearby = _candidates.Count > 0;
             }
             catch { }
+        }
+
+        /// <summary>
+        /// Full evaluation of an item — reads components, checks price, applies filters.
+        /// Called once per item (result cached for subsequent scans).
+        /// </summary>
+        private CachedScanResult EvaluateItem(GameController gc, Entity worldItemEntity, string itemName)
+        {
+            // Must-loot items — mode whitelist, bypass all value filtering
+            if (MustLootItems.Count > 0 && MustLootItems.Any(m =>
+                itemName.Contains(m, StringComparison.OrdinalIgnoreCase)))
+            {
+                return new CachedScanResult
+                {
+                    ShouldLoot = true, ItemName = itemName,
+                    ChaosValue = 0, InventorySlots = 1, ChaosPerSlot = 0,
+                };
+            }
+
+            // Get inner item entity (component read)
+            Entity? itemEntity = null;
+            if (worldItemEntity.TryGetComponent<WorldItem>(out var worldItem))
+                itemEntity = worldItem.ItemEntity;
+
+            // Skip quest items
+            if (IgnoreQuestItems && itemEntity is { IsValid: true } &&
+                itemEntity.Path.Contains("/Quest", StringComparison.OrdinalIgnoreCase))
+                return new CachedScanResult { ShouldLoot = false, ItemName = itemName };
+
+            var priceEntity = (itemEntity is { IsValid: true }) ? itemEntity : worldItemEntity;
+
+            var priceResult = GetPriceResult(gc, priceEntity);
+            var chaosValue = priceResult.MaxChaosValue;
+
+            if (priceResult.DetailsId.Contains("voices", StringComparison.OrdinalIgnoreCase))
+                chaosValue = priceResult.MaxChaosValue / 150.0;
+            var invSlots = GetInventorySlots(priceEntity);
+            var chaosPerSlot = invSlots > 0 ? chaosValue / invSlots : chaosValue;
+
+            // Apply filters
+            if (SkipLowValueUniques && ShouldSkipUnique(priceEntity, priceResult, chaosPerSlot, itemName))
+            {
+                LogSkipEvent(worldItemEntity.Id, itemName, LastSkipReason, chaosValue);
+                return new CachedScanResult { ShouldLoot = false, ItemName = itemName };
+            }
+
+            if (FilterClusterJewels && MinClusterJewelChaosValue > 0 &&
+                IsNonUniqueClusterJewel(priceEntity, itemName) &&
+                ShouldSkipClusterJewel(priceResult, itemName))
+            {
+                LogSkipEvent(worldItemEntity.Id, itemName, LastSkipReason, chaosValue);
+                return new CachedScanResult { ShouldLoot = false, ItemName = itemName };
+            }
+
+            if (FilterSkillGems && IsSkillGem(priceEntity) && ShouldSkipGem(priceEntity, priceResult, itemName))
+            {
+                LogSkipEvent(worldItemEntity.Id, itemName, LastSkipReason, chaosValue);
+                return new CachedScanResult { ShouldLoot = false, ItemName = itemName };
+            }
+
+            if (FilterSynthesisedItems && ShouldSkipSynthesised(priceEntity, itemName))
+            {
+                LogSkipEvent(worldItemEntity.Id, itemName, LastSkipReason, chaosValue);
+                return new CachedScanResult { ShouldLoot = false, ItemName = itemName };
+            }
+
+            return new CachedScanResult
+            {
+                ShouldLoot = true,
+                ItemName = itemName,
+                ChaosValue = chaosValue,
+                InventorySlots = invSlots,
+                ChaosPerSlot = chaosPerSlot,
+            };
         }
 
         /// <summary>
@@ -294,10 +343,96 @@ namespace AutoExile.Systems
                 return (false, null);
 
             var withinRadius = best.Distance <= interaction.InteractRadius;
+
+            // If within click radius but label is overlapped by another label,
+            // nudge the player toward the label to shift the isometric camera angle.
+            // One move-key press toward the label center is enough to separate them.
+            // Verified via MCP testing: walking toward the label center clears the overlap
+            // and isTargeted returns true afterward.
+            if (withinRadius && _gameController != null && nav != null)
+            {
+                if (IsLabelOverlapped(_gameController, best.Entity.Id))
+                {
+                    var labelScreenPos = GetLabelScreenCenter(_gameController, best.Entity.Id);
+                    if (labelScreenPos.HasValue)
+                    {
+                        // Single move toward label center to shift camera angle
+                        var wr = _gameController.Window.GetWindowRectangle();
+                        var absPos = new Vector2(wr.X + labelScreenPos.Value.X, wr.Y + labelScreenPos.Value.Y);
+                        BotInput.StartMovement(absPos, nav.MoveKey);
+                        // Don't pick up this tick — let the nudge happen, next tick re-checks overlap
+                        return (false, null);
+                    }
+                }
+            }
+
             interaction.PickupGroundItem(best.Entity, nav,
                 requireProximity: !withinRadius);
 
             return (withinRadius, best);
+        }
+
+        /// <summary>
+        /// Get the screen-space center of a ground item's label.
+        /// Returns null if label not found or not visible.
+        /// </summary>
+        private static Vector2? GetLabelScreenCenter(GameController gc, long entityId)
+        {
+            try
+            {
+                foreach (var l in gc.IngameState.IngameUi.ItemsOnGroundLabelElement.LabelsOnGround)
+                {
+                    if (l?.ItemOnGround?.Id == entityId && l.Label?.IsVisible == true)
+                    {
+                        var r = l.Label.GetClientRect();
+                        return new Vector2(r.X + r.Width / 2, r.Y + r.Height / 2);
+                    }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        /// <summary>
+        /// Check if a ground item's label rect overlaps any other label in LabelsOnGround.
+        /// Uses rect intersection — cheap O(n) over visible labels (typically 5-15).
+        /// When overlapped, the caller should force requireProximity=true to walk toward
+        /// the item, which shifts the isometric camera angle and separates the labels.
+        /// </summary>
+        private static bool IsLabelOverlapped(GameController gc, long entityId)
+        {
+            try
+            {
+                var labels = gc.IngameState.IngameUi.ItemsOnGroundLabelElement.LabelsOnGround;
+                SharpDX.RectangleF? targetRect = null;
+
+                // First pass: find the target label's rect
+                foreach (var l in labels)
+                {
+                    if (l?.ItemOnGround?.Id == entityId && l.Label?.IsVisible == true)
+                    {
+                        targetRect = l.Label.GetClientRect();
+                        break;
+                    }
+                }
+                if (!targetRect.HasValue) return false;
+
+                var t = targetRect.Value;
+
+                // Second pass: check for intersection with any other visible label
+                foreach (var l in labels)
+                {
+                    if (l?.ItemOnGround == null || l.ItemOnGround.Id == entityId) continue;
+                    if (l.Label == null || !l.Label.IsVisible) continue;
+
+                    var o = l.Label.GetClientRect();
+                    bool overlaps = t.X < o.X + o.Width && t.X + t.Width > o.X &&
+                                    t.Y < o.Y + o.Height && t.Y + t.Height > o.Y;
+                    if (overlaps) return true;
+                }
+            }
+            catch { }
+            return false;
         }
 
         // =================================================================
@@ -342,7 +477,7 @@ namespace AutoExile.Systems
             _toggleStartTime = DateTime.Now;
 
             // Press Z to turn labels OFF
-            if (!BotInput.PressKey(System.Windows.Forms.Keys.Z)) return false;
+            if (!BotInput.PressKeyOverlay(System.Windows.Forms.Keys.Z)) return false;
 
             TogglePhase = LabelTogglePhase.PressingOff;
             ToggleStatus = "Toggling labels off...";
@@ -367,7 +502,7 @@ namespace AutoExile.Systems
                     .LabelsOnGroundVisible.Count;
                 if (currentCount < _preToggleLabelCount / 2 && _preToggleLabelCount > 3)
                 {
-                    BotInput.PressKey(System.Windows.Forms.Keys.Z);
+                    BotInput.PressKeyOverlay(System.Windows.Forms.Keys.Z);
                     ToggleStatus = "Safety: restoring labels after timeout";
                 }
                 TogglePhase = LabelTogglePhase.Idle;
@@ -402,7 +537,7 @@ namespace AutoExile.Systems
                     }
 
                     // Labels are off — press Z again to turn them back on
-                    if (!BotInput.PressKey(System.Windows.Forms.Keys.Z)) return true;
+                    if (!BotInput.PressKeyOverlay(System.Windows.Forms.Keys.Z)) return true;
                     TogglePhase = LabelTogglePhase.PressingOn;
                     ToggleStatus = "Toggling labels back on...";
                     return true;
@@ -426,7 +561,7 @@ namespace AutoExile.Systems
                     if (currentCount <= 1 && _preToggleLabelCount > 3)
                     {
                         // Labels didn't come back — press Z one more time as safety
-                        BotInput.PressKey(System.Windows.Forms.Keys.Z);
+                        BotInput.PressKeyOverlay(System.Windows.Forms.Keys.Z);
                         ToggleStatus = "Safety: labels didn't return, pressing Z again";
                     }
 
@@ -675,7 +810,7 @@ namespace AutoExile.Systems
 
         /// <summary>
         /// Cooldown before retry. Successfully picked up items get 30s (prevent flicker re-pickup).
-        /// Flicker (entity gone before click) gets 0.5s.
+        /// Entity-gone failures escalate: first time 0.5s (might be flicker), then permanent.
         /// Actual click failures escalate: 5s, 15s, 30s.
         /// </summary>
         public TimeSpan Cooldown
@@ -685,7 +820,13 @@ namespace AutoExile.Systems
                 if (Reason == "picked up")
                     return TimeSpan.FromSeconds(30);
                 if (Reason == "entity gone before click")
-                    return TimeSpan.FromSeconds(0.5);
+                {
+                    // First time: brief cooldown (might be label flicker).
+                    // Second time: entity is definitively gone — long block.
+                    return FailCount <= 1
+                        ? TimeSpan.FromSeconds(0.5)
+                        : TimeSpan.FromSeconds(120);
+                }
 
                 return FailCount switch
                 {

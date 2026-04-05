@@ -48,6 +48,12 @@ namespace AutoExile.Systems
         /// </summary>
         public int MinMapTier { get; set; }
 
+        /// <summary>
+        /// When true, always use Ctrl+click to insert maps (farming mode).
+        /// When false, use right-click for unnamed maps (boss fragment mode).
+        /// </summary>
+        public bool ForceCtrlClick { get; set; }
+
         // Navigation to device — track failed close-approach attempts
         private int _navAttempts;
         private float _bestDistSeen = float.MaxValue;
@@ -240,7 +246,10 @@ namespace AutoExile.Systems
                         var screenPos = gc.IngameState.Camera.WorldToScreen(device.BoundsCenterPosNum);
                         var windowRect = gc.Window.GetWindowRectangle();
                         var absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
-                        BotInput.CursorPressKey(absPos, nav.MoveKey);
+                        if (BotInput.IsMovementActive && !BotInput.IsMovementSuspended)
+                            BotInput.UpdateMovementCursor(absPos);
+                        else
+                            BotInput.StartMovement(absPos, nav.MoveKey);
                         Status = $"[Nav] Direct walk to device — no A* path (dist: {dist:F0})";
                         return MapDeviceResult.InProgress;
                     }
@@ -309,9 +318,17 @@ namespace AutoExile.Systems
             }
 
             // Two distinct flows:
-            // A) Named map (mapping mode): must select atlas node first → device panel opens → Ctrl+click map
-            // B) Auto-match (blight/simulacrum): right-click map in stash → game handles node selection + insertion
+            // A) Named map (farming/mapping): must select atlas node first → device panel opens → Ctrl+click map key
+            // B) Auto-match (blight/simulacrum/boss): right-click fragment in stash → game handles node selection + insertion
+            // ForceCtrlClick prevents accidental right-click on map keys (farming mode without map name selected)
             bool namedMapFlow = !string.IsNullOrEmpty(TargetMapName);
+
+            if (!namedMapFlow && ForceCtrlClick)
+            {
+                Status = "[Select] No map name configured — select a map in farming settings";
+                _phase = MapDevicePhase.Idle;
+                return MapDeviceResult.Failed;
+            }
 
             if (namedMapFlow)
             {
@@ -377,16 +394,20 @@ namespace AutoExile.Systems
                 var invPanel = gc.IngameState.IngameUi.InventoryPanel;
                 if (invPanel == null || !invPanel.IsVisible)
                 {
-                    _invOpenAttempts++;
                     if (_invOpenAttempts > MaxInvOpenAttempts)
                     {
                         Status = "[Select] Failed to open inventory panel";
                         _phase = MapDevicePhase.Idle;
                         return MapDeviceResult.Failed;
                     }
-                    BotInput.PressKey(System.Windows.Forms.Keys.I);
-                    _lastActionTime = DateTime.Now;
-                    Status = $"[Select] Opening inventory (attempt {_invOpenAttempts})...";
+                    // Only count attempt if the key press actually went through
+                    if (!CanAct()) return MapDeviceResult.InProgress;
+                    if (BotInput.PressKey(System.Windows.Forms.Keys.I))
+                    {
+                        _invOpenAttempts++;
+                        _lastActionTime = DateTime.Now;
+                        Status = $"[Select] Opening inventory (attempt {_invOpenAttempts})...";
+                    }
                     return MapDeviceResult.InProgress;
                 }
 
@@ -407,9 +428,11 @@ namespace AutoExile.Systems
                         var slotRect = slotItem.GetClientRect();
                         var absPos2 = new Vector2(windowRect2.X + slotRect.Center.X,
                             windowRect2.Y + slotRect.Center.Y);
-                        BotInput.RightClick(absPos2);
-                        _lastActionTime = DateTime.Now;
-                        Status = "[Select] Right-clicking fragment from inventory";
+                        if (BotInput.RightClick(absPos2))
+                        {
+                            _lastActionTime = DateTime.Now;
+                            Status = "[Select] Right-clicking fragment from inventory";
+                        }
                         return MapDeviceResult.InProgress;
                     }
                 }
@@ -436,16 +459,19 @@ namespace AutoExile.Systems
             var clickPos = BotInput.RandomizeWithinRect(rect);
             var absPos = new Vector2(windowRect.X + clickPos.X, windowRect.Y + clickPos.Y);
 
-            bool clicked = namedMapFlow
+            // Named map or ForceCtrlClick (farming): Ctrl+click to insert into device slot.
+            // Auto-match (boss fragments only): Right-click to auto-select node + insert.
+            bool useCtrlClick = namedMapFlow || ForceCtrlClick;
+            bool clicked = useCtrlClick
                 ? BotInput.CtrlClick(absPos)
                 : BotInput.RightClick(absPos);
             if (!clicked)
                 return MapDeviceResult.InProgress; // gate blocked, retry next tick
 
             _lastActionTime = DateTime.Now;
-            Status = namedMapFlow
-                ? $"[Select] Ctrl+clicking {TargetMapName} map into device"
-                : "[Select] Right-clicking map into device";
+            Status = useCtrlClick
+                ? $"[Select] Ctrl+clicking map into device"
+                : "[Select] Right-clicking fragment into device";
 
             // Re-enter this phase — IsMapInDevice check will advance us
             return MapDeviceResult.InProgress;
@@ -527,7 +553,9 @@ namespace AutoExile.Systems
             }
 
             var absPos = new Vector2(windowRect.X + nodeCenter.X, windowRect.Y + nodeCenter.Y);
-            BotInput.Click(absPos);
+            if (!BotInput.Click(absPos))
+                return MapDeviceResult.InProgress; // gate blocked, retry next tick
+
             _lastActionTime = DateTime.Now;
             _nodeClickAttempts++;
             Status = $"[Select] Clicking {TargetMapName} node (attempt {_nodeClickAttempts})";
@@ -555,7 +583,11 @@ namespace AutoExile.Systems
                 return MapDeviceResult.InProgress;
             }
 
-            BotInput.ClickLabel(gc, activateBtn.GetClientRect());
+            if (!BotInput.ClickLabel(gc, activateBtn.GetClientRect()))
+            {
+                Status = "[Activate] Waiting for input gate";
+                return MapDeviceResult.InProgress;
+            }
             _lastActionTime = DateTime.Now;
 
             // Stay in Activate phase — next tick will detect atlas closing (lines above)

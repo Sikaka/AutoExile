@@ -25,9 +25,9 @@ namespace AutoExile.Mechanics
     }
 
     /// <summary>
-    /// Interface for in-map mechanics that MappingMode can detect and delegate to.
+    /// Interface for in-map mechanics that WaveFarmMode can detect and delegate to.
     /// Each mechanic handles its own detection, lifecycle, and UI interaction.
-    /// MappingMode calls Detect() periodically, then Tick() when the mechanic is active.
+    /// WaveFarmMode calls Detect() periodically, then Tick() when the mechanic is active.
     /// </summary>
     public interface IMapMechanic
     {
@@ -52,7 +52,7 @@ namespace AutoExile.Mechanics
 
         /// <summary>
         /// True when the mechanic is in an active encounter phase (combat waves, etc.).
-        /// During active encounter, MappingMode should not loot or explore.
+        /// During active encounter, WaveFarmMode should not loot or explore.
         /// </summary>
         bool IsEncounterActive { get; }
 
@@ -70,13 +70,13 @@ namespace AutoExile.Mechanics
 
         /// <summary>
         /// True if completing this mechanic transitions the player to a sub-zone
-        /// (e.g., wish zone mirage map). MappingMode uses this to snapshot parent
+        /// (e.g., wish zone mirage map). WaveFarmMode uses this to snapshot parent
         /// map state before the zone transition occurs.
         /// </summary>
         bool TriggersSubZone => false;
 
         /// <summary>
-        /// Run one tick of the mechanic's logic. MappingMode delegates entirely when active.
+        /// Run one tick of the mechanic's logic. WaveFarmMode delegates entirely when active.
         /// Handles navigation to anchor, starting encounter, wave management, reward collection.
         /// </summary>
         MechanicResult Tick(BotContext ctx);

@@ -5,6 +5,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Collections.Concurrent;
+using ExileCore.Shared.Nodes;
 
 namespace AutoExile.WebServer
 {
@@ -349,6 +350,10 @@ namespace AutoExile.WebServer
                         break;
                     case "/api/presets/import" when method == "POST":
                         await HandlePresetImport(req, resp);
+                        break;
+
+                    case "/api/capture-position" when method == "POST":
+                        await HandleCapturePosition(req, resp);
                         break;
 
                     default:
@@ -904,6 +909,44 @@ namespace AutoExile.WebServer
             }
         }
 
+        private async Task HandleCapturePosition(HttpListenerRequest req, HttpListenerResponse resp)
+        {
+            var body = await ReadBody(req);
+            var doc = JsonDocument.Parse(body);
+            var settingKey = doc.RootElement.GetProperty("setting").GetString() ?? "";
+
+            if (Settings == null)
+            {
+                resp.StatusCode = 503;
+                await ServeJson(resp, new { error = "Settings not available" });
+                return;
+            }
+
+            var status = _currentStatus;
+            if (!status.InGame || (status.PlayerGridX == 0 && status.PlayerGridY == 0))
+            {
+                resp.StatusCode = 400;
+                await ServeJson(resp, new { error = "Not in game or position unavailable" });
+                return;
+            }
+
+            var posStr = $"{status.PlayerGridX:F0},{status.PlayerGridY:F0}";
+
+            // Find the TextNode by setting key path and set its value
+            var node = SettingsApi.FindNode(Settings, settingKey);
+            if (node is TextNode textNode)
+            {
+                textNode.Value = posStr;
+                ConfigManager?.Save(Settings);
+                await ServeJson(resp, new { ok = true, position = posStr });
+            }
+            else
+            {
+                resp.StatusCode = 400;
+                await ServeJson(resp, new { error = $"Setting '{settingKey}' not found or not a TextNode" });
+            }
+        }
+
         // ====================================================================
         // Helpers
         // ====================================================================
@@ -1004,6 +1047,11 @@ namespace AutoExile.WebServer
         public float BossRunsPerDrop { get; init; }
         public float BossChaosPerHour { get; init; }
         public string BossRunTime { get; init; } = "";
+
+        // Farming stats (populated only when mode is Farming)
+        public string FarmStrategy { get; init; } = "";
+        public int FarmRuns { get; init; }
+        public string FarmPhase { get; init; } = "";
 
         // Labyrinth stats (populated only when mode is Labyrinth)
         public int LabIzaroEncounters { get; init; }

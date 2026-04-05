@@ -2,6 +2,7 @@ using ExileCore;
 using ExileCore.PoEMemory.Components;
 using ExileCore.PoEMemory.MemoryObjects;
 using ExileCore.Shared.Enums;
+using Input = ExileCore.Input;
 using SharpDX;
 using System.Numerics;
 using System.Windows.Forms;
@@ -86,6 +87,7 @@ namespace AutoExile.Systems
             _prevItemCount = -1;
             _consecutiveFailures = 0;
             _cursorHasIncubator = false;
+            _incubatorBatchRunning = false;
             _incubatorsApplied = 0;
             _pendingTabSwitch = null;
             _afterTabSwitch = StashPhase.Idle;
@@ -105,6 +107,7 @@ namespace AutoExile.Systems
             WithdrawFragmentPath = null;
             WithdrawCount = 0;
             _pendingTabSwitch = null;
+            _incubatorBatchRunning = false;
             Status = "Cancelled";
         }
 
@@ -181,9 +184,11 @@ namespace AutoExile.Systems
                     {
                         var screenPos = gc.IngameState.Camera.WorldToScreen(stash.BoundsCenterPosNum);
                         var windowRect = gc.Window.GetWindowRectangle();
-                        BotInput.CursorPressKey(
-                            new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y),
-                            nav.MoveKey);
+                        var absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
+                        if (BotInput.IsMovementActive && !BotInput.IsMovementSuspended)
+                            BotInput.UpdateMovementCursor(absPos);
+                        else
+                            BotInput.StartMovement(absPos, nav.MoveKey);
                         Status = $"Direct walk to stash — no A* path (dist: {dist:F0})";
                         return StashResult.InProgress;
                     }
@@ -355,9 +360,12 @@ namespace AutoExile.Systems
                 return StashResult.Failed;
             }
 
+            // If a batch is running, wait for it
+            if (BotInput.IsBatchRunning)
+                return StashResult.InProgress;
+
             if (_withdrawsRemaining <= 0 || string.IsNullOrEmpty(WithdrawFragmentPath))
             {
-                // Done withdrawing — proceed to store phase
                 EnterStorePhase(gc);
                 return StashResult.InProgress;
             }
@@ -371,36 +379,39 @@ namespace AutoExile.Systems
                 return StashResult.InProgress;
             }
 
-            ExileCore.PoEMemory.MemoryObjects.Entity? fragmentItem = null;
+            // Build list of positions — click the same fragment stack N times
+            var windowRect = gc.Window.GetWindowRectangle();
             SharpDX.RectangleF fragmentRect = default;
+            bool found = false;
             foreach (var item in items)
             {
                 var entity = item.Entity;
                 if (entity?.Path?.Contains(WithdrawFragmentPath, StringComparison.OrdinalIgnoreCase) == true)
                 {
-                    fragmentItem = entity;
                     fragmentRect = item.GetClientRect();
+                    found = true;
                     break;
                 }
             }
 
-            if (fragmentItem == null)
+            if (!found)
             {
                 Status = $"Fragment '{WithdrawFragmentPath}' not found in stash";
                 EnterStorePhase(gc);
                 return StashResult.InProgress;
             }
 
-            // Ctrl+click to withdraw one unit
-            var windowRect = gc.Window.GetWindowRectangle();
             var absPos = new Vector2(windowRect.X + fragmentRect.Center.X, windowRect.Y + fragmentRect.Center.Y);
-            if (BotInput.CanAct)
+            var positions = new List<Vector2>();
+            for (int i = 0; i < _withdrawsRemaining; i++)
+                positions.Add(absPos);
+
+            Status = $"Withdrawing {_withdrawsRemaining} fragments...";
+            var remaining = _withdrawsRemaining;
+            BotInput.CtrlClickBatch(positions, count =>
             {
-                BotInput.CtrlClick(absPos);
-                _lastActionTime = DateTime.Now;
-                _withdrawsRemaining--;
-                Status = $"Withdrawing fragment ({_withdrawsRemaining} remaining)";
-            }
+                _withdrawsRemaining = remaining - count;
+            });
             return StashResult.InProgress;
         }
 
@@ -414,9 +425,14 @@ namespace AutoExile.Systems
                 return _itemsStored > 0 ? StashResult.Succeeded : StashResult.Failed;
             }
 
-            if (_attempts >= MaxAttempts)
+            // If a batch is running, wait for it to complete
+            if (BotInput.IsBatchRunning)
+                return StashResult.InProgress;
+
+            // If we already ran a batch, we're done — close stash
+            if (_itemsStored > 0)
             {
-                Status = $"Max attempts reached — stored {_itemsStored} items — closing stash";
+                Status = $"Done — stored {_itemsStored} items — closing stash";
                 return EnterCloseStash();
             }
 
@@ -424,56 +440,34 @@ namespace AutoExile.Systems
             var slotItems = GetInventorySlotItems(gc);
             if (slotItems == null || slotItems.Count == 0)
             {
-                Status = $"Done — stored {_itemsStored} items — closing stash";
+                Status = $"Done — nothing to store — closing stash";
                 return EnterCloseStash();
             }
 
-            // Filter: find first stashable item (skip items the filter wants to keep)
-            ServerInventory.InventSlotItem? itemToStash = null;
-            int stashableCount = 0;
+            // Build list of all stashable item positions
+            var windowRect = gc.Window.GetWindowRectangle();
+            var positions = new List<Vector2>();
             foreach (var si in slotItems)
             {
                 if (ItemFilter != null && !ItemFilter(si))
                     continue; // keep this item
-                stashableCount++;
-                itemToStash ??= si;
+                var rect = si.GetClientRect();
+                var center = new Vector2(rect.Center.X, rect.Center.Y);
+                positions.Add(new Vector2(windowRect.X + center.X, windowRect.Y + center.Y));
             }
 
-            if (itemToStash == null)
+            if (positions.Count == 0)
             {
                 Status = $"Done — stored {_itemsStored} items (kept {slotItems.Count} filtered) — closing stash";
                 return EnterCloseStash();
             }
 
-            // Detect failed transfer: if stashable count didn't decrease since last click
-            if (_prevItemCount >= 0 && stashableCount >= _prevItemCount)
+            // Fire the batch — single async sequence: hold Ctrl → click all → release Ctrl
+            Status = $"Storing {positions.Count} items...";
+            BotInput.CtrlClickBatch(positions, count =>
             {
-                _consecutiveFailures++;
-                if (_consecutiveFailures >= MaxConsecutiveFailures)
-                {
-                    Status = $"Too many failed transfers — stored {_itemsStored} items — closing stash";
-                    return EnterCloseStash();
-                }
-            }
-            else
-            {
-                _consecutiveFailures = 0;
-            }
-
-            _prevItemCount = stashableCount;
-
-            // Get click position from first stashable item
-            var item = itemToStash;
-            var rect = item.GetClientRect();
-            var center = new Vector2(rect.Center.X, rect.Center.Y);
-            var windowRect = gc.Window.GetWindowRectangle();
-            var absPos = new Vector2(windowRect.X + center.X, windowRect.Y + center.Y);
-
-            BotInput.CtrlClick(absPos);
-            _lastActionTime = DateTime.Now;
-            _attempts++;
-            _itemsStored++;
-            Status = $"Storing item {_itemsStored} ({slotItems.Count} remaining)";
+                _itemsStored = count;
+            });
             return StashResult.InProgress;
         }
 
@@ -590,6 +584,9 @@ namespace AutoExile.Systems
         // Incubator Application
         // =================================================================
 
+        /// <summary>Whether the incubator batch is currently running.</summary>
+        private bool _incubatorBatchRunning;
+
         private StashResult TickApplyIncubators(GameController gc)
         {
             // Stash must stay open for incubator right-click
@@ -601,44 +598,20 @@ namespace AutoExile.Systems
                 return StashResult.InProgress;
             }
 
-            var cursor = gc.IngameState.IngameUi.Cursor;
-            bool cursorHolding = cursor?.ChildCount > 0;
+            // Wait for batch to finish
+            if (_incubatorBatchRunning)
+                return StashResult.InProgress;
 
-            // Step 2: Cursor has incubator → click equipment slot
-            if (_cursorHasIncubator)
+            // If batch already ran, move to close
+            if (_incubatorsApplied > 0)
             {
-                if (!cursorHolding)
-                {
-                    // Incubator was applied (cursor cleared)
-                    _incubatorsApplied++;
-                    _cursorHasIncubator = false;
-                    Status = $"Incubator applied ({_incubatorsApplied})";
-                    // Try next incubator on next tick
-                    return StashResult.InProgress;
-                }
-
-                // Find an equipment slot without incubator and click it
-                var slotPos = FindEquipmentSlotToApply(gc);
-                if (slotPos == null)
-                {
-                    // No empty slots — right-click to drop cursor item back
-                    BotInput.PressKey(Keys.Escape);
-                    _lastActionTime = DateTime.Now;
-                    _cursorHasIncubator = false;
-                    Status = "No empty equipment slots — done";
-                    _phase = StashPhase.CloseStash;
-                    _phaseStartTime = DateTime.Now;
-                    return StashResult.InProgress;
-                }
-
-                BotInput.Click(slotPos.Value);
-                _lastActionTime = DateTime.Now;
-                Status = "Clicking equipment slot";
+                Status = $"Applied {_incubatorsApplied} incubators — closing stash";
+                _phase = StashPhase.CloseStash;
+                _phaseStartTime = DateTime.Now;
                 return StashResult.InProgress;
             }
 
-            // Step 1: Find incubator in stash and right-click it
-            // First check if there are any equipment slots available
+            // Check we have both incubators and empty equipment slots
             if (FindEquipmentSlotToApply(gc) == null)
             {
                 Status = "All equipment has incubators — skipping";
@@ -647,20 +620,106 @@ namespace AutoExile.Systems
                 return StashResult.InProgress;
             }
 
-            var incubatorPos = FindIncubatorInStash(gc);
-            if (incubatorPos == null)
+            if (FindIncubatorInStash(gc) == null)
             {
-                Status = $"No incubators in stash — applied {_incubatorsApplied}";
+                Status = "No incubators in stash";
                 _phase = StashPhase.CloseStash;
                 _phaseStartTime = DateTime.Now;
                 return StashResult.InProgress;
             }
 
-            BotInput.RightClick(incubatorPos.Value);
-            _lastActionTime = DateTime.Now;
-            _cursorHasIncubator = true;
-            Status = "Right-clicking incubator";
+            // Launch the async batch
+            _incubatorBatchRunning = true;
+            Status = "Applying incubators...";
+            _ = DoIncubatorBatch(gc);
             return StashResult.InProgress;
+        }
+
+        private async Task DoIncubatorBatch(GameController gc)
+        {
+            const int maxRetries = 3;
+            const int maxIncubators = 10; // safety limit
+            int applied = 0;
+
+            try
+            {
+                for (int i = 0; i < maxIncubators; i++)
+                {
+                    // Find an incubator in stash
+                    var incubatorPos = FindIncubatorInStash(gc);
+                    if (incubatorPos == null) break;
+
+                    // Find an equipment slot without incubator
+                    var slotPos = FindEquipmentSlotToApply(gc);
+                    if (slotPos == null) break;
+
+                    // Right-click the incubator to pick it up
+                    await BotInput.MoveCursorToPublic(incubatorPos.Value);
+                    await Task.Delay(BotInput.RandSettle());
+                    Input.RightDown();
+                    BotInput.MarkInputEventPublic("RightDown", "incubator-pickup");
+                    await Task.Delay(BotInput.RandHold());
+                    Input.RightUp();
+                    BotInput.MarkInputEventPublic("RightUp", "incubator-pickup");
+
+                    // Wait and verify cursor has item
+                    await Task.Delay(150);
+                    bool picked = false;
+                    for (int retry = 0; retry < maxRetries; retry++)
+                    {
+                        try { picked = gc.IngameState.IngameUi.Cursor?.ChildCount > 0; } catch { }
+                        if (picked) break;
+                        await Task.Delay(100);
+                    }
+                    if (!picked) break; // failed to pick up
+
+                    // Click the equipment slot to apply
+                    await BotInput.MoveCursorToPublic(slotPos.Value);
+                    await Task.Delay(BotInput.RandSettle());
+                    Input.LeftDown();
+                    BotInput.MarkInputEventPublic("LeftDown", "incubator-apply");
+                    await Task.Delay(BotInput.RandHold());
+                    Input.LeftUp();
+                    BotInput.MarkInputEventPublic("LeftUp", "incubator-apply");
+
+                    // Wait and verify cursor is empty (incubator was applied)
+                    await Task.Delay(150);
+                    bool cleared = false;
+                    for (int retry = 0; retry < maxRetries; retry++)
+                    {
+                        try { cleared = gc.IngameState.IngameUi.Cursor?.ChildCount == 0; } catch { }
+                        if (cleared) break;
+                        await Task.Delay(100);
+                    }
+
+                    if (cleared)
+                    {
+                        applied++;
+                        Status = $"Applied incubator {applied}";
+                    }
+                    else
+                    {
+                        // Cursor still has item — press Escape to drop it
+                        Input.KeyDown(Keys.Escape);
+                        BotInput.MarkInputEventPublic("KeyDown", "Escape incubator-cancel");
+                        await Task.Delay(BotInput.RandHold());
+                        Input.KeyUp(Keys.Escape);
+                        BotInput.MarkInputEventPublic("KeyUp", "Escape incubator-cancel");
+                        await Task.Delay(100);
+                        break;
+                    }
+
+                    // Short delay between incubators
+                    await Task.Delay(BotInput.ActionCooldownMs);
+                }
+            }
+            catch { }
+            finally
+            {
+                _incubatorsApplied = applied;
+                _incubatorBatchRunning = false;
+                BotInput.NextActionAt = DateTime.Now.AddMilliseconds(BotInput.ActionCooldownMs);
+            }
         }
 
         /// <summary>

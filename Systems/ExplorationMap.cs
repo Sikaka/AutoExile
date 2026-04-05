@@ -224,14 +224,24 @@ namespace AutoExile.Systems
         // Per-tick update
         // ═══════════════════════════════════════════════════
 
+        // Rate limit: skip update if player hasn't moved enough to reveal new cells
+        private Vector2 _lastUpdatePos;
+        private const float MinUpdateDistance = 5f; // grid units — only rescan after moving 5+ cells
+
         /// <summary>
         /// Mark cells within render range of the player as seen. Call each tick.
         /// Uses squared distance check for performance — no sqrt needed.
+        /// Skips work if the player hasn't moved enough to reveal new cells.
         /// </summary>
         public void Update(Vector2 playerGridPos)
         {
             var blob = ActiveBlob;
             if (blob == null) return;
+
+            // Early out if player hasn't moved enough to matter
+            if (Vector2.DistanceSquared(playerGridPos, _lastUpdatePos) < MinUpdateDistance * MinUpdateDistance)
+                return;
+            _lastUpdatePos = playerGridPos;
 
             var px = (int)playerGridPos.X;
             var py = (int)playerGridPos.Y;

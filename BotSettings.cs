@@ -27,6 +27,9 @@ namespace AutoExile
         [Menu("Scan Tile Signatures", "Hotkey to scan nearby tiles for unique/rare map signatures and overlay results.")]
         public HotkeyNode ScanTileSignatures { get; set; } = new HotkeyNode(Keys.F8);
 
+        [Menu("Record Gameplay", "Toggle human gameplay recording (F9). Records game state each tick for offline analysis. Stop bot before recording.")]
+        public HotkeyNode RecordGameplay { get; set; } = new HotkeyNode(Keys.F9);
+
         [Menu("Active Mode", "Bot mode to run. Persists across reloads.")]
         public ListNode ActiveMode { get; set; } = new ListNode() { Value = "Idle" };
 
@@ -107,6 +110,10 @@ namespace AutoExile
 
         public MechanicsSettings Mechanics { get; set; } = new MechanicsSettings();
 
+        // --- Farming Mode ---
+
+        public FarmingSettings Farming { get; set; } = new FarmingSettings();
+
         // --- Boss Mode ---
 
         public BossSettings Boss { get; set; } = new BossSettings();
@@ -141,9 +148,11 @@ namespace AutoExile
             public SkillSlotConfig Skill4 { get; set; } = new SkillSlotConfig(Keys.E);
             public SkillSlotConfig Skill5 { get; set; } = new SkillSlotConfig(Keys.R);
             public SkillSlotConfig Skill6 { get; set; } = new SkillSlotConfig(Keys.None);
+            public SkillSlotConfig Skill7 { get; set; } = new SkillSlotConfig(Keys.None);
+            public SkillSlotConfig Skill8 { get; set; } = new SkillSlotConfig(Keys.None);
 
             /// <summary>All configured skill slots.</summary>
-            public IEnumerable<SkillSlotConfig> AllSkillSlots => new[] { Skill1, Skill2, Skill3, Skill4, Skill5, Skill6 };
+            public IEnumerable<SkillSlotConfig> AllSkillSlots => new[] { Skill1, Skill2, Skill3, Skill4, Skill5, Skill6, Skill7, Skill8 };
 
             /// <summary>Find the first skill slot with PrimaryMovement role, or null.</summary>
             public SkillSlotConfig? GetPrimaryMovement()
@@ -281,6 +290,9 @@ namespace AutoExile
             [Menu("Require Targetable", "Only cast when the target is targetable (not invulnerable/phasing). Useful for debuffs, totems, or skills you don't want wasted on immune targets.")]
             public ToggleNode RequireTargetable { get; set; } = new ToggleNode(false);
 
+            [Menu("Channel Skill", "Hold key down instead of press-release. For channeling skills (Cyclone, Flameblast, Scorching Ray, etc.). Key releases automatically when conditions no longer met.")]
+            public ToggleNode IsChannel { get; set; } = new ToggleNode(false);
+
             [Menu("Buff/Debuff Name", "Name to match in buff list (substring, case-insensitive). Used with OnlyWhenBuffMissing to check player buffs or target debuffs. Use Scan to discover.")]
             public TextNode BuffDebuffName { get; set; } = new TextNode("");
         }
@@ -397,6 +409,133 @@ namespace AutoExile
         }
 
         [Submenu(CollapsedByDefault = true)]
+        public class FarmingSettings
+        {
+            public FarmingSettings()
+            {
+                FarmStrategy.SetListValues(new List<string> { "Stacked Deck" });
+                FarmStrategy.Value = "Stacked Deck";
+
+                MapName.SetListValues(new List<string> { "" });
+                MapName.Value = "";
+
+                var witnessOptions = new List<string> { "None", "Searing Exarch", "Eater of Worlds", "Maven" };
+                WitnessType.SetListValues(witnessOptions);
+                WitnessType.Value = "None";
+            }
+
+            [Menu("Farm Strategy", "Which farming strategy to use.")]
+            public ListNode FarmStrategy { get; set; } = new ListNode();
+
+            [Menu("Map Name", "Which map to farm.")]
+            public ListNode MapName { get; set; } = new ListNode();
+
+            [Menu("Min Map Tier", "Minimum map tier to pick from stash. 0 = any tier.")]
+            public RangeNode<int> MinMapTier { get; set; } = new RangeNode<int>(0, 0, 16);
+
+            [Menu("Portal Key", "Hotkey for portal scroll in-game.")]
+            public HotkeyNode PortalKey { get; set; } = new HotkeyNode(Keys.F);
+
+            [Menu("Min Pack Density", "Weighted monster density to interrupt exploration. Rares count as 5, Uniques as 8. Set to 0 to never detour for packs. Lower = more aggressive engagement (good for RF/melee).")]
+            public RangeNode<int> MinPackDensity { get; set; } = new RangeNode<int>(5, 0, 30);
+
+            [Menu("Detour For Rares", "Always detour to fight rare/unique monsters within range, even if pack density is below threshold.")]
+            public ToggleNode DetourForRares { get; set; } = new ToggleNode(true);
+
+            [Menu("Max Detour Distance", "Max grid distance to chase a rare/unique from current path.")]
+            public RangeNode<int> MaxDetourDistance { get; set; } = new RangeNode<int>(60, 10, 150);
+
+            [Menu("Min Coverage", "Minimum map exploration % before clearing is considered done. Higher = more thorough clear.")]
+            public RangeNode<float> MinCoverage { get; set; } = new RangeNode<float>(0.85f, 0f, 1f);
+
+            // ── Map rolling ──
+
+            [Menu("Dangerous Map Mods", "Comma-separated mod group names to avoid. Maps with these mods get rerolled. Use group names from ExplicitMod.Group (e.g. MapElementalReflect, MapPhysicalReflect, MapNoRegen, MapHexproof, MapCannotLeech).")]
+            public TextNode DangerousMapMods { get; set; } = new TextNode("MapElementalReflect,MapPhysicalReflect,MapNoRegen,MapCannotLeech");
+
+            [Menu("Min Map Quantity", "Minimum item quantity % on maps before running. 0 = don't check. Maps below this get rerolled.")]
+            public RangeNode<int> MinMapQuantity { get; set; } = new RangeNode<int>(0, 0, 150);
+
+            // ── Atlas setup (pre-populated by strategy defaults, user can override) ──
+
+            [Menu("Witness Type", "Which endgame witness to use. Strategies pre-populate this but you can override.")]
+            public ListNode WitnessType { get; set; } = new ListNode();
+
+            [Menu("Atlas Tree Preset", "Which atlas passive tree preset to use (1-3). 0 = don't switch.")]
+            public RangeNode<int> AtlasTreePreset { get; set; } = new RangeNode<int>(0, 0, 3);
+
+            [Menu("Scarab Slot 1", "Scarab name for map device slot 1. Empty = no scarab. Strategy provides defaults.")]
+            public TextNode ScarabSlot1 { get; set; } = new TextNode("");
+
+            [Menu("Scarab Slot 2", "Scarab name for map device slot 2.")]
+            public TextNode ScarabSlot2 { get; set; } = new TextNode("");
+
+            [Menu("Scarab Slot 3", "Scarab name for map device slot 3.")]
+            public TextNode ScarabSlot3 { get; set; } = new TextNode("");
+
+            [Menu("Scarab Slot 4", "Scarab name for map device slot 4.")]
+            public TextNode ScarabSlot4 { get; set; } = new TextNode("");
+
+            [Menu("Scarab Slot 5", "Scarab name for map device slot 5. Requires 5th slot unlocked.")]
+            public TextNode ScarabSlot5 { get; set; } = new TextNode("");
+
+            /// <summary>Helper to read all scarab slots as a list (non-empty only).</summary>
+            public List<string> GetScarabList()
+            {
+                var list = new List<string>();
+                if (!string.IsNullOrWhiteSpace(ScarabSlot1.Value)) list.Add(ScarabSlot1.Value.Trim());
+                if (!string.IsNullOrWhiteSpace(ScarabSlot2.Value)) list.Add(ScarabSlot2.Value.Trim());
+                if (!string.IsNullOrWhiteSpace(ScarabSlot3.Value)) list.Add(ScarabSlot3.Value.Trim());
+                if (!string.IsNullOrWhiteSpace(ScarabSlot4.Value)) list.Add(ScarabSlot4.Value.Trim());
+                if (!string.IsNullOrWhiteSpace(ScarabSlot5.Value)) list.Add(ScarabSlot5.Value.Trim());
+                return list;
+            }
+
+            /// <summary>Set scarab slots from a list (used by strategy defaults).</summary>
+            public void SetScarabDefaults(IReadOnlyList<string> scarabs)
+            {
+                ScarabSlot1.Value = scarabs.Count > 0 ? scarabs[0] : "";
+                ScarabSlot2.Value = scarabs.Count > 1 ? scarabs[1] : "";
+                ScarabSlot3.Value = scarabs.Count > 2 ? scarabs[2] : "";
+                ScarabSlot4.Value = scarabs.Count > 3 ? scarabs[3] : "";
+                ScarabSlot5.Value = scarabs.Count > 4 ? scarabs[4] : "";
+            }
+
+            // ── Per-strategy settings ──
+
+            public StackedDeckStrategySettings StackedDeck { get; set; } = new StackedDeckStrategySettings();
+        }
+
+        [Submenu(CollapsedByDefault = false)]
+        public class StackedDeckStrategySettings
+        {
+            public StackedDeckStrategySettings()
+            {
+                PreferredWish.SetListValues(new List<string> { "Any", "Coin of Power", "Coin of Skill", "Coin of Knowledge" });
+                PreferredWish.Value = "Coin of Power";
+            }
+
+            // ── Ritual reward shop ──
+
+            [Menu("Always Buy Value (chaos)", "Items worth at least this much are bought immediately if affordable, regardless of reroll strategy. 0 = disabled.")]
+            public RangeNode<int> AlwaysBuyValue { get; set; } = new RangeNode<int>(100, 0, 1000);
+
+            [Menu("Min Buy Value (chaos)", "Minimum chaos value to consider buying. On final shop (no rerolls left), buy all items above this, best chaos/tribute ratio first.")]
+            public RangeNode<int> MinBuyValue { get; set; } = new RangeNode<int>(3, 0, 100);
+
+            [Menu("Reroll Buy Threshold (chaos)", "Total shop value must exceed this to buy instead of rerolling. Below this, save tribute for reroll if available.")]
+            public RangeNode<int> RerollBuyThreshold { get; set; } = new RangeNode<int>(50, 0, 500);
+
+            [Menu("Tribute Reserve", "Don't buy items if it would bring tribute below this amount and rerolls are still available. Saves tribute for potentially better rerolls.")]
+            public RangeNode<int> TributeReserve { get; set; } = new RangeNode<int>(3000, 0, 10000);
+
+            // ── Wishes ──
+
+            [Menu("Preferred Wish Coin", "Coin type preference for tiebreaking wish selection. Best wish is always picked by value; this breaks ties.")]
+            public ListNode PreferredWish { get; set; } = new ListNode();
+        }
+
+        [Submenu(CollapsedByDefault = true)]
         public class BossSettings
         {
             [Menu("Boss Type", "Which boss encounter to farm.")]
@@ -425,6 +564,9 @@ namespace AutoExile
 
             [Menu("Key Drop Value (chaos)", "Assumed chaos value per key drop for profit tracking. Set to the average unidentified value of the target item.")]
             public RangeNode<int> KeyDropChaosValue { get; set; } = new RangeNode<int>(15, 0, 500);
+
+            [Menu("Fear DPS Position", "Grid position to stand at during Incarnation of Fear pre-lay phase. Format: X,Y. Use 'Set Current Pos' button to capture. Empty = default (206,320).")]
+            public TextNode FearDpsPosition { get; set; } = new TextNode();
         }
 
         [Submenu(CollapsedByDefault = true)]

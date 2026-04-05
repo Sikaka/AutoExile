@@ -807,25 +807,11 @@ namespace AutoExile.Mechanics
             return "Unknown";
         }
 
-        private static int FindBestWishOption(ExileCore.PoEMemory.Element container, string preferred)
+        private static int FindBestWishOption(ExileCore.PoEMemory.Element container, string preferredCoin)
         {
-            if (string.IsNullOrEmpty(preferred) || preferred == "Any")
-                return 3;
-
-            // Match on reward tooltip text (e.g. "Coin of Power", "Coin of Skill", "Coin of Knowledge")
-            // Tooltip is on option[4] (the reward icon element at bottom of each wish card)
-            for (int i = 3; i <= 5; i++)
-            {
-                var option = container.GetChildAtIndex(i);
-                if (option == null || !option.IsVisible) continue;
-
-                var rewardElement = option.GetChildAtIndex(4);
-                var tooltipText = rewardElement?.Tooltip?.Text;
-                if (tooltipText != null && tooltipText.Contains(preferred, StringComparison.OrdinalIgnoreCase))
-                    return i;
-            }
-
-            return 3;
+            // Priority-ranked wish selection — picks the highest-value wish.
+            // Coin preference is used as a tiebreaker between similar-priority wishes.
+            return WishPriority.FindBestOption(container, preferredCoin);
         }
 
         public void Render(BotContext ctx) { }

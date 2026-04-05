@@ -9,7 +9,7 @@ using AutoExile.Systems;
 namespace AutoExile.Mechanics
 {
     /// <summary>
-    /// Result of an altar tick — tells MappingMode whether we're busy.
+    /// Result of an altar tick — tells WaveFarmMode whether we're busy.
     /// </summary>
     public enum AltarTickResult
     {
@@ -22,7 +22,7 @@ namespace AutoExile.Mechanics
     /// Lightweight eldritch altar handler. NOT an IMapMechanic — altars are
     /// opportunistic clicks during exploration, not dedicated encounters.
     ///
-    /// Called each tick by MappingMode alongside interactable checks.
+    /// Called each tick by WaveFarmMode alongside interactable checks.
     /// When a visible altar label is found:
     ///   1. Score both choices using configurable mod weights
     ///   2. If best choice net score >= threshold → settle movement → click → verify
@@ -56,8 +56,8 @@ namespace AutoExile.Mechanics
         public bool IsBusy => _settling || _pendingButton != null;
 
         /// <summary>
-        /// Call each tick during MappingMode exploration. Returns whether
-        /// the handler is busy (MappingMode should not navigate).
+        /// Call each tick during WaveFarmMode exploration. Returns whether
+        /// the handler is busy (WaveFarmMode should not navigate).
         /// </summary>
         public AltarTickResult Tick(BotContext ctx)
         {

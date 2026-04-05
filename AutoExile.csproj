@@ -9,6 +9,7 @@
 
   <ItemGroup>
     <Compile Remove="Tests\**" />
+    <Compile Remove="AutoExile.Replay\**" />
   </ItemGroup>
 
   <ItemGroup>

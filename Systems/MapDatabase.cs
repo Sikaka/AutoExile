@@ -6,7 +6,7 @@ namespace AutoExile.Systems
     /// <summary>
     /// Stores per-map metadata — boss tile signatures, support status.
     /// Persisted to Data/map_bosses.json. Populated by F8 tile scanner,
-    /// consumed by MappingMode for boss-finding navigation.
+    /// consumed by WaveFarmMode for boss-finding navigation.
     /// </summary>
     public class MapDatabase
     {

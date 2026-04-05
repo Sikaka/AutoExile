@@ -44,6 +44,9 @@ namespace AutoExile.Systems
         private const float MaxTimeoutNavigate = 60f; // hard cap
         private const float EstGridUnitsPerSecond = 25f; // conservative walk speed estimate
 
+        // Entity cache for O(1) lookups (set by BotCore, optional fallback to linear scan)
+        public EntityCache? Cache { get; set; }
+
         // State
         public bool IsBusy => _currentTarget != null;
         public string Status { get; private set; } = "";
@@ -329,8 +332,6 @@ namespace AutoExile.Systems
 
             // Use hover-verified click: moves cursor within label, waits for settle,
             // checks Targetable.isTargeted on the WorldItem entity before clicking.
-            // Falls back to clicking anyway if verification fails — the scan-time quest
-            // filter is the primary defense against picking up wrong items.
             var worldEntity = FindEntity(gc, target.EntityId);
             if (worldEntity == null)
             {
@@ -339,7 +340,27 @@ namespace AutoExile.Systems
                 return InteractionResult.Succeeded;
             }
 
-            var sent = BotInput.ClickLabelVerified(gc, labelRect, worldEntity);
+            // Check if the loot item is near a portal/exit — clicking could activate
+            // the portal instead of picking up the item (PoE prioritizes world entities over labels).
+            if (IsNearPortal(worldEntity))
+            {
+                Status = "Item near portal — skipping";
+                LastFailReason = "near portal";
+                _currentTarget = null;
+                return InteractionResult.Failed;
+            }
+
+            // Pass a rect provider that re-reads the label position at click time.
+            // During cursor interpolation + settle (~100-150ms), the player character
+            // continues sliding from movement momentum, shifting all screen-space positions.
+            // The callback provides fresh coordinates for a final cursor snap before click.
+            var entityId = target.EntityId;
+            Func<SharpDX.RectangleF?> rectProvider = () =>
+            {
+                var (f, desc) = FindGroundItemLabel(gc, entityId);
+                return f && desc?.Label?.IsVisible == true ? desc?.ClientRect : null;
+            };
+            var sent = BotInput.ClickLabelVerified(gc, labelRect, worldEntity, rectProvider);
             if (!sent)
             {
                 Status = "Gate blocked";
@@ -385,14 +406,22 @@ namespace AutoExile.Systems
             var sent = BotInput.ClickEntity(gc, entity);
             if (!sent)
             {
-                // Off-screen or gate blocked — go back to navigating if we can
+                if (!BotInput.CanAct)
+                {
+                    // Gate blocked — stay in Clicking phase and wait for gate to clear.
+                    // Bouncing to Navigating causes a flicker loop (Nav→close→Click→gated→Nav→...)
+                    Status = "Waiting for input gate";
+                    return InteractionResult.InProgress;
+                }
+
+                // Entity genuinely off-screen — go back to navigating to get closer
                 if (target.RequireProximity && target.Nav != null)
                 {
                     target.Phase = InteractionPhase.Navigating;
                     Status = "Entity off screen — moving closer";
                     return InteractionResult.InProgress;
                 }
-                Status = "Entity not on screen (or gate blocked)";
+                Status = "Entity not on screen";
                 return InteractionResult.InProgress;
             }
 
@@ -493,8 +522,51 @@ namespace AutoExile.Systems
                     return true;
                 if (ui.StashElement.IsVisible && IsPointInRect(screenPos, ui.StashElement.GetClientRect()))
                     return true;
+                // Ritual shop — if open, everything behind it is blocked
+                if (ui.RitualWindow?.IsVisible == true)
+                    return true;
             }
             catch { }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Grid positions that are dangerous to click near (portals, exit entities).
+        /// Modes populate this to prevent accidental portal activation when clicking loot.
+        /// Checked during ground item pickup — items near these positions are skipped.
+        /// </summary>
+        public List<Vector2> DangerZones { get; } = new(4);
+
+        /// <summary>
+        /// Check if a loot entity is physically close to a portal, area-transition,
+        /// or mode-specified danger zone. Prevents accidental portal activation.
+        /// </summary>
+        public bool IsNearPortal(Entity lootEntity, float radius = 15f)
+        {
+            var lootPos = lootEntity.GridPosNum;
+            float radiusSq = radius * radius;
+
+            // Check mode-specified danger zones (e.g., SekhemaPortal position)
+            foreach (var dz in DangerZones)
+            {
+                if (Vector2.DistanceSquared(lootPos, dz) < radiusSq)
+                    return true;
+            }
+
+            // Check cached portals and area transitions
+            if (Cache == null) return false;
+
+            foreach (var portal in Cache.Portals)
+            {
+                if (Vector2.DistanceSquared(lootPos, portal.GridPosNum) < radiusSq)
+                    return true;
+            }
+            foreach (var transition in Cache.AreaTransitions)
+            {
+                if (Vector2.DistanceSquared(lootPos, transition.GridPosNum) < radiusSq)
+                    return true;
+            }
 
             return false;
         }
@@ -503,6 +575,37 @@ namespace AutoExile.Systems
         {
             return point.X >= rect.X && point.X <= rect.X + rect.Width &&
                    point.Y >= rect.Y && point.Y <= rect.Y + rect.Height;
+        }
+
+        /// <summary>
+        /// Check if another visible ground label's rect overlaps the target label.
+        /// Returns the overlapping entity if found, null if clear.
+        /// Only checks labels from different entities (not the target itself).
+        /// </summary>
+        private Entity? FindOverlappingLabel(GameController gc, long targetEntityId, SharpDX.RectangleF targetRect)
+        {
+            try
+            {
+                foreach (var label in gc.IngameState.IngameUi.ItemsOnGroundLabelElement.VisibleGroundItemLabels)
+                {
+                    if (label.Label == null || !label.Label.IsVisible) continue;
+                    if (label.Entity?.Id == targetEntityId) continue; // skip self
+
+                    var otherRect = label.ClientRect;
+
+                    // Rect intersection test
+                    bool overlaps = targetRect.X < otherRect.X + otherRect.Width &&
+                                    targetRect.X + targetRect.Width > otherRect.X &&
+                                    targetRect.Y < otherRect.Y + otherRect.Height &&
+                                    targetRect.Y + targetRect.Height > otherRect.Y;
+
+                    if (overlaps && label.Entity != null)
+                        return label.Entity;
+                }
+            }
+            catch { }
+
+            return null;
         }
 
         // --- Entity lookup helpers ---
@@ -524,6 +627,17 @@ namespace AutoExile.Systems
 
         private Entity? FindEntity(GameController gc, long entityId)
         {
+            // O(1) lookup via entity cache, fall through to linear scan on miss.
+            // Cache misses happen for entities that spawn after EntityCache.Rebuild()
+            // (e.g., portals loading late after area transitions).
+            if (Cache != null)
+            {
+                var cached = Cache.Get(entityId);
+                if (cached != null)
+                    return cached;
+            }
+
+            // Fallback: linear scan of OnlyValidEntities
             foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
             {
                 if (entity.Id == entityId)

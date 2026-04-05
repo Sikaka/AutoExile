@@ -17,6 +17,7 @@ namespace AutoExile.Modes.Shared
         public bool HasPending => _pendingEntityId != 0;
         public long PendingEntityId => _pendingEntityId;
         public string PendingItemName => _pendingItemName;
+        public double PendingChaosValue => _pendingValue;
         public int PickupCount => _pickupCount;
 
 

@@ -76,8 +76,8 @@ namespace AutoExile.Modes.Shared
         public static bool HasInventoryItems(GameController gc) => StashSystem.HasInventoryItems(gc);
 
         /// <summary>
-        /// Cancel MapDevice + Stash + Interaction systems. Fixes BlightMode bug where
-        /// these weren't cancelled on area change.
+        /// Cancel MapDevice + Stash + Interaction systems + release held keys.
+        /// Called on area change and mode transitions.
         /// </summary>
         public static void CancelAllSystems(BotContext ctx)
         {
@@ -86,6 +86,8 @@ namespace AutoExile.Modes.Shared
             if (ctx.Stash.IsBusy)
                 ctx.Stash.Cancel(gc, ctx.Navigation);
             ctx.Interaction.Cancel(gc);
+            BotInput.StopMovement();
+            BotInput.ReleaseAllKeys();
         }
     }
 }

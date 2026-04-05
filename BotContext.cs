@@ -24,6 +24,8 @@ namespace AutoExile
         public required ThreatSystem Threat { get; init; }
         public required EldritchAltarHandler AltarHandler { get; init; }
         public required NinjaPriceService NinjaPrice { get; init; }
+        public required EntityCache Entities { get; init; }
+        public required ThreatMap ThreatMap { get; init; }
         public required MapDatabase MapDatabase { get; init; }
         public required BotSettings Settings { get; init; }
 

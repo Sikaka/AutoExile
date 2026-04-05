@@ -21,11 +21,36 @@ namespace AutoExile.Systems
         /// <summary>Number of alive hostile monsters within CombatRange.</summary>
         public int NearbyMonsterCount { get; private set; }
 
+        /// <summary>
+        /// Rarity-weighted density score for nearby monsters.
+        /// Normal=1, Magic=2, Rare=5, Unique=8.
+        /// Use for density-gated detour decisions: a lone rare (5) triggers
+        /// a detour at threshold 5, but 2 normals (2) don't.
+        /// </summary>
+        public int WeightedDensity { get; private set; }
+
+        /// <summary>
+        /// Nearest dormant (alive + hostile but not yet targetable) monster position.
+        /// Map bosses and some encounter enemies need proximity to become targetable.
+        /// Modes can use this to navigate toward dormant threats.
+        /// </summary>
+        public Vector2? NearestDormantPos { get; private set; }
+
+        /// <summary>Distance to nearest dormant monster (grid units). float.MaxValue if none.</summary>
+        public float NearestDormantDistance { get; private set; } = float.MaxValue;
+
+        /// <summary>Metadata path of the nearest dormant monster (for timeout-based ignore).</summary>
+        public string? NearestDormantPath { get; private set; }
+
         /// <summary>Total number of alive hostile monsters in the entity list (awareness tier).</summary>
         public int CachedMonsterCount { get; private set; }
 
         /// <summary>Grid position of the nearest alive hostile monster (for mode navigation).</summary>
         public Vector2? NearestMonsterPos { get; private set; }
+
+        /// <summary>Grid position of the nearest monster within CombatRange that failed LOS checks.
+        /// Used for repositioning when all nearby enemies are behind terrain.</summary>
+        public Vector2? NearestBlockedPos { get; private set; }
 
         /// <summary>Best target entity (highest priority: rarity + distance).</summary>
         public Entity? BestTarget { get; private set; }
@@ -104,6 +129,37 @@ namespace AutoExile.Systems
         /// <summary>Enemy render names to ignore globally. Synced from settings each tick.</summary>
         public HashSet<string> BlacklistedEnemies { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
+        // ── Default entity path blacklist (never targetable / untargetable decorations) ──
+
+        /// <summary>Entity path substrings to always exclude from combat targeting.
+        /// These are monsters that appear hostile but are never actually attackable.</summary>
+        private static readonly string[] DefaultPathBlacklist =
+        {
+            "MysticFetish",                     // King in the Mist totems — never targetable
+            "VoodooKingBoss2RitualPillar",      // King encounter pillars — Unique rarity but decorative
+        };
+
+        // ── Dormant entity path ignore list ──
+        // Paths learned at runtime when dormant entities never activate after proximity timeout.
+        // Pre-seeded with known non-activatable entity paths (critters, volatiles, etc.).
+
+        /// <summary>Entity path substrings to ignore for dormant tracking.
+        /// Populated via timeout (modes call IgnoreDormantPath) and pre-seeded with known junk.</summary>
+        private readonly HashSet<string> _ignoredDormantPaths = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "Critters/",   // Pigeons, rats, etc. — decorative, permanently untargetable
+        };
+
+        /// <summary>Number of dormant paths learned this session (not counting pre-seeded).</summary>
+        public int LearnedDormantIgnoreCount { get; private set; }
+
+        /// <summary>Add a path substring to the dormant ignore list. Future scans skip matching entities.</summary>
+        public void IgnoreDormantPath(string pathSubstring)
+        {
+            if (_ignoredDormantPaths.Add(pathSubstring))
+                LearnedDormantIgnoreCount++;
+        }
+
         // ── Attack connectivity tracking ──
         // Monitors whether attacks are actually connecting (target HP changing).
         // After a timeout with no damage, blacklists the entire cluster as unreachable.
@@ -118,6 +174,16 @@ namespace AutoExile.Systems
         private float _lastAttackTargetHp = -1f;
         private DateTime _attackConnectivityStart = DateTime.MinValue;
         private const float BaseAttackConnectTimeoutSec = 2.5f;
+
+        // ── Target focus timeout — deprioritize targets we've been stuck on too long ──
+        // Tracks per-entity focus time. After the rarity-based timeout, the entity gets a
+        // large negative score penalty so other targets win. Cleared when entity dies or
+        // on area change. Different from unreachable blacklist (which is for zero-damage).
+        private readonly Dictionary<long, DateTime> _targetFocusStart = new();
+        private readonly HashSet<long> _deprioritizedTargets = new();
+
+        /// <summary>Number of targets deprioritized this session (for diagnostics).</summary>
+        public int DeprioritizedCount => _deprioritizedTargets.Count;
         /// <summary>Extra seconds added to server-response timeouts. Synced from settings.</summary>
         public float ExtraLatencySec { get; set; }
         private const float UnreachableClusterRadius = 45f; // grid units — blacklist all monsters in this radius
@@ -128,6 +194,13 @@ namespace AutoExile.Systems
         private DateTime _lastFlaskUseAt = DateTime.MinValue;
         private const int MinSkillIntervalMs = 80;
         private const int MinFlaskIntervalMs = 200;
+
+        // ── Channel tracking ──
+        /// <summary>Currently channeling skill entry, or null if not channeling.</summary>
+        private SkillBarEntry? _activeChannel;
+
+        /// <summary>True if a channeling skill is currently being held.</summary>
+        public bool IsChanneling => _activeChannel != null && BotInput.IsHeld(_activeChannel.Key);
 
         // ── Cached skill bar data ──
 
@@ -144,7 +217,14 @@ namespace AutoExile.Systems
 
         private readonly DateTime[] _lastFlaskPress = new DateTime[5];
 
-        private static readonly Keys[] FlaskKeys = { Keys.D1, Keys.D2, Keys.D3, Keys.D4, Keys.D5 };
+        private static readonly Keys[] DefaultFlaskKeys = { Keys.D1, Keys.D2, Keys.D3, Keys.D4, Keys.D5 };
+
+        /// <summary>Actual flask key bindings read from in-game settings. Falls back to defaults.</summary>
+        private Keys[] FlaskKeys = { Keys.D1, Keys.D2, Keys.D3, Keys.D4, Keys.D5 };
+
+        /// <summary>Actual skill slot key bindings read from in-game settings. Index 0-7 = bar positions.</summary>
+        private readonly Keys[] _slotKeys = new Keys[8];
+        private bool _keybindsLoaded;
 
         // ═══════════════════════════════════════════════════
         // Public API
@@ -169,8 +249,15 @@ namespace AutoExile.Systems
 
             if (!Profile.Enabled)
             {
+                // Release any active channel when combat is disabled
+                if (_activeChannel != null)
+                {
+                    BotInput.ReleaseKey(_activeChannel.Key);
+                    _activeChannel = null;
+                }
                 InCombat = false;
                 NearbyMonsterCount = 0;
+            WeightedDensity = 0;
                 BestTarget = null;
                 LastAction = "disabled";
                 return false;
@@ -179,8 +266,11 @@ namespace AutoExile.Systems
             // Read vitals
             ReadVitals(gc);
 
-            // Scan threats
-            ScanThreats(gc, settings);
+            // Scan threats (use entity cache when available for pre-filtered monster list)
+            ScanThreats(gc, settings, ctx.Entities);
+
+            // Check if active channel should be released (target died, conditions changed, etc.)
+            ReleaseChannelIfNeeded(gc, settings);
 
             // Refresh skill bar data periodically
             RefreshSkillBar(gc, settings);
@@ -198,6 +288,15 @@ namespace AutoExile.Systems
 
             if (!InCombat)
             {
+                // Monsters in range but behind terrain — reposition to get LOS
+                if (NearestBlockedPos.HasValue && !SuppressPositioning && BotInput.CanAct)
+                {
+                    WantsToMove = true;
+                    MoveTargetGrid = NearestBlockedPos.Value;
+                    MoveTarget = ToWorld(NearestBlockedPos.Value);
+                    LastAction = $"no LOS — moving toward ({NearestBlockedPos.Value.X:F0},{NearestBlockedPos.Value.Y:F0})";
+                    return false;
+                }
                 LastAction = "no threats";
                 return false;
             }
@@ -223,8 +322,10 @@ namespace AutoExile.Systems
         {
             InCombat = false;
             NearbyMonsterCount = 0;
+            WeightedDensity = 0;
             CachedMonsterCount = 0;
             NearestMonsterPos = null;
+            NearestBlockedPos = null;
             BestTarget = null;
             PackCenter = Vector2.Zero;
             DenseClusterCenter = Vector2.Zero;
@@ -277,11 +378,28 @@ namespace AutoExile.Systems
         /// <summary>All alive hostile monsters with rarity weight, regardless of range or LOS. Used for Aggressive positioning.</summary>
         private readonly List<(Vector2 pos, float weight)> _allMonsterWeighted = new();
 
+        // Spatial grids for O(1) density queries (rebuilt during ScanThreats)
+        private readonly SpatialGrid<long> _allMonsterGrid = new();
+        private readonly SpatialGrid<long> _walkableMonsterGrid = new();
+
+        /// <summary>Spatial grid of all nearby monsters. Available for external queries.</summary>
+        public SpatialGrid<long> MonsterGrid => _allMonsterGrid;
+
         /// <summary>Whether BestTarget can be hit from current position via targeting LOS.</summary>
         public bool BestTargetHasLOS { get; private set; }
 
-        private void ScanThreats(GameController gc, BotSettings.BuildSettings settings)
+        // Rate limit: full threat scan is expensive (entity iteration + LOS checks).
+        // Cache results for ~50ms (3 ticks at 60fps). Positions update fast enough.
+        private DateTime _lastThreatScan = DateTime.MinValue;
+        private const double ThreatScanIntervalMs = 50;
+
+        private void ScanThreats(GameController gc, BotSettings.BuildSettings settings,
+            EntityCache? entityCache = null)
         {
+            if ((DateTime.Now - _lastThreatScan).TotalMilliseconds < ThreatScanIntervalMs)
+                return; // use cached results
+            _lastThreatScan = DateTime.Now;
+
             var playerGrid = gc.Player.GridPosNum;
             float combatRange = settings.CombatRange.Value;
 
@@ -292,20 +410,31 @@ namespace AutoExile.Systems
             Entity? bestTarget = null;
             float bestScore = float.MinValue;
             int combatCount = 0;    // within CombatRange
+            int weightedDensity = 0; // rarity-weighted density for detour decisions
             int cachedCount = 0;    // all alive hostiles
             var combatSum = Vector2.Zero;
+            float nearestDormantDist = float.MaxValue;
+            Vector2? nearestDormantPos = null;
+            string? nearestDormantPath = null;
             float nearestCorpseDist = float.MaxValue;
             Vector2? nearestCorpse = null;
             float nearestMonsterDist = float.MaxValue;
             Vector2? nearestMonsterPos = null;
+            float nearestBlockedDist = float.MaxValue;
+            Vector2? nearestBlockedPos = null;
 
             _nearbyMonsterPositions.Clear();
             _walkableMonsterWeighted.Clear();
             _allMonsterWeighted.Clear();
 
-            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            // Use EntityCache.Monsters when available (pre-filtered, no type check needed).
+            // Falls back to OnlyValidEntities if cache not wired up.
+            IEnumerable<Entity> monsters = entityCache != null
+                ? entityCache.Monsters
+                : gc.EntityListWrapper.OnlyValidEntities.Where(e => e.Type == EntityType.Monster);
+
+            foreach (var entity in monsters)
             {
-                if (entity.Type != EntityType.Monster) continue;
                 if (!entity.IsHostile) continue;
 
                 var dist = Vector2.Distance(entity.GridPosNum, playerGrid);
@@ -321,7 +450,33 @@ namespace AutoExile.Systems
                     continue;
                 }
 
-                if (!entity.IsAlive || !entity.IsTargetable) continue;
+                if (!entity.IsAlive) continue;
+
+                // Track dormant monsters (alive + hostile but not targetable yet).
+                // Map bosses need proximity to activate. Track nearest for approach navigation.
+                // Skip entities whose paths match the learned ignore list (critters, volatiles, etc.).
+                if (!entity.IsTargetable)
+                {
+                    if (dist < nearestDormantDist && dist < combatRange && entity.Path != null)
+                    {
+                        bool ignoredPath = false;
+                        foreach (var ignored in _ignoredDormantPaths)
+                        {
+                            if (entity.Path.Contains(ignored, StringComparison.OrdinalIgnoreCase))
+                            {
+                                ignoredPath = true;
+                                break;
+                            }
+                        }
+                        if (!ignoredPath)
+                        {
+                            nearestDormantDist = dist;
+                            nearestDormantPos = entity.GridPosNum;
+                            nearestDormantPath = entity.Path;
+                        }
+                    }
+                    continue;
+                }
 
                 // Skip monsters trapped inside essence monoliths (cannot be damaged until released)
                 if (IsInsideMonolith(entity)) continue;
@@ -329,6 +484,21 @@ namespace AutoExile.Systems
                 // Skip globally blacklisted enemies (user-configured by render name)
                 if (BlacklistedEnemies.Count > 0 && !string.IsNullOrEmpty(entity.RenderName) &&
                     BlacklistedEnemies.Contains(entity.RenderName)) continue;
+
+                // Skip default path-blacklisted entities (never targetable decorations)
+                if (entity.Path != null)
+                {
+                    bool pathBlocked = false;
+                    foreach (var blocked in DefaultPathBlacklist)
+                    {
+                        if (entity.Path.Contains(blocked))
+                        {
+                            pathBlocked = true;
+                            break;
+                        }
+                    }
+                    if (pathBlocked) continue;
+                }
 
                 // Skip monsters blacklisted as unreachable (attacks don't connect)
                 if (_unreachableMonsters.Contains(entity.Id)) continue;
@@ -365,17 +535,42 @@ namespace AutoExile.Systems
                     Pathfinding.HasTargetingLOS(tgtGrid, px, py, (int)entity.GridPosNum.X, (int)entity.GridPosNum.Y);
 
                 // Skip unreachable monsters (can't walk to AND can't shoot)
-                if (pfGrid != null && !isWalkable && !isTargetable) continue;
+                if (pfGrid != null && !isWalkable && !isTargetable)
+                {
+                    // Track nearest in-range monster blocked by LOS for repositioning
+                    if (dist < nearestBlockedDist)
+                    {
+                        nearestBlockedDist = dist;
+                        nearestBlockedPos = entity.GridPosNum;
+                    }
+                    continue;
+                }
 
                 combatCount++;
                 combatSum += entity.GridPosNum;
                 _nearbyMonsterPositions.Add(entity.GridPosNum);
+
+                // Rarity-weighted density for detour decisions (separate from cluster scoring)
+                weightedDensity += entity.Rarity switch
+                {
+                    MonsterRarity.Magic => 2,
+                    MonsterRarity.Rare => 5,
+                    MonsterRarity.Unique => 8,
+                    _ => 1
+                };
 
                 // Track walkable monsters separately for positioning (don't walk into gaps)
                 if (isWalkable || pfGrid == null)
                     _walkableMonsterWeighted.Add((entity.GridPosNum, rarityWeight));
 
                 float score = rarityWeight - dist * 0.1f;
+
+                // Target focus timeout — deprioritize monsters we've been attacking too long.
+                // Rarity-based timeouts: normals 2s, magic 3s, rares 5s, uniques 10s.
+                // Once timed out, apply a large penalty so other targets win.
+                // The target isn't blacklisted — it can become BestTarget again if nothing else is alive.
+                if (_deprioritizedTargets.Contains(entity.Id))
+                    score -= 200f; // massive penalty — only wins if nothing else is available
 
                 // Defense anchor: heavily favor monsters closer to the objective
                 if (Profile.DefenseAnchor.HasValue)
@@ -394,12 +589,17 @@ namespace AutoExile.Systems
             }
 
             NearbyMonsterCount = combatCount;
+            WeightedDensity = weightedDensity;
             CachedMonsterCount = cachedCount;
+            NearestDormantPos = nearestDormantPos;
+            NearestDormantDistance = nearestDormantDist;
+            NearestDormantPath = nearestDormantPath;
             BestTarget = bestTarget;
             InCombat = combatCount > 0;
             PackCenter = combatCount > 0 ? combatSum / combatCount : playerGrid;
             NearestCorpse = nearestCorpse;
             NearestMonsterPos = nearestMonsterPos;
+            NearestBlockedPos = nearestBlockedPos;
 
             // Set BestTargetHasLOS — can we shoot the best target from here?
             BestTargetHasLOS = false;
@@ -407,16 +607,35 @@ namespace AutoExile.Systems
                 BestTargetHasLOS = Pathfinding.HasTargetingLOS(tgtGrid, px, py,
                     (int)bestTarget.GridPosNum.X, (int)bestTarget.GridPosNum.Y);
 
-            // Dense cluster for positioning
+            // Build spatial grids from weighted lists for O(1) density queries
+            RebuildGrids(playerGrid, combatRange);
+
+            // Dense cluster for positioning — use spatial grid instead of O(n²)
             if (bestTarget != null && IsPriorityTarget(bestTarget))
                 DenseClusterCenter = bestTarget.GridPosNum;
-            else if (Profile.Positioning == CombatPositioning.Aggressive && _allMonsterWeighted.Count > 0)
-                // Aggressive: consider ALL known monsters regardless of range/LOS — mode will A* pathfind there
-                DenseClusterCenter = FindWeightedDensestPosition(_allMonsterWeighted, playerGrid);
-            else if (_walkableMonsterWeighted.Count > 0)
-                DenseClusterCenter = FindWeightedDensestPosition(_walkableMonsterWeighted, playerGrid);
+            else if (Profile.Positioning == CombatPositioning.Aggressive && _allMonsterGrid.TotalItems > 0)
+                DenseClusterCenter = _allMonsterGrid.FindDensestPosition(playerGrid);
+            else if (_walkableMonsterGrid.TotalItems > 0)
+                DenseClusterCenter = _walkableMonsterGrid.FindDensestPosition(playerGrid);
             else
-                DenseClusterCenter = playerGrid; // all targets across gaps, stay put
+                DenseClusterCenter = playerGrid;
+        }
+
+        private readonly List<(long, Vector2, float)> _gridBuildBuffer = new(256);
+
+        private void RebuildGrids(Vector2 playerGrid, float combatRange)
+        {
+            // All monsters grid
+            _gridBuildBuffer.Clear();
+            foreach (var (pos, weight) in _allMonsterWeighted)
+                _gridBuildBuffer.Add((0, pos, weight));
+            _allMonsterGrid.Rebuild(_gridBuildBuffer, playerGrid, combatRange * 2f);
+
+            // Walkable monsters grid
+            _gridBuildBuffer.Clear();
+            foreach (var (pos, weight) in _walkableMonsterWeighted)
+                _gridBuildBuffer.Add((0, pos, weight));
+            _walkableMonsterGrid.Rebuild(_gridBuildBuffer, playerGrid, combatRange);
         }
 
         /// <summary>
@@ -567,7 +786,7 @@ namespace AutoExile.Systems
                         int targetBarPos = -1;
                         for (int bi = 0; bi < 8 && bi < barIds.Count; bi++)
                         {
-                            if (DefaultKeyForSlot(bi) == key) { targetBarPos = bi; break; }
+                            if (KeyForSlot(bi) == key) { targetBarPos = bi; break; }
                         }
 
                         if (targetBarPos >= 0 && targetBarPos < barIds.Count)
@@ -596,7 +815,7 @@ namespace AutoExile.Systems
                             if (skill.InternalName != null && skill.Name != null)
                             {
                                 // Try direct key name match as last resort
-                                var slotKey = DefaultKeyForSlot(skill.SkillSlotIndex);
+                                var slotKey = KeyForSlot(skill.SkillSlotIndex);
                                 if (slotKey == key) { matchedSkill = skill; break; }
                             }
                         }
@@ -627,6 +846,7 @@ namespace AutoExile.Systems
                     BuffDebuffName = slotConfig.BuffDebuffName.Value ?? "",
                     MinCastIntervalMs = slotConfig.MinCastIntervalMs.Value,
                     RequireTargetable = slotConfig.RequireTargetable.Value,
+                    IsChannel = slotConfig.IsChannel.Value,
                 };
 
                 // Auto-detect properties from skill stats
@@ -713,6 +933,108 @@ namespace AutoExile.Systems
             _ => Keys.None
         };
 
+        /// <summary>
+        /// Get the actual key for a skill bar position, using in-game keybindings if loaded.
+        /// </summary>
+        public Keys KeyForSlot(int barPosition)
+        {
+            if (!_keybindsLoaded || barPosition < 0 || barPosition >= _slotKeys.Length)
+                return DefaultKeyForSlot(barPosition);
+            var key = _slotKeys[barPosition];
+            return key != Keys.None ? key : DefaultKeyForSlot(barPosition);
+        }
+
+        /// <summary>
+        /// Read actual keybindings from IngameState.ShortcutSettings.Shortcuts.
+        /// Call on startup and area change.
+        /// </summary>
+        public void RefreshKeybindings(GameController gc)
+        {
+            try
+            {
+                var shortcuts = gc.IngameState?.ShortcutSettings?.Shortcuts;
+                if (shortcuts == null || shortcuts.Count < 15) return;
+
+                // Skill slots: Shortcuts indices 7-14 map to Skill1-Skill8
+                // Bar positions 0-7 correspond to Skill1-Skill8
+                // Shortcuts index = bar position + 7
+                for (int bar = 0; bar < 8; bar++)
+                {
+                    var shortcut = shortcuts[bar + 7];
+                    var consoleKey = shortcut.MainKey;
+                    _slotKeys[bar] = ConsoleKeyToKeys(consoleKey, bar);
+                }
+
+                // Flask keys: Shortcuts indices 0-4 = Flask1-Flask5
+                for (int f = 0; f < 5; f++)
+                {
+                    var shortcut = shortcuts[f];
+                    var mapped = ConsoleKeyToKeys(shortcut.MainKey, -1);
+                    if (mapped != Keys.None)
+                        FlaskKeys[f] = mapped;
+                }
+
+                _keybindsLoaded = true;
+            }
+            catch
+            {
+                // Fall back to defaults if anything fails
+            }
+        }
+
+        /// <summary>
+        /// Convert System.ConsoleKey to System.Windows.Forms.Keys.
+        /// For mouse buttons (bar positions 0-2), use special mapping since
+        /// ConsoleKey uses raw values 1/2/4 for LMB/RMB/MMB.
+        /// </summary>
+        private static Keys ConsoleKeyToKeys(ConsoleKey consoleKey, int barPosition)
+        {
+            // Mouse button slots (bar positions 0-2)
+            if (barPosition >= 0 && barPosition <= 2)
+            {
+                return (int)consoleKey switch
+                {
+                    1 => Keys.None,      // LMB — move only, don't bind
+                    2 => Keys.RButton,   // RMB
+                    4 => Keys.MButton,   // MMB
+                    _ => Keys.None
+                };
+            }
+
+            // ConsoleKey and Keys share the same underlying values for most keys
+            var intVal = (int)consoleKey;
+
+            // Quick validation — ConsoleKey values map to Keys for common ranges
+            if (intVal >= 48 && intVal <= 57) return (Keys)intVal;   // D0-D9
+            if (intVal >= 65 && intVal <= 90) return (Keys)intVal;   // A-Z
+            if (intVal >= 112 && intVal <= 123) return (Keys)intVal; // F1-F12
+
+            // Named keys with matching values
+            return consoleKey switch
+            {
+                ConsoleKey.Spacebar => Keys.Space,
+                ConsoleKey.Tab => Keys.Tab,
+                ConsoleKey.Enter => Keys.Enter,
+                ConsoleKey.Escape => Keys.Escape,
+                ConsoleKey.Insert => Keys.Insert,
+                ConsoleKey.Delete => Keys.Delete,
+                ConsoleKey.Home => Keys.Home,
+                ConsoleKey.End => Keys.End,
+                ConsoleKey.PageUp => Keys.PageUp,
+                ConsoleKey.PageDown => Keys.PageDown,
+                ConsoleKey.UpArrow => Keys.Up,
+                ConsoleKey.DownArrow => Keys.Down,
+                ConsoleKey.LeftArrow => Keys.Left,
+                ConsoleKey.RightArrow => Keys.Right,
+                ConsoleKey.Backspace => Keys.Back,
+                ConsoleKey.OemComma => Keys.Oemcomma,
+                ConsoleKey.OemPeriod => Keys.OemPeriod,
+                ConsoleKey.OemMinus => Keys.OemMinus,
+                ConsoleKey.OemPlus => Keys.Oemplus,
+                _ => (Keys)intVal // Direct cast as fallback — values match for most keys
+            };
+        }
+
         // ═══════════════════════════════════════════════════
         // Skill execution
         // ═══════════════════════════════════════════════════
@@ -740,6 +1062,18 @@ namespace AutoExile.Systems
 
         internal bool TickSkills(GameController gc, BotSettings.BuildSettings settings)
         {
+            // If channeling, update cursor toward target each tick.
+            // Don't block the skill loop — higher-priority skills (curses, debuffs) can
+            // interrupt the channel via CursorPressKey (which calls ReleaseAllKeys).
+            // The channel auto-restarts next tick when the interrupted skill's gate clears.
+            if (_activeChannel != null && BotInput.IsHeld(_activeChannel.Key))
+            {
+                var targetGridPos = GetSkillTargetGrid(gc, _activeChannel);
+                if (targetGridPos.HasValue)
+                    UseSkill(gc, _activeChannel, targetGridPos); // Just updates cursor
+                // Fall through — let other skills fire if their conditions are met
+            }
+
             if (!BotInput.CanAct) return false;
             if ((DateTime.Now - _lastSkillUseAt).TotalMilliseconds < MinSkillIntervalMs) return false;
 
@@ -856,37 +1190,125 @@ namespace AutoExile.Systems
         {
             bool acted;
 
-            if (gridTarget.HasValue)
+            if (entry.IsChannel)
             {
-                // Targeted skill — cursor + key press through BotInput
-                var screenPos = Pathfinding.GridToScreen(gc, gridTarget.Value);
-
-                var windowRect = gc.Window.GetWindowRectangle();
-
-                // Bounds check — don't fire if target is off-screen
-                if (screenPos.X < 0 || screenPos.X > windowRect.Width ||
-                    screenPos.Y < 0 || screenPos.Y > windowRect.Height)
+                // ── Channel skill — hold key down continuously ──
+                // The key stays held while in combat. Cursor position is updated each
+                // tick by normal combat targeting — no gate reservation needed.
+                // This lets the game cast as fast as possible and allows dodge/blink
+                // skills to interrupt naturally (they call ReleaseAllKeys).
+                if (_activeChannel == entry && BotInput.IsHeld(entry.Key))
                 {
-                    LastSkillAction = $"{entry.Skill?.Name ?? entry.Key.ToString()}: target off-screen";
+                    // Already channeling — just update cursor toward target
+                    if (gridTarget.HasValue)
+                    {
+                        var screenPos = Pathfinding.GridToScreen(gc, gridTarget.Value);
+                        var windowRect = gc.Window.GetWindowRectangle();
+                        if (screenPos.X >= 0 && screenPos.X <= windowRect.Width &&
+                            screenPos.Y >= 0 && screenPos.Y <= windowRect.Height)
+                        {
+                            var absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
+                            Input.SetCursorPos(absPos);
+                        }
+                    }
                     return;
                 }
 
-                var absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
-                acted = BotInput.CursorPressKey(absPos, entry.Key);
+                // Start new channel — lightweight key-down, no gate reservation.
+                // Combat cursor positioning handles where the cursor points each tick.
+                BotInput.SuspendMovement();
+                if (!BotInput.IsHeld(entry.Key))
+                {
+                    Input.KeyDown(entry.Key);
+                    BotInput.TrackHeldKey(entry.Key);
+                }
+                _activeChannel = entry;
+                acted = true;
+
+                // Move cursor to target for the initial key-down frame
+                if (gridTarget.HasValue)
+                {
+                    var screenPos = Pathfinding.GridToScreen(gc, gridTarget.Value);
+                    var windowRect = gc.Window.GetWindowRectangle();
+                    if (screenPos.X >= 0 && screenPos.X <= windowRect.Width &&
+                        screenPos.Y >= 0 && screenPos.Y <= windowRect.Height)
+                    {
+                        var absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
+                        Input.SetCursorPos(absPos);
+                    }
+                }
             }
             else
             {
-                // Self-cast — just press key (no cursor move needed)
-                acted = BotInput.PressKey(entry.Key);
-            }
+                // ── Normal skill — press and release ──
+                if (gridTarget.HasValue)
+                {
+                    // Targeted skill — needs cursor, suspends movement
+                    var screenPos = Pathfinding.GridToScreen(gc, gridTarget.Value);
+                    var windowRect = gc.Window.GetWindowRectangle();
+                    if (screenPos.X < 0 || screenPos.X > windowRect.Width ||
+                        screenPos.Y < 0 || screenPos.Y > windowRect.Height)
+                    {
+                        LastSkillAction = $"{entry.Skill?.Name ?? entry.Key.ToString()}: target off-screen";
+                        return;
+                    }
+                    var absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
+                    acted = BotInput.CursorPressKey(absPos, entry.Key);
+                }
+                else
+                {
+                    // Self-cast skill — fires alongside movement without interrupting it
+                    acted = BotInput.PressKeyOverlay(entry.Key);
+                }
 
-            if (!acted) return;
+                if (!acted) return;
+            }
 
             _lastSkillUseAt = DateTime.Now;
             entry.LastCastAt = DateTime.Now;
             var skillName = entry.Skill?.Name ?? entry.Key.ToString();
-            LastSkillAction = $"{skillName} ({entry.Key}, {entry.Role})";
-            LastAction = $"skill: {skillName}";
+            var channelTag = entry.IsChannel ? " [HOLD]" : "";
+            LastSkillAction = $"{skillName} ({entry.Key}, {entry.Role}){channelTag}";
+            LastAction = $"skill: {skillName}{channelTag}";
+        }
+
+        /// <summary>
+        /// Release the active channeling skill if conditions are no longer met.
+        /// Called at the start of each combat tick.
+        /// </summary>
+        private void ReleaseChannelIfNeeded(GameController gc, BotSettings.BuildSettings settings)
+        {
+            if (_activeChannel == null) return;
+
+            // Channel key was released externally (by BotInput.ReleaseAllKeys, another action, etc.)
+            if (!BotInput.IsHeld(_activeChannel.Key))
+            {
+                _activeChannel = null;
+                return;
+            }
+
+            bool shouldRelease = false;
+
+            // No more targets
+            if (_activeChannel.Role == SkillRole.Enemy && (BestTarget == null || !InCombat))
+                shouldRelease = true;
+
+            // Conditions no longer met (target died, moved out of range, etc.)
+            if (!shouldRelease && !CheckSkillConditions(gc, _activeChannel, settings))
+                shouldRelease = true;
+
+            // Combat suppressed
+            if (SuppressTargetedSkills &&
+                (_activeChannel.Role == SkillRole.Enemy || _activeChannel.Role == SkillRole.Corpse))
+                shouldRelease = true;
+
+            if (shouldRelease)
+            {
+                BotInput.ReleaseKey(_activeChannel.Key);
+                var name = _activeChannel.Skill?.Name ?? _activeChannel.Key.ToString();
+                LastAction = $"released channel: {name}";
+                _activeChannel = null;
+            }
         }
 
         // ═══════════════════════════════════════════════════
@@ -1027,7 +1449,8 @@ namespace AutoExile.Systems
         private void TryFlask(int index)
         {
             if (index < 0 || index >= 5) return;
-            if (!BotInput.PressKey(FlaskKeys[index])) return;
+            // Flasks fire alongside movement — never interrupt continuous movement
+            if (!BotInput.PressKeyOverlay(FlaskKeys[index])) return;
 
             _lastFlaskPress[index] = DateTime.Now;
             _lastFlaskUseAt = DateTime.Now;
@@ -1178,7 +1601,11 @@ namespace AutoExile.Systems
             }
 
             var moveKey = PrimaryMoveKey ?? Keys.T;
-            BotInput.CursorPressKey(absPos, moveKey);
+            // Use continuous movement when available, fall back to pulse for compatibility
+            if (BotInput.IsMovementActive && !BotInput.IsMovementSuspended)
+                BotInput.UpdateMovementCursor(absPos);
+            else
+                BotInput.StartMovement(absPos, moveKey);
         }
 
         // ═══════════════════════════════════════════════════
@@ -1192,6 +1619,23 @@ namespace AutoExile.Systems
         /// </summary>
         private void TickAttackConnectivity(GameController gc)
         {
+            // Clean up focus tracking for dead entities
+            if (_targetFocusStart.Count > 0)
+            {
+                var deadIds = new List<long>();
+                foreach (var id in _targetFocusStart.Keys)
+                {
+                    var ent = gc.EntityListWrapper.OnlyValidEntities.FirstOrDefault(e => e.Id == id);
+                    if (ent == null || !ent.IsAlive)
+                        deadIds.Add(id);
+                }
+                foreach (var id in deadIds)
+                {
+                    _targetFocusStart.Remove(id);
+                    _deprioritizedTargets.Remove(id);
+                }
+            }
+
             if (BestTarget == null || !InCombat)
             {
                 _lastAttackTargetId = 0;
@@ -1209,6 +1653,29 @@ namespace AutoExile.Systems
             }
             catch { return; }
 
+            // ── Focus timeout — deprioritize targets we've been stuck on ──
+            if (!_targetFocusStart.ContainsKey(targetId))
+                _targetFocusStart[targetId] = DateTime.Now;
+
+            if (!_deprioritizedTargets.Contains(targetId))
+            {
+                var focusDuration = (DateTime.Now - _targetFocusStart[targetId]).TotalSeconds;
+                var focusTimeout = BestTarget.Rarity switch
+                {
+                    MonsterRarity.Unique => 10.0,
+                    MonsterRarity.Rare => 5.0,
+                    MonsterRarity.Magic => 3.0,
+                    _ => 2.0
+                };
+
+                if (focusDuration >= focusTimeout)
+                {
+                    _deprioritizedTargets.Add(targetId);
+                    LastAction = $"Deprioritized {BestTarget.RenderName ?? "?"} ({BestTarget.Rarity}) after {focusDuration:F1}s";
+                }
+            }
+
+            // ── Attack connectivity — detect zero-damage (unreachable) ──
             // New target — start tracking
             if (targetId != _lastAttackTargetId)
             {
@@ -1229,6 +1696,16 @@ namespace AutoExile.Systems
             // HP hasn't changed — check timeout
             if ((DateTime.Now - _attackConnectivityStart).TotalSeconds < BaseAttackConnectTimeoutSec + ExtraLatencySec)
                 return;
+
+            // Never blacklist Unique-rarity monsters as unreachable.
+            // Boss invulnerability phases are a normal game mechanic — the boss IS reachable,
+            // it just can't take damage temporarily. Deprioritization handles target switching.
+            if (BestTarget.Rarity == MonsterRarity.Unique)
+            {
+                // Reset timer so we don't spam this check every tick
+                _attackConnectivityStart = DateTime.Now;
+                return;
+            }
 
             // Attacks not connecting for too long — blacklist the cluster
             var anchorPos = BestTarget.GridPosNum;
@@ -1266,6 +1743,14 @@ namespace AutoExile.Systems
             UnreachableClusterCount = 0;
             _lastAttackTargetId = 0;
             _lastAttackTargetHp = -1f;
+            _targetFocusStart.Clear();
+            _deprioritizedTargets.Clear();
+
+            // Clear learned dormant ignores (keep pre-seeded ones).
+            // New zone may have different dormant entities that are valid.
+            _ignoredDormantPaths.Clear();
+            _ignoredDormantPaths.Add("Critters/");
+            LearnedDormantIgnoreCount = 0;
         }
 
         // ═══════════════════════════════════════════════════
@@ -1335,6 +1820,7 @@ namespace AutoExile.Systems
             public string BuffDebuffName = "";
             public int MinCastIntervalMs;
             public bool RequireTargetable;
+            public bool IsChannel;
             public DateTime LastCastAt = DateTime.MinValue;
         }
     }

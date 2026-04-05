@@ -46,9 +46,13 @@ namespace AutoExile
         private ThreatSystem _threat = new();
         private EldritchAltarHandler _altarHandler = new();
         private NinjaPriceService _ninjaPrice = new();
+        private EntityCache _entityCache = new();
+        private ThreatMap _threatMap = new();
+        private DateTime _lastEntityPrune = DateTime.MinValue;
         private GemValuationService _gemValuation = new();
         private BotRecorder _recorder = new();
         private BossFightRecorder _mavenRecorder = new();
+        private HumanGameplayRecorder _humanRecorder = new();
         private BotWebServer? _webServer;
         private DataStore? _dataStore;
         private ConfigManager? _configManager;
@@ -72,7 +76,6 @@ namespace AutoExile
         // Mode references for ImGui buttons
         private FollowerMode? _followerMode;
         private BlightMode? _blightMode;
-        private MappingMode? _mappingMode;
         private SimulacrumMode? _simulacrumMode;
         private HeistMode? _heistMode;
         private LabyrinthMode? _labyrinthMode;
@@ -124,6 +127,7 @@ namespace AutoExile
             Instance = this;
             _recorder.SetOutputDir(Path.Combine(DirectoryFullName, "Recordings"));
             _mavenRecorder.Initialize(DirectoryFullName);
+            _humanRecorder.Initialize(DirectoryFullName, msg => LogMessage($"[AutoExile] {msg}"));
             _ninjaPrice.Initialize(DirectoryFullName, msg => LogMessage($"[AutoExile] NinjaPrice: {msg}"));
             _mapDatabase = new MapDatabase(msg => LogMessage($"[AutoExile] {msg}"));
             _mapDatabase.Initialize(DirectoryFullName);
@@ -144,6 +148,8 @@ namespace AutoExile
                 Threat = _threat,
                 AltarHandler = _altarHandler,
                 NinjaPrice = _ninjaPrice,
+                Entities = _entityCache,
+                ThreatMap = _threatMap,
                 MapDatabase = _mapDatabase,
                 Settings = Settings,
                 Log = msg => LogMessage($"[AutoExile] {msg}")
@@ -154,8 +160,6 @@ namespace AutoExile
             RegisterMode(_followerMode);
             _blightMode = new BlightMode();
             RegisterMode(_blightMode);
-            _mappingMode = new MappingMode();
-            RegisterMode(_mappingMode);
             _simulacrumMode = new SimulacrumMode();
             RegisterMode(_simulacrumMode);
             _heistMode = new HeistMode();
@@ -172,12 +176,20 @@ namespace AutoExile
             _bossMode.Register(new SareshEncounter());
             RegisterMode(_bossMode);
 
+            // Wave farming mode (recording-driven, forward-momentum model)
+            var waveFarm = new Modes.WaveFarm.WaveFarmMode();
+            waveFarm.Register(new Modes.WaveFarm.FarmPlans.AlchAndGoPlan());
+            RegisterMode(waveFarm);
+
             // Register in-map mechanics
             _mechanics.Register(new UltimatumMechanic());
             _mechanics.Register(new HarvestMechanic());
             _mechanics.Register(new WishesMechanic());
             _mechanics.Register(new EssenceMechanic());
             _mechanics.Register(new RitualMechanic());
+
+            // Read in-game keybindings (skill slots, flasks)
+            _combat.RefreshKeybindings(GameController);
 
             // Populate boss type dropdown — save/restore value since SetListValues resets it
             var savedBossType = Settings.Boss.BossType.Value;
@@ -372,7 +384,16 @@ namespace AutoExile
             if (_ctx.TileScan != null)
                 LogMessage($"[TileScan] {currentArea}: {_ctx.TileScan.DetectedMechanics.Count} mechanics detected (map-wide)");
             _loot.ClearFailed();
+            _entityCache.Rebuild(GameController.EntityListWrapper.OnlyValidEntities);
+            // Initialize ThreatMap from pathfinding grid, then populate from existing entities
+            var pfGridForThreat = GameController.IngameState?.Data?.RawPathfindingData;
+            if (pfGridForThreat != null)
+            {
+                _threatMap.Initialize(pfGridForThreat);
+                _threatMap.RebuildFromEntities(_entityCache.Monsters);
+            }
             _combat.ClearUnreachable();
+            _combat.RefreshKeybindings(GameController);
             _altarHandler.Reset();
             _lootTracker.OnAreaChanged();
             ClearMinimapIcons();
@@ -483,6 +504,8 @@ namespace AutoExile
             _navigation.PathMergeThreshold = Settings.Build.PathMergeThreshold.Value;
             BotInput.ActionCooldownMs = Settings.ActionCooldownMs.Value;
             BotInput.WindowRect = GameController.Window.GetWindowRectangleTimeCache;
+            BotInput.TickHeldKeys(); // Safety watchdog — auto-release stale held keys
+            BotInput.TickMovementLayer(); // Auto-resume movement after discrete actions
 
             // Sync primary movement key from skill config → NavigationSystem + CombatSystem
             var primaryMove = Settings.Build.GetPrimaryMovement();
@@ -504,57 +527,33 @@ namespace AutoExile
             _threat.DodgeMaxProgress = threatSettings.DodgeMaxProgress.Value;
             _threat.MonitorRares = threatSettings.MonitorRares.Value;
 
-            // Mapping mode hotkey — F5 cycles: start → pause → resume → pause ...
-            // Double-tap from paused switches back to previous mode
-            if (Settings.TestMapExplore.PressedOnce())
-            {
-                if (_mode == _mappingMode && _mappingMode != null)
-                {
-                    if (_mappingMode.IsPaused)
-                    {
-                        // Paused → resume
-                        _mappingMode.Resume();
-                        LogMessage("[AutoExile] Mapping resumed");
-                    }
-                    else
-                    {
-                        // Running → pause
-                        _mappingMode.Pause(_ctx);
-                        LogMessage("[AutoExile] Mapping paused (overlay preserved)");
-                    }
-                }
-                else
-                {
-                    // Not in mapping mode → switch to it
-                    SetMode("Mapping");
-                    LogMessage("[AutoExile] Mapping mode activated");
-                }
-            }
+            // F5 — removed (was Mapping mode toggle, caused accidental mode switches)
 
-            // Game state dump hotkey — F6
+            // Debug dump hotkey — F6: dumps game state + recording snapshot + tile signatures
             if (Settings.DumpGameState.PressedOnce())
+            {
+                LogMessage("[AutoExile] Dumping all debug data...");
                 TriggerGameStateDump();
-
-            // Recording dump hotkey — F7 (last ~10s of tick-level state)
-            if (Settings.DumpRecording.PressedOnce())
-            {
                 _recorder.ForceDump("hotkey");
-                LogMessage($"[AutoExile] {_recorder.LastDumpStatus}");
+                LogMessage($"[AutoExile] Recording: {_recorder.LastDumpStatus}");
+                if (_tileSignatures.Count == 0)
+                    ScanTileSignatures();
+                LogMessage($"[AutoExile] Tile signatures: {_tileSignatures.Count}");
             }
 
-            // Tile signature scanner hotkey — F8 (toggle on/off, area change clears)
-            if (Settings.ScanTileSignatures.PressedOnce())
+            // Gameplay recorder hotkey — F9 (toggle on/off, works for both human and bot play)
+            if (Settings.RecordGameplay.PressedOnce())
             {
-                if (_tileSignatures.Count > 0)
-                {
-                    _tileSignatures.Clear();
-                    LogMessage("[AutoExile] Tile signatures cleared");
-                }
-                else
-                {
-                    ScanTileSignatures();
-                }
+                _humanRecorder.Toggle(GameController, Settings.Running.Value);
+                var mode = Settings.Running.Value ? "BOT" : "HUMAN";
+                LogMessage($"[AutoExile] Recorder ({mode}): {(_humanRecorder.IsRecording ? "RECORDING" : "stopped")}");
             }
+
+            // Tick human recorder (captures game state each tick while recording)
+            if (_humanRecorder.IsRecording)
+                _humanRecorder.RecordTick(GameController, _ctx);
+
+            // F7/F8 — removed (folded into F6 dump-all)
 
             // Clear tile signatures on area change
             if (_tileSignatures.Count > 0 && _lastAreaName != _tileSignatureArea)
@@ -587,6 +586,19 @@ namespace AutoExile
             _loot.LabelToggleCooldownSeconds = Settings.Loot.LabelToggleCooldownSeconds.Value;
             _loot.PriceService = _ninjaPrice;
             _lootTracker.PriceService = _ninjaPrice;
+
+            // Entity cache — prune stale entries every ~1s
+            _interaction.Cache = _entityCache;
+            if ((DateTime.Now - _lastEntityPrune).TotalMilliseconds > 1000)
+            {
+                _entityCache.Prune();
+                _lastEntityPrune = DateTime.Now;
+            }
+
+            // ThreatMap reconciliation — checks nearby chunks for monster deaths.
+            // Internal timer gates to 250ms. Uses EntityCache for O(1) lookups.
+            if (GameController.Player != null)
+                _threatMap.Reconcile(GameController.Player.GridPosNum, _entityCache);
 
             // Sync interact radius (global setting used by all systems)
             _interaction.InteractRadius = Settings.InteractRadius.Value;
@@ -629,7 +641,7 @@ namespace AutoExile
 
             // Record tick state BEFORE early returns so recordings capture paused/loading/settle state
             _recorder.RecordTick(GameController, _mode.Name,
-                (_mode as MappingMode)?.Phase.ToString()
+                (_mode as Modes.WaveFarm.WaveFarmMode)?.Status
                 ?? (_mode as BlightMode)?.Phase.ToString()
                 ?? (_mode as SimulacrumMode)?.Phase.ToString()
                 ?? (_mode as HeistMode)?.Phase.ToString()
@@ -638,14 +650,14 @@ namespace AutoExile
                 ?? (_mode as PathBenchmarkMode)?.IsRunning.ToString()
                 ?? (_mode as BossMode)?.Phase.ToString()
                 ?? "",
-                (_mode as MappingMode)?.Decision
+                (_mode as Modes.WaveFarm.WaveFarmMode)?.Decision
                 ?? (_mode as SimulacrumMode)?.Decision
                 ?? (_mode as HeistMode)?.Decision
                 ?? (_mode as FollowerMode)?.Decision
                 ?? (_mode as PathBenchmarkMode)?.Decision
                 ?? (_mode as BossMode)?.Decision
                 ?? "",
-                (_mode as MappingMode)?.Status
+                (_mode as Modes.WaveFarm.WaveFarmMode)?.Status
                 ?? (_mode as PathBenchmarkMode)?.Status
                 ?? (_mode as BossMode)?.Status
                 ?? "",
@@ -653,7 +665,10 @@ namespace AutoExile
 
             // Only run full mode logic when running
             if (!Settings.Running)
+            {
+                BotInput.StopMovement();
                 return base.Tick();
+            }
 
             // Global interrupts — handle before mode gets control
             if (!HandleInterrupts())
@@ -663,6 +678,13 @@ namespace AutoExile
             // a few seconds after zone transition. Skip mode logic to prevent
             // stale entity reads (e.g., mechanic re-detection from old zone data).
             if ((DateTime.Now - _areaChangedAt).TotalSeconds < AreaSettleSeconds)
+                return base.Tick();
+
+            // Hard floor — if raw input was sent very recently (async completion,
+            // movement layer resume, etc.), skip all mode/nav/combat logic this tick.
+            // This prevents input floods from race conditions between fire-and-forget
+            // async actions and synchronous tick logic that both pass CanAct.
+            if (!BotInput.CanTick)
                 return base.Tick();
 
             // Tick threat detection (dodge signals consumed by modes)
@@ -729,6 +751,13 @@ namespace AutoExile
             var color = running ? SharpDX.Color.LimeGreen : SharpDX.Color.Yellow;
             var status = running ? $"BOT: {_mode.Name}" : $"BOT: PAUSED ({_mode.Name})";
             Graphics.DrawText(status, new Vector2(100, 80), color);
+
+            // Human recorder indicator
+            if (_humanRecorder.IsRecording)
+            {
+                var recText = $"REC  {_humanRecorder.TicksRecorded} ticks";
+                Graphics.DrawText(recText, new Vector2(100, 100), SharpDX.Color.Red);
+            }
 
             // Loot tracker overlay (top-right area)
             var winWidth = GameController.Window.GetWindowRectangle().Width;
@@ -912,8 +941,8 @@ namespace AutoExile
                 var decision = "";
                 var status = "";
 
-                if (_mode is MappingMode map)
-                { phase = map.Phase.ToString(); decision = map.Decision; status = map.Status; }
+                if (_mode is Modes.WaveFarm.WaveFarmMode waveFarm)
+                { status = waveFarm.Status; decision = waveFarm.Decision; }
                 else if (_mode is SimulacrumMode sim)
                 { phase = sim.Phase.ToString(); decision = sim.Decision; status = sim.StatusText; }
                 else if (_mode is BlightMode blight)
@@ -945,12 +974,16 @@ namespace AutoExile
                                 idToSkill[id] = skill;
                         }
 
-                        string[] posKeys = { "LMB", "RMB", "MButton", "Q", "W", "E", "R", "T" };
                         detectedSkills = new();
 
-                        var limit = Math.Min(barIds.Count, posKeys.Length);
-                        for (int i = 3; i < limit; i++)
+                        var limit = Math.Min(barIds.Count, 8);
+                        for (int i = 0; i < limit; i++)
                         {
+                            var key = _combat.KeyForSlot(i);
+                            // Skip mouse-only slots — we don't support click-based skill usage
+                            if (key == Keys.None || key == Keys.RButton || key == Keys.MButton)
+                                continue;
+
                             var skillId = barIds[i];
                             if (skillId == 0) continue;
                             if (!idToSkill.TryGetValue(skillId, out var actorSkill)) continue;
@@ -960,7 +993,7 @@ namespace AutoExile
                             detectedSkills.Add(new DetectedSkillSlot
                             {
                                 SlotIndex = i,
-                                Key = posKeys[i],
+                                Key = key.ToString(),
                                 SkillName = skillName,
                                 InternalName = actorSkill.InternalName ?? "",
                                 IsSpell = actorSkill?.IsSpell ?? false,
@@ -1044,6 +1077,11 @@ namespace AutoExile
                     BossRunTime = _bossMode != null && _mode == _bossMode
                         && _bossMode.Phase >= BossMode.BossPhase.InBossZone && _bossMode.Phase <= BossMode.BossPhase.ExitMap
                         ? (DateTime.Now - _bossMode.RunStartTime).ToString(@"m\:ss") : "",
+
+                    // Farming stats
+                    FarmStrategy = _mode is Modes.WaveFarm.WaveFarmMode ? "Wave Farm" : "",
+                    FarmRuns = (_mode as Modes.WaveFarm.WaveFarmMode)?.RunsCompleted ?? 0,
+                    FarmPhase = (_mode as Modes.WaveFarm.WaveFarmMode)?.Status ?? "",
 
                     // Labyrinth stats
                     LabIzaroEncounters = _labyrinthMode?.State.IzaroEncounterCount ?? 0,
@@ -1331,11 +1369,11 @@ namespace AutoExile
                     : (object)Array.Empty<float>();
                 snapshot.Mode.Extra["highestWave"] = sim.State.HighestWaveThisRun;
             }
-            else if (_mode is MappingMode map)
+            else if (_mode is Modes.WaveFarm.WaveFarmMode wf)
             {
-                snapshot.Mode.Phase = map.Phase.ToString();
-                snapshot.Mode.Status = map.Status;
-                snapshot.Mode.Decision = map.Decision;
+                snapshot.Mode.Status = wf.Status;
+                snapshot.Mode.Decision = wf.Decision;
+                snapshot.Mode.Extra["runsCompleted"] = wf.RunsCompleted;
             }
             else if (_mode is BlightMode blight)
             {
@@ -1543,6 +1581,7 @@ namespace AutoExile
         private DateTime _deathTime;
         private int _reviveDelayMs;
         private DateTime _lastReviveClickAt = DateTime.MinValue;
+        private DateTime _lastDismissAt = DateTime.MinValue;
         private readonly Random _rng = new();
 
         private bool HandleInterrupts()
@@ -1600,17 +1639,77 @@ namespace AutoExile
 
             _wasDead = false;
             _reviveDelayMs = 0; // re-randomize on next death
+
+            // Dismiss unexpected UI panels that block gameplay.
+            // Ritual shop, vendor windows, etc. can open from misclicks on overlapping entities.
+            try
+            {
+                var ui = gc.IngameState.IngameUi;
+
+                // Ritual shop — opened by clicking completed ritual altar (common misclick).
+                // Must click the X button (child [9]) — ritual shop does NOT close from world clicks.
+                if (ui.RitualWindow?.IsVisible == true)
+                {
+                    // Only dismiss if the active mode/strategy didn't intentionally open it.
+                    // Check: if we're in WaveFarm and the strategy is in RitualRewards phase, skip.
+                    bool intentional = _mode is Modes.WaveFarm.WaveFarmMode;
+                    // TODO: add a flag from strategy when it intentionally opens the shop
+
+                    if (!intentional && BotInput.CanAct &&
+                        (DateTime.Now - _lastDismissAt).TotalMilliseconds > 500)
+                    {
+                        var closeBtn = ui.RitualWindow.GetChildAtIndex(9);
+                        if (closeBtn?.IsVisible == true)
+                        {
+                            var rect = closeBtn.GetClientRect();
+                            if (rect.Width > 5)
+                            {
+                                var windowRect = gc.Window.GetWindowRectangleTimeCache;
+                                var center = new Vector2(
+                                    rect.X + rect.Width / 2 + windowRect.X,
+                                    rect.Y + rect.Height / 2 + windowRect.Y);
+                                BotInput.Click(center);
+                                _lastDismissAt = DateTime.Now;
+                                LogMessage("[AutoExile] Dismissing unexpected RitualShop (clicking X button)");
+                                return false;
+                            }
+                        }
+                    }
+                }
+
+                // Vendor/trade windows — close by clicking game world
+                if (ui.SellWindow?.IsVisible == true && BotInput.CanAct &&
+                    (DateTime.Now - _lastDismissAt).TotalMilliseconds > 500)
+                {
+                    var windowRect = gc.Window.GetWindowRectangle();
+                    var worldClickPos = new Vector2(
+                        windowRect.X + windowRect.Width * 0.5f,
+                        windowRect.Y + windowRect.Height * 0.4f);
+                    BotInput.Click(worldClickPos);
+                    _lastDismissAt = DateTime.Now;
+                    LogMessage("[AutoExile] Dismissing unexpected VendorWindow (clicking world)");
+                    return false;
+                }
+            }
+            catch { }
+
             return true;
         }
 
         public override void EntityAdded(Entity entity)
         {
+            _entityCache.OnEntityAdded(entity);
+            _threatMap.OnEntityAdded(entity);
+
             if (_blightMode != null && _mode == _blightMode)
                 _blightMode.OnEntityAdded(entity);
         }
 
         public override void EntityRemoved(Entity entity)
         {
+            _entityCache.OnEntityRemoved(entity);
+            _threatMap.OnEntityRemoved(entity);
+
             if (_blightMode != null && _mode == _blightMode && GameController?.Player != null)
             {
                 var playerPos = GameController.Player.GridPosNum;
@@ -1844,6 +1943,16 @@ namespace AutoExile
                         if (match != null)
                             Settings.Mapping.MapName.Value = match;
                     }
+                }
+
+                // Populate farming mode map dropdown with the same list
+                var savedFarmMap = Settings.Farming.MapName.Value;
+                Settings.Farming.MapName.SetListValues(mapNames);
+                if (!string.IsNullOrEmpty(savedFarmMap))
+                {
+                    var match = mapNames.FirstOrDefault(m =>
+                        m.TrimStart('\u2605', ' ') == savedFarmMap.TrimStart('\u2605', ' '));
+                    if (match != null) Settings.Farming.MapName.Value = match;
                 }
 
                 _mapListPopulated = true;

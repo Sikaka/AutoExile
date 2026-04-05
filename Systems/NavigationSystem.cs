@@ -421,10 +421,6 @@ namespace AutoExile.Systems
                 }
             }
 
-            // All input goes through BotInput — if gate is closed, skip this tick
-            if (!BotInput.CanAct)
-                return;
-
             // Get current waypoint and determine action
             var waypoint = CurrentNavPath[CurrentWaypointIndex];
             var windowRect = gc.Window.GetWindowRectangle();
@@ -432,6 +428,8 @@ namespace AutoExile.Systems
 
             if (waypoint.Action == WaypointAction.Blink && !inTown)
             {
+                // Blinks/dashes still use CursorPressKey (discrete action with gate)
+                if (!BotInput.CanAct) return;
                 var boundary = CurrentWaypointIndex > 0
                     ? CurrentNavPath[CurrentWaypointIndex - 1].Position
                     : playerGrid;
@@ -539,7 +537,13 @@ namespace AutoExile.Systems
                 absPos = new Vector2(windowRect.X + edgePoint.X, windowRect.Y + edgePoint.Y);
             }
 
-            BotInput.CursorPressKey(absPos, MoveKey);
+            // Continuous movement: hold the move key and update cursor position each tick.
+            // First call starts movement (KeyDown), subsequent calls just reposition cursor.
+            // This replaces the old pulse model: CursorPressKey → wait → CursorPressKey.
+            if (BotInput.IsMovementActive && !BotInput.IsMovementSuspended)
+                BotInput.UpdateMovementCursor(absPos);
+            else
+                BotInput.StartMovement(absPos, MoveKey);
         }
 
         private void ExecuteBlink(Vector2 screenPos, SharpDX.RectangleF windowRect,
@@ -1069,7 +1073,10 @@ namespace AutoExile.Systems
         public void Pause()
         {
             if (IsNavigating)
+            {
                 IsPaused = true;
+                BotInput.StopMovement(); // Release movement key while paused
+            }
         }
 
         /// <summary>
@@ -1107,6 +1114,7 @@ namespace AutoExile.Systems
             _stuckAtSameSpotCount = 0;
             _bestDistToWaypoint = float.MaxValue;
             _noProgressTimer = 0;
+            BotInput.StopMovement();
         }
 
         /// <summary>
@@ -1138,18 +1146,15 @@ namespace AutoExile.Systems
                     return false;
             }
 
-            if (!BotInput.CanAct)
-                return false;
-
             var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
             var windowRect = gc.Window.GetWindowRectangle();
 
-            // Try movement skills for speed if distance is long enough
-            if (TryDirectDash(gc, playerGrid, gridTarget, windowRect))
+            // Try movement skills for speed if distance is long enough (needs action gate)
+            if (BotInput.CanAct && TryDirectDash(gc, playerGrid, gridTarget, windowRect))
                 return true;
 
+            // Continuous movement doesn't need the action gate
             var screenPos = GridToScreen(gc, gridTarget);
-
             ExecuteWalk(screenPos, windowRect);
             return true;
         }

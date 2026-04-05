@@ -4,7 +4,7 @@ using System.Numerics;
 namespace AutoExile.Mechanics
 {
     /// <summary>
-    /// Owns all registered in-map mechanics. MappingMode calls into this each tick
+    /// Owns all registered in-map mechanics. WaveFarmMode calls into this each tick
     /// to detect, prioritize, and dispatch mechanic handling.
     /// Lives on BotContext so any mode can use it.
     /// </summary>
@@ -47,13 +47,13 @@ namespace AutoExile.Mechanics
 
         /// <summary>
         /// Check if all Required mechanics have been completed (or failed/abandoned).
-        /// Used by MappingMode to decide if map is "done".
+        /// Used by WaveFarmMode to decide if map is "done".
         /// For repeatable mechanics, "Required" means at least one completion.
         /// </summary>
         public bool AllRequiredComplete(BotSettings.MechanicsSettings settings)
         {
             // A Required mechanic is satisfied if: completed at least once, or not found.
-            // "Not found" is handled by MappingMode's coverage threshold — if 90%+ explored
+            // "Not found" is handled by WaveFarmMode's coverage threshold — if 90%+ explored
             // and mechanic not detected, it's not in this map.
             foreach (var m in _mechanics)
             {
@@ -113,7 +113,7 @@ namespace AutoExile.Mechanics
         }
 
         /// <summary>
-        /// Set a mechanic as the active one. MappingMode calls this when it decides
+        /// Set a mechanic as the active one. WaveFarmMode calls this when it decides
         /// to engage with a detected mechanic.
         /// </summary>
         public void SetActive(IMapMechanic mechanic)

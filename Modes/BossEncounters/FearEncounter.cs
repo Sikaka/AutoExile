@@ -30,12 +30,26 @@ namespace AutoExile.Modes.BossEncounters
         private const string FragmentPath = "CurrencyUberBossKeyAnger";
         private const string BossPath = "AngerBossUBER@";
 
-        // Pre-lay position SOUTH of boss — traps land directly on boss at (206,306).
-        private static readonly Vector2 DpsPosition = new(206, 320);
+        // Default pre-lay position SOUTH of boss — traps land directly on boss at (206,306).
+        private static readonly Vector2 DefaultDpsPosition = new(206, 320);
 
         // Re-entry: position to stand NORTH of the area transition so it's targetable.
         // Transition at (207,152) — must be at Y < ~155 to click it.
         private static readonly Vector2 TransitionApproachPos = new(207, 145);
+
+        private static Vector2 GetDpsPosition(BotSettings settings)
+        {
+            var text = settings.Boss.FearDpsPosition?.Value;
+            if (!string.IsNullOrWhiteSpace(text))
+            {
+                var parts = text.Split(',');
+                if (parts.Length == 2 &&
+                    float.TryParse(parts[0].Trim(), out var x) &&
+                    float.TryParse(parts[1].Trim(), out var y))
+                    return new Vector2(x, y);
+            }
+            return DefaultDpsPosition;
+        }
 
         // Orbit
         private const float OrbitRadius = 20f;
@@ -197,12 +211,13 @@ namespace AutoExile.Modes.BossEncounters
                 return TickReentryApproach(ctx, gc, playerGrid);
             }
 
-            // ── First entry: walk to DPS position south of boss ──
-            var distToDps = Vector2.Distance(playerGrid, DpsPosition);
+            // ── First entry: walk to DPS position ──
+            var dpsPos = GetDpsPosition(ctx.Settings);
+            var distToDps = Vector2.Distance(playerGrid, dpsPos);
             if (distToDps > 10)
             {
                 if (!ctx.Navigation.IsNavigating)
-                    ctx.Navigation.NavigateTo(gc, DpsPosition);
+                    ctx.Navigation.NavigateTo(gc, dpsPos);
                 Status = $"Moving to DPS position ({distToDps:F0}g)";
                 return BossEncounterResult.InProgress;
             }
@@ -323,9 +338,10 @@ namespace AutoExile.Modes.BossEncounters
                 return BossEncounterResult.InProgress;
             }
 
-            var distToDps = Vector2.Distance(playerGrid, DpsPosition);
+            var dpsPos2 = GetDpsPosition(ctx.Settings);
+            var distToDps = Vector2.Distance(playerGrid, dpsPos2);
             if (distToDps > 15 && !ctx.Navigation.IsNavigating)
-                ctx.Navigation.NavigateTo(gc, DpsPosition);
+                ctx.Navigation.NavigateTo(gc, dpsPos2);
 
             var elapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
             Status = _bossEmerged

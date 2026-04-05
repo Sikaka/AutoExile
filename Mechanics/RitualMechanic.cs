@@ -81,6 +81,10 @@ namespace AutoExile.Mechanics
         // ── Combat tracking ──
         private DateTime _lastCombatTime;
 
+        // ── Combat profile (saved/restored around encounter) ──
+        private CombatProfile? _savedCombatProfile;
+        private const float RitualLeashRadius = 40f; // grid units — ritual circle radius
+
         // ── Loot tracking ──
         private DateTime _lootStartTime;
         private DateTime _lastLootScan = DateTime.MinValue;
@@ -162,6 +166,7 @@ namespace AutoExile.Mechanics
                 {
                     ctx.Log($"[Ritual] Phase {_phase} timed out after {phaseTimeout}s");
                     Status = $"Timed out in {_phase}";
+                    RestoreRitualCombatProfile(ctx);
                     _phase = RitualPhase.Failed;
                     return MechanicResult.Failed;
                 }
@@ -208,6 +213,8 @@ namespace AutoExile.Mechanics
             _clickAttempts = 0;
             _pendingLootId = 0;
             _pendingLootName = null;
+            // Ensure combat profile is always restored on reset (covers abandon/fail/area change)
+            _savedCombatProfile = null;
         }
 
         // ══════════════════════════════════════════════════════════════
@@ -250,18 +257,37 @@ namespace AutoExile.Mechanics
                 return MechanicResult.Failed;
             }
 
-            // Check if already activated (state transitioned to 2)
+            // Check if already activated (state transitioned to 2 or 3)
             int state = GetAltarState(_altar);
             if (state == 2)
             {
                 _lastCombatTime = DateTime.Now;
-                SetPhase(RitualPhase.WaitForActivation, "Altar activated");
+                ApplyRitualCombatProfile(ctx);
+                SetPhase(RitualPhase.Fighting, "Altar already active — fighting!");
+                ctx.Log("[Ritual] Altar state=2 during click phase, jumping to fight");
                 return MechanicResult.InProgress;
             }
+            if (state == 3)
+            {
+                SetPhase(RitualPhase.Complete, "Altar already complete");
+                return MechanicResult.Complete;
+            }
 
+            // If altar is state 1 (fresh) but not targetable, we need to get closer
             if (!_altar.IsTargetable)
             {
-                SetPhase(RitualPhase.WaitForActivation, "Altar no longer targetable");
+                var gc2 = ctx.Game;
+                var playerGrid2 = new Vector2(gc2.Player.GridPosNum.X, gc2.Player.GridPosNum.Y);
+                var distToAltar = Vector2.Distance(playerGrid2, _altarGridPos);
+                if (distToAltar > 15f)
+                {
+                    // Too far — navigate closer
+                    ctx.Navigation.MoveToward(gc2, _altarGridPos);
+                    Status = $"Moving closer to altar ({distToAltar:F0}g)";
+                    return MechanicResult.InProgress;
+                }
+                // Close but not targetable — wait briefly, might be loading
+                Status = "Altar not targetable — waiting";
                 return MechanicResult.InProgress;
             }
 
@@ -296,6 +322,7 @@ namespace AutoExile.Mechanics
                 if (state == 2)
                 {
                     _lastCombatTime = DateTime.Now;
+                    ApplyRitualCombatProfile(ctx);
                     SetPhase(RitualPhase.Fighting, "Ritual active — fighting!");
                     ctx.Log("[Ritual] Encounter activated, fighting");
                     return MechanicResult.InProgress;
@@ -306,6 +333,7 @@ namespace AutoExile.Mechanics
             if (ctx.Combat.InCombat)
             {
                 _lastCombatTime = DateTime.Now;
+                ApplyRitualCombatProfile(ctx);
                 SetPhase(RitualPhase.Fighting, "Combat detected — fighting!");
                 ctx.Log("[Ritual] Combat started");
                 return MechanicResult.InProgress;
@@ -317,11 +345,96 @@ namespace AutoExile.Mechanics
 
         private MechanicResult TickFighting(BotContext ctx)
         {
+            var gc = ctx.Game;
+
+            // Combat fires skills — positioning is allowed (not suppressed)
+            ctx.Combat.SuppressPositioning = false;
             ctx.Combat.Tick(ctx);
+
+            // Scan loot periodically during combat — items drop from kills mid-encounter.
+            // Pick up items opportunistically between waves instead of waiting for loot phase.
+            // CRITICAL: Only loot items INSIDE the ritual circle. Items outside the blocker
+            // wall will cause the bot to path out of the encounter, getting stuck against the wall.
+            var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
+
+            if ((DateTime.Now - _lastLootScan).TotalMilliseconds >= 500)
+            {
+                ctx.Loot.Scan(gc);
+                _lastLootScan = DateTime.Now;
+            }
+
+            // Tick pending loot pickup
+            if (ctx.Interaction.IsBusy)
+            {
+                var result = ctx.Interaction.Tick(gc);
+                if (result == InteractionResult.Succeeded && _pendingLootName != null)
+                {
+                    ctx.LootTracker.RecordItem(_pendingLootName, _pendingLootValue, _pendingLootId);
+                    if (_pendingLootId > 0)
+                        ctx.Loot.MarkFailed(_pendingLootId, "picked up");
+                    ctx.Log($"[Ritual] Mid-fight pickup: {_pendingLootName} ({_pendingLootValue:F0}c)");
+                    _pendingLootName = null;
+                }
+                else if (result == InteractionResult.Failed && _pendingLootId > 0)
+                {
+                    ctx.Loot.MarkFailed(_pendingLootId);
+                    _pendingLootName = null;
+                }
+            }
+
+            // Pick up nearby loot when not busy — only items within the ritual circle
+            if (!ctx.Interaction.IsBusy && ctx.Loot.HasLootNearby)
+            {
+                // Filter candidates to items within leash radius of the altar
+                LootCandidate? bestCandidate = null;
+                foreach (var candidate in ctx.Loot.Candidates)
+                {
+                    var itemDist = Vector2.Distance(candidate.Entity.GridPosNum, _altarGridPos);
+                    if (itemDist > RitualLeashRadius) continue; // Outside ritual circle — skip
+                    bestCandidate = candidate;
+                    break; // Candidates are pre-sorted by priority
+                }
+
+                if (bestCandidate != null)
+                {
+                    ctx.Interaction.PickupGroundItem(bestCandidate.Entity, ctx.Navigation,
+                        requireProximity: bestCandidate.Entity.DistancePlayer > ctx.Interaction.InteractRadius);
+                    if (ctx.Interaction.IsBusy)
+                    {
+                        _pendingLootId = bestCandidate.Entity.Id;
+                        _pendingLootName = bestCandidate.ItemName;
+                        _pendingLootValue = bestCandidate.ChaosValue;
+                    }
+                }
+            }
 
             if (ctx.Combat.InCombat)
             {
                 _lastCombatTime = DateTime.Now;
+
+                // Actively navigate into the densest cluster of ritual monsters.
+                // Without this, the bot stands at the altar and only damages monsters
+                // that happen to walk into its range. For RF/melee this means nothing dies.
+                if (!ctx.Interaction.IsBusy) // Don't override loot pickup navigation
+                {
+                    var clusterCenter = ctx.Combat.DenseClusterCenter;
+                    var distToCluster = Vector2.Distance(playerGrid, clusterCenter);
+
+                    if (distToCluster > 8f)
+                    {
+                        // Clamp target to leash radius around altar
+                        var target = clusterCenter;
+                        var distFromAltar = Vector2.Distance(target, _altarGridPos);
+                        if (distFromAltar > RitualLeashRadius)
+                        {
+                            var dir = Vector2.Normalize(target - _altarGridPos);
+                            target = _altarGridPos + dir * RitualLeashRadius;
+                        }
+
+                        ctx.Navigation.MoveToward(gc, target);
+                    }
+                }
+
                 Status = $"[Combat] Fighting ritual monsters ({ctx.Combat.NearbyMonsterCount} nearby)";
 
                 // Reset phase timeout while actively fighting
@@ -338,6 +451,7 @@ namespace AutoExile.Mechanics
                     _completedCount++;
                     _lootStartTime = DateTime.Now;
                     _lastLootScan = DateTime.MinValue;
+                    RestoreRitualCombatProfile(ctx);
                     SetPhase(RitualPhase.Looting, "Ritual complete, looting");
                     ctx.Log($"[Ritual] Encounter complete ({_completedCount} done)");
                     return MechanicResult.InProgress;
@@ -404,16 +518,31 @@ namespace AutoExile.Mechanics
                     _pendingLootName = candidate.ItemName;
                     _pendingLootValue = candidate.ChaosValue;
                     Status = $"Picking up: {candidate.ItemName}";
-                    _lootStartTime = DateTime.Now;
+                    _lootStartTime = DateTime.Now; // Reset timer — still looting
                     return MechanicResult.InProgress;
                 }
             }
 
-            // Done looting after timeout
+            // Done looting after timeout — but ONLY if there's nothing left to grab.
+            // Ritual rewards can spawn with a 1-2s delay after encounter completion.
+            // If items are still on the ground, extend the sweep.
+            var totalLootTime = (DateTime.Now - _phaseStartTime).TotalSeconds;
             if (elapsed >= settings.LootSweepSeconds.Value)
             {
-                SetPhase(RitualPhase.Complete, "Loot sweep done");
-                ctx.Log("[Ritual] Loot sweep complete, encounter done");
+                // Re-scan one final time before giving up
+                ctx.Loot.Scan(gc);
+
+                if (ctx.Loot.HasLootNearby && totalLootTime < 15.0)
+                {
+                    // Still items nearby — keep looting, reset idle timer
+                    _lootStartTime = DateTime.Now;
+                    Status = $"Looting: items still on ground ({totalLootTime:F1}s total)";
+                    return MechanicResult.InProgress;
+                }
+
+                SetPhase(RitualPhase.Complete, ctx.Loot.HasLootNearby
+                    ? "Loot sweep hard cap (15s)" : "Loot sweep done");
+                ctx.Log($"[Ritual] Loot sweep complete ({totalLootTime:F1}s total)");
                 return MechanicResult.Complete;
             }
 
@@ -696,6 +825,43 @@ namespace AutoExile.Mechanics
             _phase = phase;
             _phaseStartTime = DateTime.Now;
             Status = status;
+        }
+
+        /// <summary>
+        /// Save the current combat profile and apply a leashed profile for the ritual circle.
+        /// Constrains combat positioning to stay within the ritual area around the altar.
+        /// </summary>
+        private void ApplyRitualCombatProfile(BotContext ctx)
+        {
+            if (_savedCombatProfile != null) return; // Already saved
+
+            _savedCombatProfile = new CombatProfile
+            {
+                Enabled = ctx.Combat.Profile.Enabled,
+                Positioning = ctx.Combat.Profile.Positioning,
+                LeashAnchor = ctx.Combat.Profile.LeashAnchor,
+                LeashRadius = ctx.Combat.Profile.LeashRadius,
+            };
+
+            ctx.Combat.SetProfile(new CombatProfile
+            {
+                Enabled = true,
+                Positioning = ctx.Combat.Profile.Positioning,
+                LeashAnchor = _altarGridPos,
+                LeashRadius = RitualLeashRadius,
+            });
+        }
+
+        /// <summary>
+        /// Restore the combat profile saved before the ritual encounter.
+        /// </summary>
+        private void RestoreRitualCombatProfile(BotContext ctx)
+        {
+            if (_savedCombatProfile != null)
+            {
+                ctx.Combat.SetProfile(_savedCombatProfile);
+                _savedCombatProfile = null;
+            }
         }
 
         private bool CanClick()
