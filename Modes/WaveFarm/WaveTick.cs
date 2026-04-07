@@ -60,7 +60,13 @@ namespace AutoExile.Modes.WaveFarm
         // are likely stale (LeftRange entities, unreachable mobs, essence mobs, etc.)
         private DateTime _huntStartTime = DateTime.MinValue;
         private int _huntStartKills;
-        private const double HuntStallTimeoutSeconds = 15.0; // seconds without kills before giving up
+        private const double HuntStallTimeoutSeconds = 5.0; // seconds without kills before giving up
+
+        // Background ThreatMap cleanup — periodically run ReconcileAll to prune stale
+        // LeftRange entities that the local Reconcile() (200g radius) never visits.
+        // This prevents the bot from getting stuck hunting phantom alive chunks.
+        private DateTime _lastFullReconcile = DateTime.MinValue;
+        private const double FullReconcileIntervalSeconds = 3.0;
 
         // Missed valuable loot — items that failed pickup but are worth going back for.
         // Stored as (gridPos, itemName, chaosValue, firstSeen) so we can navigate back.
@@ -104,6 +110,7 @@ namespace AutoExile.Modes.WaveFarm
             _lastCoverage = 0;
             _huntStartTime = DateTime.MinValue;
             _huntStartKills = 0;
+            _lastFullReconcile = DateTime.MinValue;
             _lastLootScan = DateTime.MinValue;
             _lastMechanicScan = DateTime.MinValue;
             Status = "";
@@ -474,6 +481,21 @@ namespace AutoExile.Modes.WaveFarm
             // Plan's MinCoverage overrides settings if set (> 0).
             var minCoverage = config.MinCoverage > 0 ? config.MinCoverage
                 : ctx.Settings.Farming.MinCoverage.Value;
+
+            // Background full reconcile — local Reconcile() only checks chunks within 200g
+            // of the player, so distant LeftRange entities accumulate forever. Run a global
+            // pass periodically when the bot has explored a significant portion of the map.
+            // This prevents the bot from getting stuck hunting phantom alive chunks.
+            if (ctx.ThreatMap.IsInitialized && coverage >= 0.5f &&
+                (DateTime.Now - _lastFullReconcile).TotalSeconds > FullReconcileIntervalSeconds)
+            {
+                int beforeAlive = ctx.ThreatMap.TotalAlive;
+                ctx.ThreatMap.ReconcileAll(ctx.Entities);
+                int afterAlive = ctx.ThreatMap.TotalAlive;
+                if (beforeAlive != afterAlive)
+                    ctx.Log($"[Wave] Background reconcile: alive {beforeAlive} -> {afterAlive}");
+                _lastFullReconcile = DateTime.Now;
+            }
 
             // Kill ratio check — if plan requires a minimum kill ratio, don't exit
             // exploration prematurely even if coverage is met.

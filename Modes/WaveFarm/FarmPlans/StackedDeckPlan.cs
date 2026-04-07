@@ -77,16 +77,11 @@ namespace AutoExile.Modes.WaveFarm.FarmPlans
                 return WaveAction.EngageMechanic(nextDeferred.Value);
             }
 
-            // All deferred mechanics handled (or none found) — check required mechanics
-            if (!ctx.Mechanics.AllRequiredComplete(ctx.Settings.Mechanics))
-            {
-                // Required mechanic not yet complete — keep exploring to find it
-                var target = ctx.Exploration.GetNextExplorationTarget(playerPos);
-                if (target.HasValue)
-                    return WaveAction.Explore(target.Value);
-            }
-
-            // Everything done — exit map
+            // No deferred work pending — exit map.
+            // Required mechanics (Wishes/Ritual) are enforced via engagement priority during
+            // exploration, not as a blocking condition here. Trying to enforce them at exit
+            // causes infinite loops when in sub-zones (mechanic state was reset on entry,
+            // so AllRequiredComplete always returns false even though we ARE doing the wishes).
             return null;
         }
 

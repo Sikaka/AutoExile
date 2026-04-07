@@ -149,8 +149,11 @@ namespace AutoExile.Modes.WaveFarm
 
                 if (_phase == WaveFarmPhase.InMap)
                 {
-                    // Save current zone's exploration + threat map state before transitioning
-                    _zoneCache.Save(_lastZoneHash, ctx.Exploration, ctx.ThreatMap, _wave);
+                    // Save current zone's exploration + threat map + mechanics state before transitioning.
+                    // Mechanics state matters: e.g., if Wishes was completed in the parent map (entered
+                    // the mirage portal), the parent zone's mechanic completion must persist across the
+                    // sub-zone round-trip so the bot doesn't think Wishes is still pending on return.
+                    _zoneCache.Save(_lastZoneHash, ctx.Exploration, ctx.ThreatMap, _wave, ctx.Mechanics);
                     ctx.Log($"[WaveFarm] Saved zone state for hash={_lastZoneHash} (coverage={ctx.Exploration.ActiveBlobCoverage:P0}, threats={ctx.ThreatMap.TotalAlive} alive)");
 
                     if (!_isInSubZone && currentHash != _parentZoneHash)
@@ -228,7 +231,7 @@ namespace AutoExile.Modes.WaveFarm
                     // WaveTick is reset first, then metrics are restored from cache if available.
                     _wave.Reset();
                     _wave.Initialize(_activePlan!);
-                    if (_zoneCache.TryRestore(currentHash, ctx.Exploration, ctx.ThreatMap, _wave))
+                    if (_zoneCache.TryRestore(currentHash, ctx.Exploration, ctx.ThreatMap, _wave, ctx.Mechanics))
                     {
                         ctx.Log($"[WaveFarm] Restored zone state for hash={currentHash} (coverage={ctx.Exploration.ActiveBlobCoverage:P0}, threats={ctx.ThreatMap.TotalAlive} alive)");
                     }

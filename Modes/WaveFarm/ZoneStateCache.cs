@@ -1,3 +1,4 @@
+using AutoExile.Mechanics;
 using AutoExile.Systems;
 
 namespace AutoExile.Modes.WaveFarm
@@ -19,7 +20,8 @@ namespace AutoExile.Modes.WaveFarm
         /// <summary>
         /// Save current zone state before transitioning away.
         /// </summary>
-        public void Save(long hash, ExplorationMap exploration, ThreatMap threatMap, WaveTick wave)
+        public void Save(long hash, ExplorationMap exploration, ThreatMap threatMap,
+            WaveTick wave, MapMechanicManager? mechanics = null)
         {
             var snapshot = new ZoneSnapshot
             {
@@ -27,6 +29,7 @@ namespace AutoExile.Modes.WaveFarm
                 SavedAt = DateTime.Now,
                 Exploration = exploration.CreateSnapshot(),
                 ThreatMap = threatMap.CreateSnapshot(),
+                Mechanics = mechanics?.CreateSnapshot(),
                 LootAttempts = wave.LootMetrics.PickupAttempts,
                 LootSuccesses = wave.LootMetrics.PickupSuccesses,
                 LootFailures = wave.LootMetrics.PickupsFailed,
@@ -39,15 +42,19 @@ namespace AutoExile.Modes.WaveFarm
 
         /// <summary>
         /// Try to restore a previously saved zone state. Returns true if found.
-        /// Restores exploration progress, threat map, and wave tick metrics.
+        /// Restores exploration progress, threat map, mechanics, and wave tick metrics.
         /// </summary>
-        public bool TryRestore(long hash, ExplorationMap exploration, ThreatMap threatMap, WaveTick wave)
+        public bool TryRestore(long hash, ExplorationMap exploration, ThreatMap threatMap,
+            WaveTick wave, MapMechanicManager? mechanics = null)
         {
             if (!_cache.TryGetValue(hash, out var snapshot))
                 return false;
 
             exploration.RestoreSnapshot(snapshot.Exploration);
             threatMap.RestoreSnapshot(snapshot.ThreatMap);
+
+            if (mechanics != null && snapshot.Mechanics != null)
+                mechanics.RestoreSnapshot(snapshot.Mechanics);
 
             // Restore cumulative loot metrics so the overlay stays accurate
             wave.LootMetrics.RestoreCounters(
@@ -92,6 +99,7 @@ namespace AutoExile.Modes.WaveFarm
         public DateTime SavedAt;
         public ExplorationSnapshot Exploration = null!;
         public ThreatMapSnapshot ThreatMap = null!;
+        public MechanicsSnapshot? Mechanics;
 
         // Cumulative loot metrics (not per-zone, but preserves the running total)
         public int LootAttempts;
