@@ -55,6 +55,13 @@ namespace AutoExile.Modes.WaveFarm
         private DateTime _lastCoverageProgress = DateTime.MinValue;
         private float _lastCoverage;
 
+        // Hunt stall detection — after coverage is met, track time since last kill.
+        // If hunting for too long without kills, the remaining ThreatMap alive counts
+        // are likely stale (LeftRange entities, unreachable mobs, essence mobs, etc.)
+        private DateTime _huntStartTime = DateTime.MinValue;
+        private int _huntStartKills;
+        private const double HuntStallTimeoutSeconds = 15.0; // seconds without kills before giving up
+
         // Missed valuable loot — items that failed pickup but are worth going back for.
         // Stored as (gridPos, itemName, chaosValue, firstSeen) so we can navigate back.
         private readonly List<MissedLootEntry> _missedLoot = new();
@@ -95,6 +102,8 @@ namespace AutoExile.Modes.WaveFarm
             _lastExplorePath = DateTime.MinValue;
             _lastCoverageProgress = DateTime.MinValue;
             _lastCoverage = 0;
+            _huntStartTime = DateTime.MinValue;
+            _huntStartKills = 0;
             _lastLootScan = DateTime.MinValue;
             _lastMechanicScan = DateTime.MinValue;
             Status = "";
@@ -227,23 +236,29 @@ namespace AutoExile.Modes.WaveFarm
             {
                 var dormantPath = ctx.Combat.NearestDormantPath;
 
-                // Track how long we've been close to this dormant entity
+                // Log when we first start approaching a new dormant entity
+                if (dormantPath != _dormantApproachPath)
+                    ctx.Log($"[Wave] Dormant detected: '{dormantPath}' at {ctx.Combat.NearestDormantDistance:F1}g, pos=({ctx.Combat.NearestDormantPos.Value.X:F0},{ctx.Combat.NearestDormantPos.Value.Y:F0})");
+
+                // Track how long we've been close to this dormant entity.
+                // Always ensure timer is initialized when close — previous logic had an edge
+                // case where _dormantApproachStart stayed at DateTime.MinValue, causing the
+                // timeout to never fire (elapsed overflowed to billions of seconds).
                 if (ctx.Combat.NearestDormantDistance < DormantCloseRange)
                 {
-                    if (_dormantApproachPath != dormantPath)
+                    // Ensure timer is always set when close (new entity or first close tick)
+                    if (_dormantApproachPath != dormantPath || _dormantApproachStart == DateTime.MinValue)
                     {
-                        // New dormant entity — reset timer
                         _dormantApproachStart = DateTime.Now;
                         _dormantApproachPath = dormantPath;
                     }
-                    else if (_dormantApproachStart != DateTime.MinValue &&
-                             (DateTime.Now - _dormantApproachStart).TotalSeconds > DormantTimeoutSeconds)
+
+                    var elapsed = (DateTime.Now - _dormantApproachStart).TotalSeconds;
+                    if (elapsed > DormantTimeoutSeconds)
                     {
                         // Timed out — this entity never activated. Learn to ignore its path.
                         if (!string.IsNullOrEmpty(dormantPath))
                         {
-                            // Extract the meaningful path segment (e.g. "Critters/Pigeon/Pigeon")
-                            // from full metadata path "Metadata/Critters/Pigeon/Pigeon"
                             var pathKey = dormantPath.Contains("/Monsters/")
                                 ? dormantPath.Substring(dormantPath.IndexOf("/Monsters/") + 10)
                                 : dormantPath.Contains("Metadata/")
@@ -260,7 +275,6 @@ namespace AutoExile.Modes.WaveFarm
                     {
                         // Still within timeout — keep approaching
                         ctx.Navigation.MoveToward(gc, ctx.Combat.NearestDormantPos.Value);
-                        var elapsed = (DateTime.Now - _dormantApproachStart).TotalSeconds;
                         Status = $"Approaching dormant monster ({ctx.Combat.NearestDormantDistance:F0}g, {elapsed:F0}s/{DormantTimeoutSeconds:F0}s)";
                         Decision = "ApproachDormant";
                         return false;
@@ -457,8 +471,20 @@ namespace AutoExile.Modes.WaveFarm
             // ThreatMap is a persistent, map-wide grid tracking every monster observed
             // during the run. Callback-driven (no entity list iteration). Provides
             // chunk-level density data for map-wide navigation decisions.
-            var minCoverage = ctx.Settings.Farming.MinCoverage.Value;
-            if (coverage < minCoverage)
+            // Plan's MinCoverage overrides settings if set (> 0).
+            var minCoverage = config.MinCoverage > 0 ? config.MinCoverage
+                : ctx.Settings.Farming.MinCoverage.Value;
+
+            // Kill ratio check — if plan requires a minimum kill ratio, don't exit
+            // exploration prematurely even if coverage is met.
+            bool killRatioMet = true;
+            if (config.MinKillRatio > 0 && ctx.ThreatMap.IsInitialized && ctx.ThreatMap.TotalTracked > 0)
+            {
+                float killRatio = (float)ctx.ThreatMap.TotalDead / ctx.ThreatMap.TotalTracked;
+                killRatioMet = killRatio >= config.MinKillRatio;
+            }
+
+            if (coverage < minCoverage || !killRatioMet)
             {
                 // Primary: ThreatMap densest alive chunk (map-wide, persistent)
                 if (ctx.ThreatMap.IsInitialized && ctx.ThreatMap.TotalAlive > 0)
@@ -488,8 +514,33 @@ namespace AutoExile.Modes.WaveFarm
 
             // P4b: Coverage met or exploration stalled — hunt remaining monsters.
             // Use ThreatMap for map-wide awareness, fall back to live combat data.
+            // Gated by hunt stall timeout: if no kills for HuntStallTimeoutSeconds,
+            // remaining alive counts are likely stale (LeftRange, essence mobs, unreachable)
+            // and we should stop wasting time and exit.
             if (ctx.ThreatMap.IsInitialized && ctx.ThreatMap.TotalAlive > 0)
             {
+                // Track hunt progress — reset when kills happen
+                if (_huntStartTime == DateTime.MinValue)
+                {
+                    _huntStartTime = DateTime.Now;
+                    _huntStartKills = ctx.ThreatMap.TotalDead;
+                }
+                else if (ctx.ThreatMap.TotalDead > _huntStartKills)
+                {
+                    // Making progress — reset timer
+                    _huntStartTime = DateTime.Now;
+                    _huntStartKills = ctx.ThreatMap.TotalDead;
+                }
+                else if ((DateTime.Now - _huntStartTime).TotalSeconds > HuntStallTimeoutSeconds)
+                {
+                    // Stalled — remaining monsters are likely unreachable or stale.
+                    // Force a global reconciliation to clean up ALL stale chunks,
+                    // then skip hunting and fall through to post-clear / exit.
+                    ctx.ThreatMap.ReconcileAll(ctx.Entities);
+                    ctx.Log($"[Wave] Hunt stalled: {ctx.ThreatMap.TotalAlive} alive (after reconcile) but no kills for {HuntStallTimeoutSeconds}s — exiting hunt");
+                    goto postHunt;
+                }
+
                 var huntTarget = ctx.ThreatMap.GetNearestAliveChunk(playerPos, minDistance: 15f);
                 if (huntTarget.HasValue && !IsFailedExploreTarget(huntTarget.Value))
                     return WaveAction.Explore(huntTarget.Value);
@@ -497,6 +548,8 @@ namespace AutoExile.Modes.WaveFarm
             if (ctx.Combat.NearestDormantPos.HasValue &&
                 !IsFailedExploreTarget(ctx.Combat.NearestDormantPos.Value))
                 return WaveAction.Explore(ctx.Combat.NearestDormantPos.Value);
+
+            postHunt:
 
             // P5: Post-clear plan actions
             var planAction = _plan.GetPostClearAction(ctx, _deferred);

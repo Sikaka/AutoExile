@@ -419,27 +419,33 @@ namespace AutoExile.Modes
                         : "following_new_path";
                 }
             }
-            else if (dist < StopDistance)
-            {
-                // Close enough — stop and idle
-                if (ctx.Navigation.IsNavigating)
-                    ctx.Navigation.Stop(gc);
-                _state = FollowerState.NearLeader;
-                _status = $"Near {LeaderName} (dist: {dist:F0})";
-                _decision = "near_leader";
-            }
             else
             {
-                // In the follow/stop gap, leader not actively moving away.
-                // Keep current navigation but don't start new.
-                if (!ctx.Navigation.IsNavigating)
+                // shouldFollow == false. We're either inside StopDistance OR in the
+                // (StopDistance .. FollowDistance) gap with leader not moving away.
+                // BOTH cases should hold position — stop movement.
+                //
+                // Critical: MoveToward() (LOS direct movement) does NOT set IsNavigating,
+                // so the old `if (IsNavigating) Stop()` guard never fired in LOS mode and
+                // the move key stayed held forever — causing the follower to walk past the
+                // leader on momentum, oscillating in/out of StopDistance.
+                //
+                // We unconditionally release the movement key here. NavigationSystem.Stop()
+                // calls BotInput.StopMovement() which is idempotent (safe to call repeatedly).
+                ctx.Navigation.Stop(gc);
+
+                if (dist < StopDistance)
                 {
-                    if (ctx.Navigation.HasWalkableLOS(gc, playerGridPos, leaderGridPos))
-                        ctx.Navigation.MoveToward(gc, leaderGridPos);
+                    _state = FollowerState.NearLeader;
+                    _status = $"Near {LeaderName} (dist: {dist:F0})";
+                    _decision = "near_leader";
                 }
-                _state = FollowerState.Following;
-                _status = $"Following {LeaderName} (dist: {dist:F0})";
-                _decision = "in_range";
+                else
+                {
+                    _state = FollowerState.Following;
+                    _status = $"Holding {LeaderName} (dist: {dist:F0})";
+                    _decision = "in_range_hold";
+                }
             }
         }
 

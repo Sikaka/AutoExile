@@ -79,6 +79,10 @@ namespace AutoExile.Modes.WaveFarm
                 return;
             }
 
+            // Apply plan's mechanic mode overrides
+            ctx.Mechanics.SetPlanOverrides(_activePlan.MechanicModeOverrides.Count > 0
+                ? _activePlan.MechanicModeOverrides : null);
+
             var gc = ctx.Game;
             _lastAreaName = gc.Area?.CurrentArea?.Name ?? "";
 
@@ -117,6 +121,8 @@ namespace AutoExile.Modes.WaveFarm
                     && newPlan != _activePlan)
                 {
                     _activePlan = newPlan;
+                    ctx.Mechanics.SetPlanOverrides(_activePlan.MechanicModeOverrides.Count > 0
+                        ? _activePlan.MechanicModeOverrides : null);
                     ctx.Log($"[WaveFarm] Plan changed to: {_activePlan.Name}");
                 }
             }
@@ -149,23 +155,58 @@ namespace AutoExile.Modes.WaveFarm
 
                     if (!_isInSubZone && currentHash != _parentZoneHash)
                     {
-                        // Entering sub-zone (wish/mirage)
-                        _parentZoneHash = _lastZoneHash;
-                        _isInSubZone = true;
+                        // Potential sub-zone entry — validate with concrete signals before
+                        // committing. Hash changes can happen within the same zone (wave events,
+                        // obelisk state changes) without being a mirage/wish zone transition.
+                        // Require exit button OR SekhemaPortal entity as proof.
+                        bool confirmedSubZone = false;
                         _exitPortalGridPos = null;
 
-                        // Cache SekhemaPortal position immediately — it may go out of
-                        // network range later but we need to know where to walk back to
-                        foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+                        var exitBtn = FindWishZoneExitButton(gc);
+                        if (exitBtn?.IsVisible == true)
                         {
-                            if (entity.Path != null && entity.Path.Contains("SekhemaPortal"))
+                            confirmedSubZone = true;
+                            ctx.Log("[WaveFarm] Sub-zone confirmed via exit button");
+                        }
+
+                        if (!confirmedSubZone)
+                        {
+                            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
                             {
-                                _exitPortalGridPos = entity.GridPosNum;
-                                ctx.Log($"[WaveFarm] Cached exit portal at ({entity.GridPosNum.X:F0},{entity.GridPosNum.Y:F0})");
-                                break;
+                                if (entity.Path != null && entity.Path.Contains("SekhemaPortal"))
+                                {
+                                    _exitPortalGridPos = entity.GridPosNum;
+                                    confirmedSubZone = true;
+                                    ctx.Log($"[WaveFarm] Sub-zone confirmed via SekhemaPortal at ({entity.GridPosNum.X:F0},{entity.GridPosNum.Y:F0})");
+                                    break;
+                                }
                             }
                         }
-                        ctx.Log($"[WaveFarm] Entered sub-zone — parent hash={_parentZoneHash}, exitPortal={(_exitPortalGridPos.HasValue ? "found" : "NOT FOUND")}");
+
+                        if (confirmedSubZone)
+                        {
+                            _parentZoneHash = _lastZoneHash;
+                            _isInSubZone = true;
+
+                            // Cache SekhemaPortal if not already found above
+                            if (!_exitPortalGridPos.HasValue)
+                            {
+                                foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+                                {
+                                    if (entity.Path != null && entity.Path.Contains("SekhemaPortal"))
+                                    {
+                                        _exitPortalGridPos = entity.GridPosNum;
+                                        ctx.Log($"[WaveFarm] Cached exit portal at ({entity.GridPosNum.X:F0},{entity.GridPosNum.Y:F0})");
+                                        break;
+                                    }
+                                }
+                            }
+                            ctx.Log($"[WaveFarm] Entered sub-zone — parent hash={_parentZoneHash}, exitPortal={(_exitPortalGridPos.HasValue ? "found" : "NOT FOUND")}");
+                        }
+                        else
+                        {
+                            ctx.Log($"[WaveFarm] Hash changed {_lastZoneHash} -> {currentHash} but no sub-zone signals — treating as same-zone hash change");
+                        }
                     }
                     else if (_isInSubZone && currentHash == _parentZoneHash)
                     {

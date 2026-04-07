@@ -67,6 +67,9 @@ namespace AutoExile.Systems
         public string LastSkillAction { get; set; } = "";
         public long? BestTargetId { get; set; }
         public bool WantsToMove { get; set; }
+        public Vector2? NearestDormantPos { get; set; }
+        public float NearestDormantDistance { get; set; }
+        public string? NearestDormantPath { get; set; }
     }
 
     public class ModeSnapshot
@@ -656,6 +659,12 @@ namespace AutoExile.Systems
                         ["lastSkillAction"] = snapshot.Combat.LastSkillAction,
                         ["bestTargetId"] = snapshot.Combat.BestTargetId ?? 0L,
                         ["wantsToMove"] = snapshot.Combat.WantsToMove,
+                        ["nearestDormantPos"] = snapshot.Combat.NearestDormantPos.HasValue
+                            ? new[] { Math.Round(snapshot.Combat.NearestDormantPos.Value.X, 1), Math.Round(snapshot.Combat.NearestDormantPos.Value.Y, 1) }
+                            : null,
+                        ["nearestDormantDistance"] = snapshot.Combat.NearestDormantPos.HasValue
+                            ? Math.Round(snapshot.Combat.NearestDormantDistance, 1) : -1.0,
+                        ["nearestDormantPath"] = snapshot.Combat.NearestDormantPath,
                     };
                 }
 

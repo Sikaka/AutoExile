@@ -65,6 +65,18 @@ namespace AutoExile.Modes.WaveFarm
 
         /// <summary>Max click attempts for loot pickup before marking failed and moving on.</summary>
         public int MaxLootClickAttempts { get; set; } = 2;
+
+        /// <summary>
+        /// Minimum exploration coverage to consider map "cleared enough" for post-clear actions.
+        /// 0 = use BotSettings.Farming.MinCoverage (user override). Values > 0 override the setting.
+        /// </summary>
+        public float MinCoverage { get; set; } = 0f;
+
+        /// <summary>
+        /// Minimum kill ratio (TotalDead / TotalTracked) before considering the map done.
+        /// 0 = no kill threshold. Combined with MinCoverage: both must be met.
+        /// </summary>
+        public float MinKillRatio { get; set; } = 0f;
     }
 
     /// <summary>

@@ -226,14 +226,45 @@ namespace AutoExile.Systems
                     {
                         var entityId = chunk.EntityIds[i];
                         if (!_tracked.TryGetValue(entityId, out var tracked)) continue;
-                        if (tracked.Status != MonsterStatus.Alive) continue;
+                        if (tracked.Status == MonsterStatus.Dead) continue;
 
-                        // Check live entity state
+                        // Check live entity state — covers both Alive and LeftRange.
+                        // LeftRange entities that despawned permanently (e.g. encounter totems)
+                        // won't re-enter the bubble, so their AliveCount stays inflated forever
+                        // unless we reconcile them here.
                         var entity = entities.Get(entityId);
                         if (entity == null || !entity.IsAlive)
                         {
                             MarkDead(entityId, tracked);
                         }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Reconcile ALL chunks regardless of distance to player.
+        /// Call when coverage is high and remaining alive counts are suspected stale.
+        /// More expensive than Reconcile() but cleans up distant LeftRange ghosts.
+        /// </summary>
+        public void ReconcileAll(EntityCache entities)
+        {
+            if (!IsInitialized || _chunks == null) return;
+
+            foreach (var chunk in _chunks)
+            {
+                if (chunk.AliveCount == 0) continue;
+
+                for (int i = chunk.EntityIds.Count - 1; i >= 0; i--)
+                {
+                    var entityId = chunk.EntityIds[i];
+                    if (!_tracked.TryGetValue(entityId, out var tracked)) continue;
+                    if (tracked.Status == MonsterStatus.Dead) continue;
+
+                    var entity = entities.Get(entityId);
+                    if (entity == null || !entity.IsAlive)
+                    {
+                        MarkDead(entityId, tracked);
                     }
                 }
             }

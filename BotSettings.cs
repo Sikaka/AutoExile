@@ -413,7 +413,7 @@ namespace AutoExile
         {
             public FarmingSettings()
             {
-                FarmStrategy.SetListValues(new List<string> { "Stacked Deck" });
+                FarmStrategy.SetListValues(new List<string> { "Stacked Deck", "Alch & Go" });
                 FarmStrategy.Value = "Stacked Deck";
 
                 MapName.SetListValues(new List<string> { "" });

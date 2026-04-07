@@ -40,6 +40,18 @@ namespace AutoExile.Mechanics
         public IReadOnlyDictionary<string, int> CompletionCounts => _completionCounts;
         private readonly Dictionary<string, int> _completionCounts = new();
 
+        /// <summary>
+        /// Active plan overrides for mechanic modes. Set by WaveFarmMode when a plan activates.
+        /// Takes priority over BotSettings when checking mechanic modes.
+        /// </summary>
+        private IReadOnlyDictionary<string, string>? _planOverrides;
+
+        /// <summary>Set plan-level mechanic mode overrides. Pass null to clear.</summary>
+        public void SetPlanOverrides(IReadOnlyDictionary<string, string>? overrides)
+        {
+            _planOverrides = overrides;
+        }
+
         public void Register(IMapMechanic mechanic)
         {
             _mechanics.Add(mechanic);
@@ -313,7 +325,12 @@ namespace AutoExile.Mechanics
 
         private MechanicMode GetMechanicMode(IMapMechanic mechanic, BotSettings.MechanicsSettings settings)
         {
-            // Map mechanic name to its settings mode
+            // Plan overrides take priority over user settings
+            if (_planOverrides != null &&
+                _planOverrides.TryGetValue(mechanic.Name, out var overrideMode))
+                return ParseMode(overrideMode);
+
+            // Fall back to user settings
             return mechanic.Name switch
             {
                 "Ultimatum" => ParseMode(settings.Ultimatum.Mode.Value),

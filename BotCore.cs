@@ -179,6 +179,7 @@ namespace AutoExile
             // Wave farming mode (recording-driven, forward-momentum model)
             var waveFarm = new Modes.WaveFarm.WaveFarmMode();
             waveFarm.Register(new Modes.WaveFarm.FarmPlans.AlchAndGoPlan());
+            waveFarm.Register(new Modes.WaveFarm.FarmPlans.StackedDeckPlan());
             RegisterMode(waveFarm);
 
             // Register in-map mechanics
@@ -1349,6 +1350,9 @@ namespace AutoExile
                 LastSkillAction = _combat.LastSkillAction,
                 BestTargetId = _combat.BestTarget?.Id,
                 WantsToMove = _combat.WantsToMove,
+                NearestDormantPos = _combat.NearestDormantPos,
+                NearestDormantDistance = _combat.NearestDormantDistance,
+                NearestDormantPath = _combat.NearestDormantPath,
             };
 
             // Active mode state

@@ -74,6 +74,31 @@ namespace AutoExile.Modes.WaveFarm
             return best;
         }
 
+        /// <summary>
+        /// Get the nearest unengaged deferred mechanic, ignoring plan timing.
+        /// Used by GetPostClearAction — we're already post-clear so timing is irrelevant.
+        /// </summary>
+        public DeferredEntry? GetNearestUnengaged(Vector2 playerPos)
+        {
+            DeferredEntry? best = null;
+            float bestDist = float.MaxValue;
+
+            for (int i = 0; i < _entries.Count; i++)
+            {
+                var entry = _entries[i];
+                if (entry.Engaged || entry.Mechanic.IsComplete) continue;
+
+                var dist = Vector2.Distance(playerPos, entry.GridPos);
+                if (dist < bestDist)
+                {
+                    bestDist = dist;
+                    best = entry;
+                }
+            }
+
+            return best;
+        }
+
         /// <summary>Mark a deferred mechanic as engaged (started).</summary>
         public void MarkEngaged(IMapMechanic mechanic)
         {

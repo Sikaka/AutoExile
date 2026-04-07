@@ -148,6 +148,7 @@ namespace AutoExile.Systems
         private readonly HashSet<string> _ignoredDormantPaths = new(StringComparer.OrdinalIgnoreCase)
         {
             "Critters/",   // Pigeons, rats, etc. — decorative, permanently untargetable
+            "Daemon/",     // Shrine daemons, effect daemons — visual-only, never targetable
         };
 
         /// <summary>Number of dormant paths learned this session (not counting pre-seeded).</summary>
@@ -455,10 +456,18 @@ namespace AutoExile.Systems
                 // Track dormant monsters (alive + hostile but not targetable yet).
                 // Map bosses need proximity to activate. Track nearest for approach navigation.
                 // Skip entities whose paths match the learned ignore list (critters, volatiles, etc.).
+                // Also validate the entity has a readable Life component — stale entity references
+                // from zone transitions can report IsAlive=true from garbage memory.
                 if (!entity.IsTargetable)
                 {
                     if (dist < nearestDormantDist && dist < combatRange && entity.Path != null)
                     {
+                        // Validate entity is real — stale refs from same-name zone transitions
+                        // (e.g. mirage zones) can have recycled memory with garbage properties.
+                        var life = entity.GetComponent<ExileCore.PoEMemory.Components.Life>();
+                        if (life == null || life.CurHP <= 0)
+                            goto skipDormant;
+
                         bool ignoredPath = false;
                         foreach (var ignored in _ignoredDormantPaths)
                         {
@@ -475,6 +484,7 @@ namespace AutoExile.Systems
                             nearestDormantPath = entity.Path;
                         }
                     }
+                    skipDormant:
                     continue;
                 }
 
