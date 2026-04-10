@@ -44,6 +44,16 @@ namespace AutoExile.Systems
         public string? TargetMapName { get; set; }
 
         /// <summary>
+        /// Direct atlas canvas element index for special maps not in AtlasNodes (e.g., Simulacrum).
+        /// When >= 0, bypasses the AtlasNodes file name lookup and clicks this canvas child directly.
+        /// -1 = use standard AtlasNodes lookup by TargetMapName.
+        /// </summary>
+        public int TargetCanvasIndex { get; set; } = -1;
+
+        /// <summary>Atlas canvas index for the Simulacrum node. Verified post-3.25+ patch.</summary>
+        public const int SimulacrumCanvasIndex = 165;
+
+        /// <summary>
         /// Minimum map tier to accept from the stash. 0 = any tier.
         /// </summary>
         public int MinMapTier { get; set; }
@@ -119,6 +129,7 @@ namespace AutoExile.Systems
             _mapFilter = null;
             _inventoryFragmentPath = null;
             TargetMapName = null;
+            TargetCanvasIndex = -1;
             MinMapTier = 0;
             Status = "Cancelled";
         }
@@ -479,7 +490,7 @@ namespace AutoExile.Systems
 
         /// <summary>
         /// Find and click the atlas node for the target map name.
-        /// Uses AtlasNodes file index + 2 to find the UI element.
+        /// Uses TargetCanvasIndex (direct) or AtlasNodes file index + 2 to find the UI element.
         /// </summary>
         private MapDeviceResult TickSelectAtlasNode(GameController gc, Element atlas)
         {
@@ -490,33 +501,6 @@ namespace AutoExile.Systems
                 return MapDeviceResult.Failed;
             }
 
-            // Find the atlas node index for the target map name
-            var nodes = gc.Files?.AtlasNodes?.EntriesList;
-            if (nodes == null || nodes.Count == 0)
-            {
-                Status = "[Select] AtlasNodes not loaded";
-                return MapDeviceResult.InProgress;
-            }
-
-            int nodeIndex = -1;
-            for (int i = 0; i < Math.Min(nodes.Count, 110); i++)
-            {
-                var name = nodes[i].Area?.Name;
-                if (name != null && name.Equals(TargetMapName, StringComparison.OrdinalIgnoreCase))
-                {
-                    nodeIndex = i;
-                    break;
-                }
-            }
-
-            if (nodeIndex < 0)
-            {
-                Status = $"[Select] Map '{TargetMapName}' not found in AtlasNodes";
-                _phase = MapDevicePhase.Idle;
-                return MapDeviceResult.Failed;
-            }
-
-            // UI element index = file index + 2
             var canvas = atlas.GetChildAtIndex(0);
             if (canvas == null)
             {
@@ -524,7 +508,43 @@ namespace AutoExile.Systems
                 return MapDeviceResult.InProgress;
             }
 
-            var uiIndex = nodeIndex + 2;
+            int uiIndex;
+            if (TargetCanvasIndex >= 0)
+            {
+                // Direct canvas index for special maps (Simulacrum, etc.) not in AtlasNodes
+                uiIndex = TargetCanvasIndex;
+            }
+            else
+            {
+                // Standard lookup via AtlasNodes file
+                var nodes = gc.Files?.AtlasNodes?.EntriesList;
+                if (nodes == null || nodes.Count == 0)
+                {
+                    Status = "[Select] AtlasNodes not loaded";
+                    return MapDeviceResult.InProgress;
+                }
+
+                int nodeIndex = -1;
+                for (int i = 0; i < Math.Min(nodes.Count, 110); i++)
+                {
+                    var name = nodes[i].Area?.Name;
+                    if (name != null && name.Equals(TargetMapName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        nodeIndex = i;
+                        break;
+                    }
+                }
+
+                if (nodeIndex < 0)
+                {
+                    Status = $"[Select] Map '{TargetMapName}' not found in AtlasNodes";
+                    _phase = MapDevicePhase.Idle;
+                    return MapDeviceResult.Failed;
+                }
+
+                uiIndex = nodeIndex + 2;
+            }
+
             if (uiIndex >= canvas.ChildCount)
             {
                 Status = $"[Select] Atlas node UI index {uiIndex} out of range ({canvas.ChildCount} children)";

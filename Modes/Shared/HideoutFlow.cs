@@ -20,6 +20,7 @@ namespace AutoExile.Modes.Shared
         private Func<Element, bool>? _mapFilter;
         private Func<ServerInventory.InventSlotItem, bool>? _stashItemFilter;
         private string? _targetMapName;
+        private int _targetCanvasIndex = -1;
         private string? _inventoryFragmentPath;
         private int _minMapTier;
         private int _stashItemThreshold; // only stash when item count >= this (0 = always stash)
@@ -41,7 +42,8 @@ namespace AutoExile.Modes.Shared
         /// </summary>
         public void Start(Func<Element, bool> mapFilter,
             Func<ServerInventory.InventSlotItem, bool>? stashItemFilter = null,
-            string? targetMapName = null, int minMapTier = 0,
+            string? targetMapName = null, int targetCanvasIndex = -1,
+            int minMapTier = 0,
             string? inventoryFragmentPath = null,
             int stashItemThreshold = 0,
             string? dumpTabName = null,
@@ -53,6 +55,7 @@ namespace AutoExile.Modes.Shared
             _mapFilter = mapFilter;
             _stashItemFilter = stashItemFilter;
             _targetMapName = targetMapName;
+            _targetCanvasIndex = targetCanvasIndex;
             _inventoryFragmentPath = inventoryFragmentPath;
             _minMapTier = minMapTier;
             _stashItemThreshold = stashItemThreshold;
@@ -103,6 +106,7 @@ namespace AutoExile.Modes.Shared
             _mapFilter = null;
             _stashItemFilter = null;
             _targetMapName = null;
+            _targetCanvasIndex = -1;
             _inventoryFragmentPath = null;
             _minMapTier = 0;
             _stashItemThreshold = 0;
@@ -218,6 +222,7 @@ namespace AutoExile.Modes.Shared
                 ctx.MapDevice.Cancel(ctx.Game, ctx.Navigation);
 
             ctx.MapDevice.TargetMapName = _targetMapName;
+            ctx.MapDevice.TargetCanvasIndex = _targetCanvasIndex;
             ctx.MapDevice.MinMapTier = _minMapTier;
 
             if (_mapFilter != null && !ctx.MapDevice.Start(_mapFilter, _inventoryFragmentPath))
