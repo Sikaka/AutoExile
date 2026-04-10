@@ -44,16 +44,6 @@ namespace AutoExile.Systems
         public string? TargetMapName { get; set; }
 
         /// <summary>
-        /// Direct atlas canvas element index for special maps not in AtlasNodes (e.g., Simulacrum).
-        /// When >= 0, bypasses the AtlasNodes file name lookup and clicks this canvas child directly.
-        /// -1 = use standard AtlasNodes lookup by TargetMapName.
-        /// </summary>
-        public int TargetCanvasIndex { get; set; } = -1;
-
-        /// <summary>Atlas canvas index for the Simulacrum node. Verified post-3.25+ patch.</summary>
-        public const int SimulacrumCanvasIndex = 165;
-
-        /// <summary>
         /// Minimum map tier to accept from the stash. 0 = any tier.
         /// </summary>
         public int MinMapTier { get; set; }
@@ -129,7 +119,6 @@ namespace AutoExile.Systems
             _mapFilter = null;
             _inventoryFragmentPath = null;
             TargetMapName = null;
-            TargetCanvasIndex = -1;
             MinMapTier = 0;
             Status = "Cancelled";
         }
@@ -490,7 +479,9 @@ namespace AutoExile.Systems
 
         /// <summary>
         /// Find and click the atlas node for the target map name.
-        /// Uses TargetCanvasIndex (direct) or AtlasNodes file index + 2 to find the UI element.
+        /// Uses AtlasNodes file index + 2 to find the UI element.
+        /// For special maps not in AtlasNodes (e.g., Simulacrum), falls back to
+        /// right-clicking a matching fragment from the stash to auto-select the node.
         /// </summary>
         private MapDeviceResult TickSelectAtlasNode(GameController gc, Element atlas)
         {
@@ -501,30 +492,11 @@ namespace AutoExile.Systems
                 return MapDeviceResult.Failed;
             }
 
-            var canvas = atlas.GetChildAtIndex(0);
-            if (canvas == null)
+            // Try standard AtlasNodes name lookup
+            var nodes = gc.Files?.AtlasNodes?.EntriesList;
+            int nodeIndex = -1;
+            if (nodes != null)
             {
-                Status = "[Select] Atlas canvas not found";
-                return MapDeviceResult.InProgress;
-            }
-
-            int uiIndex;
-            if (TargetCanvasIndex >= 0)
-            {
-                // Direct canvas index for special maps (Simulacrum, etc.) not in AtlasNodes
-                uiIndex = TargetCanvasIndex;
-            }
-            else
-            {
-                // Standard lookup via AtlasNodes file
-                var nodes = gc.Files?.AtlasNodes?.EntriesList;
-                if (nodes == null || nodes.Count == 0)
-                {
-                    Status = "[Select] AtlasNodes not loaded";
-                    return MapDeviceResult.InProgress;
-                }
-
-                int nodeIndex = -1;
                 for (int i = 0; i < Math.Min(nodes.Count, 110); i++)
                 {
                     var name = nodes[i].Area?.Name;
@@ -534,52 +506,99 @@ namespace AutoExile.Systems
                         break;
                     }
                 }
+            }
 
-                if (nodeIndex < 0)
+            if (nodeIndex >= 0)
+            {
+                // Found in AtlasNodes — click the canvas node directly
+                var canvas = atlas.GetChildAtIndex(0);
+                if (canvas == null)
                 {
-                    Status = $"[Select] Map '{TargetMapName}' not found in AtlasNodes";
+                    Status = "[Select] Atlas canvas not found";
+                    return MapDeviceResult.InProgress;
+                }
+
+                var uiIndex = nodeIndex + 2;
+                if (uiIndex >= canvas.ChildCount)
+                {
+                    Status = $"[Select] Atlas node UI index {uiIndex} out of range ({canvas.ChildCount} children)";
                     _phase = MapDevicePhase.Idle;
                     return MapDeviceResult.Failed;
                 }
 
-                uiIndex = nodeIndex + 2;
-            }
+                var nodeElement = canvas.GetChildAtIndex(uiIndex);
+                if (nodeElement == null)
+                {
+                    Status = $"[Select] Atlas node element is null at index {uiIndex}";
+                    return MapDeviceResult.InProgress;
+                }
 
-            if (uiIndex >= canvas.ChildCount)
-            {
-                Status = $"[Select] Atlas node UI index {uiIndex} out of range ({canvas.ChildCount} children)";
-                _phase = MapDevicePhase.Idle;
-                return MapDeviceResult.Failed;
-            }
+                // Check if node is on screen
+                var nodeRect = nodeElement.GetClientRect();
+                var nodeCenter = new Vector2(nodeRect.Center.X, nodeRect.Center.Y);
+                var windowRect = gc.Window.GetWindowRectangle();
 
-            var nodeElement = canvas.GetChildAtIndex(uiIndex);
-            if (nodeElement == null)
-            {
-                Status = $"[Select] Atlas node element is null at index {uiIndex}";
+                if (nodeCenter.X < 0 || nodeCenter.X > windowRect.Width ||
+                    nodeCenter.Y < 0 || nodeCenter.Y > windowRect.Height)
+                {
+                    Status = $"[Select] {TargetMapName} node is off-screen — center atlas on the map first";
+                    _phase = MapDevicePhase.Idle;
+                    return MapDeviceResult.Failed;
+                }
+
+                var absPos = new Vector2(windowRect.X + nodeCenter.X, windowRect.Y + nodeCenter.Y);
+                if (!BotInput.Click(absPos))
+                    return MapDeviceResult.InProgress;
+
+                _lastActionTime = DateTime.Now;
+                _nodeClickAttempts++;
+                Status = $"[Select] Clicking {TargetMapName} node (attempt {_nodeClickAttempts})";
                 return MapDeviceResult.InProgress;
             }
 
-            // Check if node is on screen
-            var nodeRect = nodeElement.GetClientRect();
-            var nodeCenter = new Vector2(nodeRect.Center.X, nodeRect.Center.Y);
-            var windowRect = gc.Window.GetWindowRectangle();
-
-            if (nodeCenter.X < 0 || nodeCenter.X > windowRect.Width ||
-                nodeCenter.Y < 0 || nodeCenter.Y > windowRect.Height)
+            // Not in AtlasNodes (special map like Simulacrum) — right-click a matching
+            // fragment from the stash to auto-select the correct atlas node.
+            if (_mapFilter == null)
             {
-                Status = $"[Select] {TargetMapName} node is off-screen — center atlas on the map first";
+                Status = $"[Select] Map '{TargetMapName}' not found in AtlasNodes and no map filter set";
                 _phase = MapDevicePhase.Idle;
                 return MapDeviceResult.Failed;
             }
 
-            var absPos = new Vector2(windowRect.X + nodeCenter.X, windowRect.Y + nodeCenter.Y);
-            if (!BotInput.Click(absPos))
-                return MapDeviceResult.InProgress; // gate blocked, retry next tick
+            if (!CanAct()) return MapDeviceResult.InProgress;
 
-            _lastActionTime = DateTime.Now;
-            _nodeClickAttempts++;
-            Status = $"[Select] Clicking {TargetMapName} node (attempt {_nodeClickAttempts})";
-            return MapDeviceResult.InProgress;
+            var mapStash = atlas.GetChildFromIndices(MapStashPath);
+            if (mapStash == null)
+            {
+                Status = "[Select] Map stash not found for right-click select";
+                _phase = MapDevicePhase.Idle;
+                return MapDeviceResult.Failed;
+            }
+
+            for (int i = 0; i < mapStash.ChildCount; i++)
+            {
+                var item = mapStash.GetChildAtIndex(i);
+                if (item == null || item.Type != ElementType.InventoryItem)
+                    continue;
+                if (!_mapFilter(item))
+                    continue;
+
+                var rect = item.GetClientRect();
+                var windowRect2 = gc.Window.GetWindowRectangle();
+                var clickPos = BotInput.RandomizeWithinRect(rect);
+                var absPos2 = new Vector2(windowRect2.X + clickPos.X, windowRect2.Y + clickPos.Y);
+                if (BotInput.RightClick(absPos2))
+                {
+                    _lastActionTime = DateTime.Now;
+                    _nodeClickAttempts++;
+                    Status = $"[Select] Right-clicking fragment to select {TargetMapName} (attempt {_nodeClickAttempts})";
+                }
+                return MapDeviceResult.InProgress;
+            }
+
+            Status = $"[Select] No matching fragments in stash to select {TargetMapName}";
+            _phase = MapDevicePhase.Idle;
+            return MapDeviceResult.Failed;
         }
 
         // --- Phase: Click activate ---

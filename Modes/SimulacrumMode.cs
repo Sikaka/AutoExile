@@ -179,8 +179,7 @@ namespace AutoExile.Modes
                         _phase = SimPhase.InHideout;
                         _phaseStartTime = DateTime.Now;
                         _hideoutFlow.Start(MapDeviceSystem.IsSimulacrum,
-                        targetMapName: "Simulacrum",
-                        targetCanvasIndex: MapDeviceSystem.SimulacrumCanvasIndex);
+                        targetMapName: "Simulacrum");
                         StatusText = "No portal found — starting new run";
                     }
                     break;
@@ -238,8 +237,7 @@ namespace AutoExile.Modes
                     _mapCompleted = false;
                     _lootTracker.ResetCount();
                     _hideoutFlow.Start(MapDeviceSystem.IsSimulacrum,
-                        targetMapName: "Simulacrum",
-                        targetCanvasIndex: MapDeviceSystem.SimulacrumCanvasIndex);
+                        targetMapName: "Simulacrum");
                     StatusText = "Back in hideout — starting new run";
                 }
                 else if (_state.DeathCount > 0 && _state.DeathCount < _settings.MaxDeaths.Value)
@@ -259,8 +257,7 @@ namespace AutoExile.Modes
                     _phaseStartTime = DateTime.Now;
                     _lootTracker.ResetCount();
                     _hideoutFlow.Start(MapDeviceSystem.IsSimulacrum,
-                        targetMapName: "Simulacrum",
-                        targetCanvasIndex: MapDeviceSystem.SimulacrumCanvasIndex);
+                        targetMapName: "Simulacrum");
                     StatusText = "Too many deaths — starting new run";
                 }
                 else
@@ -268,8 +265,7 @@ namespace AutoExile.Modes
                     _phase = SimPhase.InHideout;
                     _phaseStartTime = DateTime.Now;
                     _hideoutFlow.Start(MapDeviceSystem.IsSimulacrum,
-                        targetMapName: "Simulacrum",
-                        targetCanvasIndex: MapDeviceSystem.SimulacrumCanvasIndex);
+                        targetMapName: "Simulacrum");
                 }
             }
             else
