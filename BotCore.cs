@@ -166,8 +166,6 @@ namespace AutoExile
             RegisterMode(_heistMode);
             _labyrinthMode = new LabyrinthMode();
             RegisterMode(_labyrinthMode);
-            RegisterMode(new PathBenchmarkMode());
-            RegisterMode(new LegionResetterMode());
             _bossMode = new BossMode();
             _bossMode.Register(new KingEncounter());
             _bossMode.Register(new OshabiEncounter());
@@ -648,18 +646,15 @@ namespace AutoExile
                 ?? (_mode as HeistMode)?.Phase.ToString()
                 ?? (_mode as LabyrinthMode)?.Phase.ToString()
                 ?? (_mode as FollowerMode)?.State.ToString()
-                ?? (_mode as PathBenchmarkMode)?.IsRunning.ToString()
                 ?? (_mode as BossMode)?.Phase.ToString()
                 ?? "",
                 (_mode as Modes.WaveFarm.WaveFarmMode)?.Decision
                 ?? (_mode as SimulacrumMode)?.Decision
                 ?? (_mode as HeistMode)?.Decision
                 ?? (_mode as FollowerMode)?.Decision
-                ?? (_mode as PathBenchmarkMode)?.Decision
                 ?? (_mode as BossMode)?.Decision
                 ?? "",
                 (_mode as Modes.WaveFarm.WaveFarmMode)?.Status
-                ?? (_mode as PathBenchmarkMode)?.Status
                 ?? (_mode as BossMode)?.Status
                 ?? "",
                 _navigation, _interaction, _loot, _threat);
@@ -1928,28 +1923,7 @@ namespace AutoExile
                 mapNames.Sort((a, b) =>
                     a.TrimStart('\u2605', ' ').CompareTo(b.TrimStart('\u2605', ' ')));
 
-                // Save value before SetListValues — it resets Value to first item
-                var savedMapName = Settings.Mapping.MapName.Value;
-                Settings.Mapping.MapName.SetListValues(mapNames);
-
-                // Restore saved selection
-                if (!string.IsNullOrEmpty(savedMapName))
-                {
-                    if (mapNames.Contains(savedMapName))
-                    {
-                        Settings.Mapping.MapName.Value = savedMapName;
-                    }
-                    else
-                    {
-                        // Try to match without the ★ prefix (prefix may have changed)
-                        var plain = savedMapName.TrimStart('\u2605', ' ');
-                        var match = mapNames.FirstOrDefault(m => m.TrimStart('\u2605', ' ') == plain);
-                        if (match != null)
-                            Settings.Mapping.MapName.Value = match;
-                    }
-                }
-
-                // Populate farming mode map dropdown with the same list
+                // Populate farming mode map dropdown
                 var savedFarmMap = Settings.Farming.MapName.Value;
                 Settings.Farming.MapName.SetListValues(mapNames);
                 if (!string.IsNullOrEmpty(savedFarmMap))

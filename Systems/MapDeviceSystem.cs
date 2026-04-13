@@ -354,6 +354,12 @@ namespace AutoExile.Systems
                     }
                     else
                     {
+                        // Device panel may still be loading after a right-click — wait before retrying
+                        if ((DateTime.Now - _lastActionTime).TotalSeconds < 2.0)
+                        {
+                            Status = $"[Select] Device panel open, waiting for name to update (got: {nameEl?.Text ?? "null"})";
+                            return MapDeviceResult.InProgress;
+                        }
                         // Wrong map selected — click the correct node
                         return TickSelectAtlasNode(gc, atlas);
                     }
@@ -565,7 +571,13 @@ namespace AutoExile.Systems
                 return MapDeviceResult.Failed;
             }
 
-            if (!CanAct()) return MapDeviceResult.InProgress;
+            // Longer cooldown for right-click selection — game needs time to open the device panel
+            const float RightClickSelectCooldownMs = 1500;
+            if ((DateTime.Now - _lastActionTime).TotalMilliseconds < RightClickSelectCooldownMs)
+            {
+                Status = $"[Select] Waiting for device panel after right-click ({_nodeClickAttempts}/{MaxClickAttempts})";
+                return MapDeviceResult.InProgress;
+            }
 
             var mapStash = atlas.GetChildFromIndices(MapStashPath);
             if (mapStash == null)

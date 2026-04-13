@@ -247,10 +247,9 @@ tr:hover td { background:var(--surface2); }
       </div>
       <div class="controls">
         <select id="modeSelect" class="mode-select">
-          <option>Idle</option><option>Mapping</option><option>Farming</option><option>Wave Farming</option><option>Simulacrum</option>
-          <option>Blight</option><option>Heist</option><option>Labyrinth</option>
-          <option>Follower</option><option>Boss</option><option>5-Way Resetter</option>
-          <option>Path Benchmark</option>
+          <option>Idle</option><option>Wave Farming</option><option>Simulacrum</option>
+          <option>Blight</option><option value="Heist">Heist (WIP)</option><option>Labyrinth</option>
+          <option>Follower</option><option>Boss</option>
         </select>
         <button class="btn primary" onclick="sendCmd('start')">Start</button>
         <button class="btn danger" onclick="sendCmd('stop')">Stop</button>
@@ -636,7 +635,7 @@ function updateDashboard(s) {
 
   // Farming stats — show card only when mode is Farming
   const farmCard = document.getElementById('farmCard');
-  if (s.mode === 'Farming') {
+  if (s.mode === 'Wave Farming') {
     farmCard.style.display = '';
     document.getElementById('farmRuns').textContent = s.farmRuns;
     document.getElementById('farmPhase').textContent = s.farmPhase || '-';
@@ -672,9 +671,9 @@ function updateDashboard(s) {
   }
 
   // Conditional dashboard visibility based on mode
-  const noExplore = ['Simulacrum','5-Way Resetter','Follower','Path Benchmark','Idle'];
+  const noExplore = ['Simulacrum','Follower','Idle'];
   document.getElementById('explorationCard').style.display = noExplore.includes(s.mode) ? 'none' : '';
-  document.getElementById('statMapsDone').style.display = ['Mapping','Farming','Wave Farming'].includes(s.mode) ? '' : 'none';
+  document.getElementById('statMapsDone').style.display = ['Wave Farming'].includes(s.mode) ? '' : 'none';
   document.getElementById('labGemCard').style.display = s.mode === 'Labyrinth' ? '' : 'none';
 
   // Minimap phase overlay
@@ -1120,14 +1119,13 @@ const TOWER_TYPES = ['chilling','fireball','empowering','seismic','minion','shoc
 
 // Mode-to-settings mapping for the Active Mode tab
 const MODE_SETTINGS = {
-  Mapping:     { sections: ['mapping'], mechanics: ['interactables','ultimatum','harvest','wishes','essence','ritual','eldritchAltar'] },
+  'Wave Farming': { sections: ['farming'], mechanics: ['interactables','ultimatum','harvest','wishes','essence','ritual','eldritchAltar'] },
   Simulacrum:  { sections: ['simulacrum'], mechanics: [] },
   Blight:      { sections: ['blight'], mechanics: [] },
   Heist:       { sections: ['heist'], mechanics: [] },
   Labyrinth:   { sections: ['labyrinth'], mechanics: [] },
   Boss:        { sections: ['boss'], mechanics: [] },
   Follower:    { sections: ['follower'], mechanics: [] },
-  '5-Way Resetter': { sections: ['legionResetter'], mechanics: [] },
 };
 
 let currentBotMode = 'Idle';
@@ -1164,9 +1162,9 @@ function renderModeTab(container, modeName) {
 
   // Mode-specific settings
   for (const section of cfg.sections) {
-    if (section === 'mapping') {
-      addSection(container, 'Mapping', [['mapping.mapName'],['mapping.minMapTier'],['mapping.portalKey'],
-        ['mapping.minPackDensity'],['mapping.detourForRares'],['mapping.maxDetourDistance']]);
+    if (section === 'farming') {
+      addSection(container, 'Farming', [['farming.mapName'],['farming.minMapTier'],['farming.portalKey'],
+        ['farming.farmStrategy']]);
     } else if (section === 'simulacrum') {
       addSection(container, 'Simulacrum', [['simulacrum.maxDeaths'],['simulacrum.minWaveDelaySeconds'],
         ['simulacrum.waveTimeoutMinutes'],['simulacrum.stashItemThreshold']]);

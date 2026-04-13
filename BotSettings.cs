@@ -74,10 +74,6 @@ namespace AutoExile
 
         public LootSettings Loot { get; set; } = new LootSettings();
 
-        // --- Mapping (mode-specific) ---
-
-        public MappingSettings Mapping { get; set; } = new MappingSettings();
-
         // --- Follower (mode-specific) ---
 
         public FollowerSettings Follower { get; set; } = new FollowerSettings();
@@ -97,10 +93,6 @@ namespace AutoExile
         // --- Labyrinth (mode-specific) ---
 
         public LabyrinthSettings Labyrinth { get; set; } = new LabyrinthSettings();
-
-        // --- 5-Way Resetter (mode-specific) ---
-
-        public LegionResetterSettings LegionResetter { get; set; } = new LegionResetterSettings();
 
         // --- Threat / Dodge ---
 
@@ -295,31 +287,6 @@ namespace AutoExile
 
             [Menu("Buff/Debuff Name", "Name to match in buff list (substring, case-insensitive). Used with OnlyWhenBuffMissing to check player buffs or target debuffs. Use Scan to discover.")]
             public TextNode BuffDebuffName { get; set; } = new TextNode("");
-        }
-
-        [Submenu(CollapsedByDefault = true)]
-        public class MappingSettings
-        {
-            [Menu("Map Name", "Which map to farm. Supported maps (marked with ★) have boss location data for faster clears.")]
-            public ListNode MapName { get; set; } = new ListNode();
-
-            [Menu("Min Map Tier", "Minimum map tier to pick from stash when inserting. 0 = any tier.")]
-            public RangeNode<int> MinMapTier { get; set; } = new RangeNode<int>(0, 0, 16);
-
-            [Menu("Portal Key", "Hotkey for portal scroll in-game. Used to open a portal when exiting maps.")]
-            public HotkeyNode PortalKey { get; set; } = new HotkeyNode(Keys.F);
-
-            [Menu("Min Pack Density", "Minimum nearby monsters to interrupt exploration. Below this, skills fire while walking.")]
-            public RangeNode<int> MinPackDensity { get; set; } = new RangeNode<int>(8, 1, 30);
-
-            [Menu("Detour For Rares", "Always interrupt exploration to fight rare/unique monsters within detour range.")]
-            public ToggleNode DetourForRares { get; set; } = new ToggleNode(true);
-
-            [Menu("Max Detour Distance", "Max grid distance to chase a rare/unique from current path. Beyond this, keep exploring.")]
-            public RangeNode<int> MaxDetourDistance { get; set; } = new RangeNode<int>(60, 10, 150);
-
-            [Menu("Min Coverage", "Minimum map exploration % before considering map complete. Set to 0 for pure mechanic farming (rush target → exit).")]
-            public RangeNode<float> MinCoverage { get; set; } = new RangeNode<float>(0.70f, 0f, 1f);
         }
 
         [Submenu(CollapsedByDefault = true)]
@@ -1154,22 +1121,6 @@ namespace AutoExile
 
             [Menu("Dodge Cooldown (ms)", "Minimum time between dodge movements.")]
             public RangeNode<int> DodgeCooldownMs { get; set; } = new RangeNode<int>(500, 100, 2000);
-        }
-
-        [Submenu(CollapsedByDefault = true)]
-        public class LegionResetterSettings
-        {
-            [Menu("Idle Position X", "Grid X to stand at while waiting for leader. Use 'Set' button to capture current position.")]
-            public RangeNode<int> IdlePositionX { get; set; } = new RangeNode<int>(608, 0, 2000);
-
-            [Menu("Idle Position Y", "Grid Y to stand at while waiting for leader.")]
-            public RangeNode<int> IdlePositionY { get; set; } = new RangeNode<int>(611, 0, 2000);
-
-            [Menu("Leader Attack Threshold (s)", "How long the leader must attack continuously before we start the circle dance. Prevents false starts from misclicks.")]
-            public RangeNode<float> LeaderAttackThresholdSeconds { get; set; } = new RangeNode<float>(2f, 0.5f, 10f);
-
-            [Menu("Spawn Delay (s)", "How long to stand in the circle before dashing out. ~3s for standard spawn trigger.")]
-            public RangeNode<float> SpawnDelaySeconds { get; set; } = new RangeNode<float>(3f, 1f, 10f);
         }
 
     }
