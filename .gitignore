@@ -2,6 +2,11 @@
 bin/
 obj/
 
+AutoExile.Replay/
+USER BRANCH/
+Docs/
+
+
 # Logs
 Logs/
 
