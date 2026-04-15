@@ -60,10 +60,23 @@ namespace AutoExile.Systems
         /// <summary>How many fragments to withdraw (ctrl+clicks). Each click withdraws one stack unit.</summary>
         public int WithdrawCount { get; set; }
 
+        /// <summary>
+        /// Multi-item withdrawal queue. Processed sequentially within the same stash
+        /// session: switch to <see cref="WithdrawTabName"/> once, then for each entry
+        /// find the matching item and ctrl+click <c>Count</c> times.
+        ///
+        /// When non-empty, this REPLACES the single-item <see cref="WithdrawFragmentPath"/>
+        /// + <see cref="WithdrawCount"/> path. The single-item fields stay supported for
+        /// existing Boss/Simulacrum callers; multi-item is for Wave Farming where one
+        /// stash trip pulls scarabs + portal scrolls + maybe maps in one go.
+        /// </summary>
+        public List<(string PathSubstring, int Count)> WithdrawList { get; set; } = new();
+
         // Tab switching state
         private string? _pendingTabSwitch;
         private StashPhase _afterTabSwitch;
         private int _withdrawsRemaining;
+        private int _withdrawListIndex; // which entry of WithdrawList we're processing
 
         // Incubator state
         private bool _cursorHasIncubator;
@@ -74,10 +87,40 @@ namespace AutoExile.Systems
         public bool IsBusy => _phase != StashPhase.Idle;
         public int ItemsStored => _itemsStored;
 
-        public bool Start()
+        /// <summary>
+        /// Begin a stash interaction. All configurable fields (store tab, withdraw tab,
+        /// fragment path, count, filter) reset to the supplied arguments — they do NOT
+        /// inherit from a previous Start(). This prevents callers (e.g. between-wave
+        /// stashing) from accidentally re-running fragment withdrawal that was set up
+        /// for a prior hideout flow.
+        /// </summary>
+        public bool Start(
+            string? storeTabName = null,
+            string? withdrawTabName = null,
+            string? withdrawFragmentPath = null,
+            int withdrawCount = 0,
+            Func<ServerInventory.InventSlotItem, bool>? itemFilter = null,
+            IReadOnlyList<(string PathSubstring, int Count)>? withdrawList = null)
         {
             if (_phase != StashPhase.Idle)
                 return false;
+
+            // Reset config — every Start() is a clean slate.
+            StoreTabName         = storeTabName;
+            WithdrawTabName      = withdrawTabName;
+            WithdrawFragmentPath = withdrawFragmentPath;
+            WithdrawCount        = withdrawCount;
+            ItemFilter           = itemFilter;
+
+            // Multi-item path: if a list is supplied, that wins over the single-item
+            // fields. The single-item API is kept for Boss/Sim where fragmentPath/count
+            // is the entire withdrawal — no need to construct a list for one item.
+            WithdrawList.Clear();
+            if (withdrawList != null && withdrawList.Count > 0)
+                foreach (var w in withdrawList)
+                    if (w.Count > 0 && !string.IsNullOrWhiteSpace(w.PathSubstring))
+                        WithdrawList.Add((w.PathSubstring, w.Count));
+            _withdrawListIndex = 0;
 
             _phase = StashPhase.NavigateToStash;
             _phaseStartTime = DateTime.Now;
@@ -106,9 +149,56 @@ namespace AutoExile.Systems
             WithdrawTabName = null;
             WithdrawFragmentPath = null;
             WithdrawCount = 0;
+            WithdrawList.Clear();
+            _withdrawListIndex = 0;
             _pendingTabSwitch = null;
             _incubatorBatchRunning = false;
             Status = "Cancelled";
+        }
+
+        /// <summary>
+        /// Navigate to stash and open it — but don't deposit or withdraw anything.
+        /// Returns Succeeded once the stash panel is open, Failed if unable to open.
+        /// Used by StashIndexer to get the stash open before scanning.
+        /// </summary>
+        public StashResult TickOpenOnly(GameController gc, NavigationSystem nav)
+        {
+            if (gc.IngameState.IngameUi.StashElement?.IsVisible == true)
+            {
+                _phase = StashPhase.Idle;
+                return StashResult.Succeeded;
+            }
+
+            if (_phase == StashPhase.Idle)
+            {
+                _phase = StashPhase.NavigateToStash;
+                _phaseStartTime = DateTime.Now;
+                _lastActionTime = DateTime.MinValue;
+                // Clear all store/withdraw settings so nothing is deposited
+                ItemFilter = _ => false;
+                StoreTabName = null;
+                WithdrawTabName = null;
+                WithdrawFragmentPath = null;
+                WithdrawCount = 0;
+                WithdrawList.Clear();
+                _withdrawListIndex = 0;
+            }
+
+            if ((DateTime.Now - _phaseStartTime).TotalSeconds > BasePhaseTimeoutSeconds + ExtraLatencySec)
+            {
+                _phase = StashPhase.Idle;
+                return StashResult.Failed;
+            }
+
+            if ((DateTime.Now - _lastActionTime).TotalMilliseconds < ActionCooldownMs)
+                return StashResult.InProgress;
+
+            return _phase switch
+            {
+                StashPhase.NavigateToStash => TickNavigate(gc, nav),
+                StashPhase.OpenStash => TickOpenStash(gc),
+                _ => StashResult.InProgress,
+            };
         }
 
         public StashResult Tick(GameController gc, NavigationSystem nav)
@@ -206,12 +296,26 @@ namespace AutoExile.Systems
         /// <summary>Decide what to do first once stash is open.</summary>
         private void EnterFirstStashPhase(GameController gc)
         {
-            // Withdraw fragments first (if configured)
+            // Multi-item path takes precedence — wave farming withdraws scarabs +
+            // portal scrolls + maybe maps in one stash trip.
+            if (!string.IsNullOrEmpty(WithdrawTabName) && WithdrawList.Count > 0)
+            {
+                _pendingTabSwitch = WithdrawTabName;
+                _afterTabSwitch = StashPhase.WithdrawItems;
+                _phase = StashPhase.SwitchToWithdrawTab;
+                _phaseStartTime = DateTime.Now;
+                _withdrawListIndex = 0;
+                _withdrawsRemaining = WithdrawList[0].Count;
+                Status = $"Switching to {WithdrawTabName} tab for {WithdrawList.Count} items";
+                return;
+            }
+
+            // Single-item path — Boss/Sim fragment withdrawal.
             if (!string.IsNullOrEmpty(WithdrawTabName) && !string.IsNullOrEmpty(WithdrawFragmentPath) && WithdrawCount > 0)
             {
                 _pendingTabSwitch = WithdrawTabName;
                 _afterTabSwitch = StashPhase.WithdrawItems;
-    
+
                 _phase = StashPhase.SwitchToWithdrawTab;
                 _phaseStartTime = DateTime.Now;
                 _withdrawsRemaining = WithdrawCount;
@@ -360,59 +464,114 @@ namespace AutoExile.Systems
                 return StashResult.Failed;
             }
 
-            // If a batch is running, wait for it
+            // Wait for any in-flight batch to complete before evaluating again.
+            // The batch holds Ctrl down across all clicks; we don't want to start a
+            // second batch while one is mid-flight or it'll race with Ctrl release.
             if (BotInput.IsBatchRunning)
                 return StashResult.InProgress;
 
-            if (_withdrawsRemaining <= 0 || string.IsNullOrEmpty(WithdrawFragmentPath))
+            // Resolve the current target — either WithdrawList[index] (multi-item)
+            // or the legacy single-item path. The two are mutually exclusive at Start().
+            string? currentPath;
+            int wantTotal;
+            if (WithdrawList.Count > 0)
             {
-                EnterStorePhase(gc);
+                if (_withdrawListIndex >= WithdrawList.Count)
+                {
+                    EnterStorePhase(gc);
+                    return StashResult.InProgress;
+                }
+                currentPath = WithdrawList[_withdrawListIndex].PathSubstring;
+                wantTotal   = WithdrawList[_withdrawListIndex].Count;
+            }
+            else
+            {
+                currentPath = WithdrawFragmentPath;
+                wantTotal   = WithdrawCount;
+            }
+
+            if (wantTotal <= 0 || string.IsNullOrEmpty(currentPath))
+            {
+                AdvanceOrFinishWithdraw(gc);
                 return StashResult.InProgress;
             }
 
-            // Find the fragment in the visible stash tab
+            // Inventory-aware stopping — bail when we have enough. Handles BOTH
+            // stackable items (one ctrl+click transfers the whole stack) and
+            // non-stackable items (one ctrl+click per slot).
+            int haveInInv = CountInventoryItems(gc, currentPath);
+            if (haveInInv >= wantTotal)
+            {
+                AdvanceOrFinishWithdraw(gc);
+                return StashResult.InProgress;
+            }
+
+            // Settle window after each batch — gives the UI time to update so
+            // CountInventoryItems reflects the just-transferred items before we
+            // launch another batch.
+            if ((DateTime.Now - _lastActionTime).TotalMilliseconds < ActionCooldownMs)
+                return StashResult.InProgress;
+
+            // Find ALL matching items in the visible stash tab. Batch-clicking ONE
+            // position N times only works for stacks; for non-stackable items
+            // (maps) each one occupies a different slot and we need to click each.
             var items = stashEl.VisibleStash?.VisibleInventoryItems;
             if (items == null)
             {
                 Status = "No items visible in withdraw tab";
-                EnterStorePhase(gc);
+                AdvanceOrFinishWithdraw(gc);
                 return StashResult.InProgress;
             }
 
-            // Build list of positions — click the same fragment stack N times
             var windowRect = gc.Window.GetWindowRectangle();
-            SharpDX.RectangleF fragmentRect = default;
-            bool found = false;
+            var positions = new List<Vector2>();
             foreach (var item in items)
             {
                 var entity = item.Entity;
-                if (entity?.Path?.Contains(WithdrawFragmentPath, StringComparison.OrdinalIgnoreCase) == true)
+                if (entity?.Path?.Contains(currentPath, StringComparison.OrdinalIgnoreCase) == true)
                 {
-                    fragmentRect = item.GetClientRect();
-                    found = true;
-                    break;
+                    var rect = item.GetClientRect();
+                    positions.Add(new Vector2(
+                        windowRect.X + rect.Center.X,
+                        windowRect.Y + rect.Center.Y));
                 }
             }
 
-            if (!found)
+            if (positions.Count == 0)
             {
-                Status = $"Fragment '{WithdrawFragmentPath}' not found in stash";
-                EnterStorePhase(gc);
+                Status = $"'{currentPath}' not found in tab ({haveInInv}/{wantTotal} have) — skipping";
+                AdvanceOrFinishWithdraw(gc);
                 return StashResult.InProgress;
             }
 
-            var absPos = new Vector2(windowRect.X + fragmentRect.Center.X, windowRect.Y + fragmentRect.Center.Y);
-            var positions = new List<Vector2>();
-            for (int i = 0; i < _withdrawsRemaining; i++)
-                positions.Add(absPos);
-
-            Status = $"Withdrawing {_withdrawsRemaining} fragments...";
-            var remaining = _withdrawsRemaining;
-            BotInput.CtrlClickBatch(positions, count =>
-            {
-                _withdrawsRemaining = remaining - count;
-            });
+            Status = $"Withdrawing '{currentPath}' ({haveInInv}/{wantTotal}, {positions.Count} stash slots)";
+            // CtrlClickBatch holds Ctrl down across every click in one async pass,
+            // then releases. Items get transferred (stacks fully, single items one-per-click).
+            // After the batch completes, IsBatchRunning flips back to false; the
+            // settle window above lets inventory state catch up before we re-evaluate.
+            BotInput.CtrlClickBatch(positions);
+            _lastActionTime = DateTime.Now;
             return StashResult.InProgress;
+        }
+
+        /// <summary>
+        /// After a withdrawal batch completes (or the item wasn't found), move to
+        /// the next entry in <see cref="WithdrawList"/>, or transition to storing
+        /// items if we've exhausted the list.
+        /// </summary>
+        private void AdvanceOrFinishWithdraw(GameController gc)
+        {
+            if (WithdrawList.Count > 0)
+            {
+                _withdrawListIndex++;
+                if (_withdrawListIndex < WithdrawList.Count)
+                {
+                    _withdrawsRemaining = WithdrawList[_withdrawListIndex].Count;
+                    Status = $"Next withdrawal: {WithdrawList[_withdrawListIndex].PathSubstring}";
+                    return; // stay in WithdrawItems phase, next tick processes the next item
+                }
+            }
+            EnterStorePhase(gc);
         }
 
         private StashResult TickStoreItems(GameController gc)

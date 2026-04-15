@@ -10,6 +10,9 @@
   <ItemGroup>
     <Compile Remove="Tests\**" />
     <Compile Remove="AutoExile.Replay\**" />
+    <Compile Remove="USER BRANCH\**" />
+    <EmbeddedResource Remove="USER BRANCH\**" />
+    <None Remove="USER BRANCH\**" />
   </ItemGroup>
 
   <ItemGroup>

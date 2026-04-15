@@ -60,6 +60,9 @@ namespace AutoExile
         [Menu("Debug Incubator Overlay", "Show equipment slot indices and stash item rects when inventory/stash is open.")]
         public ToggleNode DebugIncubatorOverlay { get; set; } = new ToggleNode(false);
 
+        [Menu("Debug Perf Overlay", "Show per-section tick timings (avg/max ms) and loot/interaction/explore failure tallies during wave farming.")]
+        public ToggleNode DebugPerfOverlay { get; set; } = new ToggleNode(false);
+
         [Menu("Interact Radius", "Grid distance at which the bot can click entities, items, stash, map device, etc.")]
         public RangeNode<int> InteractRadius { get; set; } = new RangeNode<int>(20, 10, 80);
 
@@ -109,6 +112,30 @@ namespace AutoExile
         // --- Boss Mode ---
 
         public BossSettings Boss { get; set; } = new BossSettings();
+
+        // --- Run (shared across all modes that run+exit a zone) ---
+
+        public RunSettings Run { get; set; } = new RunSettings();
+
+        // --- Stash (shared across all modes) ---
+
+        public StashSettings Stash { get; set; } = new StashSettings();
+
+        // --- Map Rolling (shared by anything that withdraws + rolls maps) ---
+
+        public MapRollingSettings MapRolling { get; set; } = new MapRollingSettings();
+
+        // --- Map Device (shared slot config for atlas inserts) ---
+
+        public MapDeviceSettings MapDevice { get; set; } = new MapDeviceSettings();
+
+        // --- Faustus Currency Exchange ---
+
+        public FaustusSettings Faustus { get; set; } = new FaustusSettings();
+
+        // --- Notifications (Discord webhook) ---
+
+        public NotificationSettings Notifications { get; set; } = new NotificationSettings();
 
         // =====================================================================
         // Submenu classes
@@ -397,12 +424,6 @@ namespace AutoExile
             [Menu("Map Name", "Which map to farm.")]
             public ListNode MapName { get; set; } = new ListNode();
 
-            [Menu("Min Map Tier", "Minimum map tier to pick from stash. 0 = any tier.")]
-            public RangeNode<int> MinMapTier { get; set; } = new RangeNode<int>(0, 0, 16);
-
-            [Menu("Portal Key", "Hotkey for portal scroll in-game.")]
-            public HotkeyNode PortalKey { get; set; } = new HotkeyNode(Keys.F);
-
             [Menu("Min Pack Density", "Weighted monster density to interrupt exploration. Rares count as 5, Uniques as 8. Set to 0 to never detour for packs. Lower = more aggressive engagement (good for RF/melee).")]
             public RangeNode<int> MinPackDensity { get; set; } = new RangeNode<int>(5, 0, 30);
 
@@ -415,14 +436,6 @@ namespace AutoExile
             [Menu("Min Coverage", "Minimum map exploration % before clearing is considered done. Higher = more thorough clear.")]
             public RangeNode<float> MinCoverage { get; set; } = new RangeNode<float>(0.85f, 0f, 1f);
 
-            // ── Map rolling ──
-
-            [Menu("Dangerous Map Mods", "Comma-separated mod group names to avoid. Maps with these mods get rerolled. Use group names from ExplicitMod.Group (e.g. MapElementalReflect, MapPhysicalReflect, MapNoRegen, MapHexproof, MapCannotLeech).")]
-            public TextNode DangerousMapMods { get; set; } = new TextNode("MapElementalReflect,MapPhysicalReflect,MapNoRegen,MapCannotLeech");
-
-            [Menu("Min Map Quantity", "Minimum item quantity % on maps before running. 0 = don't check. Maps below this get rerolled.")]
-            public RangeNode<int> MinMapQuantity { get; set; } = new RangeNode<int>(0, 0, 150);
-
             // ── Atlas setup (pre-populated by strategy defaults, user can override) ──
 
             [Menu("Witness Type", "Which endgame witness to use. Strategies pre-populate this but you can override.")]
@@ -430,43 +443,6 @@ namespace AutoExile
 
             [Menu("Atlas Tree Preset", "Which atlas passive tree preset to use (1-3). 0 = don't switch.")]
             public RangeNode<int> AtlasTreePreset { get; set; } = new RangeNode<int>(0, 0, 3);
-
-            [Menu("Scarab Slot 1", "Scarab name for map device slot 1. Empty = no scarab. Strategy provides defaults.")]
-            public TextNode ScarabSlot1 { get; set; } = new TextNode("");
-
-            [Menu("Scarab Slot 2", "Scarab name for map device slot 2.")]
-            public TextNode ScarabSlot2 { get; set; } = new TextNode("");
-
-            [Menu("Scarab Slot 3", "Scarab name for map device slot 3.")]
-            public TextNode ScarabSlot3 { get; set; } = new TextNode("");
-
-            [Menu("Scarab Slot 4", "Scarab name for map device slot 4.")]
-            public TextNode ScarabSlot4 { get; set; } = new TextNode("");
-
-            [Menu("Scarab Slot 5", "Scarab name for map device slot 5. Requires 5th slot unlocked.")]
-            public TextNode ScarabSlot5 { get; set; } = new TextNode("");
-
-            /// <summary>Helper to read all scarab slots as a list (non-empty only).</summary>
-            public List<string> GetScarabList()
-            {
-                var list = new List<string>();
-                if (!string.IsNullOrWhiteSpace(ScarabSlot1.Value)) list.Add(ScarabSlot1.Value.Trim());
-                if (!string.IsNullOrWhiteSpace(ScarabSlot2.Value)) list.Add(ScarabSlot2.Value.Trim());
-                if (!string.IsNullOrWhiteSpace(ScarabSlot3.Value)) list.Add(ScarabSlot3.Value.Trim());
-                if (!string.IsNullOrWhiteSpace(ScarabSlot4.Value)) list.Add(ScarabSlot4.Value.Trim());
-                if (!string.IsNullOrWhiteSpace(ScarabSlot5.Value)) list.Add(ScarabSlot5.Value.Trim());
-                return list;
-            }
-
-            /// <summary>Set scarab slots from a list (used by strategy defaults).</summary>
-            public void SetScarabDefaults(IReadOnlyList<string> scarabs)
-            {
-                ScarabSlot1.Value = scarabs.Count > 0 ? scarabs[0] : "";
-                ScarabSlot2.Value = scarabs.Count > 1 ? scarabs[1] : "";
-                ScarabSlot3.Value = scarabs.Count > 2 ? scarabs[2] : "";
-                ScarabSlot4.Value = scarabs.Count > 3 ? scarabs[3] : "";
-                ScarabSlot5.Value = scarabs.Count > 4 ? scarabs[4] : "";
-            }
 
             // ── Per-strategy settings ──
 
@@ -508,26 +484,8 @@ namespace AutoExile
             [Menu("Boss Type", "Which boss encounter to farm.")]
             public ListNode BossType { get; set; } = new ListNode();
 
-            [Menu("Max Deaths", "Abandon run after this many deaths.")]
-            public RangeNode<int> MaxDeaths { get; set; } = new RangeNode<int>(3, 1, 10);
-
-            [Menu("Loot Sweep Timeout (s)", "Max seconds picking up loot after boss kill.")]
-            public RangeNode<float> LootSweepTimeoutSeconds { get; set; } = new RangeNode<float>(5f, 3f, 60f);
-
-            [Menu("Stash When Items >=", "Only stash between runs when inventory has at least this many items. 0 = always stash.")]
-            public RangeNode<int> StashItemThreshold { get; set; } = new RangeNode<int>(10, 0, 30);
-
-            [Menu("Dump Tab", "Stash tab to deposit loot into. Empty = use current tab.")]
-            public ListNode DumpTabName { get; set; } = new ListNode { Value = "Dump" };
-
-            [Menu("Resource Tab", "Stash tab to withdraw fragments from. Empty = skip withdrawal.")]
-            public ListNode ResourceTabName { get; set; } = new ListNode { Value = "Fragment" };
-
             [Menu("Fragment Stock", "Keep this many fragments in inventory. Withdraws from resource tab to maintain stock.")]
             public RangeNode<int> FragmentStock { get; set; } = new RangeNode<int>(20, 1, 60);
-
-            [Menu("Portal Key", "Hotkey for portal scroll to exit boss zone.")]
-            public HotkeyNode PortalKey { get; set; } = new HotkeyNode(Keys.F);
 
             [Menu("Key Drop Value (chaos)", "Assumed chaos value per key drop for profit tracking. Set to the average unidentified value of the target item.")]
             public RangeNode<int> KeyDropChaosValue { get; set; } = new RangeNode<int>(15, 0, 500);
@@ -539,17 +497,14 @@ namespace AutoExile
         [Submenu(CollapsedByDefault = true)]
         public class SimulacrumSettings
         {
-            [Menu("Max Deaths", "Abandon run after this many deaths. Start new simulacrum.")]
-            public RangeNode<int> MaxDeaths { get; set; } = new RangeNode<int>(3, 1, 10);
-
             [Menu("Min Wave Delay (s)", "Minimum seconds to wait between wave end and next wave start.")]
             public RangeNode<float> MinWaveDelaySeconds { get; set; } = new RangeNode<float>(5f, 1f, 30f);
 
             [Menu("Wave Timeout (min)", "Max minutes per wave before abandoning the run.")]
             public RangeNode<float> WaveTimeoutMinutes { get; set; } = new RangeNode<float>(3f, 1f, 10f);
 
-            [Menu("Stash Item Threshold", "Stash items between waves when inventory has this many items.")]
-            public RangeNode<int> StashItemThreshold { get; set; } = new RangeNode<int>(5, 1, 30);
+            [Menu("Simulacrum Stock", "Keep this many full Simulacrums in inventory. Withdraws from the central Fragment tab (Stash settings) to maintain stock between runs.")]
+            public RangeNode<int> SimulacrumStock { get; set; } = new RangeNode<int>(5, 1, 20);
         }
 
         [Submenu(CollapsedByDefault = true)]
@@ -662,9 +617,6 @@ namespace AutoExile
 
             [Menu("Izaro Timeout (s)", "Max seconds fighting Izaro before aborting.")]
             public RangeNode<int> IzaroTimeoutSeconds { get; set; } = new RangeNode<int>(60, 20, 180);
-
-            [Menu("Max Deaths", "Abandon run after this many deaths.")]
-            public RangeNode<int> MaxDeaths { get; set; } = new RangeNode<int>(1, 0, 5);
 
             [Menu("Prefer Same Type", "Prefer 'same type' transforms over 'same colour' when available.")]
             public ToggleNode PreferSameType { get; set; } = new ToggleNode(true);
@@ -1121,6 +1073,121 @@ namespace AutoExile
 
             [Menu("Dodge Cooldown (ms)", "Minimum time between dodge movements.")]
             public RangeNode<int> DodgeCooldownMs { get; set; } = new RangeNode<int>(500, 100, 2000);
+        }
+
+        [Submenu(CollapsedByDefault = false)]
+        public class RunSettings
+        {
+            [Menu("Max Deaths", "Abandon current run after this many deaths. Shared across all modes; per-mode logic may interpret 'run' differently (Lab = whole run, Boss = per encounter, Sim = per simulacrum).")]
+            public RangeNode<int> MaxDeaths { get; set; } = new RangeNode<int>(3, 1, 20);
+
+            [Menu("Stash Item Threshold", "Stash items between runs / waves when inventory has at least this many items. 0 = always stash.")]
+            public RangeNode<int> StashItemThreshold { get; set; } = new RangeNode<int>(5, 0, 30);
+
+            [Menu("Loot Sweep Timeout (s)", "Max seconds spent picking up loot after a kill before moving on.")]
+            public RangeNode<float> LootSweepTimeoutSeconds { get; set; } = new RangeNode<float>(5f, 3f, 60f);
+
+            [Menu("Portal Key", "Hotkey to scroll a portal in-game (used to open a portal back to hideout). Match your in-game keybinding.")]
+            public HotkeyNode PortalKey { get; set; } = new HotkeyNode(Keys.F);
+
+            [Menu("Max Runtime (minutes)", "Stop the bot after this many minutes of *active* runtime (paused time doesn't count). 0 = no limit. Default 300 = 5 hours.")]
+            public RangeNode<int> MaxRuntimeMinutes { get; set; } = new RangeNode<int>(300, 0, 1440);
+        }
+
+        [Submenu(CollapsedByDefault = true)]
+        public class MapRollingSettings
+        {
+            [Menu("Min Map Tier", "Minimum map tier to pick from stash. 0 = any tier.")]
+            public RangeNode<int> MinMapTier { get; set; } = new RangeNode<int>(0, 0, 16);
+
+            [Menu("Dangerous Map Mods", "Comma-separated mod group names to avoid. Maps with any of these get rerolled (e.g. MapElementalReflect, MapPhysicalReflect, MapNoRegen, MapHexproof, MapCannotLeech).")]
+            public TextNode DangerousMapMods { get; set; } = new TextNode("MapElementalReflect,MapPhysicalReflect,MapNoRegen,MapCannotLeech");
+
+            [Menu("Min Map Quantity %", "Minimum item-quantity % on maps before running. 0 = don't check. Maps below this get rerolled.")]
+            public RangeNode<int> MinMapQuantity { get; set; } = new RangeNode<int>(0, 0, 150);
+        }
+
+        [Submenu(CollapsedByDefault = true)]
+        public class MapDeviceSettings
+        {
+            [Menu("Slot 1", "Item path/name to insert in map device slot 1. Empty = no item. Strategies populate defaults; user can override.")]
+            public TextNode Slot1 { get; set; } = new TextNode("");
+
+            [Menu("Slot 2", "Item path/name for slot 2.")]
+            public TextNode Slot2 { get; set; } = new TextNode("");
+
+            [Menu("Slot 3", "Item path/name for slot 3.")]
+            public TextNode Slot3 { get; set; } = new TextNode("");
+
+            [Menu("Slot 4", "Item path/name for slot 4.")]
+            public TextNode Slot4 { get; set; } = new TextNode("");
+
+            [Menu("Slot 5", "Item path/name for slot 5. Requires 5th slot unlocked in-game.")]
+            public TextNode Slot5 { get; set; } = new TextNode("");
+
+            /// <summary>Returns non-empty slot values in order.</summary>
+            public List<string> ActiveSlots()
+            {
+                var list = new List<string>();
+                foreach (var s in new[] { Slot1, Slot2, Slot3, Slot4, Slot5 })
+                    if (!string.IsNullOrWhiteSpace(s.Value)) list.Add(s.Value.Trim());
+                return list;
+            }
+
+            /// <summary>Replace all slot values from an ordered list (used by strategy plans for defaults).</summary>
+            public void SetDefaults(IReadOnlyList<string> values)
+            {
+                Slot1.Value = values.Count > 0 ? values[0] : "";
+                Slot2.Value = values.Count > 1 ? values[1] : "";
+                Slot3.Value = values.Count > 2 ? values[2] : "";
+                Slot4.Value = values.Count > 3 ? values[3] : "";
+                Slot5.Value = values.Count > 4 ? values[4] : "";
+            }
+        }
+
+        [Submenu(CollapsedByDefault = false)]
+        public class StashSettings
+        {
+            [Menu("Dump Tab", "Stash tab to deposit bulk loot into (rares, uniques, currency, etc.). Empty = use current tab. Shared across all modes. Auto-populates with the live tab list after opening your stash once.")]
+            public ListNode DumpTabName { get; set; } = new ListNode { Value = "" };
+
+            [Menu("Fragment Tab", "Stash tab to deposit/withdraw boss fragments and simulacrum splinters. For Boss/Simulacrum modes only. Should be a regular tab type — premium Fragment Stash sub-tab navigation is not supported yet.")]
+            public ListNode FragmentTabName { get; set; } = new ListNode { Value = "" };
+
+            [Menu("Mapping Supplies Tab", "Stash tab containing pre-rolled maps + scarabs the wave-farming mode pulls from each run. Should be a regular tab type (Quad/Premium) — premium Map/Fragment sub-tab navigation is not supported yet, so consolidate maps and scarabs into one regular tab.")]
+            public ListNode MappingSuppliesTabName { get; set; } = new ListNode { Value = "" };
+        }
+
+        [Submenu(CollapsedByDefault = true)]
+        public class FaustusSettings
+        {
+            [Menu("Enable Faustus Restock", "Use Faustus NPC Currency Exchange to buy scarabs/splinters in the hideout.")]
+            public ToggleNode EnableFaustusRestock { get; set; } = new ToggleNode(false);
+
+            [Menu("Scarab Restock Threshold", "Buy scarabs from Faustus if fewer than this many are in inventory.")]
+            public RangeNode<int> ScarabRestockThreshold { get; set; } = new RangeNode<int>(5, 0, 50);
+
+            [Menu("Simulacrum Restock Threshold", "Buy full Simulacrums from Faustus if fewer than this many are in inventory.")]
+            public RangeNode<int> SimulacrumRestockThreshold { get; set; } = new RangeNode<int>(1, 0, 10);
+
+            [Menu("Pay Currency", "Currency BaseName to use when buying from Faustus (e.g. 'Chaos Orb' or 'Divine Orb').")]
+            public TextNode FaustusPayCurrency { get; set; } = new TextNode("Chaos Orb");
+        }
+
+        [Submenu(CollapsedByDefault = true)]
+        public class NotificationSettings
+        {
+            [Menu("Enable Discord Notifications", "Send a message to a Discord webhook when specific items drop.")]
+            public ToggleNode EnableDiscordNotifications { get; set; } = new ToggleNode(false);
+
+            [Menu("Discord Webhook URL", "The full Webhook URL from Discord channel settings.")]
+            public TextNode DiscordWebhookUrl { get; set; } = new TextNode("");
+
+            [Menu("Notification Keywords", "Comma-separated list of item names or substrings to notify for (e.g. 'Large Cluster Jewel'). Empty = notify for all items above min value.")]
+            public TextNode NotificationKeywords { get; set; } = new TextNode("");
+
+            [Menu("Min Chaos Value", "Only notify for items worth at least this much chaos. 0 = always notify.")]
+            public RangeNode<int> MinChaosValueNotification { get; set; } = new RangeNode<int>(100, 0, 10000);
         }
 
     }

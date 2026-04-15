@@ -458,6 +458,43 @@ namespace AutoExile.Mechanics
                 }
             }
 
+            // Not InCombat right now, but a close-range build (RF/melee) won't be
+            // InCombat until a monster is within CombatRange (~20-30g). Ritual
+            // monsters can spawn/path at the edge of the leash (40g) — far enough
+            // that without a manual push, we stand at the altar forever while
+            // mobs sit at the wall. If there are ALIVE hostiles inside the leash,
+            // walk to the nearest one. Combat engages as we close; then the
+            // InCombat branch above takes over cluster targeting.
+            if (!ctx.Interaction.IsBusy)
+            {
+                Entity? nearestInLeash = null;
+                float bestDistSq = float.MaxValue;
+                foreach (var m in ctx.Entities.Monsters)
+                {
+                    if (!m.IsAlive || !m.IsHostile || !m.IsTargetable) continue;
+                    var mg = new Vector2(m.GridPosNum.X, m.GridPosNum.Y);
+                    if (Vector2.Distance(mg, _altarGridPos) > RitualLeashRadius) continue;
+                    var dsq = Vector2.DistanceSquared(mg, playerGrid);
+                    if (dsq < bestDistSq) { bestDistSq = dsq; nearestInLeash = m; }
+                }
+                if (nearestInLeash != null)
+                {
+                    // Close the gap but don't overshoot the leash — clamp the target
+                    // to the leash circle the same way the InCombat branch does.
+                    var target = new Vector2(nearestInLeash.GridPosNum.X, nearestInLeash.GridPosNum.Y);
+                    var distFromAltar = Vector2.Distance(target, _altarGridPos);
+                    if (distFromAltar > RitualLeashRadius)
+                    {
+                        var dir = Vector2.Normalize(target - _altarGridPos);
+                        target = _altarGridPos + dir * RitualLeashRadius;
+                    }
+                    ctx.Navigation.MoveToward(gc, target);
+                    _phaseStartTime = DateTime.Now; // treat closing as progress
+                    Status = $"[Hunt] Closing on ritual monster ({MathF.Sqrt(bestDistSq):F0}g)";
+                    return MechanicResult.InProgress;
+                }
+            }
+
             // Wait 2 seconds after combat ends to confirm
             var timeSinceCombat = (DateTime.Now - _lastCombatTime).TotalSeconds;
             if (timeSinceCombat < 2.0)

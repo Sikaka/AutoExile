@@ -18,16 +18,20 @@ namespace AutoExile
         public required LootSystem Loot { get; init; }
         public required MapDeviceSystem MapDevice { get; init; }
         public required StashSystem Stash { get; init; }
+        public required StashIndexer StashIndex { get; init; }
+        public required FaustusSystem Faustus { get; init; }
         public required ExplorationMap Exploration { get; init; }
         public required LootTracker LootTracker { get; init; }
         public required MapMechanicManager Mechanics { get; init; }
         public required ThreatSystem Threat { get; init; }
         public required EldritchAltarHandler AltarHandler { get; init; }
         public required NinjaPriceService NinjaPrice { get; init; }
+        public required RuntimeTracker Runtime { get; init; }
         public required EntityCache Entities { get; init; }
         public required ThreatMap ThreatMap { get; init; }
         public required MapDatabase MapDatabase { get; init; }
         public required BotSettings Settings { get; init; }
+        public required PerformanceTracker Perf { get; init; }
 
         /// <summary>
         /// Minimap icons discovered from TileEntities. Updated periodically by BotCore.

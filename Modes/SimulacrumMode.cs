@@ -178,8 +178,7 @@ namespace AutoExile.Modes
                         _state.Reset();
                         _phase = SimPhase.InHideout;
                         _phaseStartTime = DateTime.Now;
-                        _hideoutFlow.Start(MapDeviceSystem.IsSimulacrum,
-                        targetMapName: "Simulacrum");
+                        StartHideoutFlow(ctx);
                         StatusText = "No portal found — starting new run";
                     }
                     break;
@@ -236,11 +235,10 @@ namespace AutoExile.Modes
                     _phaseStartTime = DateTime.Now;
                     _mapCompleted = false;
                     _lootTracker.ResetCount();
-                    _hideoutFlow.Start(MapDeviceSystem.IsSimulacrum,
-                        targetMapName: "Simulacrum");
+                    StartHideoutFlow(ctx);
                     StatusText = "Back in hideout — starting new run";
                 }
-                else if (_state.DeathCount > 0 && _state.DeathCount < _settings.MaxDeaths.Value)
+                else if (_state.DeathCount > 0 && _state.DeathCount < ctx.Settings.Run.MaxDeaths.Value)
                 {
                     // Died — try to re-enter
                     _phase = SimPhase.EnterPortal;
@@ -248,7 +246,7 @@ namespace AutoExile.Modes
                     _hideoutFlow.StartPortalReentry();
                     StatusText = $"Revived (death {_state.DeathCount}) — re-entering map";
                 }
-                else if (_state.DeathCount >= _settings.MaxDeaths.Value)
+                else if (_state.DeathCount >= ctx.Settings.Run.MaxDeaths.Value)
                 {
                     // Too many deaths — start fresh
                     _state.RecordRunComplete();
@@ -256,16 +254,14 @@ namespace AutoExile.Modes
                     _phase = SimPhase.InHideout;
                     _phaseStartTime = DateTime.Now;
                     _lootTracker.ResetCount();
-                    _hideoutFlow.Start(MapDeviceSystem.IsSimulacrum,
-                        targetMapName: "Simulacrum");
+                    StartHideoutFlow(ctx);
                     StatusText = "Too many deaths — starting new run";
                 }
                 else
                 {
                     _phase = SimPhase.InHideout;
                     _phaseStartTime = DateTime.Now;
-                    _hideoutFlow.Start(MapDeviceSystem.IsSimulacrum,
-                        targetMapName: "Simulacrum");
+                    StartHideoutFlow(ctx);
                 }
             }
             else
@@ -293,6 +289,52 @@ namespace AutoExile.Modes
                 _lootTracker.ResetCount();
                 StatusText = "Entered map — finding monolith";
             }
+        }
+
+        // Full Simulacrum metadata path — same item the map device consumes.
+        // Splinters that combine into a Simulacrum live under a different path
+        // and are NOT withdrawn here (the in-game UI auto-assembles when full).
+        private const string FullSimulacrumPath = "CurrencyAfflictionFragment";
+
+        /// <summary>
+        /// Stash filter: stash everything EXCEPT full Simulacrums. Used by every
+        /// Stash interaction in this mode (hideout, between-wave, end-of-run sweep)
+        /// so we never accidentally deposit the fragments we just withdrew or are
+        /// holding for the next run.
+        /// </summary>
+        private static bool KeepSimulacrumsFilter(ServerInventory.InventSlotItem item)
+        {
+            var path = item.Item?.Path;
+            if (path != null && path.Contains(FullSimulacrumPath, StringComparison.OrdinalIgnoreCase))
+                return false; // keep — don't stash
+            return true;      // stash everything else
+        }
+
+        /// <summary>
+        /// Start the hideout flow for a fresh simulacrum run.
+        /// Reads shared stash + run settings (no per-mode duplication) and tells the
+        /// hideout flow to withdraw full Simulacrums from the central Fragment tab,
+        /// then insert one into the map device.
+        /// </summary>
+        private void StartHideoutFlow(BotContext ctx)
+        {
+            var stash = ctx.Settings.Stash;
+            var sim   = ctx.Settings.Simulacrum;
+
+            // No targetMapName — Simulacrum has no atlas node. Forcing named-map flow
+            // would loop trying to click a node that doesn't exist. Auto-match flow
+            // instead: scan inventory (or the device's stash panel) for a fragment
+            // matching the IsSimulacrum filter, open the player inventory if needed,
+            // and right-click the Simulacrum to insert + activate.
+            _hideoutFlow.Start(MapDeviceSystem.IsSimulacrum,
+                stashItemFilter:    KeepSimulacrumsFilter,
+                stashItemThreshold: ctx.Settings.Run.StashItemThreshold.Value,
+                dumpTabName:        string.IsNullOrWhiteSpace(stash.DumpTabName.Value)     ? null : stash.DumpTabName.Value,
+                resourceTabName:    string.IsNullOrWhiteSpace(stash.FragmentTabName.Value) ? null : stash.FragmentTabName.Value,
+                withdrawFragmentPath:  FullSimulacrumPath,
+                inventoryFragmentPath: FullSimulacrumPath,
+                fragmentStock:  sim.SimulacrumStock.Value,
+                minFragments:   1);
         }
 
         // =================================================================
@@ -574,17 +616,26 @@ namespace AutoExile.Modes
             // cached stash position first so the entity loads into the entity list.
             if (!_state.IsWaveActive && _state.StashPosition.HasValue && !ctx.Interaction.IsBusy)
             {
-                var invCount = (StashSystem.GetInventorySlotItems(gc)?.Count ?? 0);
-                bool shouldStartStashing = invCount >= _settings.StashItemThreshold.Value;
-                bool shouldContinueStashing = _isStashing && invCount > 0;
+                // Count only items the filter would actually deposit — full Simulacrums
+                // are kept in inventory for future runs and must NOT trigger a stash trip.
+                // Without this, holding spare fragments causes an infinite loop:
+                // open stash → filter rejects everything → close → re-trigger.
+                int stashableCount = 0;
+                var slots = StashSystem.GetInventorySlotItems(gc);
+                if (slots != null)
+                    foreach (var it in slots)
+                        if (KeepSimulacrumsFilter(it)) stashableCount++;
+
+                bool shouldStartStashing    = stashableCount >= ctx.Settings.Run.StashItemThreshold.Value;
+                bool shouldContinueStashing = _isStashing && stashableCount > 0;
 
                 if (shouldStartStashing || shouldContinueStashing)
                 {
                     _isStashing = true;
-                    Decision = $"Between waves → Stash ({invCount} items)";
+                    Decision = $"Between waves → Stash ({stashableCount} items)";
                     _phase = SimPhase.BetweenWaveStash;
                     _phaseStartTime = DateTime.Now;
-                    StatusText = $"Stashing items ({invCount} in inventory)";
+                    StatusText = $"Stashing items ({stashableCount} stashable in inventory)";
                     return;
                 }
                 _isStashing = false;
@@ -1009,11 +1060,18 @@ namespace AutoExile.Modes
                 }
             }
 
-            // Step 2: Close enough — start StashSystem if not already running
+            // Step 2: Close enough — start StashSystem if not already running.
+            // Between waves we ONLY deposit loot — never withdraw fragments. New
+            // Simulacrums are pulled when starting a fresh run from hideout, not
+            // mid-encounter. The KeepSimulacrumsFilter ensures we don't deposit
+            // any spare full Simulacrums sitting in inventory for future runs.
             if (!ctx.Stash.IsBusy)
             {
                 ctx.Navigation.Stop(gc);
-                ctx.Stash.Start();
+                var dumpTab = ctx.Settings.Stash.DumpTabName.Value;
+                ctx.Stash.Start(
+                    storeTabName: string.IsNullOrWhiteSpace(dumpTab) ? null : dumpTab,
+                    itemFilter:   KeepSimulacrumsFilter);
             }
 
             // Step 3: Tick StashSystem
@@ -1091,11 +1149,17 @@ namespace AutoExile.Modes
                 _lastEmptyScanAt = DateTime.MinValue; // ensure grace starts fresh from arrival
             }
 
-            // Step 2: Stash items if inventory is above threshold (same check as between-waves)
+            // Step 2: Stash items if inventory has stashable loot above threshold.
+            // Excludes spare full Simulacrums (filter rejects them), so holding
+            // fragments doesn't trigger an empty stash trip.
             if (_state.StashPosition.HasValue)
             {
-                var invCount = (StashSystem.GetInventorySlotItems(gc)?.Count ?? 0);
-                if (invCount >= _settings.StashItemThreshold.Value)
+                int stashableCount = 0;
+                var slots = StashSystem.GetInventorySlotItems(gc);
+                if (slots != null)
+                    foreach (var it in slots)
+                        if (KeepSimulacrumsFilter(it)) stashableCount++;
+                if (stashableCount >= ctx.Settings.Run.StashItemThreshold.Value)
                 {
                     // Navigate close to stash so the entity loads into the entity list
                     var playerPos = gc.Player.GridPosNum;
@@ -1113,7 +1177,12 @@ namespace AutoExile.Modes
                     if (!ctx.Stash.IsBusy)
                     {
                         ctx.Navigation.Stop(gc);
-                        ctx.Stash.Start();
+                        // End-of-run sweep stashing — deposit only, no withdrawal.
+                        // Keep any remaining full Simulacrums for the next run.
+                        var dumpTab = ctx.Settings.Stash.DumpTabName.Value;
+                        ctx.Stash.Start(
+                            storeTabName: string.IsNullOrWhiteSpace(dumpTab) ? null : dumpTab,
+                            itemFilter:   KeepSimulacrumsFilter);
                     }
                 }
                 if (ctx.Stash.IsBusy)
@@ -1278,7 +1347,7 @@ namespace AutoExile.Modes
 
             if (_state.DeathCount > 0)
             {
-                g.DrawText($"Deaths: {_state.DeathCount}/{_settings.MaxDeaths.Value}",
+                g.DrawText($"Deaths: {_state.DeathCount}/{ctx.Settings.Run.MaxDeaths.Value}",
                     new Vector2(hudX, hudY), SharpDX.Color.Red);
                 hudY += lineH;
             }

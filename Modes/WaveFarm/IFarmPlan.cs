@@ -20,6 +20,23 @@ namespace AutoExile.Modes.WaveFarm
         /// <summary>Atlas setup: scarabs, witness type, atlas tree preset.</summary>
         PlanAtlasConfig AtlasConfig { get; }
 
+        /// <summary>
+        /// Eldritch altar mod weights this plan prefers (key = NormalizeLetters(mod display text),
+        /// value = weight). Pushed to <see cref="BotSettings.EldritchAltarSettings.ModWeights"/>
+        /// when the user selects this strategy. Empty = use the built-in defaults from
+        /// <see cref="Mechanics.EldritchAltarHandler.DefaultModWeights"/>.
+        /// </summary>
+        IReadOnlyDictionary<string, int> AltarWeightDefaults { get; }
+
+        /// <summary>
+        /// Item-name substrings that bypass loot-value filtering for this plan
+        /// (case-insensitive). Pushed to <see cref="Systems.LootSystem.MustLootItems"/>
+        /// when the user selects this strategy and reasserted on every map entry.
+        /// Use this for plan-critical items the value filter would otherwise skip
+        /// (Stacked Decks, Heist Blueprints, target div cards, etc.).
+        /// </summary>
+        IReadOnlyList<string> MustLootItems => Array.Empty<string>();
+
         /// <summary>Wave behavior tuning for this plan.</summary>
         WaveConfig Config { get; }
 

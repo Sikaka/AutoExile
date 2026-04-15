@@ -15,6 +15,10 @@ namespace AutoExile.Modes.WaveFarm.FarmPlans
 
         public PlanAtlasConfig AtlasConfig { get; } = new();
 
+        // No altar preference — fall back to the built-in default weights.
+        public IReadOnlyDictionary<string, int> AltarWeightDefaults { get; } =
+            new Dictionary<string, int>();
+
         public WaveConfig Config { get; } = new()
         {
             BacktrackLootThreshold = 2.0,

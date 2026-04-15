@@ -280,12 +280,14 @@ namespace AutoExile.Modes
             ctx.Loot.MustLootItems.Clear();
 
             var bossSettings = ctx.Settings.Boss;
+            var stashSettings = ctx.Settings.Stash;
+            var runSettings = ctx.Settings.Run;
             _hideoutFlow.Start(_activeEncounter!.MapFilter,
                 stashItemFilter: GetStashFilter(),
                 inventoryFragmentPath: _activeEncounter.InventoryFragmentPath,
-                stashItemThreshold: bossSettings.StashItemThreshold.Value,
-                dumpTabName: string.IsNullOrWhiteSpace(bossSettings.DumpTabName.Value) ? null : bossSettings.DumpTabName.Value,
-                resourceTabName: string.IsNullOrWhiteSpace(bossSettings.ResourceTabName.Value) ? null : bossSettings.ResourceTabName.Value,
+                stashItemThreshold: runSettings.StashItemThreshold.Value,
+                dumpTabName: string.IsNullOrWhiteSpace(stashSettings.DumpTabName.Value) ? null : stashSettings.DumpTabName.Value,
+                resourceTabName: string.IsNullOrWhiteSpace(stashSettings.FragmentTabName.Value) ? null : stashSettings.FragmentTabName.Value,
                 withdrawFragmentPath: _activeEncounter.InventoryFragmentPath,
                 fragmentStock: bossSettings.FragmentStock.Value,
                 minFragments: _activeEncounter.FragmentCost);
@@ -365,7 +367,7 @@ namespace AutoExile.Modes
 
         private void TickLootSweep(BotContext ctx, GameController gc, InteractionResult interactionResult)
         {
-            var timeout = ctx.Settings.Boss.LootSweepTimeoutSeconds.Value;
+            var timeout = ctx.Settings.Run.LootSweepTimeoutSeconds.Value;
             if ((DateTime.Now - _phaseStartTime).TotalSeconds > timeout)
             {
                 _phase = BossPhase.ExitMap;
@@ -523,7 +525,7 @@ namespace AutoExile.Modes
             // At entry position but still no portal — open one with portal key
             if (!_portalKeyPressed)
             {
-                var portalKey = ctx.Settings.Boss.PortalKey.Value;
+                var portalKey = ctx.Settings.Run.PortalKey.Value;
                 BotInput.PressKey(portalKey);
                 _portalKeyPressed = true;
                 _lastActionTime = DateTime.Now;
@@ -637,14 +639,14 @@ namespace AutoExile.Modes
                     StartHideoutFlow(ctx);
                     ctx.Log($"[Boss] Run {_runsCompleted} complete ({AvgRunTimeSeconds:F0}s avg) — starting next");
                 }
-                else if (_deathCount > 0 && _deathCount < ctx.Settings.Boss.MaxDeaths.Value)
+                else if (_deathCount > 0 && _deathCount < ctx.Settings.Run.MaxDeaths.Value)
                 {
                     _phase = BossPhase.EnterPortal;
                     _phaseStartTime = DateTime.Now;
                     _hideoutFlow.StartPortalReentry();
                     Status = $"Died ({_deathCount}) — re-entering";
                 }
-                else if (_deathCount >= ctx.Settings.Boss.MaxDeaths.Value)
+                else if (_deathCount >= ctx.Settings.Run.MaxDeaths.Value)
                 {
                     _totalRunTimeMs += (DateTime.Now - _runStartTime).TotalMilliseconds;
                     _runsCompleted++;

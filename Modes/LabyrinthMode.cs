@@ -462,7 +462,7 @@ namespace AutoExile.Modes
                     StatusText = $"Done — completed {_state.RunsCompleted} runs";
                     return;
                 }
-                if (_state.DeathCount >= settings.MaxDeaths.Value && _phase != LabPhase.Done)
+                if (_state.DeathCount >= ctx.Settings.Run.MaxDeaths.Value && _phase != LabPhase.Done)
                 {
                     _state.Reset();
                     ctx.Log("Too many deaths — starting fresh run");
@@ -3238,7 +3238,7 @@ namespace AutoExile.Modes
 
             if (_state.DeathCount > 0)
             {
-                g.DrawText($"Deaths: {_state.DeathCount}/{ctx.Settings.Labyrinth.MaxDeaths.Value}",
+                g.DrawText($"Deaths: {_state.DeathCount}/{ctx.Settings.Run.MaxDeaths.Value}",
                     new Vector2(hudX, hudY), SharpDX.Color.Red);
                 hudY += lineH;
             }

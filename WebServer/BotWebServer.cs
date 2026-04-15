@@ -35,7 +35,8 @@ namespace AutoExile.WebServer
         public BotSettings? Settings { get; set; }
         public DataStore? DataStore { get; set; }
         public Systems.MapDatabase? MapDatabase { get; set; }
-        public ConfigManager? ConfigManager { get; set; }
+        public ProfileManager? ProfileManager { get; set; }
+        public Systems.RuntimeTracker? Runtime { get; set; }
         public Systems.NinjaPriceService? NinjaPrice { get; set; }
         public Systems.LootTracker? LootTracker { get; set; }
         public Systems.GemValuationService? GemValuation { get; set; }
@@ -332,28 +333,44 @@ namespace AutoExile.WebServer
                         await HandlePlayerBuffs(resp);
                         break;
 
-                    // Presets
-                    case "/api/presets" when method == "GET":
-                        await ServeJson(resp, ConfigManager?.ListPresets() ?? new List<string>());
+                    // Profiles — source of truth for bot behavior
+                    case "/api/profiles" when method == "GET":
+                        await ServeJson(resp, new
+                        {
+                            active = ProfileManager?.ActiveProfileName ?? "",
+                            profiles = ProfileManager?.ListProfiles() ?? new List<string>(),
+                            schemaVersion = ProfileManager.CurrentSchemaVersion,
+                        });
                         break;
-                    case "/api/presets/save" when method == "POST":
-                        await HandlePresetSave(req, resp);
+                    case "/api/profiles/switch" when method == "POST":
+                        await HandleProfileSwitch(req, resp);
                         break;
-                    case "/api/presets/load" when method == "POST":
-                        await HandlePresetLoad(req, resp);
+                    case "/api/profiles/create" when method == "POST":
+                        await HandleProfileCreate(req, resp);
                         break;
-                    case "/api/presets/delete" when method == "POST":
-                        await HandlePresetDelete(req, resp);
+                    case "/api/profiles/rename" when method == "POST":
+                        await HandleProfileRename(req, resp);
                         break;
-                    case "/api/presets/export" when method == "GET":
-                        await HandlePresetExport(req, resp);
+                    case "/api/profiles/delete" when method == "POST":
+                        await HandleProfileDelete(req, resp);
                         break;
-                    case "/api/presets/import" when method == "POST":
-                        await HandlePresetImport(req, resp);
+                    case "/api/profiles/export" when method == "GET":
+                        await HandleProfileExport(req, resp);
+                        break;
+                    case "/api/profiles/import" when method == "POST":
+                        await HandleProfileImport(req, resp);
                         break;
 
                     case "/api/capture-position" when method == "POST":
                         await HandleCapturePosition(req, resp);
+                        break;
+
+                    case "/api/action/discord-test" when method == "POST":
+                        await HandleDiscordTest(resp);
+                        break;
+
+                    case "/api/runtime/reset" when method == "POST":
+                        await HandleRuntimeReset(resp);
                         break;
 
                     default:
@@ -378,85 +395,105 @@ namespace AutoExile.WebServer
         }
 
         // ====================================================================
-        // Presets
+        // Profiles — the active profile is the sole source of truth for bot
+        // behavior. Every /api/settings edit auto-saves to the active profile.
         // ====================================================================
 
-        private async Task HandlePresetSave(HttpListenerRequest req, HttpListenerResponse resp)
+        private async Task HandleProfileSwitch(HttpListenerRequest req, HttpListenerResponse resp)
         {
             var body = await ReadBody(req);
             var data = JsonSerializer.Deserialize<JsonElement>(body);
             var name = data.GetProperty("name").GetString() ?? "";
-            if (string.IsNullOrWhiteSpace(name) || Settings == null || ConfigManager == null)
-            {
-                resp.StatusCode = 400;
-                await ServeJson(resp, new { error = "Invalid name or settings not available" });
-                return;
-            }
-            ConfigManager.SavePreset(Settings, name);
-            await ServeJson(resp, new { ok = true });
-        }
-
-        private async Task HandlePresetLoad(HttpListenerRequest req, HttpListenerResponse resp)
-        {
-            var body = await ReadBody(req);
-            var data = JsonSerializer.Deserialize<JsonElement>(body);
-            var name = data.GetProperty("name").GetString() ?? "";
-            if (string.IsNullOrWhiteSpace(name) || Settings == null || ConfigManager == null)
+            if (string.IsNullOrWhiteSpace(name) || Settings == null || ProfileManager == null)
             {
                 resp.StatusCode = 400;
                 await ServeJson(resp, new { error = "Invalid name" });
                 return;
             }
-            var ok = ConfigManager.LoadPreset(Settings, name);
-            if (!ok) { resp.StatusCode = 404; await ServeJson(resp, new { error = "Preset not found" }); return; }
-            await ServeJson(resp, new { ok = true });
+            var ok = ProfileManager.SwitchProfile(Settings, name);
+            if (!ok) { resp.StatusCode = 404; await ServeJson(resp, new { error = "Profile not found" }); return; }
+            await ServeJson(resp, new { ok = true, active = ProfileManager.ActiveProfileName });
         }
 
-        private async Task HandlePresetDelete(HttpListenerRequest req, HttpListenerResponse resp)
+        private async Task HandleProfileCreate(HttpListenerRequest req, HttpListenerResponse resp)
         {
             var body = await ReadBody(req);
             var data = JsonSerializer.Deserialize<JsonElement>(body);
             var name = data.GetProperty("name").GetString() ?? "";
-            if (string.IsNullOrWhiteSpace(name) || ConfigManager == null)
+            var switchTo = data.TryGetProperty("switchTo", out var s) && s.GetBoolean();
+            if (string.IsNullOrWhiteSpace(name) || Settings == null || ProfileManager == null)
             {
                 resp.StatusCode = 400;
                 await ServeJson(resp, new { error = "Invalid name" });
                 return;
             }
-            var ok = ConfigManager.DeletePreset(name);
-            if (!ok) { resp.StatusCode = 404; await ServeJson(resp, new { error = "Preset not found" }); return; }
+            var ok = ProfileManager.CreateProfile(Settings, name, switchTo);
+            if (!ok) { resp.StatusCode = 409; await ServeJson(resp, new { error = "Profile already exists or invalid name" }); return; }
+            await ServeJson(resp, new { ok = true, active = ProfileManager.ActiveProfileName });
+        }
+
+        private async Task HandleProfileRename(HttpListenerRequest req, HttpListenerResponse resp)
+        {
+            var body = await ReadBody(req);
+            var data = JsonSerializer.Deserialize<JsonElement>(body);
+            var oldName = data.GetProperty("from").GetString() ?? "";
+            var newName = data.GetProperty("to").GetString() ?? "";
+            if (string.IsNullOrWhiteSpace(oldName) || string.IsNullOrWhiteSpace(newName) || ProfileManager == null)
+            {
+                resp.StatusCode = 400;
+                await ServeJson(resp, new { error = "Invalid names" });
+                return;
+            }
+            var ok = ProfileManager.RenameProfile(oldName, newName);
+            if (!ok) { resp.StatusCode = 409; await ServeJson(resp, new { error = "Rename failed" }); return; }
+            await ServeJson(resp, new { ok = true, active = ProfileManager.ActiveProfileName });
+        }
+
+        private async Task HandleProfileDelete(HttpListenerRequest req, HttpListenerResponse resp)
+        {
+            var body = await ReadBody(req);
+            var data = JsonSerializer.Deserialize<JsonElement>(body);
+            var name = data.GetProperty("name").GetString() ?? "";
+            if (string.IsNullOrWhiteSpace(name) || ProfileManager == null)
+            {
+                resp.StatusCode = 400;
+                await ServeJson(resp, new { error = "Invalid name" });
+                return;
+            }
+            var ok = ProfileManager.DeleteProfile(name);
+            if (!ok) { resp.StatusCode = 409; await ServeJson(resp, new { error = "Cannot delete (active profile or not found)" }); return; }
             await ServeJson(resp, new { ok = true });
         }
 
-        private async Task HandlePresetExport(HttpListenerRequest req, HttpListenerResponse resp)
+        private async Task HandleProfileExport(HttpListenerRequest req, HttpListenerResponse resp)
         {
             var name = req.QueryString["name"] ?? "";
-            if (string.IsNullOrWhiteSpace(name) || ConfigManager == null)
+            if (string.IsNullOrWhiteSpace(name) || ProfileManager == null)
             {
                 resp.StatusCode = 400;
                 await WriteString(resp, "Invalid name");
                 return;
             }
-            var json = ConfigManager.ExportPreset(name);
+            var json = ProfileManager.ExportProfile(name);
             if (json == null) { resp.StatusCode = 404; await WriteString(resp, "Not found"); return; }
             resp.ContentType = "application/json";
             resp.AddHeader("Content-Disposition", $"attachment; filename=\"{name}.json\"");
             await WriteString(resp, json);
         }
 
-        private async Task HandlePresetImport(HttpListenerRequest req, HttpListenerResponse resp)
+        private async Task HandleProfileImport(HttpListenerRequest req, HttpListenerResponse resp)
         {
             var body = await ReadBody(req);
             var data = JsonSerializer.Deserialize<JsonElement>(body);
             var name = data.GetProperty("name").GetString() ?? "";
             var json = data.GetProperty("json").GetString() ?? "";
-            if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(json) || ConfigManager == null)
+            if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(json) || ProfileManager == null)
             {
                 resp.StatusCode = 400;
                 await ServeJson(resp, new { error = "Invalid data" });
                 return;
             }
-            var ok = ConfigManager.ImportPreset(name, json);
+            var ok = ProfileManager.ImportProfile(name, json);
             if (!ok) { resp.StatusCode = 400; await ServeJson(resp, new { error = "Invalid JSON" }); return; }
             await ServeJson(resp, new { ok = true });
         }
@@ -592,7 +629,7 @@ namespace AutoExile.WebServer
             if (success)
             {
                 // Persist to our config file
-                ConfigManager?.Save(Settings);
+                ProfileManager?.SaveActive(Settings);
                 await ServeJson(resp, new { ok = true });
             }
             else
@@ -726,7 +763,7 @@ namespace AutoExile.WebServer
                 overrides[modId] = danger;
 
             // Persist
-            ConfigManager?.Save(Settings);
+            ProfileManager?.SaveActive(Settings);
             await ServeJson(resp, new { ok = true, id = modId, danger });
         }
 
@@ -782,7 +819,7 @@ namespace AutoExile.WebServer
             else
                 userWeights[modId] = weight;
 
-            ConfigManager?.Save(Settings);
+            ProfileManager?.SaveActive(Settings);
             await ServeJson(resp, new { ok = true, id = modId, weight });
         }
 
@@ -937,13 +974,54 @@ namespace AutoExile.WebServer
             if (node is TextNode textNode)
             {
                 textNode.Value = posStr;
-                ConfigManager?.Save(Settings);
+                ProfileManager?.SaveActive(Settings);
                 await ServeJson(resp, new { ok = true, position = posStr });
             }
             else
             {
                 resp.StatusCode = 400;
                 await ServeJson(resp, new { error = $"Setting '{settingKey}' not found or not a TextNode" });
+            }
+        }
+
+        private async Task HandleRuntimeReset(HttpListenerResponse resp)
+        {
+            if (Runtime == null)
+            {
+                resp.StatusCode = 503;
+                await ServeJson(resp, new { error = "Runtime tracker not available" });
+                return;
+            }
+            Runtime.Reset();
+            await ServeJson(resp, new { ok = true });
+        }
+
+        private async Task HandleDiscordTest(HttpListenerResponse resp)
+        {
+            if (Settings == null)
+            {
+                resp.StatusCode = 503;
+                await ServeJson(resp, new { error = "Settings not available" });
+                return;
+            }
+
+            var url = Settings.Notifications.DiscordWebhookUrl.Value;
+            if (string.IsNullOrWhiteSpace(url))
+            {
+                resp.StatusCode = 400;
+                await ServeJson(resp, new { error = "Webhook URL is empty" });
+                return;
+            }
+
+            try
+            {
+                await AutoExile.Systems.DiscordNotifier.SendTestAsync(url);
+                await ServeJson(resp, new { ok = true });
+            }
+            catch (Exception ex)
+            {
+                resp.StatusCode = 502;
+                await ServeJson(resp, new { error = ex.Message });
             }
         }
 
@@ -1029,6 +1107,12 @@ namespace AutoExile.WebServer
         public int ItemsLooted { get; init; }
         public int MapsCompleted { get; init; }
         public string SessionDuration { get; init; } = "";
+
+        // Active runtime tracking (excludes paused time). Drives the in-game
+        // countdown and the dashboard widget. RuntimeMaxMinutes == 0 means no limit.
+        public int RuntimeActiveSeconds { get; init; }
+        public int RuntimeRemainingSeconds { get; init; } // 0 when expired or no limit
+        public int RuntimeMaxMinutes { get; init; }
 
         // Simulacrum stats (populated only when mode is Simulacrum)
         public int SimWave { get; init; }

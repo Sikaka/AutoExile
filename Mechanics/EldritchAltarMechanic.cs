@@ -48,6 +48,13 @@ namespace AutoExile.Mechanics
         private const float ClickCooldownMs = 400;
         private const float SettleTimeMs = 300;
 
+        // Pre-click stop-and-settle state. The bot must explicitly halt continuous
+        // movement and wait a settle window BEFORE clicking an altar choice — without
+        // it the character drifts mid-click and the click can land off the button.
+        private bool _altarStopInitiated;
+        private DateTime _altarStopAt;
+        private const float AltarSettleMs = 250;
+
         // ── Blacklist — altars we've decided to skip or that failed ──
         private readonly HashSet<uint> _blacklist = new();
 
@@ -180,6 +187,25 @@ namespace AutoExile.Mechanics
                     continue;
                 }
 
+                // STOP-AND-SETTLE before clicking. Without this the character can
+                // drift mid-click — the choice button moves on screen and the click
+                // lands on empty space (or worse, a different option). The two-step
+                // sequence: (1) explicitly stop continuous movement on the first
+                // entry; (2) yield ticks until the settle window elapses; (3) click.
+                if (!_altarStopInitiated)
+                {
+                    BotInput.StopMovement();
+                    _altarStopInitiated = true;
+                    _altarStopAt = DateTime.Now;
+                    Status = $"Altar in range — halting before click";
+                    return AltarTickResult.Busy;
+                }
+                if ((DateTime.Now - _altarStopAt).TotalMilliseconds < AltarSettleMs)
+                {
+                    Status = $"Altar — settling ({(int)(DateTime.Now - _altarStopAt).TotalMilliseconds}/{AltarSettleMs}ms)";
+                    return AltarTickResult.Busy;
+                }
+
                 ctx.Log($"[Altar] Taking altar (score {bestScore}): {chosenText}");
 
                 if (!BotInput.CanAct) return AltarTickResult.Busy;
@@ -190,6 +216,7 @@ namespace AutoExile.Mechanics
                 _pendingAltarEntityId = entityId;
                 _clickAttempts = 1;
                 _lastClickTime = DateTime.Now;
+                _altarStopInitiated = false; // reset for next altar
                 Status = $"Clicked altar: {chosenText} (score {bestScore})";
                 return AltarTickResult.Busy;
             }
@@ -211,6 +238,7 @@ namespace AutoExile.Mechanics
             _pendingButton = null;
             _pendingAltarEntityId = 0;
             _clickAttempts = 0;
+            _altarStopInitiated = false;
             Status = "";
         }
 

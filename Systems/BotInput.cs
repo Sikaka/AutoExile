@@ -1,4 +1,5 @@
 using System.Numerics;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using ExileCore;
 using ExileCore.PoEMemory.Components;
@@ -584,6 +585,97 @@ namespace AutoExile.Systems
         // Bot pattern now:    [hold-move ──── tap-skill ── click-loot ──]
         // ══════════════════════════════════════════════════════════════
 
+        // ── Move-only key safety ──
+        // PoE's move-only skill walks to the cursor position. Two failure modes:
+        //   1. Cursor sitting on the player character → nothing to walk toward.
+        //   2. A modifier key (Ctrl/Shift/Alt) is held at the moment the move key
+        //      goes down → the game sees Ctrl+MoveKey, not MoveKey. Ctrl+move-only
+        //      is "attack in place" in PoE, which looks exactly like our stall.
+        // Guards live in StartMovement / ResumeMovement, not in the high-level
+        // walk helpers — so every caller of StartMovement gets them.
+
+        [DllImport("user32.dll")]
+        private static extern short GetAsyncKeyState(int vKey);
+
+        /// <summary>True if the OS reports a modifier key as physically held
+        /// (outside our own tracking — e.g. a user-pressed key or a leaked
+        /// KeyDown from an earlier action we failed to release).</summary>
+        private static bool OsHasModifierHeld()
+        {
+            const int mask = unchecked((short)0x8000);
+            return (GetAsyncKeyState((int)Keys.LControlKey) & mask) != 0
+                || (GetAsyncKeyState((int)Keys.RControlKey) & mask) != 0
+                || (GetAsyncKeyState((int)Keys.LShiftKey)   & mask) != 0
+                || (GetAsyncKeyState((int)Keys.RShiftKey)   & mask) != 0
+                || (GetAsyncKeyState((int)Keys.LMenu)       & mask) != 0
+                || (GetAsyncKeyState((int)Keys.RMenu)       & mask) != 0;
+        }
+
+        /// <summary>Force-release any tracked modifier keys AND flush any OS-level
+        /// modifier state before the move key fires. Called from StartMovement /
+        /// ResumeMovement so Ctrl+move-only can never reach the game.</summary>
+        private static void ReleaseAllModifiersBeforeMove()
+        {
+            // Never touch modifiers while CtrlClickBatch is executing — it holds
+            // Ctrl intentionally across many clicks and manages its own lifecycle.
+            if (IsBatchRunning) return;
+
+            // 1. Release anything we're tracking as held.
+            ReleaseTrackedModifiers();
+
+            // 2. Belt-and-braces: if the OS still reports a modifier held (leaked
+            //    from a prior CtrlClickBatch / crashed flow / user physically
+            //    pressing Ctrl), send explicit KeyUps. This can't forcibly undo
+            //    a physically-held key, but it clears any ghost state from our
+            //    own KeyDown events that TrackHeldKey never recorded.
+            if (!OsHasModifierHeld()) return;
+            SendKeyUp(Keys.LControlKey, "movement-guard");
+            SendKeyUp(Keys.RControlKey, "movement-guard");
+            SendKeyUp(Keys.LShiftKey,   "movement-guard");
+            SendKeyUp(Keys.RShiftKey,   "movement-guard");
+            SendKeyUp(Keys.LMenu,       "movement-guard");
+            SendKeyUp(Keys.RMenu,       "movement-guard");
+        }
+
+        private static void ReleaseTrackedModifiers()
+        {
+            if (_heldKeys.Count == 0) return;
+            var toRelease = new List<Keys>();
+            foreach (var k in _heldKeys.Keys)
+            {
+                if (k == Keys.LControlKey || k == Keys.RControlKey || k == Keys.ControlKey ||
+                    k == Keys.LShiftKey   || k == Keys.RShiftKey   || k == Keys.ShiftKey   ||
+                    k == Keys.LMenu       || k == Keys.RMenu       || k == Keys.Menu)
+                    toRelease.Add(k);
+            }
+            foreach (var k in toRelease)
+            {
+                SendKeyUp(k, "movement-guard");
+                _heldKeys.Remove(k);
+            }
+        }
+
+        /// <summary>Minimum pixel distance from window center for a move-only target.
+        /// PoE's move-only walks TO the cursor — if the cursor is on the player
+        /// (≈ window center) the character stands still. Push it out.</summary>
+        private const float MoveCursorMinOffset = 60f;
+
+        /// <summary>If the target is too close to the player on screen, shift it
+        /// outward along the same direction. Returns the (possibly-nudged) target.
+        /// If the target is exactly on center, nudges straight down.</summary>
+        private static Vector2 NudgeOffPlayer(Vector2 absScreenPos)
+        {
+            if (WindowRect.Width < 10 || WindowRect.Height < 10) return absScreenPos;
+            var center = new Vector2(
+                WindowRect.X + WindowRect.Width  / 2f,
+                WindowRect.Y + WindowRect.Height / 2f);
+            var dir = absScreenPos - center;
+            var len = dir.Length();
+            if (len >= MoveCursorMinOffset) return absScreenPos;
+            var unit = len < 0.5f ? new Vector2(0, 1) : dir / len;
+            return center + unit * MoveCursorMinOffset;
+        }
+
         /// <summary>True if the movement layer is actively holding a movement key.</summary>
         public static bool IsMovementActive { get; private set; }
 
@@ -610,6 +702,11 @@ namespace AutoExile.Systems
             if (TryCaptureReplay("StartMovement", absScreenPos, moveKey)) return true;
             if (!ClampToWindow(ref absScreenPos)) return false;
 
+            // Move-only walks TO the cursor. If the target is on the player the
+            // character stands still. Safety-nudge every call, including the
+            // steer-only fast path below.
+            absScreenPos = NudgeOffPlayer(absScreenPos);
+
             // If already moving with the same key and not suspended, just steer cursor.
             // No key release/press needed — the key is already held.
             if (IsMovementActive && _movementKey == moveKey && !IsMovementSuspended)
@@ -633,6 +730,10 @@ namespace AutoExile.Systems
             {
                 SendKeyUp(_movementKey, "movement");
             }
+
+            // Flush any held modifiers so the move key doesn't register as
+            // Ctrl+move (attack-in-place) / Shift+move / Alt+move.
+            ReleaseAllModifiersBeforeMove();
 
             Input.SetCursorPos(absScreenPos);
             _movementCursorPos = absScreenPos;
@@ -672,6 +773,7 @@ namespace AutoExile.Systems
             if (!IsMovementActive || IsMovementSuspended) return false;
             if (TryCaptureReplay("UpdateMovementCursor", absScreenPos)) return true;
             if (!ClampToWindow(ref absScreenPos)) return false;
+            absScreenPos = NudgeOffPlayer(absScreenPos);
 
             // Throttle: only update if position changed significantly or enough time passed
             var distSq = Vector2.DistanceSquared(absScreenPos, _movementCursorPos);
@@ -741,7 +843,11 @@ namespace AutoExile.Systems
             // Enforce global input rate limit before re-pressing the movement key
             if (!CanSendInputEvent) return;
 
-            Input.SetCursorPos(_movementCursorPos);
+            // Same guards as StartMovement — cursor off player, no stuck modifiers.
+            var target = NudgeOffPlayer(_movementCursorPos);
+            _movementCursorPos = target;
+            ReleaseAllModifiersBeforeMove();
+            Input.SetCursorPos(target);
             SendKeyDown(_movementKey, "resume");
             IsMovementSuspended = false;
         }

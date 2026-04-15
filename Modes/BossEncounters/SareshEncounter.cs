@@ -505,7 +505,7 @@ namespace AutoExile.Modes.BossEncounters
         // ── Phase: Loot ──
         private BossEncounterResult TickWaitingForLoot(BotContext ctx, GameController gc, Vector2 playerGrid)
         {
-            var timeout = ctx.Settings.Boss.LootSweepTimeoutSeconds.Value;
+            var timeout = ctx.Settings.Run.LootSweepTimeoutSeconds.Value;
             var elapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
 
             if (elapsed > timeout)

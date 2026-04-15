@@ -36,6 +36,8 @@ namespace AutoExile
         private LootSystem _loot = new();
         private MapDeviceSystem _mapDevice = new();
         private StashSystem _stash = new();
+        private StashIndexer _stashIndex = new();
+        private FaustusSystem _faustus = new();
 
         // Gem level-up
         private DateTime _lastGemLevelAt = DateTime.MinValue;
@@ -46,6 +48,7 @@ namespace AutoExile
         private ThreatSystem _threat = new();
         private EldritchAltarHandler _altarHandler = new();
         private NinjaPriceService _ninjaPrice = new();
+        private RuntimeTracker _runtime = new();
         private EntityCache _entityCache = new();
         private ThreatMap _threatMap = new();
         private DateTime _lastEntityPrune = DateTime.MinValue;
@@ -55,8 +58,9 @@ namespace AutoExile
         private HumanGameplayRecorder _humanRecorder = new();
         private BotWebServer? _webServer;
         private DataStore? _dataStore;
-        private ConfigManager? _configManager;
+        private ProfileManager? _profileManager;
         private MapDatabase _mapDatabase = null!;
+        private readonly PerformanceTracker _perf = new();
 
         // Public accessors for external tools (POEMCP /eval)
         public NavigationSystem Navigation => _navigation;
@@ -142,16 +146,20 @@ namespace AutoExile
                 Loot = _loot,
                 MapDevice = _mapDevice,
                 Stash = _stash,
+                StashIndex = _stashIndex,
+                Faustus = _faustus,
                 Exploration = _exploration,
                 LootTracker = _lootTracker,
                 Mechanics = _mechanics,
                 Threat = _threat,
                 AltarHandler = _altarHandler,
                 NinjaPrice = _ninjaPrice,
+                Runtime = _runtime,
                 Entities = _entityCache,
                 ThreatMap = _threatMap,
                 MapDatabase = _mapDatabase,
                 Settings = Settings,
+                Perf = _perf,
                 Log = msg => LogMessage($"[AutoExile] {msg}")
             };
 
@@ -179,6 +187,16 @@ namespace AutoExile
             waveFarm.Register(new Modes.WaveFarm.FarmPlans.AlchAndGoPlan());
             waveFarm.Register(new Modes.WaveFarm.FarmPlans.StackedDeckPlan());
             RegisterMode(waveFarm);
+
+            // Picking a farm strategy in the web UI auto-applies that plan's defaults
+            // (scarab slots, altar mod weights). Fires regardless of current bot mode
+            // so the user can configure ahead of starting Wave Farming. Saved profiles
+            // override these defaults — apply just gives a clean starting point.
+            Settings.Farming.FarmStrategy.OnValueSelected += name =>
+            {
+                waveFarm.ApplyPlanDefaults(name, Settings, msg => LogMessage($"[AutoExile] {msg}"));
+                _profileManager?.SaveActive(Settings);
+            };
 
             // Register in-map mechanics
             _mechanics.Register(new UltimatumMechanic());
@@ -212,20 +230,37 @@ namespace AutoExile
                     SetMode(name);
             };
 
-            // Load our own config (overrides ExileCore defaults)
-            _configManager = new ConfigManager(msg => LogMessage($"[AutoExile] {msg}"));
-            _configManager.Initialize(DirectoryFullName);
-            _configManager.LoadAndApply(Settings);
+            // Load the active profile (source of truth for bot behavior — ExileCore's
+            // own settings file is ignored for anything other than infrastructure).
+            _profileManager = new ProfileManager(msg => LogMessage($"[AutoExile] {msg}"));
+            _profileManager.Initialize(DirectoryFullName);
+            _profileManager.OnProfileSwitched += _ => _runtime.Reset();
+            _profileManager.LoadActive(Settings);
 
             // Initialize data store
             _dataStore = new DataStore(msg => LogMessage($"[AutoExile] {msg}"));
             _dataStore.Initialize(DirectoryFullName);
 
-            // Wire loot recording callback → data store
+            // Wire loot recording callback → data store + optional Discord webhook
             _lootTracker.OnItemRecorded = (name, value, slots) =>
             {
                 var area = GameController?.Area?.CurrentArea?.Name ?? "";
                 _dataStore.RecordLoot(name, value, slots, area, _mode.Name);
+
+                // Discord notification — opt-in, value threshold + optional keyword filter
+                var notif = Settings.Notifications;
+                if (notif.EnableDiscordNotifications.Value
+                    && !string.IsNullOrWhiteSpace(notif.DiscordWebhookUrl.Value)
+                    && value >= notif.MinChaosValueNotification.Value)
+                {
+                    var keywords = notif.NotificationKeywords.Value ?? "";
+                    bool keywordMatch = string.IsNullOrWhiteSpace(keywords) ||
+                        Array.Exists(
+                            keywords.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries),
+                            kw => name.Contains(kw, StringComparison.OrdinalIgnoreCase));
+                    if (keywordMatch)
+                        DiscordNotifier.Notify(notif.DiscordWebhookUrl.Value, name, area, value);
+                }
             };
 
             // Wire loot skip/fail events → data store (for web UI logs tab)
@@ -234,6 +269,7 @@ namespace AutoExile
                 var area = GameController?.Area?.CurrentArea?.Name ?? "";
                 var valueStr = chaosValue > 0 ? $" ({chaosValue:F0}c)" : "";
                 _dataStore.RecordEvent("loot_skip", $"{itemName}{valueStr}: {reason}", area);
+                _perf.RecordFailure("lootSkip", reason ?? "(unknown)");
             };
 
             // Populate map name list from atlas nodes (when in-game)
@@ -246,7 +282,8 @@ namespace AutoExile
                 _webServer = new BotWebServer(Settings.WebUiPort.Value, Settings.WebUiNetworkAccess.Value, msg => LogMessage($"[AutoExile] {msg}"));
                 _webServer.Settings = Settings;
                 _webServer.DataStore = _dataStore;
-                _webServer.ConfigManager = _configManager;
+                _webServer.ProfileManager = _profileManager;
+                _webServer.Runtime = _runtime;
                 _webServer.MapDatabase = _mapDatabase;
                 _webServer.NinjaPrice = _ninjaPrice;
                 _webServer.LootTracker = _lootTracker;
@@ -437,13 +474,26 @@ namespace AutoExile
             // POE is unfocused or an async action is in flight.
             TickWebServer();
 
+            // Update active-runtime accounting on every tick (even when POE is
+            // unfocused) so the timer reflects real elapsed wall time accurately.
+            // Pause edges are based on Settings.Running.Value.
+            _runtime.Tick(Settings.Running.Value);
+
+            // Hard stop on max runtime — flips Running off; user must reset the
+            // timer (or bump MaxRuntimeMinutes) to resume.
+            if (Settings.Running.Value && _runtime.IsExpired(Settings.Run.MaxRuntimeMinutes.Value))
+            {
+                Settings.Running.Value = false;
+                LogMessage($"[AutoExile] Max runtime ({Settings.Run.MaxRuntimeMinutes.Value} min) reached — bot stopped");
+            }
+
             // Periodic config save — persists ImGui setting changes to config.json
             // so they survive plugin reloads (web UI changes save immediately, but
             // ImGui changes only live in memory without this).
             if ((DateTime.Now - _lastConfigSave).TotalSeconds >= ConfigSaveIntervalSec)
             {
                 _lastConfigSave = DateTime.Now;
-                _configManager?.Save(Settings);
+                _profileManager?.SaveActive(Settings);
             }
 
             // Don't do anything when POE isn't the active window
@@ -748,11 +798,36 @@ namespace AutoExile
             var status = running ? $"BOT: {_mode.Name}" : $"BOT: PAUSED ({_mode.Name})";
             Graphics.DrawText(status, new Vector2(100, 80), color);
 
+            // Runtime line — shows elapsed (always) + remaining (when limit set).
+            // Pause time is excluded automatically by RuntimeTracker.
+            var maxMin   = Settings.Run.MaxRuntimeMinutes.Value;
+            var elapsed  = _runtime.ActiveDuration;
+            var elapsedStr = $"{(int)elapsed.TotalHours}:{elapsed.Minutes:D2}";
+            string runtimeText;
+            SharpDX.Color runtimeColor;
+            if (maxMin <= 0)
+            {
+                runtimeText  = $"Runtime: {elapsedStr} (no limit)";
+                runtimeColor = SharpDX.Color.LightGray;
+            }
+            else
+            {
+                var remaining = _runtime.Remaining(maxMin);
+                var remStr = $"{(int)remaining.TotalHours}:{remaining.Minutes:D2}";
+                runtimeText  = $"Runtime: {elapsedStr} / {maxMin / 60}:{(maxMin % 60):D2}  (stopping in {remStr})";
+                // Amber at last 10%, red at last 5 minutes
+                var pctLeft = (double)remaining.TotalMinutes / maxMin;
+                runtimeColor = remaining.TotalMinutes < 5 ? SharpDX.Color.Red
+                            :  pctLeft < 0.10              ? SharpDX.Color.Orange
+                            :                                SharpDX.Color.LightGray;
+            }
+            Graphics.DrawText(runtimeText, new Vector2(100, 96), runtimeColor);
+
             // Human recorder indicator
             if (_humanRecorder.IsRecording)
             {
                 var recText = $"REC  {_humanRecorder.TicksRecorded} ticks";
-                Graphics.DrawText(recText, new Vector2(100, 100), SharpDX.Color.Red);
+                Graphics.DrawText(recText, new Vector2(100, 116), SharpDX.Color.Red);
             }
 
             // Loot tracker overlay (top-right area)
@@ -1051,6 +1126,11 @@ namespace AutoExile
                     MapsCompleted = _lootTracker.MapsCompleted,
                     SessionDuration = _lootTracker.SessionDuration.TotalSeconds > 0
                         ? _lootTracker.SessionDuration.ToString(@"hh\:mm\:ss") : "",
+                    RuntimeActiveSeconds    = (int)_runtime.ActiveDuration.TotalSeconds,
+                    RuntimeRemainingSeconds = Settings.Run.MaxRuntimeMinutes.Value > 0
+                        ? (int)_runtime.Remaining(Settings.Run.MaxRuntimeMinutes.Value).TotalSeconds
+                        : 0,
+                    RuntimeMaxMinutes       = Settings.Run.MaxRuntimeMinutes.Value,
                     // Simulacrum stats
                     SimWave = _simulacrumMode?.State.CurrentWave ?? 0,
                     SimWaveActive = _simulacrumMode?.State.IsWaveActive ?? false,
@@ -1740,7 +1820,7 @@ namespace AutoExile
             // Persist to settings so it survives reloads
             if (Settings.ActiveMode != null)
                 Settings.ActiveMode.Value = name;
-            _configManager?.Save(Settings);
+            _profileManager?.SaveActive(Settings);
         }
 
         // =================================================================
@@ -1948,6 +2028,20 @@ namespace AutoExile
 
         private IList<string>? _lastStashTabNames;
 
+        /// <summary>
+        /// Return <paramref name="options"/> with <paramref name="saved"/> appended if
+        /// it's non-empty and not already present. Used so a user-saved tab name
+        /// survives auto-populate even when the live tab list doesn't include it
+        /// (tab not currently visible, premium tab name not enumerated, etc.).
+        /// </summary>
+        private static List<string> WithSavedOption(List<string> options, string? saved)
+        {
+            if (string.IsNullOrWhiteSpace(saved) || options.Contains(saved))
+                return options;
+            var copy = new List<string>(options) { saved };
+            return copy;
+        }
+
         private void SyncStashTabNames()
         {
             try
@@ -1974,13 +2068,25 @@ namespace AutoExile
                 var options = new List<string> { "" };
                 options.AddRange(names);
 
-                // Update Boss tab dropdowns — save/restore current values
-                var savedDump = Settings.Boss.DumpTabName.Value;
-                var savedResource = Settings.Boss.ResourceTabName.Value;
-                Settings.Boss.DumpTabName.SetListValues(options);
-                Settings.Boss.ResourceTabName.SetListValues(options);
-                Settings.Boss.DumpTabName.Value = options.Contains(savedDump) ? savedDump : "";
-                Settings.Boss.ResourceTabName.Value = options.Contains(savedResource) ? savedResource : "";
+                // Update central stash dropdowns — save/restore current values.
+                // Preserve user-saved names even when not in the current live list:
+                // include them as extra options instead of clearing them. Without
+                // this, opening a stash that doesn't have your supplies tab visible
+                // (premium tabs, scrolled offscreen) would silently wipe the setting.
+                var savedDump     = Settings.Stash.DumpTabName.Value;
+                var savedFragment = Settings.Stash.FragmentTabName.Value;
+                var savedSupplies = Settings.Stash.MappingSuppliesTabName.Value;
+
+                var dumpOptions     = WithSavedOption(options, savedDump);
+                var fragmentOptions = WithSavedOption(options, savedFragment);
+                var suppliesOptions = WithSavedOption(options, savedSupplies);
+
+                Settings.Stash.DumpTabName.SetListValues(dumpOptions);
+                Settings.Stash.FragmentTabName.SetListValues(fragmentOptions);
+                Settings.Stash.MappingSuppliesTabName.SetListValues(suppliesOptions);
+                Settings.Stash.DumpTabName.Value            = savedDump;
+                Settings.Stash.FragmentTabName.Value        = savedFragment;
+                Settings.Stash.MappingSuppliesTabName.Value = savedSupplies;
             }
             catch { /* stash API can throw during zone transitions */ }
         }

@@ -54,6 +54,14 @@ namespace AutoExile.Systems
         /// </summary>
         public bool ForceCtrlClick { get; set; }
 
+        /// <summary>
+        /// Item path substrings to insert into the device's scarab slots after the map
+        /// is loaded but before activation. Each entry contributes one ctrl+click on a
+        /// matching inventory item — the device auto-fills the next empty slot.
+        /// Empty/null = skip the scarab insertion phase entirely.
+        /// </summary>
+        public IReadOnlyList<string>? ScarabPaths { get; set; }
+
         // Navigation to device — track failed close-approach attempts
         private int _navAttempts;
         private float _bestDistSeen = float.MaxValue;
@@ -65,6 +73,15 @@ namespace AutoExile.Systems
         // Inventory fragment fallback
         private int _invOpenAttempts;
         private const int MaxInvOpenAttempts = 5;
+
+        /// <summary>
+        /// After a Ctrl+click or right-click on a map/fragment, wait at least this
+        /// long before re-evaluating insertion state. Gives the device UI time to
+        /// render the loaded item + activate button. Without this, fast tick rates
+        /// re-enter the select phase before slot 0 / the activate button updates,
+        /// causing the bot to click again and double-load (or close the panel).
+        /// </summary>
+        private const int InsertSettleMs = 800;
 
         // Portal spawn settle
         private DateTime? _portalFirstSeenAt;
@@ -91,13 +108,17 @@ namespace AutoExile.Systems
         /// The filter receives each InventoryItem element from the map stash
         /// and should return true for the desired map type.
         /// </summary>
-        public bool Start(Func<Element, bool> mapFilter, string? inventoryFragmentPath = null)
+        public bool Start(Func<Element, bool> mapFilter, string? inventoryFragmentPath = null,
+            IReadOnlyList<string>? scarabPaths = null)
         {
             if (_phase != MapDevicePhase.Idle)
                 return false;
 
             _mapFilter = mapFilter;
             _inventoryFragmentPath = inventoryFragmentPath;
+            // Reset scarab list every Start() — caller must opt in each run, otherwise
+            // a stale wave-farm config could insert scarabs into a Boss/Sim device.
+            ScarabPaths = scarabPaths;
             _phase = MapDevicePhase.NavigateToDevice;
             _phaseStartTime = DateTime.Now;
             _lastActionTime = DateTime.MinValue;
@@ -118,6 +139,7 @@ namespace AutoExile.Systems
             _phase = MapDevicePhase.Idle;
             _mapFilter = null;
             _inventoryFragmentPath = null;
+            ScarabPaths = null;
             TargetMapName = null;
             MinMapTier = 0;
             Status = "Cancelled";
@@ -152,6 +174,7 @@ namespace AutoExile.Systems
                 MapDevicePhase.NavigateToDevice => TickNavigateToDevice(gc, nav),
                 MapDevicePhase.OpenDevice => TickOpenDevice(gc),
                 MapDevicePhase.SelectMap => TickSelectMap(gc),
+                MapDevicePhase.InsertScarabs => TickInsertScarabs(gc),
                 MapDevicePhase.Activate => TickActivate(gc),
                 MapDevicePhase.WaitForPortals => TickWaitForPortals(gc),
                 MapDevicePhase.EnterPortal => TickEnterPortal(gc, nav),
@@ -308,12 +331,38 @@ namespace AutoExile.Systems
                 return MapDeviceResult.Failed;
             }
 
-            // Check if a map is already in the device
+            // PRIMARY check — if the activate button is showing, something is loaded
+            // (auto-inserted on atlas open OR placed by a prior tick that we're racing
+            // against). Skip ALL map insertion logic. If scarabs are configured for
+            // this run we still need the InsertScarabs phase before activating.
+            if (IsActivateButtonReady(atlas))
+            {
+                _phase = NextPhaseAfterMapLoaded();
+                _phaseStartTime = DateTime.Now;
+                Status = "Activate button ready — " + (_phase == MapDevicePhase.InsertScarabs
+                    ? "inserting scarabs"
+                    : "going straight to activate");
+                return MapDeviceResult.InProgress;
+            }
+
+            // Secondary check — slot 0 occupied (covers cases where activate button
+            // hasn't rendered yet but the slot already shows the item).
             if (IsMapInDevice(atlas))
             {
-                _phase = MapDevicePhase.Activate;
+                _phase = NextPhaseAfterMapLoaded();
                 _phaseStartTime = DateTime.Now;
-                Status = "Map already in device — activating";
+                Status = _phase == MapDevicePhase.InsertScarabs
+                    ? "Map in device — inserting scarabs"
+                    : "Map already in device — activating";
+                return MapDeviceResult.InProgress;
+            }
+
+            // Settle window — if we just clicked a fragment, give the UI time to update
+            // before re-checking. Otherwise we re-enter this phase, see no activate
+            // button yet (still rendering), and click the same/next fragment again.
+            if ((DateTime.Now - _lastActionTime).TotalMilliseconds < InsertSettleMs)
+            {
+                Status = $"[Select] Waiting {InsertSettleMs}ms for device to update after click";
                 return MapDeviceResult.InProgress;
             }
 
@@ -346,8 +395,9 @@ namespace AutoExile.Systems
                 if (!_nodeSelected)
                 {
                     var nameEl = atlas.GetChildFromIndices(MapNameTextPath);
+                    var expectedName = StripMapPrefix(TargetMapName);
                     if (nameEl?.Text != null &&
-                        nameEl.Text.Equals(TargetMapName, StringComparison.OrdinalIgnoreCase))
+                        nameEl.Text.Equals(expectedName, StringComparison.OrdinalIgnoreCase))
                     {
                         _nodeSelected = true;
                         Status = $"[Select] {TargetMapName} confirmed selected";
@@ -391,7 +441,14 @@ namespace AutoExile.Systems
                 break;
             }
 
-            // Fallback: check player inventory for right-clickable fragments (boss invitations, etc.)
+            // Fallback: check player inventory for the map / fragment.
+            //
+            // Click type depends on flow:
+            //   • Named-map flow (TargetMapName set, e.g. "City Square"): the atlas
+            //     node is already selected, so a Ctrl+click on the inventory map
+            //     drops it into the selected slot.
+            //   • Auto-match flow (boss fragment with no TargetMapName): right-click
+            //     auto-selects the correct atlas node AND inserts in one action.
             if (targetMap == null && _inventoryFragmentPath != null)
             {
                 if (!CanAct()) return MapDeviceResult.InProgress;
@@ -417,7 +474,7 @@ namespace AutoExile.Systems
                     return MapDeviceResult.InProgress;
                 }
 
-                // Inventory is open — find and right-click a matching fragment
+                // Inventory is open — find and click the matching item
                 bool foundAny = false;
                 var invItems = gc.IngameState.ServerData?.PlayerInventories?[0]?.Inventory?.InventorySlotItems;
                 if (invItems != null)
@@ -434,10 +491,16 @@ namespace AutoExile.Systems
                         var slotRect = slotItem.GetClientRect();
                         var absPos2 = new Vector2(windowRect2.X + slotRect.Center.X,
                             windowRect2.Y + slotRect.Center.Y);
-                        if (BotInput.RightClick(absPos2))
+
+                        bool inserted = namedMapFlow
+                            ? BotInput.CtrlClick(absPos2)
+                            : BotInput.RightClick(absPos2);
+                        if (inserted)
                         {
                             _lastActionTime = DateTime.Now;
-                            Status = "[Select] Right-clicking fragment from inventory";
+                            Status = namedMapFlow
+                                ? $"[Select] Ctrl+clicking inventory map into {TargetMapName} slot"
+                                : "[Select] Right-clicking fragment from inventory";
                         }
                         return MapDeviceResult.InProgress;
                     }
@@ -445,7 +508,7 @@ namespace AutoExile.Systems
 
                 if (!foundAny)
                 {
-                    Status = $"[Select] No fragments in stash or inventory — out of {_inventoryFragmentPath}";
+                    Status = $"[Select] No '{_inventoryFragmentPath}' in stash or inventory";
                     _phase = MapDevicePhase.Idle;
                     return MapDeviceResult.Failed;
                 }
@@ -498,7 +561,10 @@ namespace AutoExile.Systems
                 return MapDeviceResult.Failed;
             }
 
-            // Try standard AtlasNodes name lookup
+            // Try standard AtlasNodes name lookup. The web UI prefixes "supported"
+            // map names with "★ " as a visual marker — the game files return the
+            // bare name, so we strip the marker before comparing.
+            var lookupName = StripMapPrefix(TargetMapName);
             var nodes = gc.Files?.AtlasNodes?.EntriesList;
             int nodeIndex = -1;
             if (nodes != null)
@@ -506,7 +572,7 @@ namespace AutoExile.Systems
                 for (int i = 0; i < Math.Min(nodes.Count, 110); i++)
                 {
                     var name = nodes[i].Area?.Name;
-                    if (name != null && name.Equals(TargetMapName, StringComparison.OrdinalIgnoreCase))
+                    if (name != null && name.Equals(lookupName, StringComparison.OrdinalIgnoreCase))
                     {
                         nodeIndex = i;
                         break;
@@ -631,6 +697,20 @@ namespace AutoExile.Systems
             if (activateBtn == null || !activateBtn.IsVisible)
             {
                 Status = "Activate button not found";
+                return MapDeviceResult.InProgress;
+            }
+
+            // Don't click a greyed-out button — it'll register a fake "click" with
+            // no effect and leave us spinning in WaitForPortals forever. The button
+            // becomes IsActive==true only after a map is loaded into slot 0.
+            if (!activateBtn.IsActive)
+            {
+                // Bounce back to SelectMap so the map-insertion path runs again.
+                // Common case: bot inserted scarabs but the map insertion never
+                // actually landed (mapStash empty + inventory fallback didn't fire).
+                Status = "Activate button greyed out — no map loaded; returning to map selection";
+                _phase = MapDevicePhase.SelectMap;
+                _phaseStartTime = DateTime.Now;
                 return MapDeviceResult.InProgress;
             }
 
@@ -805,6 +885,159 @@ namespace AutoExile.Systems
             return slot0 != null && slot0.ChildCount >= 2;
         }
 
+        /// <summary>
+        /// Activate button is READY (clickable, not greyed-out) iff its
+        /// <c>IsActive</c> flag is true. The element's <c>IsVisible</c> stays
+        /// true the entire time the device panel is open — the disabled button
+        /// is rendered, just unclickable. Using IsVisible as the readiness check
+        /// makes the bot think activation succeeded (button "visible") and skip
+        /// map insertion + spin in WaitForPortals forever.
+        /// </summary>
+        private bool IsActivateButtonReady(Element atlas)
+        {
+            var btn = atlas.GetChildFromIndices(ActivateButtonPath);
+            return btn != null && btn.IsVisible && btn.IsActive;
+        }
+
+        /// <summary>
+        /// Strip the web UI's "★ " supported-map marker (and any leading whitespace)
+        /// from a map name so it matches the bare names that the game's AtlasNodes
+        /// and device panel return.
+        /// </summary>
+        private static string? StripMapPrefix(string? name)
+        {
+            if (string.IsNullOrEmpty(name)) return name;
+            return name.TrimStart('★', ' ', '\u00a0').Trim();
+        }
+
+        /// <summary>
+        /// After the map is loaded into the device, decide the next phase. If the
+        /// caller supplied scarab paths, route through <see cref="MapDevicePhase.InsertScarabs"/>
+        /// first; otherwise jump straight to <see cref="MapDevicePhase.Activate"/>.
+        /// </summary>
+        private MapDevicePhase NextPhaseAfterMapLoaded()
+        {
+            return ScarabPaths != null && ScarabPaths.Count > 0
+                ? MapDevicePhase.InsertScarabs
+                : MapDevicePhase.Activate;
+        }
+
+        /// <summary>
+        /// Count empty scarab slots (device slots 1-5; slot 0 is the map). Returns 0
+        /// when the slots panel is missing — caller should fall through to activate
+        /// rather than spinning.
+        /// </summary>
+        private int CountEmptyScarabSlots(Element atlas)
+        {
+            var slots = atlas.GetChildFromIndices(DeviceSlotsPath);
+            if (slots == null) return 0;
+            int empty = 0;
+            for (int i = 1; i <= 5; i++)
+            {
+                var s = slots.GetChildAtIndex(i);
+                if (s != null && s.IsVisible && s.ChildCount < 2) empty++;
+            }
+            return empty;
+        }
+
+        // --- Phase: Insert scarabs from inventory into device slots ---
+
+        /// <summary>
+        /// Insert scarabs from inventory by ctrl+clicking each one. The game auto-fills
+        /// the next empty device slot per click — no per-slot targeting needed. Loops
+        /// until either every configured-path inventory item has been clicked, or all
+        /// 5 device scarab slots are full, or no matching inventory item remains.
+        /// </summary>
+        private MapDeviceResult TickInsertScarabs(GameController gc)
+        {
+            var atlas = gc.IngameState.IngameUi.Atlas;
+            if (atlas?.IsVisible != true)
+            {
+                // Atlas closed — UI race, fall through. WaitForPortals will pick up.
+                _phase = MapDevicePhase.Activate;
+                _phaseStartTime = DateTime.Now;
+                Status = "[Scarabs] Atlas closed — proceeding to activate";
+                return MapDeviceResult.InProgress;
+            }
+
+            // No scarabs configured — shouldn't happen since we only enter this phase
+            // when ScarabPaths is non-empty, but defend anyway.
+            if (ScarabPaths == null || ScarabPaths.Count == 0)
+            {
+                _phase = MapDevicePhase.Activate;
+                _phaseStartTime = DateTime.Now;
+                return MapDeviceResult.InProgress;
+            }
+
+            // Settle window after each ctrl+click — same reason as map insertion: the
+            // device UI takes time to re-render slot occupancy. Without this we'd
+            // double-click and over-stuff slots.
+            if ((DateTime.Now - _lastActionTime).TotalMilliseconds < InsertSettleMs)
+            {
+                Status = $"[Scarabs] Waiting {InsertSettleMs}ms for slot to update";
+                return MapDeviceResult.InProgress;
+            }
+
+            // All 5 scarab slots full → done.
+            int empty = CountEmptyScarabSlots(atlas);
+            if (empty <= 0)
+            {
+                _phase = MapDevicePhase.Activate;
+                _phaseStartTime = DateTime.Now;
+                Status = "[Scarabs] All slots full — activating";
+                return MapDeviceResult.InProgress;
+            }
+
+            // Find the first matching inventory item.
+            var invItems = gc.IngameState.ServerData?.PlayerInventories?[0]?.Inventory?.InventorySlotItems;
+            if (invItems == null)
+            {
+                _phase = MapDevicePhase.Activate;
+                _phaseStartTime = DateTime.Now;
+                Status = "[Scarabs] Inventory not readable — activating";
+                return MapDeviceResult.InProgress;
+            }
+
+            ExileCore.PoEMemory.MemoryObjects.ServerInventory.InventSlotItem? targetSlot = null;
+            string? matchedPath = null;
+            foreach (var slotItem in invItems)
+            {
+                var path = slotItem.Item?.Path;
+                if (string.IsNullOrEmpty(path)) continue;
+                foreach (var sp in ScarabPaths)
+                {
+                    if (path.Contains(sp, StringComparison.OrdinalIgnoreCase))
+                    {
+                        targetSlot = slotItem;
+                        matchedPath = sp;
+                        break;
+                    }
+                }
+                if (targetSlot != null) break;
+            }
+
+            if (targetSlot == null)
+            {
+                _phase = MapDevicePhase.Activate;
+                _phaseStartTime = DateTime.Now;
+                Status = $"[Scarabs] No more matching scarabs in inventory ({empty} slots empty) — activating";
+                return MapDeviceResult.InProgress;
+            }
+
+            if (!CanAct()) return MapDeviceResult.InProgress;
+
+            var rect = targetSlot.GetClientRect();
+            var windowRect = gc.Window.GetWindowRectangle();
+            var absPos = new Vector2(windowRect.X + rect.Center.X, windowRect.Y + rect.Center.Y);
+
+            if (BotInput.CtrlClick(absPos))
+            {
+                _lastActionTime = DateTime.Now;
+                Status = $"[Scarabs] Inserting '{matchedPath}' (empty slots: {empty})";
+            }
+            return MapDeviceResult.InProgress;
+        }
+
         // --- Static map filter helpers ---
 
         /// <summary>
@@ -870,6 +1103,7 @@ namespace AutoExile.Systems
         NavigateToDevice,
         OpenDevice,
         SelectMap,
+        InsertScarabs,
         Activate,
         WaitForPortals,
         EnterPortal,

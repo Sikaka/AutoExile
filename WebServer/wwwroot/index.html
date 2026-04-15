@@ -335,7 +335,7 @@ tr:hover td { background:var(--surface2); }
       </div>
       <div class="farm-field">
         <label>Min Tier</label>
-        <select id="farmMinTier" class="farm-input" onchange="updateSetting('farming.minMapTier',parseInt(this.value))">
+        <select id="farmMinTier" class="farm-input" onchange="updateSetting('mapRolling.minMapTier',parseInt(this.value))">
           <option value="0">Any</option>
           <option value="14">14+</option><option value="15">15+</option><option value="16">16</option>
         </select>
@@ -346,11 +346,11 @@ tr:hover td { background:var(--surface2); }
     <div style="margin-bottom:12px">
       <label style="font-size:10px;text-transform:uppercase;letter-spacing:.8px;color:var(--text-dim);display:block;margin-bottom:6px">Scarab Slots</label>
       <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px">
-        <input id="farmScarab1" class="farm-text" placeholder="Slot 1" onchange="updateSetting('farming.scarabSlot1',this.value)">
-        <input id="farmScarab2" class="farm-text" placeholder="Slot 2" onchange="updateSetting('farming.scarabSlot2',this.value)">
-        <input id="farmScarab3" class="farm-text" placeholder="Slot 3" onchange="updateSetting('farming.scarabSlot3',this.value)">
-        <input id="farmScarab4" class="farm-text" placeholder="Slot 4" onchange="updateSetting('farming.scarabSlot4',this.value)">
-        <input id="farmScarab5" class="farm-text" placeholder="Slot 5" onchange="updateSetting('farming.scarabSlot5',this.value)">
+        <input id="farmScarab1" class="farm-text" placeholder="Slot 1" onchange="updateSetting('mapDevice.slot1',this.value)">
+        <input id="farmScarab2" class="farm-text" placeholder="Slot 2" onchange="updateSetting('mapDevice.slot2',this.value)">
+        <input id="farmScarab3" class="farm-text" placeholder="Slot 3" onchange="updateSetting('mapDevice.slot3',this.value)">
+        <input id="farmScarab4" class="farm-text" placeholder="Slot 4" onchange="updateSetting('mapDevice.slot4',this.value)">
+        <input id="farmScarab5" class="farm-text" placeholder="Slot 5" onchange="updateSetting('mapDevice.slot5',this.value)">
         <button class="btn" style="font-size:10px;padding:4px 8px" onclick="applyStrategyDefaults()">Defaults</button>
       </div>
     </div>
@@ -382,11 +382,14 @@ tr:hover td { background:var(--surface2); }
 
   <div class="grid2">
     <div class="card">
-      <h2>Player</h2>
+      <h2>Runtime</h2>
       <div id="areaName" style="font-size:13px;color:var(--text-dim);margin-bottom:12px">--</div>
-      <div class="bar-container"><div class="bar-label"><span>HP</span><span id="hpText">0%</span></div><div class="bar"><div id="hpBar" class="bar-fill hp" style="width:0%"></div></div></div>
-      <div class="bar-container"><div class="bar-label"><span>ES</span><span id="esText">0%</span></div><div class="bar"><div id="esBar" class="bar-fill es" style="width:0%"></div></div></div>
-      <div class="bar-container"><div class="bar-label"><span>Mana</span><span id="manaText">0%</span></div><div class="bar"><div id="manaBar" class="bar-fill mana" style="width:0%"></div></div></div>
+      <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:6px">
+        <span id="runtimeElapsed" style="font-size:24px;font-family:'Cascadia Code','Fira Code',monospace;color:var(--accent)">0:00</span>
+        <span id="runtimeRemaining" style="font-size:12px;color:var(--text-dim)">no limit</span>
+      </div>
+      <div class="bar"><div id="runtimeBar" class="bar-fill" style="width:0%;background:var(--accent)"></div></div>
+      <button class="btn" style="margin-top:10px;padding:5px 12px;font-size:11px" onclick="resetRuntime()">Reset Timer</button>
     </div>
     <div class="card">
       <h2>Combat & Navigation</h2>
@@ -435,18 +438,19 @@ tr:hover td { background:var(--surface2); }
 <!-- ==================== SETTINGS ==================== -->
 <div id="tab-settings" class="tab-content">
 <div class="main">
-  <!-- Presets bar -->
+  <!-- Profile bar — active profile auto-saves on every edit -->
   <div id="presetsBar" class="presets-bar">
-    <span class="presets-label">Presets</span>
-    <select id="presetSelect">
-      <option value="">-- Select Preset --</option>
+    <span class="presets-label">Profile</span>
+    <select id="profileSelect" onchange="switchProfile(this.value)">
+      <option value="">-- Loading --</option>
     </select>
-    <button class="btn" style="padding:5px 12px;font-size:11px" onclick="loadPreset()">Load</button>
-    <button class="btn" style="padding:5px 12px;font-size:11px" onclick="savePreset()">Save</button>
-    <button class="btn danger" style="padding:5px 12px;font-size:11px" onclick="deletePreset()">Delete</button>
+    <span id="profileActiveBadge" style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.8px">Active</span>
+    <button class="btn" style="padding:5px 12px;font-size:11px" onclick="createProfile()">New</button>
+    <button class="btn" style="padding:5px 12px;font-size:11px" onclick="renameProfile()">Rename</button>
+    <button class="btn danger" style="padding:5px 12px;font-size:11px" onclick="deleteProfile()">Delete</button>
     <span style="flex:1"></span>
-    <button class="btn" style="padding:5px 12px;font-size:11px" onclick="exportPreset()">Export</button>
-    <button class="btn" style="padding:5px 12px;font-size:11px" onclick="importPreset()">Import</button>
+    <button class="btn" style="padding:5px 12px;font-size:11px" onclick="exportProfile()">Export</button>
+    <button class="btn" style="padding:5px 12px;font-size:11px" onclick="importProfile()">Import</button>
     <input type="file" id="presetFileInput" accept=".json" style="display:none" onchange="handlePresetFile(event)">
   </div>
   <!-- Search bar -->
@@ -557,7 +561,7 @@ function updateDashboard(s) {
   else { dot.className='status-dot paused'; txt.textContent='Paused'; }
 
   document.getElementById('areaName').textContent = s.area || '--';
-  setBar('hp',s.hpPercent); setBar('es',s.esPercent); setBar('mana',s.manaPercent);
+  updateRuntimeWidget(s);
 
   const ce = document.getElementById('inCombat');
   ce.textContent = s.inCombat ? 'FIGHTING' : 'Clear';
@@ -699,6 +703,59 @@ function updateDashboard(s) {
 }
 
 function setBar(id,pct) { const p=Math.round(pct*100); document.getElementById(id+'Bar').style.width=p+'%'; document.getElementById(id+'Text').textContent=p+'%'; }
+
+function fmtHM(seconds) {
+  if (seconds < 0) seconds = 0;
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  return h + ':' + m.toString().padStart(2, '0');
+}
+
+function updateRuntimeWidget(s) {
+  const elapsedEl   = document.getElementById('runtimeElapsed');
+  const remainingEl = document.getElementById('runtimeRemaining');
+  const barEl       = document.getElementById('runtimeBar');
+  if (!elapsedEl) return;
+
+  const active = s.runtimeActiveSeconds || 0;
+  const max    = s.runtimeMaxMinutes || 0;
+  const left   = s.runtimeRemainingSeconds || 0;
+
+  elapsedEl.textContent = fmtHM(active);
+
+  if (max <= 0) {
+    remainingEl.textContent = 'no limit';
+    remainingEl.style.color = 'var(--text-dim)';
+    barEl.style.width = '0%';
+    return;
+  }
+
+  const maxSec = max * 60;
+  const usedPct = Math.min(100, Math.round((active / maxSec) * 100));
+  barEl.style.width = usedPct + '%';
+
+  // Last 5 minutes red, last 10% amber
+  const remPct = left / maxSec;
+  let color = 'var(--accent)';
+  if (left <= 0) color = '#888';
+  else if (left < 300) color = '#ff5c5c';
+  else if (remPct < 0.10) color = '#ffaa33';
+  barEl.style.background = color;
+  remainingEl.style.color = color;
+
+  remainingEl.textContent = left > 0
+    ? `${fmtHM(left)} remaining (cap ${Math.floor(max/60)}:${(max%60).toString().padStart(2,'0')})`
+    : `expired — bot stopped`;
+}
+
+async function resetRuntime() {
+  if (!confirm('Reset the active-runtime timer to zero?')) return;
+  try {
+    const r = await fetch('/api/runtime/reset', { method: 'POST' });
+    if (r.ok) flashSave();
+    else { const d = await r.json(); alert('Reset failed: ' + (d.error || r.status)); }
+  } catch(e) { alert('Reset failed: ' + e.message); }
+}
 
 function addLog(cls,text) {
   const now = new Date().toLocaleTimeString();
@@ -976,7 +1033,20 @@ function buildEnemyBlacklist() {
 async function sendCmd(action, value) {
   try { await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,value})}); } catch {}
 }
-document.getElementById('modeSelect').addEventListener('change', function(){sendCmd('setMode',this.value);});
+document.getElementById('modeSelect').addEventListener('change', function(){
+  sendCmd('setMode', this.value);
+  // Optimistically update the dashboard — don't wait for the bot to echo the change back.
+  // If the bot isn't running, the WebSocket never reports the transition and the mode tab stays stale.
+  if (this.value && this.value !== currentBotMode) {
+    currentBotMode = this.value;
+    const lbl = document.getElementById('modeTabLabel');
+    if (lbl) lbl.textContent = this.value === 'Idle' ? 'Mode' : this.value;
+    if (settingsLoaded) {
+      const modeTab = document.getElementById('stab-mode');
+      if (modeTab) { modeTab.innerHTML = ''; renderModeTab(modeTab, currentBotMode); }
+    }
+  }
+});
 
 // ==================== LAB GEM REPORT ====================
 async function loadGemReport() {
@@ -1139,6 +1209,12 @@ function switchSettingsTab(name) {
   document.querySelectorAll('.settings-tab-content').forEach(c => c.classList.remove('active'));
   const el = document.getElementById('stab-'+name);
   if (el) el.classList.add('active');
+  // Always re-render the mode tab on entry to pick up any mode change that happened
+  // while the user was on a different tab.
+  if (name === 'mode' && settingsLoaded && el) {
+    el.innerHTML = '';
+    renderModeTab(el, currentBotMode);
+  }
 }
 
 async function loadSettings() {
@@ -1163,11 +1239,20 @@ function renderModeTab(container, modeName) {
   // Mode-specific settings
   for (const section of cfg.sections) {
     if (section === 'farming') {
-      addSection(container, 'Farming', [['farming.mapName'],['farming.minMapTier'],['farming.portalKey'],
-        ['farming.farmStrategy']]);
+      addSection(container, 'Farming', [['farming.mapName'],['farming.farmStrategy']]);
+      addSection(container, 'Map Rolling (shared)', [['mapRolling.minMapTier'],
+        ['mapRolling.dangerousMapMods'],['mapRolling.minMapQuantity']]);
+      addSection(container, 'Map Device Slots (shared)', [['mapDevice.slot1'],['mapDevice.slot2'],
+        ['mapDevice.slot3'],['mapDevice.slot4'],['mapDevice.slot5']]);
+      addSection(container, 'Run (shared)', [['run.portalKey'],['run.maxDeaths'],
+        ['run.stashItemThreshold'],['run.lootSweepTimeoutSeconds']]);
+      addSection(container, 'Stash (shared)', [['stash.dumpTabName'],['stash.mappingSuppliesTabName']]);
     } else if (section === 'simulacrum') {
-      addSection(container, 'Simulacrum', [['simulacrum.maxDeaths'],['simulacrum.minWaveDelaySeconds'],
-        ['simulacrum.waveTimeoutMinutes'],['simulacrum.stashItemThreshold']]);
+      addSection(container, 'Simulacrum', [['simulacrum.simulacrumStock'],
+        ['simulacrum.minWaveDelaySeconds'],['simulacrum.waveTimeoutMinutes']]);
+      addSection(container, 'Run (shared)', [['run.maxDeaths'],['run.stashItemThreshold'],
+        ['run.lootSweepTimeoutSeconds'],['run.portalKey']]);
+      addSection(container, 'Stash (shared)', [['stash.dumpTabName'],['stash.fragmentTabName']]);
     } else if (section === 'blight') {
       const blightDiv = document.createElement('div');
       const blightTitle = document.createElement('div'); blightTitle.className='section-divider'; blightTitle.textContent='Blight'; blightDiv.appendChild(blightTitle);
@@ -1197,11 +1282,13 @@ function renderModeTab(container, modeName) {
       addSection(container, 'Labyrinth', [['labyrinth.difficulty'],['labyrinth.maxRuns'],
         ['labyrinth.minExpectedProfit'],['labyrinth.keepThreshold'],['labyrinth.preferSameType'],
         ['labyrinth.openRewardChests'],['labyrinth.zoneTimeoutSeconds'],['labyrinth.izaroTimeoutSeconds'],
-        ['labyrinth.maxDeaths'],['labyrinth.settleSeconds']]);
+        ['labyrinth.settleSeconds']]);
+      addSection(container, 'Run (shared)', [['run.maxDeaths']]);
     } else if (section === 'boss') {
-      addSection(container, 'Boss', [['boss.bossType'],['boss.maxDeaths'],['boss.lootSweepTimeoutSeconds'],
-        ['boss.dumpTabName'],['boss.resourceTabName'],['boss.fragmentStock'],['boss.stashItemThreshold'],
-        ['boss.portalKey'],['boss.keyDropChaosValue']]);
+      addSection(container, 'Boss', [['boss.bossType'],['boss.fragmentStock'],['boss.keyDropChaosValue']]);
+      addSection(container, 'Run (shared)', [['run.maxDeaths'],['run.lootSweepTimeoutSeconds'],
+        ['run.stashItemThreshold'],['run.portalKey']]);
+      addSection(container, 'Stash (shared)', [['stash.dumpTabName'],['stash.fragmentTabName']]);
     } else if (section === 'follower') {
       addSection(container, 'Follower', [['follower.leaderName'],['follower.followDistance'],['follower.stopDistance'],
         ['follower.followThroughTransitions'],['follower.enableCombat'],['follower.enableLoot'],['follower.lootNearLeaderOnly']]);
@@ -1702,6 +1789,26 @@ async function setAltarMod(modId, weight, inputEl) {
   } catch {}
 }
 
+async function testDiscordWebhook(btn) {
+  const original = btn.textContent;
+  btn.textContent = 'Sending...';
+  btn.disabled = true;
+  try {
+    const resp = await fetch('/api/action/discord-test', { method: 'POST' });
+    const result = await resp.json();
+    if (result.ok) {
+      btn.textContent = 'Sent ✓';
+    } else {
+      btn.textContent = 'Failed';
+      console.warn('Discord test failed:', result.error);
+    }
+  } catch(e) {
+    btn.textContent = 'Error';
+    console.error('Discord test error:', e);
+  }
+  setTimeout(() => { btn.textContent = original; btn.disabled = false; }, 3000);
+}
+
 async function capturePosition(settingKey) {
   const inputId = 'input-' + settingKey.replace(/\./g, '-');
   const input = document.getElementById(inputId);
@@ -1810,6 +1917,8 @@ function buildField(key, entry, note) {
         input = `<div style="display:flex;gap:4px;align-items:center;flex:1"><input type="text" value="${esc(entry.value||'')}" onchange="updateSetting('${key}',this.value)" style="flex:1" id="input-${key.replace(/\./g,'-')}"><button onclick="scanPlayerBuffs('${key}')" style="white-space:nowrap">Scan Buffs</button></div>`;
       } else if (entry.description && entry.description.includes('Set Current Pos')) {
         input = `<div style="display:flex;gap:4px;align-items:center;flex:1"><input type="text" value="${esc(entry.value||'')}" onchange="updateSetting('${key}',this.value)" style="flex:1" id="input-${key.replace(/\./g,'-')}"><button onclick="capturePosition('${key}')" style="white-space:nowrap">Set Current Pos</button></div>`;
+      } else if (key === 'notifications.discordWebhookUrl') {
+        input = `<div style="display:flex;gap:4px;align-items:center;flex:1"><input type="password" value="${esc(entry.value||'')}" onchange="updateSetting('${key}',this.value)" style="flex:1" id="input-${key.replace(/\./g,'-')}"><button onclick="testDiscordWebhook(this)" style="white-space:nowrap">Test</button></div>`;
       } else {
         input = `<input type="text" value="${esc(entry.value||'')}" onchange="updateSetting('${key}',this.value)">`;
       }
@@ -1942,73 +2051,100 @@ function clearSettingsSearch(clearInput) {
   document.getElementById('settingsTabBar').style.display = '';
 }
 
-// ==================== PRESETS ====================
+// ==================== PROFILES ====================
+// The active profile is the source of truth — every settings edit auto-saves to it
+// via the existing /api/settings POST → ProfileManager.SaveActive backend chain.
+let activeProfile = '';
+
 async function refreshPresetList() {
   try {
-    const r = await fetch('/api/presets');
-    const names = await r.json();
-    const sel = document.getElementById('presetSelect');
-    const cur = sel.value;
-    sel.innerHTML = '<option value="">-- Select Preset --</option>';
+    const r = await fetch('/api/profiles');
+    const data = await r.json();
+    activeProfile = data.active || '';
+    const names = data.profiles || [];
+    const sel = document.getElementById('profileSelect');
+    sel.innerHTML = '';
     for (const name of names) {
       const opt = document.createElement('option');
       opt.value = name; opt.textContent = name;
+      if (name === activeProfile) opt.selected = true;
       sel.appendChild(opt);
     }
-    if (cur && names.includes(cur)) sel.value = cur;
+    const badge = document.getElementById('profileActiveBadge');
+    if (badge) badge.textContent = activeProfile ? 'Active' : '—';
   } catch {}
 }
 
-async function savePreset() {
-  const name = prompt('Preset name:');
+async function switchProfile(name) {
+  if (!name || name === activeProfile) return;
+  try {
+    const r = await fetch('/api/profiles/switch', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({name})
+    });
+    if (!r.ok) { const d = await r.json(); alert('Switch failed: ' + (d.error || r.status)); return; }
+    activeProfile = name;
+    flashSave();
+    // Reload settings into the UI to reflect the new profile's values
+    settingsLoaded = false;
+    await loadSettings();
+  } catch(e) { alert('Switch failed: ' + e.message); }
+}
+
+async function createProfile() {
+  const name = prompt('New profile name (a copy of your current settings):');
   if (!name || !name.trim()) return;
+  const switchTo = confirm('Switch to the new profile after creating?');
   try {
-    const r = await fetch('/api/presets/save', {
+    const r = await fetch('/api/profiles/create', {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({name: name.trim()})
+      body: JSON.stringify({name: name.trim(), switchTo})
     });
-    if (r.ok) { flashSave(); await refreshPresetList(); document.getElementById('presetSelect').value = name.trim(); }
-    else { const d = await r.json(); alert('Save failed: ' + (d.error || r.status)); }
-  } catch(e) { alert('Save failed: ' + e.message); }
+    if (!r.ok) { const d = await r.json(); alert('Create failed: ' + (d.error || r.status)); return; }
+    flashSave();
+    await refreshPresetList();
+    if (switchTo) { settingsLoaded = false; await loadSettings(); }
+  } catch(e) { alert('Create failed: ' + e.message); }
 }
 
-async function loadPreset() {
-  const name = document.getElementById('presetSelect').value;
-  if (!name) { alert('Select a preset first'); return; }
-  if (!confirm(`Load preset "${name}"? This will overwrite your current settings.`)) return;
+async function renameProfile() {
+  const sel = document.getElementById('profileSelect');
+  const oldName = sel.value;
+  if (!oldName) { alert('Select a profile first'); return; }
+  const newName = prompt(`Rename "${oldName}" to:`, oldName);
+  if (!newName || !newName.trim() || newName.trim() === oldName) return;
   try {
-    const r = await fetch('/api/presets/load', {
+    const r = await fetch('/api/profiles/rename', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({from: oldName, to: newName.trim()})
+    });
+    if (!r.ok) { const d = await r.json(); alert('Rename failed: ' + (d.error || r.status)); return; }
+    await refreshPresetList();
+  } catch(e) { alert('Rename failed: ' + e.message); }
+}
+
+async function deleteProfile() {
+  const sel = document.getElementById('profileSelect');
+  const name = sel.value;
+  if (!name) return;
+  if (name === activeProfile) { alert('Cannot delete the active profile. Switch to a different profile first.'); return; }
+  if (!confirm(`Delete profile "${name}"? This cannot be undone.`)) return;
+  try {
+    const r = await fetch('/api/profiles/delete', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({name})
     });
-    if (r.ok) {
-      flashSave();
-      // Reload settings to reflect changes
-      settingsLoaded = false;
-      await loadSettings();
-    } else { const d = await r.json(); alert('Load failed: ' + (d.error || r.status)); }
-  } catch(e) { alert('Load failed: ' + e.message); }
-}
-
-async function deletePreset() {
-  const name = document.getElementById('presetSelect').value;
-  if (!name) { alert('Select a preset first'); return; }
-  if (!confirm(`Delete preset "${name}"?`)) return;
-  try {
-    const r = await fetch('/api/presets/delete', {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({name})
-    });
-    if (r.ok) { await refreshPresetList(); }
-    else { const d = await r.json(); alert('Delete failed: ' + (d.error || r.status)); }
+    if (!r.ok) { const d = await r.json(); alert('Delete failed: ' + (d.error || r.status)); return; }
+    await refreshPresetList();
   } catch(e) { alert('Delete failed: ' + e.message); }
 }
 
-async function exportPreset() {
-  const name = document.getElementById('presetSelect').value;
-  if (!name) { alert('Select a preset to export'); return; }
+async function exportProfile() {
+  const sel = document.getElementById('profileSelect');
+  const name = sel.value;
+  if (!name) { alert('Select a profile to export'); return; }
   try {
-    const r = await fetch(`/api/presets/export?name=${encodeURIComponent(name)}`);
+    const r = await fetch(`/api/profiles/export?name=${encodeURIComponent(name)}`);
     if (!r.ok) { alert('Export failed'); return; }
     const blob = await r.blob();
     const url = URL.createObjectURL(blob);
@@ -2018,7 +2154,7 @@ async function exportPreset() {
   } catch(e) { alert('Export failed: ' + e.message); }
 }
 
-function importPreset() {
+function importProfile() {
   document.getElementById('presetFileInput').click();
 }
 
@@ -2026,21 +2162,18 @@ async function handlePresetFile(event) {
   const file = event.target.files[0];
   if (!file) return;
   event.target.value = ''; // reset for re-import
-  const name = prompt('Preset name:', file.name.replace(/\.json$/i, ''));
+  const name = prompt('Profile name:', file.name.replace(/\.json$/i, ''));
   if (!name || !name.trim()) return;
   try {
     const json = await file.text();
-    // Validate JSON
-    JSON.parse(json);
-    const r = await fetch('/api/presets/import', {
+    JSON.parse(json); // validate
+    const r = await fetch('/api/profiles/import', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({name: name.trim(), json})
     });
-    if (r.ok) {
-      flashSave();
-      await refreshPresetList();
-      document.getElementById('presetSelect').value = name.trim();
-    } else { const d = await r.json(); alert('Import failed: ' + (d.error || r.status)); }
+    if (!r.ok) { const d = await r.json(); alert('Import failed: ' + (d.error || r.status)); return; }
+    flashSave();
+    await refreshPresetList();
   } catch(e) { alert('Invalid JSON file: ' + e.message); }
 }
 
@@ -2098,11 +2231,11 @@ function initFarmCard() {
 
   // Min tier
   const tierSel = document.getElementById('farmMinTier');
-  if (S['farming.minMapTier']) tierSel.value = S['farming.minMapTier'].value ?? 0;
+  if (S['mapRolling.minMapTier']) tierSel.value = S['mapRolling.minMapTier'].value ?? 0;
 
   // Scarab slots
   for (let i = 1; i <= 5; i++) {
-    const key = 'farming.scarabSlot' + i;
+    const key = 'mapDevice.slot' + i;
     const el = document.getElementById('farmScarab' + i);
     if (S[key]) el.value = S[key].value || '';
   }
@@ -2136,7 +2269,7 @@ function applyStrategyDefaults() {
       const val = defs.scarabs[i] || '';
       const el = document.getElementById('farmScarab' + (i+1));
       el.value = val;
-      updateSetting('farming.scarabSlot' + (i+1), val);
+      updateSetting('mapDevice.slot' + (i+1), val);
     }
   }
 
@@ -2166,8 +2299,8 @@ async function loadFarmStrategySettings(strategyName) {
   // Shown on the main card already — don't duplicate
   const shownAbove = new Set([
     'farming.farmStrategy','farming.mapName','farming.witnessType','farming.atlasTreePreset',
-    'farming.minMapTier','farming.scarabSlot1','farming.scarabSlot2','farming.scarabSlot3',
-    'farming.scarabSlot4','farming.scarabSlot5','farming.portalKey',
+    'mapRolling.minMapTier','mapDevice.slot1','mapDevice.slot2','mapDevice.slot3',
+    'mapDevice.slot4','mapDevice.slot5','run.portalKey',
   ]);
 
   // Collect relevant settings (strategy-specific + shared tuning like MinCoverage, MinPackDensity)

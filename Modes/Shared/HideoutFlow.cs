@@ -29,6 +29,15 @@ namespace AutoExile.Modes.Shared
         private int _fragmentStock; // target number of fragments to maintain in inventory
         private int _minFragments; // minimum fragments needed to open (0 = any amount works)
 
+        // Multi-item withdrawal (Wave Farming uses this for scarabs + portal scrolls
+        // + maps in one stash trip). Mutually exclusive with the single _withdrawFragmentPath
+        // path — when both are set, the list wins.
+        private IReadOnlyList<(string PathSubstring, int Count)>? _withdrawList;
+
+        // Scarab path substrings to insert into the map device after the map is loaded.
+        // Set by Wave Farming; null/empty for Boss/Sim (they don't use scarabs).
+        private IReadOnlyList<string>? _scarabPaths;
+
         private const float BasePortalTimeoutSeconds = 15f;
         private const float MapDeviceRetrySeconds = 10f;
         private const float ActionCooldownMs = 500f;
@@ -48,7 +57,9 @@ namespace AutoExile.Modes.Shared
             string? resourceTabName = null,
             string? withdrawFragmentPath = null,
             int fragmentStock = 0,
-            int minFragments = 1)
+            int minFragments = 1,
+            IReadOnlyList<(string PathSubstring, int Count)>? withdrawList = null,
+            IReadOnlyList<string>? scarabPaths = null)
         {
             _mapFilter = mapFilter;
             _stashItemFilter = stashItemFilter;
@@ -61,6 +72,8 @@ namespace AutoExile.Modes.Shared
             _withdrawFragmentPath = withdrawFragmentPath;
             _fragmentStock = fragmentStock;
             _minFragments = minFragments;
+            _withdrawList = withdrawList != null && withdrawList.Count > 0 ? withdrawList : null;
+            _scarabPaths = scarabPaths != null && scarabPaths.Count > 0 ? scarabPaths : null;
             _phase = HideoutPhase.Settle;
             _phaseStartTime = DateTime.Now;
             Status = "Hideout — settling";
@@ -111,6 +124,8 @@ namespace AutoExile.Modes.Shared
             _withdrawFragmentPath = null;
             _fragmentStock = 0;
             _minFragments = 1;
+            _withdrawList = null;
+            _scarabPaths = null;
             Status = "";
         }
 
@@ -125,7 +140,29 @@ namespace AutoExile.Modes.Shared
                 return HideoutSignal.InProgress;
             }
 
-            // Count fragments and non-fragment loot in inventory
+            // ── Multi-item path (Wave Farming) ────────────────────────────
+            // When _withdrawList is set, compute which entries are still under-stocked
+            // and rebuild the StashSystem withdrawal list accordingly. This is the
+            // "withdraw scarabs + portals + maps each run" path.
+            List<(string PathSubstring, int Count)>? activeWithdrawList = null;
+            int totalNeededFromList = 0;
+            if (_withdrawList != null && !string.IsNullOrWhiteSpace(_resourceTabName))
+            {
+                activeWithdrawList = new List<(string, int)>();
+                foreach (var (path, target) in _withdrawList)
+                {
+                    var have = StashSystem.CountInventoryItems(ctx.Game, path);
+                    var need = target - have;
+                    if (need > 0)
+                    {
+                        activeWithdrawList.Add((path, need));
+                        totalNeededFromList += need;
+                    }
+                }
+                if (activeWithdrawList.Count == 0) activeWithdrawList = null; // fully stocked
+            }
+
+            // Count fragments and non-fragment loot in inventory (single-item path)
             int fragmentsInInventory = StashSystem.CountInventoryItems(ctx.Game, _withdrawFragmentPath);
             int lootItems = StashSystem.CountNonMatchingItems(ctx.Game, _withdrawFragmentPath);
 
@@ -135,8 +172,10 @@ namespace AutoExile.Modes.Shared
             bool canWithdraw = usesFragments
                 && !string.IsNullOrEmpty(_resourceTabName)
                 && _fragmentStock > 0;
-            bool needWithdraw = canWithdraw && fragmentsInInventory < minNeeded;
-            int withdrawNeeded = needWithdraw ? _fragmentStock : 0;
+            bool needSingleWithdraw = canWithdraw && fragmentsInInventory < minNeeded;
+            int withdrawNeeded = needSingleWithdraw ? _fragmentStock : 0;
+            bool needMultiWithdraw = activeWithdrawList != null;
+            bool needWithdraw = needSingleWithdraw || needMultiWithdraw;
 
             // Not enough fragments and no way to get more — signal stop (only for modes that use fragments)
             if (usesFragments && fragmentsInInventory < minNeeded && !canWithdraw)
@@ -155,14 +194,17 @@ namespace AutoExile.Modes.Shared
             {
                 _phase = HideoutPhase.Stash;
                 _phaseStartTime = DateTime.Now;
-                ctx.Stash.ItemFilter = needStore ? _stashItemFilter : (_ => false);
-                ctx.Stash.StoreTabName = needStore ? _dumpTabName : null;
-                ctx.Stash.WithdrawTabName = needWithdraw ? _resourceTabName : null;
-                ctx.Stash.WithdrawFragmentPath = needWithdraw ? _withdrawFragmentPath : null;
-                ctx.Stash.WithdrawCount = withdrawNeeded;
-                ctx.Stash.Start();
+                ctx.Stash.Start(
+                    storeTabName:         needStore    ? _dumpTabName          : null,
+                    withdrawTabName:      needWithdraw ? _resourceTabName      : null,
+                    // Single-item fields only used when there's no multi-item list.
+                    withdrawFragmentPath: needMultiWithdraw ? null : (needSingleWithdraw ? _withdrawFragmentPath : null),
+                    withdrawCount:        needMultiWithdraw ? 0    : withdrawNeeded,
+                    itemFilter:           needStore ? _stashItemFilter : (_ => false),
+                    withdrawList:         activeWithdrawList);
                 var parts = new List<string>();
-                if (needWithdraw) parts.Add($"withdraw {withdrawNeeded} fragments");
+                if (needSingleWithdraw) parts.Add($"withdraw {withdrawNeeded} fragments");
+                if (needMultiWithdraw)  parts.Add($"withdraw {totalNeededFromList} items ({activeWithdrawList!.Count} types)");
                 if (needStore) parts.Add($"stash {lootItems} loot items");
                 Status = string.Join(" & ", parts);
                 return HideoutSignal.InProgress;
@@ -220,7 +262,7 @@ namespace AutoExile.Modes.Shared
             ctx.MapDevice.TargetMapName = _targetMapName;
             ctx.MapDevice.MinMapTier = _minMapTier;
 
-            if (_mapFilter != null && !ctx.MapDevice.Start(_mapFilter, _inventoryFragmentPath))
+            if (_mapFilter != null && !ctx.MapDevice.Start(_mapFilter, _inventoryFragmentPath, _scarabPaths))
                 Status = $"MapDevice.Start failed (phase={ctx.MapDevice.Phase})";
         }
 

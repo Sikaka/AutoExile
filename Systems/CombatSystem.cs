@@ -132,11 +132,13 @@ namespace AutoExile.Systems
         // ── Default entity path blacklist (never targetable / untargetable decorations) ──
 
         /// <summary>Entity path substrings to always exclude from combat targeting.
-        /// These are monsters that appear hostile but are never actually attackable.</summary>
+        /// These are monsters that appear hostile but are never actually attackable,
+        /// or are attackable but blow up for heavy damage on death.</summary>
         private static readonly string[] DefaultPathBlacklist =
         {
             "MysticFetish",                     // King in the Mist totems — never targetable
             "VoodooKingBoss2RitualPillar",      // King encounter pillars — Unique rarity but decorative
+            "Volatile",                         // All "Volatile" monsters — explode on death, never worth killing
         };
 
         // ── Dormant entity path ignore list ──
@@ -149,6 +151,7 @@ namespace AutoExile.Systems
         {
             "Critters/",   // Pigeons, rats, etc. — decorative, permanently untargetable
             "Daemon/",     // Shrine daemons, effect daemons — visual-only, never targetable
+            "Volatile",    // Explode on death — don't dormant-approach them either
         };
 
         /// <summary>Number of dormant paths learned this session (not counting pre-seeded).</summary>
