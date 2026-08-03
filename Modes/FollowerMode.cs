@@ -727,11 +727,21 @@ namespace AutoExile.Modes
                 if (transition != null)
                 {
                     // Already navigated here — click directly, no redundant proximity nav
-                    ctx.Interaction.InteractWithEntity(transition, ctx.Navigation,
+                    var started = ctx.Interaction.InteractWithEntity(transition, ctx.Navigation,
                         requireProximity: false);
-                    _state = FollowerState.ClickingTransition;
-                    _status = "Arrived — clicking portal/transition";
-                    _decision = "click_transition";
+                    if (started)
+                    {
+                        _state = FollowerState.ClickingTransition;
+                        _status = "Arrived — clicking portal/transition";
+                        _decision = "click_transition";
+                    }
+                    else
+                    {
+                        // Interaction system busy (e.g., picking up loot). Retry clicking next tick.
+                        _state = FollowerState.NavigatingToTransition;
+                        _status = "Interaction busy — retrying click";
+                        _decision = "click_transition_busy";
+                    }
                 }
                 else
                 {
@@ -764,18 +774,9 @@ namespace AutoExile.Modes
                 ? FindNearestEntity(gc, nearGridPos, includePortals: false, includeTransitions: true)
                 : null;
 
-            // Pick the closer one (prefer portal if equal)
-            Entity? target = null;
-            if (portal != null && transition != null)
-            {
-                var portalDist = Vector2.Distance(nearGridPos, new Vector2(portal.GridPosNum.X, portal.GridPosNum.Y));
-                var transDist = Vector2.Distance(nearGridPos, new Vector2(transition.GridPosNum.X, transition.GridPosNum.Y));
-                target = portalDist <= transDist ? portal : transition;
-            }
-            else
-            {
-                target = portal ?? transition;
-            }
+            // Prefer portals over area transitions to avoid accidental side-area/boss entry.
+            // If no portal is found, fall back to area transitions when configured.
+            Entity? target = portal ?? transition;
 
             if (target == null)
                 return false;
