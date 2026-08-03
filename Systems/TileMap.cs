@@ -29,14 +29,75 @@ namespace AutoExile.Systems
         {
             try
             {
-                var terrain = gc.IngameState.Data.Terrain;
+                // Access terrain via reflection to avoid hard dependency on GameOffsets field names
+                var dataObj = gc.IngameState.Data;
                 var memory = gc.Memory;
+                if (dataObj == null)
+                    return false;
 
-                if (terrain.NumCols == 0 || terrain.NumRows == 0)
+                object? terrainObj = null;
+                var dataType = dataObj.GetType();
+                var terrainProp = dataType.GetProperty("Terrain");
+                if (terrainProp != null)
+                    terrainObj = terrainProp.GetValue(dataObj);
+                else
+                {
+                    var terrainField = dataType.GetField("Terrain");
+                    if (terrainField != null)
+                        terrainObj = terrainField.GetValue(dataObj);
+                }
+
+                if (terrainObj == null)
+                    return false;
+
+                // Read dimensions via reflection
+                var numColsProp = terrainObj.GetType().GetProperty("NumCols");
+                var numRowsProp = terrainObj.GetType().GetProperty("NumRows");
+                if (numColsProp == null || numRowsProp == null)
+                    return false;
+
+                var numColsVal = numColsProp.GetValue(terrainObj);
+                var numRowsVal = numRowsProp.GetValue(terrainObj);
+                var numCols = Convert.ToInt32(numColsVal);
+                var numRows = Convert.ToInt32(numRowsVal);
+
+                if (numCols == 0 || numRows == 0)
                     return false;
 
                 var tiles = new ConcurrentDictionary<string, List<Vector2>>();
-                TileStructure[] tileData = memory.ReadStdVector<TileStructure>(terrain.TgtArray);
+
+                // Try several common field/property names for the target array (offsets can rename these)
+                object? tgtArrayVal = null;
+                var tryNames = new string[] { "TgtArray", "tgtArray", "TgtFileArray", "TgtFiles", "TgtArrayPtr" };
+                foreach (var name in tryNames)
+                {
+                    var p = terrainObj.GetType().GetProperty(name);
+                    if (p != null)
+                    {
+                        tgtArrayVal = p.GetValue(terrainObj);
+                        break;
+                    }
+                    var f = terrainObj.GetType().GetField(name);
+                    if (f != null)
+                    {
+                        tgtArrayVal = f.GetValue(terrainObj);
+                        break;
+                    }
+                }
+
+                if (tgtArrayVal == null)
+                    return false;
+
+                TileStructure[] tileData;
+                try
+                {
+                    // Use dynamic to defer binding — memory.ReadStdVector expects an IntPtr/ptr-like value
+                    tileData = memory.ReadStdVector<TileStructure>((dynamic)tgtArrayVal);
+                }
+                catch
+                {
+                    return false;
+                }
 
                 if (tileData == null || tileData.Length == 0)
                     return false;
