@@ -1,48 +1,26 @@
-using System.Text.Json;
-using System.Text.Json.Serialization;
+using AutoExile.Statistics;
 
 namespace AutoExile.Systems
 {
     /// <summary>
     /// Stores per-map metadata — boss tile signatures, support status.
-    /// Persisted to Data/map_bosses.json. Populated by F8 tile scanner,
+    /// Persisted in the canonical SQLite store. Populated by F8 tile scanner,
     /// consumed by WaveFarmMode for boss-finding navigation.
     /// </summary>
     public class MapDatabase
     {
-        private string _filePath = "";
+        private StatsService? _stats;
         private Dictionary<string, MapEntry> _entries = new(StringComparer.OrdinalIgnoreCase);
         private readonly Action<string> _log;
-
-        private static readonly JsonSerializerOptions JsonOpts = new()
-        {
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-            WriteIndented = true,
-        };
 
         public MapDatabase(Action<string> log)
         {
             _log = log;
         }
 
-        public void Initialize(string pluginDir)
+        public void Initialize(StatsService stats)
         {
-            var dataDir = Path.Combine(pluginDir, "Data");
-            Directory.CreateDirectory(dataDir);
-            _filePath = Path.Combine(dataDir, "map_data.json");
-
-            // Migration: load from old filename if new doesn't exist
-            if (!File.Exists(_filePath))
-            {
-                var oldPath = Path.Combine(dataDir, "map_bosses.json");
-                if (File.Exists(oldPath))
-                {
-                    File.Copy(oldPath, _filePath);
-                    _log("MapDatabase: migrated map_bosses.json → map_data.json");
-                }
-            }
-
+            _stats = stats;
             Load();
         }
 
@@ -89,7 +67,7 @@ namespace AutoExile.Systems
             entry.BossTiles = tileKeys;
             entry.LastScanned = DateTime.UtcNow;
             _entries[mapName] = entry;
-            Save();
+            Save(mapName, entry);
             _log($"MapDatabase: saved {tileKeys.Count} boss tiles for '{mapName}'");
         }
 
@@ -104,27 +82,32 @@ namespace AutoExile.Systems
             entry.TransitionDetailName = detailName;
             entry.LastScanned = DateTime.UtcNow;
             _entries[mapName] = entry;
-            Save();
+            Save(mapName, entry);
             _log($"MapDatabase: saved transition detail '{detailName}' for '{mapName}'");
         }
 
         private void Load()
         {
-            if (!File.Exists(_filePath))
+            if (_stats == null)
             {
-                _log("MapDatabase: no existing data file, starting fresh");
+                _log("MapDatabase: SQLite store unavailable");
                 return;
             }
 
             try
             {
-                var json = File.ReadAllText(_filePath);
-                var data = JsonSerializer.Deserialize<Dictionary<string, MapEntry>>(json, JsonOpts);
-                if (data != null)
+                _entries.Clear();
+                foreach (var item in _stats.ReadMapMetadata())
                 {
-                    _entries = new Dictionary<string, MapEntry>(data, StringComparer.OrdinalIgnoreCase);
-                    _log($"MapDatabase: loaded {_entries.Count} map entries ({SupportedMaps.Count()} supported)");
+                    _entries[item.MapName] = new MapEntry
+                    {
+                        BossTiles = item.BossTiles.ToList(),
+                        LastScanned = item.LastScannedUtc,
+                        BossEntityPath = item.BossEntityPath,
+                        TransitionDetailName = item.TransitionDetailName,
+                    };
                 }
+                _log($"MapDatabase: loaded {_entries.Count} map entries from SQLite ({SupportedMaps.Count()} supported)");
             }
             catch (Exception ex)
             {
@@ -132,22 +115,11 @@ namespace AutoExile.Systems
             }
         }
 
-        private void Save()
+        private void Save(string mapName, MapEntry entry)
         {
-            try
-            {
-                var json = JsonSerializer.Serialize(_entries, JsonOpts);
-                var path = _filePath;
-                Task.Run(() =>
-                {
-                    try { File.WriteAllText(path, json); }
-                    catch (Exception ex) { _log($"MapDatabase: save error: {ex.Message}"); }
-                });
-            }
-            catch (Exception ex)
-            {
-                _log($"MapDatabase: serialize error: {ex.Message}");
-            }
+            if (_stats == null) return;
+            _stats.UpsertMapMetadata(new MapMetadataSnapshot(mapName, entry.BossTiles ?? new List<string>(),
+                entry.LastScanned, entry.BossEntityPath, entry.TransitionDetailName));
         }
     }
 

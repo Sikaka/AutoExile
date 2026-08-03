@@ -39,6 +39,7 @@ namespace AutoExile.WebServer
         private string _metaPath = "";
         private string _profilesDir = "";
         private readonly Action<string> _log;
+        private readonly object _saveLock = new();
 
         /// <summary>Name of the profile currently loaded in memory.</summary>
         public string ActiveProfileName { get; private set; } = DefaultProfileName;
@@ -152,18 +153,21 @@ namespace AutoExile.WebServer
         /// </summary>
         public void SaveActive(BotSettings settings)
         {
-            try
+            lock (_saveLock)
             {
-                WriteProfileFile(settings, ActiveProfileName);
-                WriteMeta(new Meta
+                try
                 {
-                    ActiveProfile = ActiveProfileName,
-                    SchemaVersion = CurrentSchemaVersion,
-                });
-            }
-            catch (Exception ex)
-            {
-                _log($"Save active profile failed: {ex.Message}");
+                    WriteProfileFile(settings, ActiveProfileName);
+                    WriteMeta(new Meta
+                    {
+                        ActiveProfile = ActiveProfileName,
+                        SchemaVersion = CurrentSchemaVersion,
+                    });
+                }
+                catch (Exception ex)
+                {
+                    _log($"Save active profile failed: {ex.Message}");
+                }
             }
         }
 
@@ -404,6 +408,21 @@ namespace AutoExile.WebServer
                         continue;
                     }
 
+                    if (key == "altarModOverrides")
+                    {
+                        try
+                        {
+                            var overrides = JsonSerializer.Deserialize<Dictionary<string, int>>(value.GetRawText());
+                            if (overrides != null)
+                            {
+                                settings.Mechanics.EldritchAltar.ModWeights = overrides;
+                                applied++;
+                            }
+                        }
+                        catch { skipped++; }
+                        continue;
+                    }
+
                     var (success, _) = SettingsApi.Apply(settings, key, value);
                     if (success) applied++; else skipped++;
                 }
@@ -436,6 +455,10 @@ namespace AutoExile.WebServer
             var overrides = settings.Mechanics?.Ultimatum?.ModRanking?.DangerOverrides;
             if (overrides != null && overrides.Count > 0)
                 cfg["ultimatumModOverrides"] = overrides;
+
+            var altarOverrides = settings.Mechanics?.EldritchAltar?.ModWeights;
+            if (altarOverrides != null && altarOverrides.Count > 0)
+                cfg["altarModOverrides"] = altarOverrides;
 
             File.WriteAllText(PathFor(name), JsonSerializer.Serialize(cfg, WriteOpts));
         }

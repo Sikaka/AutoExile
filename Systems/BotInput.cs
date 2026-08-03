@@ -59,6 +59,27 @@ namespace AutoExile.Systems
             return true;
         }
 
+        // Keep world-directed cursor input away from UI-heavy screen edges. These
+        // ratios mirror AutoPOE's world safe zone; UI clicks still use the full
+        // window so stash and map-device controls remain reachable.
+        private const float WorldSafeMinXRatio = 0.0977f;
+        private const float WorldSafeMaxXRatio = 0.9023f;
+        private const float WorldSafeMinYRatio = 0.12f;
+        private const float WorldSafeMaxYRatio = 0.84f;
+
+        private static bool ClampToWorldSafeZone(ref Vector2 pos)
+        {
+            if (!ClampToWindow(ref pos)) return false;
+
+            pos.X = Math.Clamp(pos.X,
+                WindowRect.X + WindowRect.Width * WorldSafeMinXRatio,
+                WindowRect.X + WindowRect.Width * WorldSafeMaxXRatio);
+            pos.Y = Math.Clamp(pos.Y,
+                WindowRect.Y + WindowRect.Height * WorldSafeMinYRatio,
+                WindowRect.Y + WindowRect.Height * WorldSafeMaxYRatio);
+            return true;
+        }
+
         // ── Action Log ──
         private static readonly ActionRecord[] _actionLog = new ActionRecord[500];
         private static int _actionLogIndex;
@@ -514,12 +535,34 @@ namespace AutoExile.Systems
                 LogRawInput("KeyDown-DROPPED", $"{key} {context} (too soon: {(DateTime.Now - _lastInputEvent).TotalMilliseconds:F0}ms)".Trim());
                 return;
             }
+            if (key == Keys.RButton)
+            {
+                SendRightDown(context);
+                return;
+            }
+            if (key == Keys.MButton)
+            {
+                SendMiddleDown(context);
+                return;
+            }
+
             MarkInputEvent("KeyDown", $"{key} {context}".Trim());
             Input.KeyDown(key);
         }
 
         private static void SendKeyUp(Keys key, string context = "")
         {
+            if (key == Keys.RButton)
+            {
+                SendRightUp(context);
+                return;
+            }
+            if (key == Keys.MButton)
+            {
+                SendMiddleUp(context);
+                return;
+            }
+
             MarkInputEvent("KeyUp", $"{key} {context}".Trim());
             Input.KeyUp(key);
         }
@@ -556,6 +599,26 @@ namespace AutoExile.Systems
         {
             MarkInputEvent("RightUp", context);
             Input.RightUp();
+        }
+
+        private const uint MouseEventMiddleDown = 0x0020;
+        private const uint MouseEventMiddleUp = 0x0040;
+
+        private static void SendMiddleDown(string context = "")
+        {
+            if (!CanSendInputEvent)
+            {
+                LogRawInput("MiddleDown-DROPPED", $"{context} (too soon: {(DateTime.Now - _lastInputEvent).TotalMilliseconds:F0}ms)".Trim());
+                return;
+            }
+            MarkInputEvent("MiddleDown", context);
+            MouseEvent(MouseEventMiddleDown, 0, 0, 0, UIntPtr.Zero);
+        }
+
+        private static void SendMiddleUp(string context = "")
+        {
+            MarkInputEvent("MiddleUp", context);
+            MouseEvent(MouseEventMiddleUp, 0, 0, 0, UIntPtr.Zero);
         }
 
         /// <summary>
@@ -596,6 +659,9 @@ namespace AutoExile.Systems
 
         [DllImport("user32.dll")]
         private static extern short GetAsyncKeyState(int vKey);
+
+        [DllImport("user32.dll", EntryPoint = "mouse_event")]
+        private static extern void MouseEvent(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
 
         /// <summary>True if the OS reports a modifier key as physically held
         /// (outside our own tracking — e.g. a user-pressed key or a leaked
@@ -700,7 +766,7 @@ namespace AutoExile.Systems
         public static bool StartMovement(Vector2 absScreenPos, Keys moveKey)
         {
             if (TryCaptureReplay("StartMovement", absScreenPos, moveKey)) return true;
-            if (!ClampToWindow(ref absScreenPos)) return false;
+            if (!ClampToWorldSafeZone(ref absScreenPos)) return false;
 
             // Move-only walks TO the cursor. If the target is on the player the
             // character stands still. Safety-nudge every call, including the
@@ -772,7 +838,7 @@ namespace AutoExile.Systems
         {
             if (!IsMovementActive || IsMovementSuspended) return false;
             if (TryCaptureReplay("UpdateMovementCursor", absScreenPos)) return true;
-            if (!ClampToWindow(ref absScreenPos)) return false;
+            if (!ClampToWorldSafeZone(ref absScreenPos)) return false;
             absScreenPos = NudgeOffPlayer(absScreenPos);
 
             // Throttle: only update if position changed significantly or enough time passed
@@ -926,6 +992,7 @@ namespace AutoExile.Systems
 
         /// <summary>Currently held keys and when they were pressed.</summary>
         private static readonly Dictionary<Keys, DateTime> _heldKeys = new();
+        private static long _holdGeneration;
 
         /// <summary>Auto-release held keys after this many seconds (safety watchdog).</summary>
         public static float HeldKeyTimeoutSeconds = 5f;
@@ -960,6 +1027,8 @@ namespace AutoExile.Systems
             if (TryCaptureReplay("HoldKey", key: key)) return true;
             if (!CanAct) return false;
 
+            // Supersede any targeted hold whose cursor movement is still pending.
+            Interlocked.Increment(ref _holdGeneration);
             SuspendMovement();
 
             // Release if already held (prevents double-down)
@@ -982,7 +1051,7 @@ namespace AutoExile.Systems
         {
             if (TryCaptureReplay("HoldKeyAt", absPos, key)) return true;
             if (!CanAct) return false;
-            if (!ClampToWindow(ref absPos)) return false;
+            if (!ClampToWorldSafeZone(ref absPos)) return false;
 
             SuspendMovement();
 
@@ -992,22 +1061,37 @@ namespace AutoExile.Systems
 
             var moveMs = EstimateMoveMs(absPos);
             NextActionAt = DateTime.Now.AddMilliseconds(moveMs + ActionCooldownMs);
-            _ = DoHoldKeyAt(absPos, key);
+            var generation = Interlocked.Increment(ref _holdGeneration);
+            _ = DoHoldKeyAt(absPos, key, generation);
             return true;
         }
 
-        private static async Task DoHoldKeyAt(Vector2 absPos, Keys key)
+        private static async Task DoHoldKeyAt(Vector2 absPos, Keys key, long generation)
         {
             await MoveCursorTo(absPos);
+            if (generation != Volatile.Read(ref _holdGeneration)) return;
             await Task.Delay(RandSettle());
+            if (generation != Volatile.Read(ref _holdGeneration)) return;
             await SendDelay();
+            if (generation != Volatile.Read(ref _holdGeneration)) return;
             SendKeyDown(key);
             _heldKeys[key] = DateTime.Now;
+        }
+
+        /// <summary>Update a channelled skill cursor inside the world-safe region.</summary>
+        public static bool UpdateWorldSkillCursor(Vector2 absPos)
+        {
+            if (!ClampToWorldSafeZone(ref absPos)) return false;
+            Input.SetCursorPos(absPos);
+            return true;
         }
 
         /// <summary>Release a specific held key.</summary>
         public static void ReleaseKey(Keys key)
         {
+            // Cancel a matching hold even when its async cursor move has not yet
+            // reached the key-down/tracking step.
+            Interlocked.Increment(ref _holdGeneration);
             if (_heldKeys.Remove(key))
                 SendKeyUp(key);
         }
@@ -1018,6 +1102,8 @@ namespace AutoExile.Systems
         /// </summary>
         public static void ReleaseAllKeys()
         {
+            // Invalidate pending HoldKeyAt continuations before releasing keys.
+            Interlocked.Increment(ref _holdGeneration);
             if (_heldKeys.Count > 0)
             {
                 foreach (var key in _heldKeys.Keys)
@@ -1163,7 +1249,7 @@ namespace AutoExile.Systems
         {
             if (TryCaptureReplay("CursorPressKey", absPos, key)) return true;
             if (!CanAct) { LogAction("CursorPressKey", absPos, key, false); return false; }
-            if (!ClampToWindow(ref absPos)) { LogAction("CursorPressKey", absPos, key, false); return false; }
+            if (!ClampToWorldSafeZone(ref absPos)) { LogAction("CursorPressKey", absPos, key, false); return false; }
             SuspendMovement();
             ReleaseAllKeys();
             var moveMs = EstimateMoveMs(absPos);
@@ -1178,7 +1264,7 @@ namespace AutoExile.Systems
         /// <summary>Force cursor+key press, bypassing the input gate. For dodge — survival trumps input cadence.</summary>
         public static bool ForceCursorPressKey(Vector2 absPos, Keys key)
         {
-            if (!ClampToWindow(ref absPos)) { LogAction("ForceCursorPressKey", absPos, key, false); return false; }
+            if (!ClampToWorldSafeZone(ref absPos)) { LogAction("ForceCursorPressKey", absPos, key, false); return false; }
             SuspendMovement();
             ReleaseAllKeys();
             var moveMs = EstimateMoveMs(absPos);

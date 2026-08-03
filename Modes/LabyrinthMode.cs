@@ -58,6 +58,7 @@ namespace AutoExile.Modes
         private DateTime _lastActionTime = DateTime.MinValue;
         private string _lastAreaName = "";
         private uint _lastAreaHash;
+        private string _statsActivationKey = "";
 
         // State tracking
         private readonly LabyrinthState _state = new();
@@ -68,6 +69,7 @@ namespace AutoExile.Modes
 
         // Exit memory — angle-based layout learning across runs
         private readonly LabExitMemory _exitMemory = new();
+        private AutoExile.Statistics.StatsService? _stats;
         private bool _exitMemoryLoaded;
         private DateTime _lastMemorySave = DateTime.MinValue;
         private string? _pluginDir; // cached for memory save path
@@ -164,6 +166,7 @@ namespace AutoExile.Modes
 
         public void OnEnter(BotContext ctx)
         {
+            _stats = ctx.Stats;
             // Init dedicated log file
             try
             {
@@ -193,7 +196,7 @@ namespace AutoExile.Modes
                 // Load exit memory (angle-based layout learning)
                 if (!_exitMemoryLoaded)
                 {
-                    _exitMemory.Load(Path.Combine(pluginDir, "lab_memory.json"), LabLog);
+                    _exitMemory.Load(ctx.Stats, LabLog);
                     _exitMemoryLoaded = true;
                 }
             }
@@ -230,6 +233,7 @@ namespace AutoExile.Modes
             var areaName = gc.Area?.CurrentArea?.Name ?? "";
             _lastAreaName = areaName;
             _lastAreaHash = gc.IngameState?.Data?.CurrentAreaHash ?? 0;
+            _statsActivationKey = "";
 
             DetectCurrentLocation(ctx);
             LabLog($"OnEnter: area={areaName} phase={_phase} status={StatusText}");
@@ -244,8 +248,8 @@ namespace AutoExile.Modes
 
         private void SaveExitMemory()
         {
-            if (_pluginDir != null && _exitMemory.IsDirty)
-                _exitMemory.Save(Path.Combine(_pluginDir, "lab_memory.json"), LabLog);
+            if (_stats != null && _exitMemory.IsDirty)
+                _exitMemory.Save(_stats, LabLog);
         }
 
         // ═══════════════════════════════════════════════════
@@ -443,12 +447,16 @@ namespace AutoExile.Modes
                     // Was in lab — either completed or died
                     if (_phase == LabPhase.ExitLab)
                     {
+                        ctx.Stats.EndRun(Name, "completed", "lab_completed");
+                        _statsActivationKey = "";
                         _state.RecordRunComplete();
                         ctx.LootTracker.RecordMapComplete();
                         ctx.Log($"Lab run {_state.RunsCompleted} complete. Profit: {_state.TotalProfit:F0}c");
                     }
                     else
                     {
+                        ctx.Stats.EndRun(Name, "failed", "lab_death");
+                        _statsActivationKey = "";
                         _state.DeathCount++;
                         ctx.Log($"Died in lab (death {_state.DeathCount})");
                     }
@@ -482,6 +490,13 @@ namespace AutoExile.Modes
             }
             else if (newArea == "Aspirant's Trial")
             {
+                if (string.IsNullOrEmpty(_statsActivationKey))
+                {
+                    _statsActivationKey = $"lab:{DateTime.UtcNow.Ticks}";
+                    ctx.Stats.BeginRun(Name, _statsActivationKey, newArea, consumed: true);
+                }
+                if (newHash != 0)
+                    ctx.Stats.ObserveRunEntry(Name, newHash, newArea);
                 // Could be staging, arena, or reward — will detect via entities after settle
                 _phaseStartTime = DateTime.Now;
                 StatusText = "Aspirant's Trial — detecting zone type...";

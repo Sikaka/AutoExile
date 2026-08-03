@@ -5,6 +5,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <ExapiPackage Condition="'$(ExapiPackage)' == ''">$(MSBuildProjectDirectory)\Resources</ExapiPackage>
   </PropertyGroup>
 
   <ItemGroup>
@@ -25,20 +27,25 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite.Core" Version="10.0.10" />
+    <PackageReference Include="SQLitePCLRaw.provider.winsqlite3" Version="3.0.5" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Reference Include="ExileCore">
-      <HintPath>Resources\ExileCore.dll</HintPath>
+      <HintPath>$(ExapiPackage)\ExileCore.dll</HintPath>
     </Reference>
     <Reference Include="GameOffsets">
-      <HintPath>Resources\GameOffsets.dll</HintPath>
+      <HintPath>$(ExapiPackage)\GameOffsets.dll</HintPath>
     </Reference>
     <Reference Include="ImGui.NET">
-      <HintPath>Resources\ImGui.NET.dll</HintPath>
+      <HintPath>$(ExapiPackage)\ImGui.NET.dll</HintPath>
     </Reference>
     <Reference Include="SharpDX">
-      <HintPath>Resources\SharpDX.dll</HintPath>
+      <HintPath>$(ExapiPackage)\SharpDX.dll</HintPath>
     </Reference>
     <Reference Include="SharpDX.Mathematics">
-      <HintPath>Resources\SharpDX.Mathematics.dll</HintPath>
+      <HintPath>$(ExapiPackage)\SharpDX.Mathematics.dll</HintPath>
     </Reference>
   </ItemGroup>
 

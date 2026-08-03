@@ -292,6 +292,9 @@ namespace AutoExile.Systems
             // ── Identified unique: lookup by unique name ──
             if (rarity == ItemRarity.Unique && !string.IsNullOrEmpty(uniqueName))
             {
+                if (uniqueName.Equals("Voices", StringComparison.OrdinalIgnoreCase))
+                    return PriceVoices(entity);
+
                 return LookupItem(uniqueName, category.Value);
             }
 
@@ -320,6 +323,49 @@ namespace AutoExile.Systems
 
             // ── Everything else: lookup by base name ──
             return LookupItem(baseName, category.Value);
+        }
+
+        /// <summary>
+        /// Voices prices differ by the number of passive nodes. The one-passive
+        /// entry is represented by a null variant in poe.ninja, while the other
+        /// rolls use values such as "3 passives".
+        /// </summary>
+        private PriceResult PriceVoices(Entity entity)
+        {
+            var prices = _prices;
+            if (!prices.TryGetValue(NinjaPriceCategory.UniqueJewel, out var byName) ||
+                !byName.TryGetValue("Voices", out var entries) || entries.Count == 0)
+            {
+                return PriceResult.Zero;
+            }
+
+            int passiveCount = 0;
+            if (entity.TryGetComponent<LocalStats>(out var localStats) && localStats.StatDictionary != null)
+            {
+                var statKey = Enum.Parse<GameStat>(nameof(GameStat.LocalJewelExpansionPassiveNodeCount));
+                localStats.StatDictionary.TryGetValue(statKey, out passiveCount);
+            }
+
+            if (passiveCount <= 0)
+                return LookupItem("Voices", NinjaPriceCategory.UniqueJewel);
+
+            var expectedVariant = passiveCount == 1 ? null : $"{passiveCount} passives";
+            var match = entries.FirstOrDefault(entry =>
+                passiveCount == 1
+                    ? string.IsNullOrEmpty(entry.Variant)
+                    : string.Equals(entry.Variant, expectedVariant, StringComparison.OrdinalIgnoreCase));
+
+            if (match == null)
+                return LookupItem("Voices", NinjaPriceCategory.UniqueJewel);
+
+            var value = match.ChaosValue ?? 0;
+            return new PriceResult
+            {
+                MinChaosValue = value,
+                MaxChaosValue = value,
+                MatchCount = 1,
+                DetailsId = match.DetailsId,
+            };
         }
 
         private PriceResult PriceUnidentifiedUnique(Entity entity)
@@ -460,7 +506,11 @@ namespace AutoExile.Systems
             {
                 if (stat.StartsWith(ClusterEnchantPrefix, StringComparison.Ordinal))
                 {
-                    enchantName = stat[ClusterEnchantPrefix.Length..].Replace("\n", ", ");
+                    enchantName = stat[ClusterEnchantPrefix.Length..]
+                        .Replace("\r\n", ", ")
+                        .Replace("\n", ", ")
+                        .Replace("\r", "")
+                        .Trim();
                 }
                 else if (stat.StartsWith("Adds ", StringComparison.Ordinal) && stat.Contains("Passive Skill"))
                 {
@@ -800,7 +850,7 @@ namespace AutoExile.Systems
                         {
                             var url = $"https://poe.ninja/poe1/api/economy/exchange/current/overview?league={Uri.EscapeDataString(league)}&type={type}";
                             var cacheFile = Path.Combine(cacheDir, $"{type}.json");
-                            var json = await FetchWithCache(url, cacheFile);
+                            var json = await FetchWithCache(url, cacheFile, type);
                             if (json == null) continue;
 
                             var response = JsonSerializer.Deserialize<CurrencyOverviewResponse>(json,
@@ -838,9 +888,9 @@ namespace AutoExile.Systems
                     {
                         try
                         {
-                            var url = $"https://poe.ninja/api/data/itemoverview?league={Uri.EscapeDataString(league)}&type={type}&language=en";
+                            var url = $"https://poe.ninja/poe1/api/economy/stash/current/item/overview?league={Uri.EscapeDataString(league)}&type={type}";
                             var cacheFile = Path.Combine(cacheDir, $"{type}.json");
-                            var json = await FetchWithCache(url, cacheFile);
+                            var json = await FetchWithCache(url, cacheFile, type);
                             if (json == null) continue;
 
                             var response = JsonSerializer.Deserialize<ItemOverviewResponse>(json,
@@ -906,7 +956,7 @@ namespace AutoExile.Systems
             });
         }
 
-        private async Task<string?> FetchWithCache(string url, string cacheFile)
+        private async Task<string?> FetchWithCache(string url, string cacheFile, string endpointType)
         {
             // Try web first
             try
@@ -918,15 +968,26 @@ namespace AutoExile.Systems
                     return json;
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                _log($"Price endpoint {endpointType} failed: {ex.Message}");
+            }
 
             // Fall back to cache
             try
             {
                 if (File.Exists(cacheFile))
+                {
+                    _log($"Using cached prices for {endpointType}");
                     return File.ReadAllText(cacheFile);
+                }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                _log($"Price cache {endpointType} failed: {ex.Message}");
+            }
+
+            _log($"No prices available for {endpointType}");
 
             return null;
         }

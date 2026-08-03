@@ -1,4 +1,6 @@
 using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Reflection;
 using System.Text;
@@ -6,22 +8,24 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Collections.Concurrent;
 using ExileCore.Shared.Nodes;
+using AutoExile.Statistics;
 
 namespace AutoExile.WebServer
 {
     /// <summary>
-    /// Embedded HTTP server using HttpListener. Zero external dependencies.
+    /// Embedded HTTP and WebSocket server. Zero external dependencies.
     /// Serves a web dashboard, REST API, and WebSocket for live updates.
     /// </summary>
     public class BotWebServer : IDisposable
     {
-        private HttpListener? _listener;
+        private SimpleHttpServer? _listener;
         private CancellationTokenSource? _cts;
-        private Task? _listenTask;
         private Task? _broadcastTask;
         private int _port;
         private readonly bool _networkAccess;
         private readonly Action<string> _log;
+        private string _advertisedHost = "localhost";
+        private IPAddress[] _tailscaleAddresses = Array.Empty<IPAddress>();
 
         // Thread-safe state bridge: bot thread writes, web thread reads
         private volatile BotStatusSnapshot _currentStatus = new();
@@ -33,7 +37,7 @@ namespace AutoExile.WebServer
 
         // Settings + data store — set by BotCore after construction
         public BotSettings? Settings { get; set; }
-        public DataStore? DataStore { get; set; }
+        public StatsService? Stats { get; set; }
         public Systems.MapDatabase? MapDatabase { get; set; }
         public ProfileManager? ProfileManager { get; set; }
         public Systems.RuntimeTracker? Runtime { get; set; }
@@ -81,7 +85,7 @@ namespace AutoExile.WebServer
             _log = log;
         }
 
-        public string Url => $"http://localhost:{_port}/";
+        public string Url => $"http://{_advertisedHost}:{_port}/";
         public bool IsRunning => _listener?.IsListening == true;
 
         public void Start()
@@ -96,74 +100,43 @@ namespace AutoExile.WebServer
                 try
                 {
                     _cts = new CancellationTokenSource();
-                    _listener = new HttpListener();
-
-                    // Always start with localhost only — works without admin/netsh
-                    _listener.Prefixes.Add($"http://localhost:{port}/");
-                    _listener.Prefixes.Add($"http://127.0.0.1:{port}/");
-
-                    // Add network prefix BEFORE Start() if requested — adding after Start()
-                    // can crash the listener on some Windows configurations
+                    // Bind ordinary TCP sockets only to loopback and exact active Tailscale
+                    // addresses. This needs no HTTP.sys URL reservation or administrator rights.
+                    var tailscaleAddresses = Array.Empty<IPAddress>();
                     if (_networkAccess)
                     {
                         try
                         {
-                            _listener.Prefixes.Add($"http://+:{port}/");
+                            tailscaleAddresses = GetTailscaleIPv4Addresses();
+                            if (tailscaleAddresses.Length == 0)
+                                _log("Tailscale access requested, but no local 100.64.0.0/10 IPv4 address was found; keeping localhost only.");
                         }
                         catch (Exception ex)
                         {
-                            _log($"Network access prefix failed (need admin or netsh urlacl): {ex.Message}");
+                            _log($"Tailscale address discovery failed; keeping localhost only: {ex.Message}");
+                            tailscaleAddresses = Array.Empty<IPAddress>();
                         }
                     }
 
-                    _listener.Start();
+                    var bindAddresses = new[] { IPAddress.Loopback }
+                        .Concat(tailscaleAddresses)
+                        .Distinct()
+                        .ToArray();
+                    _listener = new SimpleHttpServer(bindAddresses, port, IsAllowedRemoteAddress, HandleRequest, _log);
+                    _listener.Start(_cts.Token);
                     _port = port; // update in case we fell back to an alternate port
-                    _log($"Web server started at http://localhost:{port}/");
+                    _tailscaleAddresses = tailscaleAddresses;
+                    _advertisedHost = tailscaleAddresses.FirstOrDefault()?.ToString() ?? "localhost";
+                    _log($"Web server started at {Url}");
 
-                    _listenTask = Task.Run(() => ListenLoop(_cts.Token));
                     _broadcastTask = Task.Run(() => BroadcastLoop(_cts.Token));
                     LastError = null;
                     return;
                 }
-                catch (HttpListenerException hlex)
-                {
-                    _log($"Web server failed on port {port}: {hlex.Message} (ErrorCode={hlex.ErrorCode})");
-                    _listener?.Close();
-                    _listener = null;
-                    _cts?.Dispose();
-                    _cts = null;
-
-                    // If network access caused the failure, retry localhost-only
-                    if (_networkAccess && hlex.ErrorCode == 5) // Access denied
-                    {
-                        _log("Retrying without network access...");
-                        try
-                        {
-                            _cts = new CancellationTokenSource();
-                            _listener = new HttpListener();
-                            _listener.Prefixes.Add($"http://localhost:{port}/");
-                            _listener.Prefixes.Add($"http://127.0.0.1:{port}/");
-                            _listener.Start();
-                            _port = port;
-                            _log($"Web server started at http://localhost:{port}/ (localhost only)");
-                            _listenTask = Task.Run(() => ListenLoop(_cts.Token));
-                            _broadcastTask = Task.Run(() => BroadcastLoop(_cts.Token));
-                            LastError = null;
-                            return;
-                        }
-                        catch
-                        {
-                            _listener?.Close();
-                            _listener = null;
-                            _cts?.Dispose();
-                            _cts = null;
-                        }
-                    }
-                }
                 catch (Exception ex)
                 {
                     _log($"Web server failed on port {port}: {ex.GetType().Name}: {ex.Message}");
-                    _listener?.Close();
+                    _listener?.Dispose();
                     _listener = null;
                     _cts?.Dispose();
                     _cts = null;
@@ -194,7 +167,6 @@ namespace AutoExile.WebServer
             }
 
             _listener?.Stop();
-            _listener?.Close();
             _listener = null;
             _log("Web server stopped");
         }
@@ -207,33 +179,10 @@ namespace AutoExile.WebServer
             _commandQueue.TryDequeue(out command!);
 
         // ====================================================================
-        // Listener loop
+        // Request handling
         // ====================================================================
 
-        private async Task ListenLoop(CancellationToken ct)
-        {
-            while (!ct.IsCancellationRequested && _listener?.IsListening == true)
-            {
-                try
-                {
-                    var ctx = await _listener.GetContextAsync().WaitAsync(ct);
-                    _ = Task.Run(() => HandleRequest(ctx, ct), ct);
-                }
-                catch (OperationCanceledException) { break; }
-                catch (HttpListenerException hlex)
-                {
-                    _log($"Web server listener stopped: {hlex.Message} (ErrorCode={hlex.ErrorCode})");
-                    LastError = $"Listener crashed: {hlex.Message}";
-                    break;
-                }
-                catch (Exception ex)
-                {
-                    _log($"Web server error: {ex.GetType().Name}: {ex.Message}");
-                }
-            }
-        }
-
-        private async Task HandleRequest(HttpListenerContext ctx, CancellationToken ct)
+        private async Task HandleRequest(SimpleHttpContext ctx, CancellationToken ct)
         {
             var req = ctx.Request;
             var resp = ctx.Response;
@@ -242,6 +191,13 @@ namespace AutoExile.WebServer
 
             try
             {
+                if (!IsAllowedRemoteAddress(req.RemoteEndPoint?.Address, req.LocalEndPoint?.Address))
+                {
+                    resp.StatusCode = 403;
+                    await WriteString(resp, "Tailscale access required");
+                    return;
+                }
+
                 // WebSocket upgrade
                 if (req.IsWebSocketRequest && path == "/api/ws")
                 {
@@ -272,6 +228,20 @@ namespace AutoExile.WebServer
                     case "/api/status" when method == "GET":
                         await ServeJson(resp, _currentStatus);
                         break;
+                    case "/api/stats/summary" when method == "GET":
+                        await ServeJson(resp, Stats?.Snapshot ?? new StatsSnapshot(), pretty: true);
+                        break;
+                    case "/api/stats/runs" when method == "GET":
+                        await ServeJson(resp, (Stats?.Snapshot.RecentRuns ?? Array.Empty<StatsRunSnapshot>())
+                            .Take(GetQueryInt(req, "limit", 50)), pretty: true);
+                        break;
+                    case "/api/stats/health" when method == "GET":
+                        await ServeJson(resp, Stats?.Snapshot.Health ?? new StatsHealth(), pretty: true);
+                        break;
+                    case "/api/stats/sessions/rotate" when method == "POST":
+                        Stats?.RotateSession("web_request");
+                        await ServeJson(resp, new { ok = true, deferred = Stats?.Snapshot.CurrentRun != null });
+                        break;
 
                     // Control
                     case "/api/control" when method == "POST":
@@ -294,6 +264,10 @@ namespace AutoExile.WebServer
                     // History
                     case "/api/history/loot" when method == "GET":
                         await HandleHistoryLoot(req, resp);
+                        break;
+                    case "/api/history/best-finds" when method == "GET":
+                        await ServeJson(resp, (Stats?.Snapshot.BestFinds ?? Array.Empty<StatsLootSnapshot>())
+                            .Take(GetQueryInt(req, "limit", 20)), pretty: true);
                         break;
                     case "/api/history/runs" when method == "GET":
                         await HandleHistoryRuns(req, resp);
@@ -321,7 +295,8 @@ namespace AutoExile.WebServer
                         break;
                     case "/api/loot/reset" when method == "POST":
                         LootTracker?.ResetSession();
-                        await ServeJson(resp, new { ok = true });
+                        Stats?.RotateSession("loot_reset_compatibility_endpoint");
+                        await ServeJson(resp, new { ok = true, semantics = "new_session" });
                         break;
                     case "/api/lab/gems" when method == "GET":
                         await HandleLabGemValuation(resp);
@@ -399,7 +374,7 @@ namespace AutoExile.WebServer
         // behavior. Every /api/settings edit auto-saves to the active profile.
         // ====================================================================
 
-        private async Task HandleProfileSwitch(HttpListenerRequest req, HttpListenerResponse resp)
+        private async Task HandleProfileSwitch(SimpleHttpRequest req, SimpleHttpResponse resp)
         {
             var body = await ReadBody(req);
             var data = JsonSerializer.Deserialize<JsonElement>(body);
@@ -415,7 +390,7 @@ namespace AutoExile.WebServer
             await ServeJson(resp, new { ok = true, active = ProfileManager.ActiveProfileName });
         }
 
-        private async Task HandleProfileCreate(HttpListenerRequest req, HttpListenerResponse resp)
+        private async Task HandleProfileCreate(SimpleHttpRequest req, SimpleHttpResponse resp)
         {
             var body = await ReadBody(req);
             var data = JsonSerializer.Deserialize<JsonElement>(body);
@@ -432,7 +407,7 @@ namespace AutoExile.WebServer
             await ServeJson(resp, new { ok = true, active = ProfileManager.ActiveProfileName });
         }
 
-        private async Task HandleProfileRename(HttpListenerRequest req, HttpListenerResponse resp)
+        private async Task HandleProfileRename(SimpleHttpRequest req, SimpleHttpResponse resp)
         {
             var body = await ReadBody(req);
             var data = JsonSerializer.Deserialize<JsonElement>(body);
@@ -449,7 +424,7 @@ namespace AutoExile.WebServer
             await ServeJson(resp, new { ok = true, active = ProfileManager.ActiveProfileName });
         }
 
-        private async Task HandleProfileDelete(HttpListenerRequest req, HttpListenerResponse resp)
+        private async Task HandleProfileDelete(SimpleHttpRequest req, SimpleHttpResponse resp)
         {
             var body = await ReadBody(req);
             var data = JsonSerializer.Deserialize<JsonElement>(body);
@@ -465,7 +440,7 @@ namespace AutoExile.WebServer
             await ServeJson(resp, new { ok = true });
         }
 
-        private async Task HandleProfileExport(HttpListenerRequest req, HttpListenerResponse resp)
+        private async Task HandleProfileExport(SimpleHttpRequest req, SimpleHttpResponse resp)
         {
             var name = req.QueryString["name"] ?? "";
             if (string.IsNullOrWhiteSpace(name) || ProfileManager == null)
@@ -481,7 +456,7 @@ namespace AutoExile.WebServer
             await WriteString(resp, json);
         }
 
-        private async Task HandleProfileImport(HttpListenerRequest req, HttpListenerResponse resp)
+        private async Task HandleProfileImport(SimpleHttpRequest req, SimpleHttpResponse resp)
         {
             var body = await ReadBody(req);
             var data = JsonSerializer.Deserialize<JsonElement>(body);
@@ -502,13 +477,12 @@ namespace AutoExile.WebServer
         // WebSocket
         // ====================================================================
 
-        private async Task HandleWebSocket(HttpListenerContext ctx, CancellationToken ct)
+        private async Task HandleWebSocket(SimpleHttpContext ctx, CancellationToken ct)
         {
             WebSocket? ws = null;
             try
             {
-                var wsCtx = await ctx.AcceptWebSocketAsync(null);
-                ws = wsCtx.WebSocket;
+                ws = await ctx.AcceptWebSocketAsync();
 
                 lock (_wsLock) { _wsClients.Add(ws); }
 
@@ -577,7 +551,7 @@ namespace AutoExile.WebServer
         // API handlers
         // ====================================================================
 
-        private async Task HandleControl(HttpListenerRequest req, HttpListenerResponse resp)
+        private async Task HandleControl(SimpleHttpRequest req, SimpleHttpResponse resp)
         {
             var body = await ReadBody(req);
             var cmd = JsonSerializer.Deserialize<WebCommand>(body, JsonOpts);
@@ -592,7 +566,7 @@ namespace AutoExile.WebServer
             await ServeJson(resp, new { ok = true, action = cmd.Action });
         }
 
-        private async Task HandleGetSettings(HttpListenerResponse resp)
+        private async Task HandleGetSettings(SimpleHttpResponse resp)
         {
             if (Settings == null)
             {
@@ -605,7 +579,7 @@ namespace AutoExile.WebServer
             await ServeJson(resp, flat, pretty: true);
         }
 
-        private async Task HandleSetSettings(HttpListenerRequest req, HttpListenerResponse resp)
+        private async Task HandleSetSettings(SimpleHttpRequest req, SimpleHttpResponse resp)
         {
             if (Settings == null)
             {
@@ -639,7 +613,7 @@ namespace AutoExile.WebServer
             }
         }
 
-        private async Task HandleMapTerrain(HttpListenerResponse resp)
+        private async Task HandleMapTerrain(SimpleHttpResponse resp)
         {
             var terrain = _cachedTerrain;
             if (terrain == null)
@@ -660,28 +634,28 @@ namespace AutoExile.WebServer
             });
         }
 
-        private async Task HandleHistoryLoot(HttpListenerRequest req, HttpListenerResponse resp)
+        private async Task HandleHistoryLoot(SimpleHttpRequest req, SimpleHttpResponse resp)
         {
             var limit = GetQueryInt(req, "limit", 100);
-            var data = DataStore?.GetRecentLoot(limit) ?? new();
+            var data = (Stats?.Snapshot.RecentLoot ?? Array.Empty<StatsLootSnapshot>()).Take(limit);
             await ServeJson(resp, data, pretty: true);
         }
 
-        private async Task HandleHistoryRuns(HttpListenerRequest req, HttpListenerResponse resp)
+        private async Task HandleHistoryRuns(SimpleHttpRequest req, SimpleHttpResponse resp)
         {
             var limit = GetQueryInt(req, "limit", 50);
-            var data = DataStore?.GetRecentRuns(limit) ?? new();
+            var data = (Stats?.Snapshot.RecentRuns ?? Array.Empty<StatsRunSnapshot>()).Take(limit);
             await ServeJson(resp, data, pretty: true);
         }
 
-        private async Task HandleHistoryEvents(HttpListenerRequest req, HttpListenerResponse resp)
+        private async Task HandleHistoryEvents(SimpleHttpRequest req, SimpleHttpResponse resp)
         {
             var limit = GetQueryInt(req, "limit", 100);
-            var data = DataStore?.GetRecentEvents(limit) ?? new();
+            var data = (Stats?.Snapshot.RecentEvents ?? Array.Empty<StatsEventSnapshot>()).Take(limit);
             await ServeJson(resp, data, pretty: true);
         }
 
-        private async Task HandleGetUltimatumMods(HttpListenerResponse resp)
+        private async Task HandleGetUltimatumMods(SimpleHttpResponse resp)
         {
             if (Settings == null) { resp.StatusCode = 503; await ServeJson(resp, new { error = "not ready" }); return; }
 
@@ -737,7 +711,7 @@ namespace AutoExile.WebServer
             await ServeJson(resp, result, pretty: true);
         }
 
-        private async Task HandleSetUltimatumMod(HttpListenerRequest req, HttpListenerResponse resp)
+        private async Task HandleSetUltimatumMod(SimpleHttpRequest req, SimpleHttpResponse resp)
         {
             if (Settings == null) { resp.StatusCode = 503; await ServeJson(resp, new { error = "not ready" }); return; }
 
@@ -767,7 +741,7 @@ namespace AutoExile.WebServer
             await ServeJson(resp, new { ok = true, id = modId, danger });
         }
 
-        private async Task HandleGetAltarMods(HttpListenerResponse resp)
+        private async Task HandleGetAltarMods(SimpleHttpResponse resp)
         {
             if (Settings == null) { resp.StatusCode = 503; await ServeJson(resp, new { error = "not ready" }); return; }
 
@@ -794,7 +768,7 @@ namespace AutoExile.WebServer
             await ServeJson(resp, result, pretty: true);
         }
 
-        private async Task HandleSetAltarMod(HttpListenerRequest req, HttpListenerResponse resp)
+        private async Task HandleSetAltarMod(SimpleHttpRequest req, SimpleHttpResponse resp)
         {
             if (Settings == null) { resp.StatusCode = 503; await ServeJson(resp, new { error = "not ready" }); return; }
 
@@ -823,7 +797,7 @@ namespace AutoExile.WebServer
             await ServeJson(resp, new { ok = true, id = modId, weight });
         }
 
-        private async Task HandleSearchUniques(HttpListenerRequest req, HttpListenerResponse resp)
+        private async Task HandleSearchUniques(SimpleHttpRequest req, SimpleHttpResponse resp)
         {
             var ninja = NinjaPrice;
             if (ninja == null || !ninja.IsLoaded)
@@ -845,7 +819,7 @@ namespace AutoExile.WebServer
             await ServeJson(resp, response);
         }
 
-        private async Task HandleGetMaps(HttpListenerResponse resp)
+        private async Task HandleGetMaps(SimpleHttpResponse resp)
         {
             var db = MapDatabase;
             var supported = db?.SupportedMaps.ToList() ?? new();
@@ -858,7 +832,7 @@ namespace AutoExile.WebServer
             await ServeJson(resp, result, pretty: true);
         }
 
-        private async Task HandleLabGemValuation(HttpListenerResponse resp)
+        private async Task HandleLabGemValuation(SimpleHttpResponse resp)
         {
             var ninja = NinjaPrice;
             var gem = GemValuation;
@@ -885,7 +859,7 @@ namespace AutoExile.WebServer
             await ServeJson(resp, report, pretty: true);
         }
 
-        private async Task HandleNearbyMonsters(HttpListenerResponse resp)
+        private async Task HandleNearbyMonsters(SimpleHttpResponse resp)
         {
             var scanner = ScanNearbyMonsters;
             if (scanner == null)
@@ -924,7 +898,7 @@ namespace AutoExile.WebServer
             }
         }
 
-        private async Task HandlePlayerBuffs(HttpListenerResponse resp)
+        private async Task HandlePlayerBuffs(SimpleHttpResponse resp)
         {
             var getter = GetPlayerBuffs;
             if (getter == null)
@@ -946,7 +920,7 @@ namespace AutoExile.WebServer
             }
         }
 
-        private async Task HandleCapturePosition(HttpListenerRequest req, HttpListenerResponse resp)
+        private async Task HandleCapturePosition(SimpleHttpRequest req, SimpleHttpResponse resp)
         {
             var body = await ReadBody(req);
             var doc = JsonDocument.Parse(body);
@@ -984,7 +958,7 @@ namespace AutoExile.WebServer
             }
         }
 
-        private async Task HandleRuntimeReset(HttpListenerResponse resp)
+        private async Task HandleRuntimeReset(SimpleHttpResponse resp)
         {
             if (Runtime == null)
             {
@@ -996,7 +970,7 @@ namespace AutoExile.WebServer
             await ServeJson(resp, new { ok = true });
         }
 
-        private async Task HandleDiscordTest(HttpListenerResponse resp)
+        private async Task HandleDiscordTest(SimpleHttpResponse resp)
         {
             if (Settings == null)
             {
@@ -1029,26 +1003,60 @@ namespace AutoExile.WebServer
         // Helpers
         // ====================================================================
 
-        private static async Task<string> ReadBody(HttpListenerRequest req)
+        private static IPAddress[] GetTailscaleIPv4Addresses()
+        {
+            return NetworkInterface.GetAllNetworkInterfaces()
+                .Where(adapter => adapter.OperationalStatus == OperationalStatus.Up &&
+                                  (adapter.Name.Contains("Tailscale", StringComparison.OrdinalIgnoreCase) ||
+                                   adapter.Description.Contains("Tailscale", StringComparison.OrdinalIgnoreCase)))
+                .SelectMany(adapter => adapter.GetIPProperties().UnicastAddresses)
+                .Select(unicast => unicast.Address)
+                .Where(address => address.AddressFamily == AddressFamily.InterNetwork && IsTailscaleIPv4(address))
+                .Distinct()
+                .OrderBy(address => address.ToString(), StringComparer.Ordinal)
+                .ToArray();
+        }
+
+        private bool IsAllowedRemoteAddress(IPAddress? remoteAddress, IPAddress? localAddress)
+        {
+            if (remoteAddress == null) return false;
+            if (remoteAddress.IsIPv4MappedToIPv6)
+                remoteAddress = remoteAddress.MapToIPv4();
+            if (IPAddress.IsLoopback(remoteAddress)) return true;
+
+            if (!_networkAccess || localAddress == null) return false;
+            if (localAddress.IsIPv4MappedToIPv6)
+                localAddress = localAddress.MapToIPv4();
+
+            return IsTailscaleIPv4(remoteAddress) && _tailscaleAddresses.Contains(localAddress);
+        }
+
+        private static bool IsTailscaleIPv4(IPAddress address)
+        {
+            var bytes = address.GetAddressBytes();
+            return bytes.Length == 4 && bytes[0] == 100 && bytes[1] is >= 64 and <= 127;
+        }
+
+        private static async Task<string> ReadBody(SimpleHttpRequest req)
         {
             using var reader = new StreamReader(req.InputStream, req.ContentEncoding);
             return await reader.ReadToEndAsync();
         }
 
-        private static int GetQueryInt(HttpListenerRequest req, string key, int defaultValue)
+        private static int GetQueryInt(SimpleHttpRequest req, string key, int defaultValue)
         {
             var val = req.QueryString[key];
             return int.TryParse(val, out var result) ? result : defaultValue;
         }
 
-        private static async Task ServeJson(HttpListenerResponse resp, object data, bool pretty = false)
+        private static async Task ServeJson(SimpleHttpResponse resp, object data, bool pretty = false)
         {
             resp.ContentType = "application/json; charset=utf-8";
             var json = JsonSerializer.Serialize(data, pretty ? JsonOptsPretty : JsonOpts);
             await WriteString(resp, json);
         }
 
-        private static async Task ServeEmbeddedFile(HttpListenerResponse resp, string fileName, string contentType)
+        private static async Task ServeEmbeddedFile(SimpleHttpResponse resp, string fileName, string contentType)
         {
             var assembly = Assembly.GetExecutingAssembly();
             using var stream = assembly.GetManifestResourceStream($"webui.{fileName}");
@@ -1063,7 +1071,7 @@ namespace AutoExile.WebServer
             await stream.CopyToAsync(resp.OutputStream);
         }
 
-        private static async Task WriteString(HttpListenerResponse resp, string text)
+        private static async Task WriteString(SimpleHttpResponse resp, string text)
         {
             var bytes = Encoding.UTF8.GetBytes(text);
             resp.ContentLength64 = bytes.Length;
@@ -1122,6 +1130,7 @@ namespace AutoExile.WebServer
         public float SimAvgWaves { get; init; }
         public string SimAvgRunTime { get; init; } = "";
         public string SimRunTime { get; init; } = "";
+        public StatsSnapshot Stats { get; init; } = new();
 
         // Boss stats (populated only when mode is Boss)
         public int BossRuns { get; init; }
