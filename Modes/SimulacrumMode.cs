@@ -125,6 +125,9 @@ namespace AutoExile.Modes
                 ctx.Stats.BeginSimulacrumActivation($"recovered:{areaHash}",
                     gc.Area.CurrentArea.Name ?? "");
                 ctx.Stats.ObserveSimulacrumEntry(areaHash, gc.Area.CurrentArea.Name ?? "");
+                // The recovered instance was already accounted for above.  Seed the
+                // area tracker so the first Tick does not record the same entry again.
+                _lastAreaName = gc.Area.CurrentArea.Name ?? "";
                 _state.Reset();
                 _phase = SimPhase.FindMonolith;
                 _phaseStartTime = DateTime.Now;

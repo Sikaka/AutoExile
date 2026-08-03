@@ -122,11 +122,14 @@ try
         stats.EndRun("Boss", "failed", "boss_failed");
         stats.UpsertMapMetadata(new MapMetadataSnapshot("Test Map", new[] { "4:5:6" },
             DateTime.UtcNow, "Metadata/Boss", "new_transition"));
+        var labWriteCompleted = 0;
         stats.ReplaceLabExitMemory(today, new[]
         {
             new LabExitMemorySnapshot(today, "Test Lab", 2, 90f, "Sanctum"),
-        });
+        }, succeeded => Interlocked.Exchange(ref labWriteCompleted, succeeded ? 1 : -1));
         Flush(stats);
+        Require(Volatile.Read(ref labWriteCompleted) == 1,
+            "lab exit-memory write was not acknowledged after its transaction committed");
         var boss = stats.Snapshot.SessionFor("Boss");
         Require(boss.Attempts == 2 && boss.Consumed == 2 && boss.FullClears == 1 && boss.FailedRuns == 1 && boss.ItemsLooted == 1,
             "mode aggregate mismatch");
@@ -215,8 +218,12 @@ try
     {
         Require(!unavailable.Initialize(pluginDirectory), "invalid database path unexpectedly initialized");
         unavailable.BeginSimulacrumActivation("safe-noop", "Hideout");
-        Require(!unavailable.ReplaceLabExitMemory(today, Array.Empty<LabExitMemorySnapshot>()),
+        var unavailableLabWriteCompleted = 0;
+        Require(!unavailable.ReplaceLabExitMemory(today, Array.Empty<LabExitMemorySnapshot>(),
+                succeeded => Interlocked.Exchange(ref unavailableLabWriteCompleted, succeeded ? 1 : -1)),
             "unavailable statistics store accepted an exit-memory write");
+        Require(Volatile.Read(ref unavailableLabWriteCompleted) == -1,
+            "rejected exit-memory write did not report persistence failure");
         Require(unavailable.Snapshot.Health.Status == "unavailable", "database failure was not surfaced");
     }
 

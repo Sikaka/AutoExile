@@ -73,22 +73,45 @@ FROM lab_exit_memory WHERE day=$day ORDER BY zone_name,exit_count,angle_milli_de
             return result;
         }
 
-        public bool ReplaceLabExitMemory(string day, IReadOnlyCollection<LabExitMemorySnapshot> values)
+        public bool ReplaceLabExitMemory(string day, IReadOnlyCollection<LabExitMemorySnapshot> values,
+            Action<bool>? completed = null)
         {
-            if (string.IsNullOrWhiteSpace(day)) return false;
-            return Enqueue(db =>
+            if (string.IsNullOrWhiteSpace(day))
             {
-                using var tx = db.BeginTransaction();
-                Execute(db, tx, "DELETE FROM lab_exit_memory WHERE day=$day", ("$day", day));
-                var now = NowMs();
-                foreach (var value in values)
-                    Execute(db, tx, @"INSERT INTO lab_exit_memory(day,zone_name,exit_count,angle_milli_degrees,destination_name,updated_at_ms)
+                completed?.Invoke(false);
+                return false;
+            }
+
+            void Complete(bool success)
+            {
+                try { completed?.Invoke(success); }
+                catch (Exception ex) { _log($"Lab exit-memory completion callback error: {ex.Message}"); }
+            }
+
+            var accepted = Enqueue(db =>
+            {
+                try
+                {
+                    using var tx = db.BeginTransaction();
+                    Execute(db, tx, "DELETE FROM lab_exit_memory WHERE day=$day", ("$day", day));
+                    var now = NowMs();
+                    foreach (var value in values)
+                        Execute(db, tx, @"INSERT INTO lab_exit_memory(day,zone_name,exit_count,angle_milli_degrees,destination_name,updated_at_ms)
 VALUES($day,$zone,$count,$angle,$destination,$now)",
-                        ("$day", day), ("$zone", value.ZoneName), ("$count", value.ExitCount),
-                        ("$angle", (long)Math.Round(value.AngleDegrees * 1000f)),
-                        ("$destination", value.DestinationName), ("$now", now));
-                tx.Commit();
+                            ("$day", day), ("$zone", value.ZoneName), ("$count", value.ExitCount),
+                            ("$angle", (long)Math.Round(value.AngleDegrees * 1000f)),
+                            ("$destination", value.DestinationName), ("$now", now));
+                    tx.Commit();
+                    Complete(true);
+                }
+                catch
+                {
+                    Complete(false);
+                    throw;
+                }
             });
+            if (!accepted) Complete(false);
+            return accepted;
         }
 
         private SqliteConnection OpenReadConnection()

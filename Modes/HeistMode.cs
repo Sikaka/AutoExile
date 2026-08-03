@@ -56,6 +56,9 @@ namespace AutoExile.Modes
         {
             _phase = HeistPhase.Idle;
             _state.Reset();
+            // Force the first Tick to establish a fresh run even when the user
+            // switches back to Heist without changing areas.
+            _lastAreaName = "";
             _status = "Heist mode entered";
             // Heist curio drops are "quest" items — must pick them up
             ctx.Loot.IgnoreQuestItems = false;

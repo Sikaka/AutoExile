@@ -44,6 +44,9 @@ namespace AutoExile.Systems
 
         private ExitMemoryFile _data = new();
         private bool _dirty;
+        private bool _savePending;
+        private long _dirtyVersion;
+        private readonly object _saveGate = new();
         private const float DefaultTolerance = 20f; // degrees
 
         /// <summary>
@@ -83,22 +86,36 @@ namespace AutoExile.Systems
         /// </summary>
         public void Save(StatsService stats, Action<string>? log = null)
         {
-            if (!_dirty) return;
+            long version;
+            lock (_saveGate)
+            {
+                if (!_dirty || _savePending) return;
+                _savePending = true;
+                version = _dirtyVersion;
+            }
+
             try
             {
                 var rows = _data.Entries.SelectMany(entry => entry.Mappings.Select(mapping =>
                     new LabExitMemorySnapshot(_data.Date, entry.ZoneName, entry.ExitCount,
                         mapping.AngleDegrees, mapping.DestinationName))).ToList();
-                if (!stats.ReplaceLabExitMemory(_data.Date, rows))
+                var zoneCount = _data.Entries.Count;
+                stats.ReplaceLabExitMemory(_data.Date, rows, succeeded =>
                 {
-                    log?.Invoke("Exit memory save deferred: statistics store is unavailable");
-                    return;
-                }
-                _dirty = false;
-                log?.Invoke($"Exit memory saved: {_data.Entries.Count} zones");
+                    lock (_saveGate)
+                    {
+                        if (succeeded && _dirtyVersion == version)
+                            _dirty = false;
+                        _savePending = false;
+                    }
+                    log?.Invoke(succeeded
+                        ? $"Exit memory saved: {zoneCount} zones"
+                        : "Exit memory save deferred: statistics store is unavailable");
+                });
             }
             catch (Exception ex)
             {
+                lock (_saveGate) _savePending = false;
                 log?.Invoke($"Exit memory SQLite save error: {ex.Message}");
             }
         }
@@ -146,7 +163,7 @@ namespace AutoExile.Systems
                         return false; // duplicate — same angle, same destination
                     mapping.AngleDegrees = angleDegrees;
                     mapping.DestinationName = destinationName;
-                    _dirty = true;
+                    MarkDirty();
                     return true;
                 }
             }
@@ -157,11 +174,23 @@ namespace AutoExile.Systems
                 AngleDegrees = angleDegrees,
                 DestinationName = destinationName,
             });
-            _dirty = true;
+            MarkDirty();
             return true;
         }
 
-        public bool IsDirty => _dirty;
+        public bool IsDirty
+        {
+            get { lock (_saveGate) return _dirty; }
+        }
+
+        private void MarkDirty()
+        {
+            lock (_saveGate)
+            {
+                _dirty = true;
+                _dirtyVersion++;
+            }
+        }
 
         private ExitMemoryEntry? FindEntry(string zoneName, int exitCount)
         {
