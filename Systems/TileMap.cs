@@ -102,8 +102,6 @@ namespace AutoExile.Systems
                 if (tileData == null || tileData.Length == 0)
                     return false;
 
-                var numCols = (int)terrain.NumCols;
-
                 Parallel.ForEach(
                     System.Collections.Concurrent.Partitioner.Create(0, tileData.Length),
                     (range, _) =>
