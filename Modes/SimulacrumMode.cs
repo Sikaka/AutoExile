@@ -124,10 +124,14 @@ namespace AutoExile.Modes
                 var areaHash = gc.IngameState?.Data?.CurrentAreaHash ?? 0;
                 ctx.Stats.BeginSimulacrumActivation($"recovered:{areaHash}",
                     gc.Area.CurrentArea.Name ?? "");
-                ctx.Stats.ObserveSimulacrumEntry(areaHash, gc.Area.CurrentArea.Name ?? "");
-                // The recovered instance was already accounted for above.  Seed the
-                // area tracker so the first Tick does not record the same entry again.
-                _lastAreaName = gc.Area.CurrentArea.Name ?? "";
+                if (areaHash != 0)
+                {
+                    ctx.Stats.ObserveSimulacrumEntry(areaHash, gc.Area.CurrentArea.Name ?? "");
+                    // The recovered instance was accounted for above. Seed the area
+                    // tracker only after a real hash was observed; otherwise the first
+                    // Tick remains the retry path once the game exposes the instance.
+                    _lastAreaName = gc.Area.CurrentArea.Name ?? "";
+                }
                 _state.Reset();
                 _phase = SimPhase.FindMonolith;
                 _phaseStartTime = DateTime.Now;
