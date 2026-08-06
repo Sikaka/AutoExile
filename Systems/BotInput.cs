@@ -1254,6 +1254,41 @@ namespace AutoExile.Systems
             SendKeyUp(key);
         }
 
+        /// <summary>
+        /// Press a sequence of keys as a macro. Each tuple is (key, holdMs).
+        /// betweenDelayMs is the delay between key releases and next key down.
+        /// Suspends movement and releases held keys before starting (like PressKey).
+        /// </summary>
+        public static bool PressKeyMacro((Keys key, int holdMs)[] sequence, int betweenDelayMs = 50)
+        {
+            if (sequence == null || sequence.Length == 0) return false;
+            if (!CanAct) { LogAction("PressKeyMacro", null, null, false); return false; }
+            SuspendMovement();
+            ReleaseAllKeys();
+            // Estimate total duration: sum holds + between delays + cooldown
+            long totalMs = ActionCooldownMs;
+            foreach (var (key, hold) in sequence) totalMs += Math.Max(0, hold);
+            totalMs += Math.Max(0, betweenDelayMs) * Math.Max(0, sequence.Length - 1);
+            NextActionAt = DateTime.Now.AddMilliseconds(totalMs);
+            _ = DoPressKeyMacro(sequence, betweenDelayMs);
+            LogAction("PressKeyMacro", null, null, true);
+            return true;
+        }
+
+        private static async Task DoPressKeyMacro((Keys key, int holdMs)[] sequence, int betweenDelayMs)
+        {
+            foreach (var (key, holdMs) in sequence)
+            {
+                await SendDelay();
+                SendKeyDown(key);
+                await Task.Delay(Math.Max(0, holdMs));
+                await SendDelay();
+                SendKeyUp(key);
+                if (betweenDelayMs > 0)
+                    await Task.Delay(betweenDelayMs);
+            }
+        }
+
         // ── Mouse clicks ──
 
         /// <summary>Move cursor, settle, left-click (hold+release). Suspends continuous movement.</summary>
