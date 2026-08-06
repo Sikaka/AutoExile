@@ -27,6 +27,7 @@ namespace AutoExile.Modes
         public bool EnableCombat { get; set; } = true;
         public bool EnableLoot { get; set; } = true;
         public bool LootNearLeaderOnly { get; set; } = true;
+        public bool AutoResumeOnRevive { get; set; } = true;
 
         // Exposed state for F6 dump
         public FollowerState State => _state;
@@ -78,6 +79,7 @@ namespace AutoExile.Modes
         private const float QuestScanIntervalMs = 500;
         private readonly HashSet<long> _completedQuestEntities = new(); // only added on confirmed success
         private long _pendingQuestEntityId; // currently being interacted with
+        private bool _pausedByDeath = false;
 
         public void OnEnter(BotContext ctx)
         {
@@ -144,6 +146,41 @@ namespace AutoExile.Modes
             {
                 _state = FollowerState.SearchingForLeader;
                 _hasLastLeaderPos = false;
+            }
+
+            // Pause follow behavior while dead to avoid returning to hideout or other actions
+            if (gc.Player == null || !gc.Player.IsAlive)
+            {
+                if (!_pausedByDeath)
+                {
+                    _pausedByDeath = true;
+                    try { ctx.Navigation.Stop(gc); } catch { }
+                    ctx.Log("Follower paused due to death");
+                }
+                _status = "Dead — paused";
+                _decision = "dead";
+                return;
+            }
+            else if (_pausedByDeath)
+            {
+                // Revived — resume follower behavior only if setting allows it
+                if (AutoResumeOnRevive)
+                {
+                    _pausedByDeath = false;
+                    _state = FollowerState.SearchingForLeader;
+                    _hasLastLeaderPos = false;
+                    _leaderVelocity = Vector2.Zero;
+                    _transitionGridPos = null;
+                    _transitionEntityId = 0;
+                    ctx.Log("Follower resumed after revive");
+                    _status = "Revived — searching for leader";
+                }
+                else
+                {
+                    _status = "Dead — paused (auto-resume disabled)";
+                    _decision = "dead_paused_manual";
+                    return;
+                }
             }
 
             // Detect area changes — cancel all in-flight systems

@@ -749,6 +749,7 @@ namespace AutoExile
                 _followerMode.EnableCombat = Settings.Follower.EnableCombat.Value;
                 _followerMode.EnableLoot = Settings.Follower.EnableLoot.Value;
                 _followerMode.LootNearLeaderOnly = Settings.Follower.LootNearLeaderOnly.Value;
+                _followerMode.AutoResumeOnRevive = Settings.Follower.AutoResumeOnRevive.Value;
             }
 
             // Let the active mode decide what to do (may set up navigation paths)
