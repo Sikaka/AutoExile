@@ -78,6 +78,7 @@ namespace AutoExile.Modes
         private const float QuestScanIntervalMs = 500;
         private readonly HashSet<long> _completedQuestEntities = new(); // only added on confirmed success
         private long _pendingQuestEntityId; // currently being interacted with
+        private bool _pausedByDeath = false;
 
         public void OnEnter(BotContext ctx)
         {
@@ -149,10 +150,27 @@ namespace AutoExile.Modes
             // Pause follow behavior while dead to avoid returning to hideout or other actions
             if (gc.Player == null || !gc.Player.IsAlive)
             {
+                if (!_pausedByDeath)
+                {
+                    _pausedByDeath = true;
+                    try { ctx.Navigation.Stop(gc); } catch { }
+                    ctx.Log("Follower paused due to death");
+                }
                 _status = "Dead — paused";
                 _decision = "dead";
-                try { ctx.Navigation.Stop(gc); } catch { }
                 return;
+            }
+            else if (_pausedByDeath)
+            {
+                // Revived — resume follower behavior
+                _pausedByDeath = false;
+                _state = FollowerState.SearchingForLeader;
+                _hasLastLeaderPos = false;
+                _leaderVelocity = Vector2.Zero;
+                _transitionGridPos = null;
+                _transitionEntityId = 0;
+                ctx.Log("Follower resumed after revive");
+                _status = "Revived — searching for leader";
             }
 
             // Detect area changes — cancel all in-flight systems
