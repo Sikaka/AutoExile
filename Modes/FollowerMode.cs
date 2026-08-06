@@ -146,6 +146,15 @@ namespace AutoExile.Modes
                 _hasLastLeaderPos = false;
             }
 
+            // Pause follow behavior while dead to avoid returning to hideout or other actions
+            if (gc.Player == null || !gc.Player.IsAlive)
+            {
+                _status = "Dead — paused";
+                _decision = "dead";
+                try { ctx.Navigation.Stop(gc); } catch { }
+                return;
+            }
+
             // Detect area changes — cancel all in-flight systems
             var currentArea = gc.Area?.CurrentArea?.Name ?? "";
             if (!string.IsNullOrEmpty(currentArea) && currentArea != _lastAreaName)
