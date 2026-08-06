@@ -42,14 +42,14 @@ namespace AutoExile.Systems
         private DateTime _clickLabelEnteredAt;
         private int _retries;
         private const int MaxRetries = 2;
-        private const float LabelAppearWaitMs = 1500f; // grace period for label to appear after arriving
+        private const float LabelAppearWaitMs = 600f; // grace period for label to appear after arriving
 
         // Timing
         private DateTime _startedAt;
         private const float BaseTimeoutSeconds = 15f; // longer to allow navigation
         /// <summary>Extra seconds added to server-response timeouts. Set from settings.</summary>
         public float ExtraLatencySec { get; set; }
-        private const float MenuWaitMs = 500f;
+        private const float MenuWaitMs = 200f;
 
         // Minimum standoff from the tower when approaching (grid units).
         // We don't walk directly on top — we stop this far back along the approach vector.
