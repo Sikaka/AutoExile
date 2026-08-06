@@ -27,6 +27,7 @@ namespace AutoExile.Modes
         public bool EnableCombat { get; set; } = true;
         public bool EnableLoot { get; set; } = true;
         public bool LootNearLeaderOnly { get; set; } = true;
+        public bool AutoResumeOnRevive { get; set; } = true;
 
         // Exposed state for F6 dump
         public FollowerState State => _state;
@@ -162,15 +163,24 @@ namespace AutoExile.Modes
             }
             else if (_pausedByDeath)
             {
-                // Revived — resume follower behavior
-                _pausedByDeath = false;
-                _state = FollowerState.SearchingForLeader;
-                _hasLastLeaderPos = false;
-                _leaderVelocity = Vector2.Zero;
-                _transitionGridPos = null;
-                _transitionEntityId = 0;
-                ctx.Log("Follower resumed after revive");
-                _status = "Revived — searching for leader";
+                // Revived — resume follower behavior only if setting allows it
+                if (AutoResumeOnRevive)
+                {
+                    _pausedByDeath = false;
+                    _state = FollowerState.SearchingForLeader;
+                    _hasLastLeaderPos = false;
+                    _leaderVelocity = Vector2.Zero;
+                    _transitionGridPos = null;
+                    _transitionEntityId = 0;
+                    ctx.Log("Follower resumed after revive");
+                    _status = "Revived — searching for leader";
+                }
+                else
+                {
+                    _status = "Dead — paused (auto-resume disabled)";
+                    _decision = "dead_paused_manual";
+                    return;
+                }
             }
 
             // Detect area changes — cancel all in-flight systems

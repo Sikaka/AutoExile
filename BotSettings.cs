@@ -339,6 +339,9 @@ namespace AutoExile
 
             [Menu("Loot While Near Leader Only", "Only loot when within follow distance of leader (don't wander off to loot).")]
             public ToggleNode LootNearLeaderOnly { get; set; } = new ToggleNode(true);
+
+            [Menu("Auto-resume on revive", "When enabled, follower will automatically resume following after the player revives.")]
+            public ToggleNode AutoResumeOnRevive { get; set; } = new ToggleNode(true);
         }
 
         [Submenu(CollapsedByDefault = true)]
