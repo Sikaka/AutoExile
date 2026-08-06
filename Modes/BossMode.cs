@@ -363,7 +363,7 @@ namespace AutoExile.Modes
         // ── Loot sweep ──
 
         private DateTime _lastLootScan = DateTime.MinValue;
-        private const float LootScanIntervalMs = 500;
+        private const float LootScanIntervalMs = 250;
 
         private void TickLootSweep(BotContext ctx, GameController gc, InteractionResult interactionResult)
         {
