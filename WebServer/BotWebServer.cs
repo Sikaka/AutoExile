@@ -329,8 +329,20 @@ namespace AutoExile.WebServer
                     case "/api/nearby-monsters" when method == "GET":
                         await HandleNearbyMonsters(resp);
                         break;
-                    case "/api/player-buffs" when method == "GET":
+                            case "/api/player-buffs" when method == "GET":
                         await HandlePlayerBuffs(resp);
+                        break;
+                    case "/api/macros" when method == "GET":
+                        await HandleGetMacros(resp);
+                        break;
+                    case "/api/macros" when method == "POST":
+                        await HandleSetMacros(req, resp);
+                        break;
+                    case "/api/macros" when method == "GET":
+                        await HandleGetMacros(resp);
+                        break;
+                    case "/api/macros" when method == "POST":
+                        await HandleSetMacros(req, resp);
                         break;
 
                     // Profiles — source of truth for bot behavior
@@ -946,6 +958,45 @@ namespace AutoExile.WebServer
             }
         }
 
+        private async Task HandleGetMacros(HttpListenerResponse resp)
+        {
+            try
+            {
+                if (ProfileManager == null) { resp.StatusCode = 500; await ServeJson(resp, new { error = "Profile manager not set" }); return; }
+                var macros = MacroStore.LoadMacros(ProfileManager);
+                await ServeJson(resp, new { macros }, pretty: true);
+            }
+            catch (Exception ex)
+            {
+                resp.StatusCode = 500;
+                await ServeJson(resp, new { error = ex.Message });
+            }
+        }
+
+        private async Task HandleSetMacros(HttpListenerRequest req, HttpListenerResponse resp)
+        {
+            try
+            {
+                if (ProfileManager == null) { resp.StatusCode = 500; await ServeJson(resp, new { error = "Profile manager not set" }); return; }
+                var body = await ReadBody(req);
+                var doc = JsonDocument.Parse(body);
+                var root = doc.RootElement;
+                if (!root.TryGetProperty("macros", out var macrosEl) || macrosEl.ValueKind != JsonValueKind.Array)
+                {
+                    resp.StatusCode = 400; await ServeJson(resp, new { error = "Invalid body: expected { macros: [...] }" }); return;
+                }
+                var macros = JsonSerializer.Deserialize<List<MacroDefinition>>(macrosEl.GetRawText());
+                if (macros == null) { resp.StatusCode = 400; await ServeJson(resp, new { error = "Invalid macros" }); return; }
+                var ok = MacroStore.SaveMacros(ProfileManager, macros);
+                await ServeJson(resp, new { ok });
+            }
+            catch (Exception ex)
+            {
+                resp.StatusCode = 500;
+                await ServeJson(resp, new { error = ex.Message });
+            }
+        }
+
         private async Task HandleCapturePosition(HttpListenerRequest req, HttpListenerResponse resp)
         {
             var body = await ReadBody(req);
@@ -1144,6 +1195,10 @@ namespace AutoExile.WebServer
         public int LabGemsTransformed { get; init; }
         public float LabTotalProfit { get; init; }
         public string LabSelectedGem { get; init; } = "";
+
+        // Macro state
+        public string ActiveMacroName { get; init; } = "";
+        public bool MacroRepeating { get; init; }
 
         public long Timestamp { get; init; }
 

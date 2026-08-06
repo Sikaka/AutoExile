@@ -108,6 +108,9 @@ namespace AutoExile.WebServer
             Directory.CreateDirectory(_profilesDir);
         }
 
+        /// <summary>Expose profiles directory for ancillary per-profile files (macros, flag files).</summary>
+        public string ProfilesDirectory => _profilesDir;
+
         // ================================================================
         // Lifecycle — startup + every-change save
         // ================================================================

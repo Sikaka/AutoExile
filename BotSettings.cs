@@ -30,6 +30,12 @@ namespace AutoExile
         [Menu("Record Gameplay", "Toggle human gameplay recording (F9). Records game state each tick for offline analysis. Stop bot before recording.")]
         public HotkeyNode RecordGameplay { get; set; } = new HotkeyNode(Keys.F9);
 
+        [Menu("Macro Toggle Hotkey", "Hotkey to toggle the configured macro on/off (see Macros settings)")]
+        public HotkeyNode MacroToggle { get; set; } = new HotkeyNode(Keys.F10);
+
+        [Menu("Macro Toggle Name", "Name of the macro to toggle with the Macro Toggle Hotkey")]
+        public TextNode MacroToggleName { get; set; } = new TextNode("");
+
         [Menu("Active Mode", "Bot mode to run. Persists across reloads.")]
         public ListNode ActiveMode { get; set; } = new ListNode() { Value = "Idle" };
 

@@ -154,8 +154,24 @@ namespace AutoExile.Modes
                 if (!_pausedByDeath)
                 {
                     _pausedByDeath = true;
-                    try { ctx.Navigation.Stop(gc); } catch { }
-                    ctx.Log("Follower paused due to death");
+                    try
+                    {
+                        // Cancel any in-flight interactions and navigation to prevent clicks or movement
+                        ctx.Interaction.Cancel(gc);
+                    }
+                    catch { }
+                    try
+                    {
+                        ctx.Navigation.Stop(gc);
+                    }
+                    catch { }
+                    try
+                    {
+                        // Cancel any pending input sequences (macros, clicks)
+                        BotInput.Cancel();
+                    }
+                    catch { }
+                    ctx.Log($"Follower paused due to death (PlayerIsAlive={gc.Player?.IsAlive.ToString() ?? "null"})");
                 }
                 _status = "Dead — paused";
                 _decision = "dead";
@@ -166,13 +182,17 @@ namespace AutoExile.Modes
                 // Revived — resume follower behavior only if setting allows it
                 if (AutoResumeOnRevive)
                 {
+                    // Ensure no lingering interactions remain
+                    try { ctx.Interaction.Cancel(gc); } catch { }
+                    try { BotInput.Cancel(); } catch { }
+
                     _pausedByDeath = false;
                     _state = FollowerState.SearchingForLeader;
                     _hasLastLeaderPos = false;
                     _leaderVelocity = Vector2.Zero;
                     _transitionGridPos = null;
                     _transitionEntityId = 0;
-                    ctx.Log("Follower resumed after revive");
+                    ctx.Log($"Follower resumed after revive (AutoResumeOnRevive={AutoResumeOnRevive})");
                     _status = "Revived — searching for leader";
                 }
                 else
@@ -816,6 +836,44 @@ namespace AutoExile.Modes
 
             if (target == null)
                 return false;
+
+            // Safety: only follow an exit if the leader was actually near that exit when we
+            // lost sight of them. Avoid following remote transitions/side areas when the
+            // last known leader position is far away (e.g., a teleport or incorrect stale pos).
+            var targetPos = new Vector2(target.GridPosNum.X, target.GridPosNum.Y);
+            // Minimum distance threshold: at least as large as FollowDistance*1.5 or 40 grid units
+            var exitFollowThreshold = Math.Max(FollowDistance * 1.5f, 40f);
+            var distToExit = Vector2.Distance(nearGridPos, targetPos);
+            if (distToExit > exitFollowThreshold)
+            {
+                ctx.Log($"Follower: skipping exit follow — exit at {distToExit:F0}g from last leader pos (threshold {exitFollowThreshold:F0})");
+                return false;
+            }
+
+            // Additional safety: when following area transitions (not town portals), prefer to
+            // verify that the leader is in the same destination/zone. This prevents following
+            // into boss/side areas that the leader didn't actually go to.
+            var isPortal = target.Type == EntityType.TownPortal || target.Type == EntityType.Portal || IsLeagueMechanicPortal(target);
+            if (!isPortal)
+            {
+                try
+                {
+                    var leaderZone = GetLeaderZoneFromPartyUI(gc);
+                    var destName = target.RenderName ?? target.Path ?? "";
+                    if (!string.IsNullOrEmpty(leaderZone) && !string.IsNullOrEmpty(destName))
+                    {
+                        // If the leader's zone does not mention the transition's render name
+                        // and the transition's name doesn't mention the leader's zone, skip it.
+                        if (!leaderZone.Contains(destName, StringComparison.OrdinalIgnoreCase)
+                            && !destName.Contains(leaderZone, StringComparison.OrdinalIgnoreCase))
+                        {
+                            ctx.Log($"Follower: skipping transition — leader zone '{leaderZone}' does not match transition '{destName}'");
+                            return false;
+                        }
+                    }
+                }
+                catch { /* non-fatal — fall back to distance check above */ }
+            }
 
             return StartNavigationToEntity(ctx, gc, target);
         }

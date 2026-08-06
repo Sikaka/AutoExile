@@ -13,6 +13,7 @@ using AutoExile.WebServer;
 using System.IO;
 using System.Linq;
 using System.Numerics;
+using System.Windows.Forms;
 
 namespace AutoExile
 {
@@ -117,6 +118,16 @@ namespace AutoExile
 
         // --- Buff scanner ---
         private bool _buffScanActive;
+
+        // --- Macro runner ---
+        private List<AutoExile.WebServer.MacroDefinition> _loadedMacros = new();
+        private AutoExile.WebServer.MacroDefinition? _activeMacro = null;
+        private bool _macroRepeating = false;
+        private DateTime _nextMacroRunAt = DateTime.MinValue;
+        private string _activeMacroName = "";
+        // Per-macro hotkey mapping (populated from MacroDefinition.Hotkey)
+        private readonly Dictionary<System.Windows.Forms.Keys, string> _macroHotkeyMap = new();
+        private readonly HashSet<System.Windows.Forms.Keys> _macroHotkeyPrevDown = new();
         private int _buffScanSlotIndex = -1; // which skill slot (0-based) we're scanning for
         private HashSet<string> _buffScanBaseline = new(); // buff names on monsters before cast
         private List<string> _buffScanResults = new(); // new buffs detected after cast
@@ -234,8 +245,10 @@ namespace AutoExile
             // own settings file is ignored for anything other than infrastructure).
             _profileManager = new ProfileManager(msg => LogMessage($"[AutoExile] {msg}"));
             _profileManager.Initialize(DirectoryFullName);
-            _profileManager.OnProfileSwitched += _ => _runtime.Reset();
+            _profileManager.OnProfileSwitched += _ => { _runtime.Reset(); LoadMacrosForProfile(); };
             _profileManager.LoadActive(Settings);
+            // Load macros for the active profile
+            LoadMacrosForProfile();
 
             // Initialize data store
             _dataStore = new DataStore(msg => LogMessage($"[AutoExile] {msg}"));
@@ -294,6 +307,98 @@ namespace AutoExile
             }
 
             return base.Initialise();
+        }
+
+        private void LoadMacrosForProfile()
+        {
+            try
+            {
+                if (_profileManager != null)
+                    _loadedMacros = MacroStore.LoadMacros(_profileManager);
+                else
+                    _loadedMacros = new List<AutoExile.WebServer.MacroDefinition>();
+
+                // Rebuild hotkey map
+                _macroHotkeyMap.Clear();
+                foreach (var m in _loadedMacros)
+                {
+                    if (string.IsNullOrWhiteSpace(m.Hotkey)) continue;
+                    if (Enum.TryParse<System.Windows.Forms.Keys>(m.Hotkey, true, out var k))
+                    {
+                        // If duplicate, last wins
+                        _macroHotkeyMap[k] = m.Name;
+                    }
+                    else if (m.Hotkey.Length == 1)
+                    {
+                        var ch = m.Hotkey.ToUpper()[0];
+                        if (Enum.TryParse<System.Windows.Forms.Keys>(ch.ToString(), out var k2))
+                            _macroHotkeyMap[k2] = m.Name;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"[AutoExile] Failed to load macros: {ex.Message}");
+                _loadedMacros = new List<AutoExile.WebServer.MacroDefinition>();
+                _macroHotkeyMap.Clear();
+            }
+        }
+
+        private void ToggleMacroByName(string name)
+        {
+            var mac = _loadedMacros.FirstOrDefault(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (mac == null)
+            {
+                LogMessage($"[AutoExile] Macro not found: {name}");
+                return;
+            }
+
+            if (_macroRepeating && string.Equals(_activeMacroName, mac.Name, StringComparison.OrdinalIgnoreCase))
+            {
+                // Stop repeating
+                _macroRepeating = false;
+                _activeMacro = null;
+                _activeMacroName = "";
+                LogMessage($"[AutoExile] Stopped repeating macro '{mac.Name}'");
+            }
+            else
+            {
+                // Start repeating
+                _activeMacro = mac;
+                _activeMacroName = mac.Name;
+                _macroRepeating = true;
+                // Schedule immediate run if gate allows, otherwise schedule in near future
+                _nextMacroRunAt = DateTime.Now;
+                LogMessage($"[AutoExile] Started repeating macro '{mac.Name}'");
+            }
+        }
+
+        private void StartMacroOnce(AutoExile.WebServer.MacroDefinition mac)
+        {
+            try
+            {
+                // Map sequence to Keys tuples
+                var seq = new List<(System.Windows.Forms.Keys, int)>();
+                foreach (var a in mac.Sequence)
+                {
+                    if (string.IsNullOrWhiteSpace(a.Key)) continue;
+                    if (Enum.TryParse<System.Windows.Forms.Keys>(a.Key, true, out var k))
+                        seq.Add((k, a.HoldMs));
+                    else if (a.Key.Length == 1)
+                    {
+                        // Single char fallback
+                        var ch = a.Key.ToUpper()[0];
+                        if (Enum.TryParse<System.Windows.Forms.Keys>(ch.ToString(), out var k2))
+                            seq.Add((k2, a.HoldMs));
+                    }
+                }
+                if (seq.Count == 0) { LogMessage($"[AutoExile] Macro '{mac.Name}' has no valid keys"); return; }
+                Systems.BotInput.PressKeyMacro(seq.ToArray(), mac.BetweenDelayMs);
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"[AutoExile] Failed to run macro '{mac.Name}': {ex.Message}");
+            }
         }
 
         /// <summary>
@@ -567,6 +672,17 @@ namespace AutoExile
             // Sync movement skills (dash/blink) from CombatSystem → NavigationSystem
             _navigation.MovementSkills = _combat.MovementSkills;
 
+            // Macro repeating runner: trigger next iteration when due and gate allows
+            if (_macroRepeating && _activeMacro != null && DateTime.Now >= _nextMacroRunAt && Systems.BotInput.CanAct)
+            {
+                StartMacroOnce(_activeMacro);
+                // Schedule next run: estimate duration + repeat delay
+                long estMs = Settings.ActionCooldownMs.Value; // baseline
+                foreach (var a in _activeMacro.Sequence) estMs += Math.Max(0, a.HoldMs);
+                estMs += Math.Max(0, _activeMacro.BetweenDelayMs) * Math.Max(0, _activeMacro.Sequence.Count - 1);
+                _nextMacroRunAt = DateTime.Now.AddMilliseconds(estMs + Math.Max(0, _activeMacro.RepeatDelayMs));
+            }
+
             // Sync threat settings
             var threatSettings = Settings.Threat;
             _threat.Enabled = threatSettings.Enabled.Value;
@@ -598,10 +714,46 @@ namespace AutoExile
                 LogMessage($"[AutoExile] Recorder ({mode}): {(_humanRecorder.IsRecording ? "RECORDING" : "stopped")}");
             }
 
+            // Macro toggle hotkey — toggles repeating macro named in settings.MacroToggleName
+            if (Settings.MacroToggle.PressedOnce())
+            {
+                var name = Settings.MacroToggleName.Value ?? "";
+                if (!string.IsNullOrWhiteSpace(name))
+                    ToggleMacroByName(name);
+                else
+                    LogMessage("[AutoExile] Macro toggle hotkey pressed but MacroToggleName is empty");
+            }
+
+            // Per-macro hotkeys: edge-detect configured hotkeys and toggle corresponding macro
+            if (_macroHotkeyMap.Count > 0)
+            {
+                foreach (var kv in _macroHotkeyMap)
+                {
+                    var key = kv.Key;
+                    var name = kv.Value;
+                    try
+                    {
+                        bool isDown = ExileCore.Input.IsKeyDown(key);
+                        bool wasDown = _macroHotkeyPrevDown.Contains(key);
+                        if (isDown && !wasDown)
+                        {
+                            // Pressed this tick — toggle macro
+                            ToggleMacroByName(name);
+                        }
+                        if (isDown)
+                            _macroHotkeyPrevDown.Add(key);
+                        else
+                            _macroHotkeyPrevDown.Remove(key);
+                    }
+                    catch { }
+                }
+            }
+
             // Tick human recorder (captures game state each tick while recording)
             if (_humanRecorder.IsRecording)
                 _humanRecorder.RecordTick(GameController, _ctx);
 
+            // Continue normal tick processing...
             // F7/F8 — removed (folded into F6 dump-all)
 
             // Clear tile signatures on area change
@@ -1002,6 +1154,20 @@ namespace AutoExile
                         if (!string.IsNullOrEmpty(cmd.Value) && _modes.ContainsKey(cmd.Value))
                             SetMode(cmd.Value);
                         break;
+                    case "runMacro":
+                        if (!string.IsNullOrEmpty(cmd.Value))
+                        {
+                            var mac = _loadedMacros.FirstOrDefault(m => string.Equals(m.Name, cmd.Value, StringComparison.OrdinalIgnoreCase));
+                            if (mac != null)
+                                StartMacroOnce(mac);
+                        }
+                        break;
+                    case "toggleMacro":
+                        if (!string.IsNullOrEmpty(cmd.Value))
+                        {
+                            ToggleMacroByName(cmd.Value);
+                        }
+                        break;
                 }
             }
 
@@ -1151,7 +1317,7 @@ namespace AutoExile
                     BossAvgRunTime = Sanitize((float)(_bossMode?.AvgRunTimeSeconds ?? 0)),
                     BossRunsPerDrop = Sanitize((float)(_bossMode?.RunsPerDrop ?? 0)),
                     BossChaosPerHour = Sanitize((float)(_bossMode?.ChaosPerHour(Settings.Boss.KeyDropChaosValue.Value) ?? 0)),
-                    BossRunTime = _bossMode != null && _mode == _bossMode
+                        BossRunTime = _bossMode != null && _mode == _bossMode
                         && _bossMode.Phase >= BossMode.BossPhase.InBossZone && _bossMode.Phase <= BossMode.BossPhase.ExitMap
                         ? (DateTime.Now - _bossMode.RunStartTime).ToString(@"m\:ss") : "",
 
@@ -1168,16 +1334,20 @@ namespace AutoExile
                     LabTotalProfit = Sanitize((float)(_labyrinthMode?.State.TotalProfit ?? 0)),
                     LabSelectedGem = _labyrinthMode?.State.SelectedGemName ?? "",
 
-                    Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                        // Macro state
+                        ActiveMacroName = _activeMacroName,
+                        MacroRepeating = _macroRepeating,
 
-                    // Map overlay
-                    PlayerGridX = Sanitize(playerGrid.X),
-                    PlayerGridY = Sanitize(playerGrid.Y),
-                    AreaHash = currentHash,
-                    Entities = entities,
-                    NavPath = navPath,
-                    SkillBar = detectedSkills,
-                });
+                        Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+
+                        // Map overlay
+                        PlayerGridX = Sanitize(playerGrid.X),
+                        PlayerGridY = Sanitize(playerGrid.Y),
+                        AreaHash = currentHash,
+                        Entities = entities,
+                        NavPath = navPath,
+                        SkillBar = detectedSkills,
+                    });
             }
             catch (Exception ex)
             {

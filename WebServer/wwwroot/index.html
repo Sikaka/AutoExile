@@ -244,6 +244,7 @@ tr:hover td { background:var(--surface2); }
       <div class="bot-status">
         <div id="statusDot" class="status-dot"></div>
         <span id="botStatusText">Stopped</span>
+        <span id="macroRepeatingBadge" class="hotkey-badge" style="display:none;margin-left:8px"></span>
       </div>
       <div class="controls">
         <select id="modeSelect" class="mode-select">
@@ -465,6 +466,7 @@ tr:hover td { background:var(--surface2); }
     <div class="settings-tab" data-tab="loot" onclick="switchSettingsTab('loot')">Loot</div>
     <div class="settings-tab" data-tab="all" onclick="switchSettingsTab('all')">All Settings</div>
     <div class="settings-tab" data-tab="advanced" onclick="switchSettingsTab('advanced')">Advanced</div>
+    <div class="settings-tab" data-tab="macros" onclick="switchSettingsTab('macros')">Macros</div>
   </div>
   <div id="settingsSearchResults" style="display:none"></div>
   <div id="settingsContainer"><div class="empty-state">Loading settings...</div></div>
@@ -559,6 +561,26 @@ function updateDashboard(s) {
   if (!s.inGame) { dot.className='status-dot'; txt.textContent='Not In Game'; }
   else if (s.running) { dot.className='status-dot running'; txt.textContent=`${s.mode}${s.phase?' - '+s.phase:''}`; }
   else { dot.className='status-dot paused'; txt.textContent='Paused'; }
+
+  // Macro repeating badge
+  const macBadge = document.getElementById('macroRepeatingBadge');
+  if (s.macroRepeating && s.activeMacroName) {
+    macBadge.style.display = '';
+    macBadge.textContent = 'Repeating: ' + s.activeMacroName;
+    // Add a small stop button
+    const stopBtn = document.createElement('button');
+    stopBtn.className = 'btn';
+    stopBtn.style.cssText = 'padding:4px 8px;margin-left:8px;font-size:12px';
+    stopBtn.textContent = 'Stop';
+    stopBtn.onclick = () => { try { sendCmd('toggleMacro', s.activeMacroName); } catch(e){ console.error(e); } };
+    // Clear previous children and append button
+    while (macBadge.firstChild) macBadge.removeChild(macBadge.firstChild);
+    macBadge.appendChild(document.createTextNode('Repeating: ' + s.activeMacroName));
+    macBadge.appendChild(stopBtn);
+  } else {
+    macBadge.style.display = 'none';
+    macBadge.innerHTML = '';
+  }
 
   document.getElementById('areaName').textContent = s.area || '--';
   updateRuntimeWidget(s);
@@ -1215,6 +1237,10 @@ function switchSettingsTab(name) {
     el.innerHTML = '';
     renderModeTab(el, currentBotMode);
   }
+  if (name === 'macros' && settingsLoaded && el) {
+    el.innerHTML = '';
+    renderMacrosTab(el);
+  }
 }
 
 async function loadSettings() {
@@ -1387,6 +1413,65 @@ function renderAltarModsExpander(parent) {
   });
 }
 
+function renderMacrosTab(container) {
+  const title = document.createElement('div'); title.className='section-divider'; title.textContent='Macros'; container.appendChild(title);
+  const info = document.createElement('div'); info.style.cssText='color:var(--text-dim);margin-bottom:8px;font-size:13px';
+  info.textContent = 'Macros are stored per-profile as a JSON array of { name, actions }. Use the editor below to view/edit and click Save.';
+  container.appendChild(info);
+n  const ta = document.createElement('textarea'); ta.style.cssText = 'width:100%;height:260px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:10px;font-family:monospace;font-size:12px;';
+  ta.placeholder = '[{ "name": "example", "actions": [{"key":"Enter","holdMs":100}]}]';
+  container.appendChild(ta);
+
+  const row = document.createElement('div'); row.style.cssText='margin-top:8px;display:flex;gap:8px;';
+  const loadBtn = document.createElement('button'); loadBtn.className='btn'; loadBtn.textContent='Load';
+  const saveBtn = document.createElement('button'); saveBtn.className='btn'; saveBtn.textContent='Save';
+  const runInput = document.createElement('input'); runInput.placeholder='Macro name to run'; runInput.style.cssText='flex:1;padding:8px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);';
+  const runBtn = document.createElement('button'); runBtn.className='btn'; runBtn.textContent='Run';
+  const toggleBtn = document.createElement('button'); toggleBtn.className='btn'; toggleBtn.textContent='Toggle Repeat';
+  row.appendChild(loadBtn); row.appendChild(saveBtn); row.appendChild(runInput); row.appendChild(runBtn); row.appendChild(toggleBtn);
+  container.appendChild(row);
+
+  async function load() {
+    ta.value = 'Loading...';
+    try {
+      const r = await fetch('/api/macros');
+      if (!r.ok) { const e = await r.json().catch(()=>({})); ta.value = 'Error: ' + (e.error || r.status); return; }
+      const j = await r.json();
+      ta.value = JSON.stringify(j.macros || [], null, 2);
+    } catch(e) { ta.value = 'Error: ' + e.message; }
+  }
+  async function save() {
+    let parsed;
+    try { parsed = JSON.parse(ta.value); } catch(e) { alert('Invalid JSON: ' + e.message); return; }
+    try {
+      const r = await fetch('/api/macros',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({macros: parsed})});
+      if (!r.ok) { const e = await r.json().catch(()=>({})); alert('Save failed: ' + (e.error || r.status)); return; }
+      alert('Saved');
+    } catch(e) { alert('Save failed: ' + e.message); }
+  }
+  async function runMacro() {
+    const name = runInput.value.trim(); if (!name) { alert('Enter macro name'); return; }
+    try {
+      await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'runMacro', value:name})});
+      alert('Run request sent');
+    } catch(e) { alert('Run failed: ' + e.message); }
+  }
+  async function toggleMacro() {
+    const name = runInput.value.trim(); if (!name) { alert('Enter macro name'); return; }
+    try {
+      await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'toggleMacro', value:name})});
+      alert('Toggle request sent');
+    } catch(e) { alert('Toggle failed: ' + e.message); }
+  }
+
+  loadBtn.onclick = load;
+  saveBtn.onclick = save;
+  runBtn.onclick = runMacro;
+  toggleBtn.onclick = toggleMacro;
+  // Auto-load once rendered
+  load();
+}
+
 function renderAllSettings() {
   const c = document.getElementById('settingsContainer');
   c.innerHTML = '';
@@ -1447,8 +1532,13 @@ function renderAllSettings() {
     ['threat.threatRadius'],['threat.dodgeTriggerDistance'],['threat.dodgeDistance'],
     ['threat.dodgeMinProgress'],['threat.dodgeMaxProgress'],['threat.dodgeCooldownMs']]);
   addSection(adv, 'Web UI', [['webUiEnabled'],['webUiPort']]);
-  addSection(adv, 'Hotkeys', [['toggleRunning'],['testMapExplore'],['dumpGameState'],['dumpRecording']]);
+  addSection(adv, 'Hotkeys', [['toggleRunning'],['testMapExplore'],['dumpGameState'],['dumpRecording'],['macroToggle']]);
   c.appendChild(adv);
+
+  // Macros tab (JSON editor + save)
+  const macros = makeTabContent('macros', activeSettingsTab === 'macros');
+  renderMacrosTab(macros);
+  c.appendChild(macros);
 
   switchSettingsTab(activeSettingsTab);
 }
@@ -2643,6 +2733,106 @@ updateDashboard = function(s) {
     }
   }
 };
+
+// --- Macros UI enhancer: add per-macro hotkey controls when macros tab is present ---
+(function(){
+  function escHtml(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function normalizeHotkeyName(raw){ if(!raw) return ''; raw = String(raw).trim(); if(/^[0-9]$/.test(raw)) return 'D'+raw; if(/^[a-zA-Z]$/.test(raw)) return raw.toUpperCase(); const mappings = {' ':'Space','Spacebar':'Space','ArrowUp':'Up','ArrowDown':'Down','ArrowLeft':'Left','ArrowRight':'Right','Esc':'Escape'}; if(mappings[raw]) return mappings[raw]; return raw; }
+
+  function buildMacroList(container, textarea){
+    const listDivId = 'macro-list-enhancer';
+    if(document.getElementById(listDivId)) return; // only once
+    const wrapper = document.createElement('div'); wrapper.id = listDivId; wrapper.style.marginTop='12px';
+    const title = document.createElement('div'); title.className='section-divider'; title.textContent='Macro Hotkeys'; wrapper.appendChild(title);
+    const info = document.createElement('div'); info.style.cssText='color:var(--text-dim);margin-bottom:8px;font-size:12px'; info.textContent='Assign a hotkey per macro. Click Capture then press the desired key. Changes update the JSON editor below; click Save to persist.'; wrapper.appendChild(info);
+
+    const listContainer = document.createElement('div'); wrapper.appendChild(listContainer);
+    container.appendChild(wrapper);
+
+    async function refresh(){
+      listContainer.innerHTML = '';
+      textarea.value = 'Loading...';
+      try{
+        const r = await fetch('/api/macros');
+        if(!r.ok){ textarea.value = 'Error loading macros'; return; }
+        const j = await r.json(); const macros = j.macros || [];
+        textarea.value = JSON.stringify(macros, null, 2);
+        if(!macros.length){ const e = document.createElement('div'); e.className='empty-state'; e.textContent='No macros defined'; listContainer.appendChild(e); return; }
+
+        const table = document.createElement('table'); table.style.width='100%';
+        const thead = document.createElement('thead'); thead.innerHTML = '<tr><th>Name</th><th>Hotkey</th><th>Between ms</th><th>Repeat ms</th><th style="text-align:right">Actions</th></tr>';
+        table.appendChild(thead);
+        const tbody = document.createElement('tbody');
+
+        macros.forEach((m, idx) => {
+          const tr = document.createElement('tr');
+          const nameTd = document.createElement('td'); nameTd.style.textAlign='left'; nameTd.style.minWidth='200px'; nameTd.innerHTML = escHtml(m.name || '(unnamed)');
+
+          const hotTd = document.createElement('td'); hotTd.style.minWidth='160px';
+          const hk = document.createElement('input'); hk.type='text'; hk.value = m.hotkey||m.Hotkey||''; hk.style.cssText='background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-family:monospace;width:80px';
+          const cap = document.createElement('button'); cap.className='btn'; cap.textContent='Capture'; cap.style.cssText='margin-left:6px;padding:4px 8px;font-size:12px';
+          const clear = document.createElement('button'); clear.className='btn'; clear.textContent='Clear'; clear.style.cssText='margin-left:6px;padding:4px 8px;font-size:12px';
+          hotTd.appendChild(hk); hotTd.appendChild(cap); hotTd.appendChild(clear);
+
+          const betweenTd = document.createElement('td'); const betweenInp = document.createElement('input'); betweenInp.type='number'; betweenInp.value = m.betweenDelayMs ?? m.BetweenDelayMs ?? 50; betweenInp.style.width='80px'; betweenTd.appendChild(betweenInp);
+          const repeatTd = document.createElement('td'); const repeatInp = document.createElement('input'); repeatInp.type='number'; repeatInp.value = m.repeatDelayMs ?? m.RepeatDelayMs ?? 1000; repeatInp.style.width='80px'; repeatTd.appendChild(repeatInp);
+
+          const actionsTd = document.createElement('td'); actionsTd.style.textAlign='right';
+          const run = document.createElement('button'); run.className='btn'; run.textContent='Run'; run.style.marginLeft='6px';
+          const tog = document.createElement('button'); tog.className='btn'; tog.textContent='Toggle'; tog.style.marginLeft='6px';
+          actionsTd.appendChild(run); actionsTd.appendChild(tog);
+
+          tr.appendChild(nameTd); tr.appendChild(hotTd); tr.appendChild(betweenTd); tr.appendChild(repeatTd); tr.appendChild(actionsTd);
+          tbody.appendChild(tr);
+
+          // handlers
+          hk.onchange = () => { macros[idx].hotkey = normalizeHotkeyName(hk.value); hk.value = macros[idx].hotkey; textarea.value = JSON.stringify(macros, null, 2); };
+          betweenInp.onchange = () => { macros[idx].betweenDelayMs = parseInt(betweenInp.value)||0; textarea.value = JSON.stringify(macros, null, 2); };
+          repeatInp.onchange = () => { macros[idx].repeatDelayMs = parseInt(repeatInp.value)||0; textarea.value = JSON.stringify(macros, null, 2); };
+
+          cap.onclick = () => {
+            cap.textContent = 'Press key...'; cap.disabled = true;
+            const onKey = (ev) => {
+              ev.preventDefault(); ev.stopPropagation();
+              let keyName = '';
+              if(ev.key && ev.key.length===1){ if(/^[0-9]$/.test(ev.key)) keyName = 'D'+ev.key; else keyName = ev.key.toUpperCase(); }
+              else if(/^F\d+$/.test(ev.key)) keyName = ev.key.toUpperCase();
+              else { const map = {' ':'Space','Spacebar':'Space','Escape':'Escape','Esc':'Escape','ArrowUp':'Up','ArrowDown':'Down','ArrowLeft':'Left','ArrowRight':'Right'}; keyName = map[ev.key] || (ev.code||ev.key||'').replace('Key','').replace('Digit','D'); }
+              keyName = normalizeHotkeyName(keyName);
+              macros[idx].hotkey = keyName; hk.value = keyName; textarea.value = JSON.stringify(macros, null, 2);
+              window.removeEventListener('keydown', onKey, true);
+              cap.textContent = 'Capture'; cap.disabled = false;
+            };
+            window.addEventListener('keydown', onKey, true);
+          };
+
+          clear.onclick = () => { macros[idx].hotkey = ''; hk.value=''; textarea.value = JSON.stringify(macros, null, 2); };
+          run.onclick = async () => { try{ await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'runMacro', value: m.name})}); alert('Run request sent'); }catch(e){alert('Run failed: '+e.message);} };
+          tog.onclick = async () => { try{ await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'toggleMacro', value: m.name})}); alert('Toggle request sent'); }catch(e){alert('Toggle failed: '+e.message);} };
+        });
+
+        table.appendChild(tbody); listContainer.appendChild(table);
+      }catch(e){ textarea.value = 'Error: '+e.message; const err = document.createElement('div'); err.className='empty-state'; err.textContent='Failed to load macros'; listContainer.appendChild(err); }
+    }
+
+    // Refresh when textarea manually changes
+    textarea.addEventListener('change', () => { try{ const parsed = JSON.parse(textarea.value||'[]'); render(); }catch{} });
+
+    // Expose refresh
+    return { refresh };
+  }
+
+  // Poll for macros tab area and attach enhancer once available
+  let attached = false;
+  const poll = setInterval(() => {
+    const stab = document.getElementById('stab-macros');
+    if(stab && !attached){
+      const ta = stab.querySelector('textarea');
+      if(ta){ const h = buildMacroList(stab, ta); h.refresh(); attached = true; clearInterval(poll); }
+    }
+  }, 500);
+})();
+
 </script>
 </body>
 </html>
