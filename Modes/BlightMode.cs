@@ -62,6 +62,7 @@ namespace AutoExile.Modes
 
         // Hideout/loop tracking
         private bool _mapCompleted;
+        private long _statsMapInstanceHash;
         private string _lastMapAreaName = "";
         private const int MaxDeaths = 5; // give up after this many deaths per map
 
@@ -77,6 +78,7 @@ namespace AutoExile.Modes
         {
             _settings = ctx.Settings.Blight;
             _mapCompleted = false;
+            _statsMapInstanceHash = 0;
             _lastMapAreaName = "";
 
             // Enable combat — blight needs skills for sweep + self-defense
@@ -232,10 +234,13 @@ namespace AutoExile.Modes
                 // Arrived in hideout — decide next step
                 if (_mapCompleted)
                 {
+                    ctx.Stats.EndRun(Name, _blight.EncounterSucceeded ? "completed" : "failed",
+                        _blight.EncounterSucceeded ? "encounter_succeeded" : "encounter_failed");
                     // Map was completed, start new cycle
                     _phase = BlightPhase.InHideout;
                     _phaseStartTime = DateTime.Now;
                     _mapCompleted = false;
+                    _statsMapInstanceHash = 0;
                     _hideoutFlow.Start(MapDeviceSystem.IsAnyBlightMap);
                     StatusText = "Back in hideout — starting new map";
                 }
@@ -249,6 +254,8 @@ namespace AutoExile.Modes
                 }
                 else if (_blight.DeathCount >= MaxDeaths)
                 {
+                    ctx.Stats.EndRun(Name, "failed", "max_deaths_reached");
+                    _statsMapInstanceHash = 0;
                     // Too many deaths — start fresh
                     _blight.Reset();
                     _phase = BlightPhase.InHideout;
@@ -265,6 +272,14 @@ namespace AutoExile.Modes
             }
             else
             {
+                var instanceHash = gc.IngameState?.Data?.CurrentAreaHash ?? 0;
+                if (_statsMapInstanceHash == 0 && instanceHash != 0)
+                {
+                    _statsMapInstanceHash = instanceHash;
+                    ctx.Stats.BeginRun(Name, $"blight:{instanceHash}", newArea, consumed: true);
+                }
+                if (instanceHash == _statsMapInstanceHash)
+                    ctx.Stats.ObserveRunEntry(Name, instanceHash, newArea);
                 // Entered a map — start looking for pump
                 var deathCount = _blight.DeathCount; // preserve across reset
                 var portalPos = _blight.PortalPosition; // preserve — portal doesn't move

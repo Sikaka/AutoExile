@@ -283,20 +283,20 @@ namespace AutoExile.Systems
                 }
 
                 // Entity still exists but label not visible — transient flicker.
-                // If we haven't clicked yet, wait for label to reappear.
-                // If we already clicked, count as success (click likely worked, label removed).
+                // A hidden label is not pickup confirmation: stacked labels commonly disappear
+                // for a frame after clicking while the WorldItem remains on the ground.
                 if (_clickAttempts > 0)
                 {
-                    Status = "Item label gone after click — assumed collected";
-                    _currentTarget = null;
-                    return InteractionResult.Succeeded;
+                    Status = "Item label flickered after click — waiting for confirmation";
+                    return InteractionResult.InProgress;
                 }
 
                 Status = "Label not visible — waiting";
                 return InteractionResult.InProgress;
             }
 
-            if (labelDesc.Label == null || !labelDesc.Label.IsVisible)
+            if (labelDesc.Label == null ||
+                (!labelDesc.Label.IsVisible && !labelDesc.Label.IsVisibleLocal))
             {
                 // Label found but not visible — might need to get closer
                 if (target.RequireProximity && target.Nav != null)
@@ -358,7 +358,10 @@ namespace AutoExile.Systems
             Func<SharpDX.RectangleF?> rectProvider = () =>
             {
                 var (f, desc) = FindGroundItemLabel(gc, entityId);
-                return f && desc?.Label?.IsVisible == true ? desc?.ClientRect : null;
+                return f && desc?.Label != null &&
+                    (desc.Label.IsVisible || desc.Label.IsVisibleLocal)
+                    ? desc.ClientRect
+                    : null;
             };
             var sent = BotInput.ClickLabelVerified(gc, labelRect, worldEntity, rectProvider);
             if (!sent)
@@ -465,7 +468,8 @@ namespace AutoExile.Systems
                 var labels = gc.IngameState.IngameUi.ItemsOnGroundLabelElement.VisibleGroundItemLabels;
                 foreach (var label in labels)
                 {
-                    if (label.Label == null || !label.Label.IsVisible)
+                    if (label.Label == null ||
+                        (!label.Label.IsVisible && !label.Label.IsVisibleLocal))
                         continue;
                     var rect = label.ClientRect;
                     if (screenPos.X >= rect.X && screenPos.X <= rect.X + rect.Width &&
@@ -588,7 +592,8 @@ namespace AutoExile.Systems
             {
                 foreach (var label in gc.IngameState.IngameUi.ItemsOnGroundLabelElement.VisibleGroundItemLabels)
                 {
-                    if (label.Label == null || !label.Label.IsVisible) continue;
+                    if (label.Label == null ||
+                        (!label.Label.IsVisible && !label.Label.IsVisibleLocal)) continue;
                     if (label.Entity?.Id == targetEntityId) continue; // skip self
 
                     var otherRect = label.ClientRect;

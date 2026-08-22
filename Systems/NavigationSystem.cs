@@ -961,6 +961,17 @@ namespace AutoExile.Systems
             var windowRect = gc.Window.GetWindowRectangle();
 
             ExecuteWalk(screenPos, windowRect);
+
+            // An escape probe is itself a recovery attempt. Restart every stuck/repath
+            // clock here so the periodic branch cannot fire again on the next game tick.
+            // Without this, a single stuck event sends a new random cursor target every
+            // frame and can accumulate hundreds of probes in a few seconds.
+            _lastPosition = playerGrid;
+            _stuckTimer = 0;
+            _bestDistToWaypoint = float.MaxValue;
+            _noProgressTimer = 0;
+            _lastRepathTime = DateTime.Now;
+            _lastRepathWaypointIndex = CurrentWaypointIndex;
             LastRecoveryAction = $"Escape probe ({probeDistance:F0}g, attempt #{_stuckAtSameSpotCount})";
         }
 

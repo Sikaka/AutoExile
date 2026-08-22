@@ -44,6 +44,7 @@ namespace AutoExile.Modes.Shared
 
         public string Status { get; private set; } = "";
         public bool IsActive => _phase != HideoutPhase.Idle;
+        public bool FragmentConfigurationMissing { get; private set; }
 
         /// <summary>
         /// Start a full hideout flow: settle → stash → open map → enter portal.
@@ -74,6 +75,7 @@ namespace AutoExile.Modes.Shared
             _minFragments = minFragments;
             _withdrawList = withdrawList != null && withdrawList.Count > 0 ? withdrawList : null;
             _scarabPaths = scarabPaths != null && scarabPaths.Count > 0 ? scarabPaths : null;
+            FragmentConfigurationMissing = false;
             _phase = HideoutPhase.Settle;
             _phaseStartTime = DateTime.Now;
             Status = "Hideout — settling";
@@ -126,6 +128,7 @@ namespace AutoExile.Modes.Shared
             _minFragments = 1;
             _withdrawList = null;
             _scarabPaths = null;
+            FragmentConfigurationMissing = false;
             Status = "";
         }
 
@@ -155,7 +158,9 @@ namespace AutoExile.Modes.Shared
                     var need = target - have;
                     if (need > 0)
                     {
-                        activeWithdrawList.Add((path, need));
+                        // StashSystem expects the desired inventory total, not the
+                        // remaining delta; it subtracts the current inventory itself.
+                        activeWithdrawList.Add((path, target));
                         totalNeededFromList += need;
                     }
                 }
@@ -180,7 +185,10 @@ namespace AutoExile.Modes.Shared
             // Not enough fragments and no way to get more — signal stop (only for modes that use fragments)
             if (usesFragments && fragmentsInInventory < minNeeded && !canWithdraw)
             {
-                Status = "No fragments in inventory";
+                FragmentConfigurationMissing = true;
+                Status = string.IsNullOrWhiteSpace(_resourceTabName)
+                    ? "Fragment tab is not configured"
+                    : "Fragment inventory stock is disabled";
                 _phase = HideoutPhase.Idle;
                 return HideoutSignal.NoFragments;
             }
@@ -233,6 +241,7 @@ namespace AutoExile.Modes.Shared
                         int needed = _minFragments > 0 ? _minFragments : 1;
                         if (frags < needed)
                         {
+                            FragmentConfigurationMissing = false;
                             Status = $"Not enough fragments ({frags}/{needed}) — stopping";
                             _phase = HideoutPhase.Idle;
                             return HideoutSignal.NoFragments;

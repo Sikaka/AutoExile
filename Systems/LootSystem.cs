@@ -70,20 +70,24 @@ namespace AutoExile.Systems
         public string ToggleStatus { get; private set; } = "";
         private DateTime _toggleStartTime;
         private DateTime _lastToggleAttempt = DateTime.MinValue;
-        private int _preToggleLabelCount;
         private const int ToggleDelayMs = 500;
 
         public enum LabelTogglePhase
         {
             Idle,
-            PressingOff,    // Pressed Z to hide, waiting for labels to disappear
-            WaitingOff,     // Verifying labels are gone
-            PressingOn,     // Pressed Z to show, waiting for labels to reappear
-            WaitingOn,      // Verifying labels returned
+            PressingOff,    // First Z sent; wait until its key-up/cooldown completes
+            WaitingOff,     // Wait briefly, then retry the paired restore Z until accepted
+            PressingOn,     // Restore Z accepted; wait until its key-up/cooldown completes
+            WaitingOn,      // Short settle period before allowing another scan
         }
 
         // State
         public bool HasLootNearby { get; private set; }
+        /// <summary>
+        /// True while a visible, filter-approved item still needs pickup work, including
+        /// short price-hydration waits and bounded retries after transient failures.
+        /// </summary>
+        public bool HasUnresolvedLootNearby { get; private set; }
         public int LootableCount { get; private set; }
         public string LastSkipReason { get; private set; } = "";
         public string NinjaBridgeStatus => PriceService?.Status ?? "no price service";
@@ -143,8 +147,11 @@ namespace AutoExile.Systems
         /// Call each tick when not busy to get fresh data.
         /// </summary>
         // ── Scan result cache: avoid re-reading components for items we've already evaluated ──
-        // Keyed by entity ID. Cleared on area change. Items don't change once on the ground.
+        // Keyed by entity ID. Cleared on area change. Newly spawned item components can take
+        // a few frames to hydrate, so zero-valued results receive a short bounded refresh window.
         private readonly Dictionary<long, CachedScanResult> _scanCache = new(128);
+        private const int MaxZeroPriceAttempts = 6;
+        private static readonly TimeSpan ZeroPriceRetryDelay = TimeSpan.FromMilliseconds(200);
 
         private struct CachedScanResult
         {
@@ -153,6 +160,9 @@ namespace AutoExile.Systems
             public int InventorySlots;
             public double ChaosPerSlot;
             public string ItemName;
+            public bool PricePending;
+            public int PriceAttempts;
+            public DateTime EvaluatedAtUtc;
         }
 
         public void Scan(GameController gc)
@@ -160,6 +170,7 @@ namespace AutoExile.Systems
             _gameController = gc;
             _candidates.Clear();
             HasLootNearby = false;
+            HasUnresolvedLootNearby = false;
             LootableCount = 0;
             LastSkipReason = "";
 
@@ -170,7 +181,12 @@ namespace AutoExile.Systems
 
                 foreach (var label in labels)
                 {
-                    if (label.Label == null || !label.Label.IsVisible)
+                    // VisibleGroundItemLabels is already the game's visible-label set. ExileCore
+                    // can briefly report the inherited IsVisible flag as false while the local
+                    // label itself is rendered, so accept either visibility signal. Requiring
+                    // only IsVisible caused rendered loot to disappear from the candidate list.
+                    if (label.Label == null ||
+                        (!label.Label.IsVisible && !label.Label.IsVisibleLocal))
                         continue;
                     if (label.Entity == null)
                         continue;
@@ -178,6 +194,13 @@ namespace AutoExile.Systems
                     var worldItemEntity = label.Entity;
                     if (_failedEntities.TryGetValue(worldItemEntity.Id, out var failEntry) && !failEntry.IsExpired)
                     {
+                        // A transient pickup failure must not look like an empty floor to
+                        // callers deciding whether it is safe to advance the encounter.
+                        // Confirmed pickups and portal-adjacent items are intentionally final;
+                        // other failures block progress only for a bounded retry budget.
+                        if (failEntry.BlocksProgress)
+                            HasUnresolvedLootNearby = true;
+
                         LogSkipEvent(worldItemEntity.Id, label.Label.Text ?? "?",
                             $"blocked by previous failure: {failEntry.Reason} (attempt {failEntry.FailCount}, cooldown {failEntry.Cooldown.TotalSeconds:F0}s)", 0);
                         continue;
@@ -192,8 +215,29 @@ namespace AutoExile.Systems
                     // ── Check scan cache: skip component reads for already-evaluated items ──
                     if (_scanCache.TryGetValue(worldItemEntity.Id, out var cached))
                     {
+                        if (cached.PricePending &&
+                            cached.PriceAttempts < MaxZeroPriceAttempts &&
+                            DateTime.UtcNow - cached.EvaluatedAtUtc >= ZeroPriceRetryDelay)
+                        {
+                            var refreshed = EvaluateItem(gc, worldItemEntity, itemName);
+                            refreshed.PriceAttempts = cached.PriceAttempts + 1;
+                            refreshed.EvaluatedAtUtc = DateTime.UtcNow;
+                            cached = refreshed;
+                            _scanCache[worldItemEntity.Id] = cached;
+                        }
+
+                        // Do not pick up an item while its newly spawned components may still
+                        // hydrate. After the bounded window, preserve the old safe behavior and
+                        // loot genuinely unpriced items instead of leaving them on the ground.
+                        if (cached.PricePending && cached.PriceAttempts < MaxZeroPriceAttempts)
+                        {
+                            HasUnresolvedLootNearby = true;
+                            continue;
+                        }
+
                         if (cached.ShouldLoot)
                         {
+                            HasUnresolvedLootNearby = true;
                             _candidates.Add(new LootCandidate
                             {
                                 Entity = worldItemEntity,
@@ -209,10 +253,19 @@ namespace AutoExile.Systems
 
                     // ── First time seeing this item — evaluate with full component reads ──
                     var evaluated = EvaluateItem(gc, worldItemEntity, itemName);
+                    evaluated.PriceAttempts = evaluated.PricePending ? 1 : 0;
+                    evaluated.EvaluatedAtUtc = DateTime.UtcNow;
                     _scanCache[worldItemEntity.Id] = evaluated;
+
+                    if (evaluated.PricePending && evaluated.PriceAttempts < MaxZeroPriceAttempts)
+                    {
+                        HasUnresolvedLootNearby = true;
+                        continue;
+                    }
 
                     if (evaluated.ShouldLoot)
                     {
+                        HasUnresolvedLootNearby = true;
                         _candidates.Add(new LootCandidate
                         {
                             Entity = worldItemEntity,
@@ -222,6 +275,23 @@ namespace AutoExile.Systems
                             InventorySlots = evaluated.InventorySlots,
                             ChaosPerSlot = evaluated.ChaosPerSlot,
                         });
+                    }
+                }
+
+                // Failed-item labels may flicker out for a frame even though the WorldItem
+                // still exists. Preserve the progress blocker from the world entity so a
+                // hidden transient failure cannot open the next wave during its cooldown.
+                if (!HasUnresolvedLootNearby)
+                {
+                    foreach (var entity in gc.EntityListWrapper.ValidEntitiesByType[EntityType.WorldItem])
+                    {
+                        if (entity.DistancePlayer > 30) continue;
+                        if (_failedEntities.TryGetValue(entity.Id, out var failed) &&
+                            !failed.IsExpired && failed.BlocksProgress)
+                        {
+                            HasUnresolvedLootNearby = true;
+                            break;
+                        }
                     }
                 }
 
@@ -265,9 +335,6 @@ namespace AutoExile.Systems
 
             var priceResult = GetPriceResult(gc, priceEntity);
             var chaosValue = priceResult.MaxChaosValue;
-
-            if (priceResult.DetailsId.Contains("voices", StringComparison.OrdinalIgnoreCase))
-                chaosValue = priceResult.MaxChaosValue / 150.0;
             var invSlots = GetInventorySlots(priceEntity);
             var chaosPerSlot = invSlots > 0 ? chaosValue / invSlots : chaosValue;
 
@@ -305,6 +372,7 @@ namespace AutoExile.Systems
                 ChaosValue = chaosValue,
                 InventorySlots = invSlots,
                 ChaosPerSlot = chaosPerSlot,
+                PricePending = PriceService?.IsLoaded == true && chaosValue <= 0,
             };
         }
 
@@ -382,7 +450,8 @@ namespace AutoExile.Systems
             {
                 foreach (var l in gc.IngameState.IngameUi.ItemsOnGroundLabelElement.LabelsOnGround)
                 {
-                    if (l?.ItemOnGround?.Id == entityId && l.Label?.IsVisible == true)
+                    if (l?.ItemOnGround?.Id == entityId && l.Label != null &&
+                        (l.Label.IsVisible || l.Label.IsVisibleLocal))
                     {
                         var r = l.Label.GetClientRect();
                         return new Vector2(r.X + r.Width / 2, r.Y + r.Height / 2);
@@ -409,7 +478,8 @@ namespace AutoExile.Systems
                 // First pass: find the target label's rect
                 foreach (var l in labels)
                 {
-                    if (l?.ItemOnGround?.Id == entityId && l.Label?.IsVisible == true)
+                    if (l?.ItemOnGround?.Id == entityId && l.Label != null &&
+                        (l.Label.IsVisible || l.Label.IsVisibleLocal))
                     {
                         targetRect = l.Label.GetClientRect();
                         break;
@@ -423,7 +493,7 @@ namespace AutoExile.Systems
                 foreach (var l in labels)
                 {
                     if (l?.ItemOnGround == null || l.ItemOnGround.Id == entityId) continue;
-                    if (l.Label == null || !l.Label.IsVisible) continue;
+                    if (l.Label == null || (!l.Label.IsVisible && !l.Label.IsVisibleLocal)) continue;
 
                     var o = l.Label.GetClientRect();
                     bool overlaps = t.X < o.X + o.Width && t.X + t.Width > o.X &&
@@ -455,12 +525,13 @@ namespace AutoExile.Systems
             foreach (var entity in gc.EntityListWrapper.ValidEntitiesByType[EntityType.WorldItem])
             {
                 if (entity.DistancePlayer > 30) continue; // within loot range
-                if (_failedEntities.ContainsKey(entity.Id)) continue;
+                if (_failedEntities.TryGetValue(entity.Id, out var failed) && !failed.IsExpired)
+                    continue;
                 nearbyItems++;
-                if (nearbyItems >= 2) break; // enough to justify a toggle
+                break;
             }
 
-            return nearbyItems >= 2;
+            return nearbyItems >= 1;
         }
 
         /// <summary>
@@ -471,8 +542,6 @@ namespace AutoExile.Systems
         {
             if (TogglePhase != LabelTogglePhase.Idle) return false;
 
-            _preToggleLabelCount = gc.IngameState.IngameUi.ItemsOnGroundLabelElement
-                .LabelsOnGroundVisible.Count;
             _lastToggleAttempt = DateTime.Now;
             _toggleStartTime = DateTime.Now;
 
@@ -494,22 +563,6 @@ namespace AutoExile.Systems
 
             var elapsed = (DateTime.Now - _toggleStartTime).TotalMilliseconds;
 
-            // Safety timeout — 3s max for the whole sequence
-            if (elapsed > 3000)
-            {
-                // If labels seem off (very few visible), press Z to restore
-                var currentCount = gc.IngameState.IngameUi.ItemsOnGroundLabelElement
-                    .LabelsOnGroundVisible.Count;
-                if (currentCount < _preToggleLabelCount / 2 && _preToggleLabelCount > 3)
-                {
-                    BotInput.PressKeyOverlay(System.Windows.Forms.Keys.Z);
-                    ToggleStatus = "Safety: restoring labels after timeout";
-                }
-                TogglePhase = LabelTogglePhase.Idle;
-                ToggleStatus = "";
-                return false;
-            }
-
             switch (TogglePhase)
             {
                 case LabelTogglePhase.PressingOff:
@@ -524,20 +577,14 @@ namespace AutoExile.Systems
                 {
                     if (elapsed < ToggleDelayMs) return true;
 
-                    // Verify labels actually disappeared
-                    var currentCount = gc.IngameState.IngameUi.ItemsOnGroundLabelElement
-                        .LabelsOnGroundVisible.Count;
-
-                    if (currentCount >= _preToggleLabelCount && _preToggleLabelCount > 3)
+                    // Once the first Z was accepted, never return to Idle until the paired
+                    // restore Z is also accepted. Label-count heuristics are stale when labels
+                    // overlap and previously allowed an unsafe single-Z exit.
+                    if (!BotInput.PressKeyOverlay(System.Windows.Forms.Keys.Z))
                     {
-                        // Labels didn't disappear — Z didn't work or wrong key. Abort.
-                        TogglePhase = LabelTogglePhase.Idle;
-                        ToggleStatus = "";
-                        return false;
+                        ToggleStatus = "Waiting to safely restore loot labels...";
+                        return true;
                     }
-
-                    // Labels are off — press Z again to turn them back on
-                    if (!BotInput.PressKeyOverlay(System.Windows.Forms.Keys.Z)) return true;
                     TogglePhase = LabelTogglePhase.PressingOn;
                     ToggleStatus = "Toggling labels back on...";
                     return true;
@@ -553,17 +600,6 @@ namespace AutoExile.Systems
                 case LabelTogglePhase.WaitingOn:
                 {
                     if (elapsed < ToggleDelayMs) return true;
-
-                    // Verify labels came back
-                    var currentCount = gc.IngameState.IngameUi.ItemsOnGroundLabelElement
-                        .LabelsOnGroundVisible.Count;
-
-                    if (currentCount <= 1 && _preToggleLabelCount > 3)
-                    {
-                        // Labels didn't come back — press Z one more time as safety
-                        BotInput.PressKeyOverlay(System.Windows.Forms.Keys.Z);
-                        ToggleStatus = "Safety: labels didn't return, pressing Z again";
-                    }
 
                     TogglePhase = LabelTogglePhase.Idle;
                     ToggleStatus = "";
@@ -838,5 +874,18 @@ namespace AutoExile.Systems
         }
 
         public bool IsExpired => DateTime.Now >= FailedAt + Cooldown;
+
+        /// <summary>
+        /// Whether encounter progress should wait for this visible item to become retryable.
+        /// Transient failures receive two cooldown-backed retries; safety skips and confirmed
+        /// pickups never hold the encounter open indefinitely.
+        /// </summary>
+        public bool BlocksProgress => Reason switch
+        {
+            "picked up" => false,
+            "near portal" => false,
+            "entity gone before click" => FailCount <= 1,
+            _ => FailCount <= 2,
+        };
     }
 }

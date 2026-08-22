@@ -48,7 +48,7 @@ namespace AutoExile
         [Menu("Web UI Port", "Port for the web dashboard (requires restart to change).")]
         public RangeNode<int> WebUiPort { get; set; } = new RangeNode<int>(9876, 1024, 65535);
 
-        [Menu("Web UI Network Access", "Allow access from other devices on the network (requires admin or URL reservation).")]
+        [Menu("Web UI Tailscale Access", "Allow access through this machine's Tailscale IPv4 address only.")]
         public ToggleNode WebUiNetworkAccess { get; set; } = new ToggleNode(false);
 
         [Menu("Auto Level Gems", "Automatically level up skill gems when the level-up panel appears.")]
@@ -171,7 +171,7 @@ namespace AutoExile
             public SkillSlotConfig Skill8 { get; set; } = new SkillSlotConfig(Keys.None);
 
             /// <summary>All configured skill slots.</summary>
-            public IEnumerable<SkillSlotConfig> AllSkillSlots => new[] { Skill1, Skill2, Skill3, Skill4, Skill5, Skill6, Skill7, Skill8 };
+            internal IEnumerable<SkillSlotConfig> AllSkillSlots => new[] { Skill1, Skill2, Skill3, Skill4, Skill5, Skill6, Skill7, Skill8 };
 
             /// <summary>Find the first skill slot with PrimaryMovement role, or null.</summary>
             public SkillSlotConfig? GetPrimaryMovement()
@@ -353,6 +353,9 @@ namespace AutoExile
             [Menu("Min Chaos Per Slot (0=off)", "Minimum chaos value per inventory slot. 0 to disable.")]
             public RangeNode<int> MinChaosPerSlot { get; set; } = new RangeNode<int>(0, 0, 10);
 
+            [Menu("Best Finds Minimum Chaos", "Minimum estimated chaos value shown in the Best Finds history. 0 shows all priced items.")]
+            public RangeNode<int> BestFindsMinChaosValue { get; set; } = new RangeNode<int>(100, 0, 10000);
+
             [Menu("Ignore Quest Items", "Skip quest items (heist contracts, etc.) during loot pickup.")]
             public ToggleNode IgnoreQuestItems { get; set; } = new ToggleNode(true);
 
@@ -511,7 +514,7 @@ namespace AutoExile
         public class HeistSettings
         {
             [Menu("Companion Interact Key", "Key to press near doors/chests for companion interaction (default V).")]
-            public System.Windows.Forms.Keys CompanionInteractKey { get; set; } = System.Windows.Forms.Keys.V;
+            public HotkeyNode CompanionInteractKey { get; set; } = new HotkeyNode(Keys.V);
 
             [Menu("Alert Threshold %", "Stop opening side chests above this alert level.")]
             public RangeNode<float> AlertThreshold { get; set; } = new RangeNode<float>(70f, 20f, 95f);
@@ -905,7 +908,7 @@ namespace AutoExile
             /// Positive = reward, negative = danger. Overrides the built-in defaults.
             /// Managed via web UI altar mod editor.
             /// </summary>
-            public Dictionary<string, int> ModWeights { get; set; } = new();
+            internal Dictionary<string, int> ModWeights { get; set; } = new();
         }
 
         [Submenu(CollapsedByDefault = false)]

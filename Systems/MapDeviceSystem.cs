@@ -74,6 +74,11 @@ namespace AutoExile.Systems
         private int _invOpenAttempts;
         private const int MaxInvOpenAttempts = 5;
 
+        // Auto-match insertion compatibility: try the native right-click first,
+        // then one Ctrl+click only when slot/activate confirmation never appears.
+        private bool _autoMatchRightClickAttempted;
+        private bool _autoMatchCtrlFallbackAttempted;
+
         /// <summary>
         /// After a Ctrl+click or right-click on a map/fragment, wait at least this
         /// long before re-evaluating insertion state. Gives the device UI time to
@@ -82,6 +87,7 @@ namespace AutoExile.Systems
         /// causing the bot to click again and double-load (or close the panel).
         /// </summary>
         private const int InsertSettleMs = 800;
+        private const int AutoMatchFallbackSettleMs = 2000;
 
         // Portal spawn settle
         private DateTime? _portalFirstSeenAt;
@@ -102,6 +108,8 @@ namespace AutoExile.Systems
         public MapDevicePhase Phase => _phase;
         public string Status { get; private set; } = "";
         public bool IsBusy => _phase != MapDevicePhase.Idle;
+        public long ActivationSequence { get; private set; }
+        public DateTime? LastActivationConfirmedAtUtc { get; private set; }
 
         /// <summary>
         /// Start the map creation flow with a filter for which map to select.
@@ -127,7 +135,10 @@ namespace AutoExile.Systems
             _nodeSelected = false;
             _nodeClickAttempts = 0;
             _invOpenAttempts = 0;
+            _autoMatchRightClickAttempted = false;
+            _autoMatchCtrlFallbackAttempted = false;
             _portalFirstSeenAt = null;
+            LastActivationConfirmedAtUtc = null;
             Status = "Starting map creation";
             return true;
         }
@@ -142,6 +153,8 @@ namespace AutoExile.Systems
             ScarabPaths = null;
             TargetMapName = null;
             MinMapTier = 0;
+            _autoMatchRightClickAttempted = false;
+            _autoMatchCtrlFallbackAttempted = false;
             Status = "Cancelled";
         }
 
@@ -357,20 +370,34 @@ namespace AutoExile.Systems
                 return MapDeviceResult.InProgress;
             }
 
-            // Settle window — if we just clicked a fragment, give the UI time to update
-            // before re-checking. Otherwise we re-enter this phase, see no activate
-            // button yet (still rendering), and click the same/next fragment again.
-            if ((DateTime.Now - _lastActionTime).TotalMilliseconds < InsertSettleMs)
-            {
-                Status = $"[Select] Waiting {InsertSettleMs}ms for device to update after click";
-                return MapDeviceResult.InProgress;
-            }
-
             // Two distinct flows:
             // A) Named map (farming/mapping): must select atlas node first → device panel opens → Ctrl+click map key
             // B) Auto-match (blight/simulacrum/boss): right-click fragment in stash → game handles node selection + insertion
             // ForceCtrlClick prevents accidental right-click on map keys (farming mode without map name selected)
             bool namedMapFlow = !string.IsNullOrEmpty(TargetMapName);
+
+            // Settle window — if we just clicked a fragment, give the UI time to update
+            // before re-checking. Otherwise we re-enter this phase, see no activate
+            // button yet (still rendering), and click the same/next fragment again.
+            // Auto-match's Ctrl+click compatibility fallback must wait longer because a
+            // successful right-click can take multiple server round trips to confirm.
+            var settleMs = !namedMapFlow && !ForceCtrlClick &&
+                           _autoMatchRightClickAttempted
+                ? AutoMatchFallbackSettleMs + (int)Math.Ceiling(ExtraLatencySec * 1000f)
+                : InsertSettleMs;
+            if ((DateTime.Now - _lastActionTime).TotalMilliseconds < settleMs)
+            {
+                Status = $"[Select] Waiting {settleMs}ms for device to update after click";
+                return MapDeviceResult.InProgress;
+            }
+
+            if (!namedMapFlow && !ForceCtrlClick &&
+                _autoMatchRightClickAttempted && _autoMatchCtrlFallbackAttempted)
+            {
+                Status = "[Select] Map insertion unconfirmed after right-click + Ctrl+click fallback";
+                _phase = MapDevicePhase.Idle;
+                return MapDeviceResult.Failed;
+            }
 
             if (!namedMapFlow && ForceCtrlClick)
             {
@@ -492,15 +519,23 @@ namespace AutoExile.Systems
                         var absPos2 = new Vector2(windowRect2.X + slotRect.Center.X,
                             windowRect2.Y + slotRect.Center.Y);
 
-                        bool inserted = namedMapFlow
+                        bool useInventoryCtrlClick = namedMapFlow || ForceCtrlClick || _autoMatchRightClickAttempted;
+                        bool inserted = useInventoryCtrlClick
                             ? BotInput.CtrlClick(absPos2)
                             : BotInput.RightClick(absPos2);
                         if (inserted)
                         {
+                            if (!namedMapFlow && !ForceCtrlClick)
+                            {
+                                if (useInventoryCtrlClick) _autoMatchCtrlFallbackAttempted = true;
+                                else _autoMatchRightClickAttempted = true;
+                            }
                             _lastActionTime = DateTime.Now;
                             Status = namedMapFlow
                                 ? $"[Select] Ctrl+clicking inventory map into {TargetMapName} slot"
-                                : "[Select] Right-clicking fragment from inventory";
+                                : useInventoryCtrlClick
+                                    ? "[Select] Right-click unconfirmed — Ctrl+clicking fragment from inventory"
+                                    : "[Select] Right-clicking fragment from inventory";
                         }
                         return MapDeviceResult.InProgress;
                     }
@@ -530,17 +565,24 @@ namespace AutoExile.Systems
 
             // Named map or ForceCtrlClick (farming): Ctrl+click to insert into device slot.
             // Auto-match (boss fragments only): Right-click to auto-select node + insert.
-            bool useCtrlClick = namedMapFlow || ForceCtrlClick;
+            bool useCtrlClick = namedMapFlow || ForceCtrlClick || _autoMatchRightClickAttempted;
             bool clicked = useCtrlClick
                 ? BotInput.CtrlClick(absPos)
                 : BotInput.RightClick(absPos);
             if (!clicked)
                 return MapDeviceResult.InProgress; // gate blocked, retry next tick
 
+            if (!namedMapFlow && !ForceCtrlClick)
+            {
+                if (useCtrlClick) _autoMatchCtrlFallbackAttempted = true;
+                else _autoMatchRightClickAttempted = true;
+            }
             _lastActionTime = DateTime.Now;
-            Status = useCtrlClick
-                ? $"[Select] Ctrl+clicking map into device"
-                : "[Select] Right-clicking fragment into device";
+            Status = namedMapFlow || ForceCtrlClick
+                ? "[Select] Ctrl+clicking map into device"
+                : useCtrlClick
+                    ? "[Select] Right-click unconfirmed — Ctrl+clicking fragment into device"
+                    : "[Select] Right-clicking fragment into device";
 
             // Re-enter this phase — IsMapInDevice check will advance us
             return MapDeviceResult.InProgress;
@@ -686,7 +728,8 @@ namespace AutoExile.Systems
             var atlas = gc.IngameState.IngameUi.Atlas;
             if (atlas?.IsVisible != true)
             {
-                // Atlas closed — portals may have spawned
+                // Atlas closing alone does not prove that the fragment was consumed.
+                // Wait for portals before publishing a confirmed activation.
                 _phase = MapDevicePhase.WaitForPortals;
                 _phaseStartTime = DateTime.Now;
                 Status = "Atlas closed — waiting for portals";
@@ -755,6 +798,8 @@ namespace AutoExile.Systems
                     return MapDeviceResult.InProgress;
                 }
 
+                ActivationSequence++;
+                LastActivationConfirmedAtUtc = DateTime.UtcNow;
                 _phase = MapDevicePhase.EnterPortal;
                 _phaseStartTime = DateTime.Now;
                 _portalFirstSeenAt = null;
