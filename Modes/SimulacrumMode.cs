@@ -72,6 +72,44 @@ namespace AutoExile.Modes
         public string StatusText { get; private set; } = "";
         public string Decision { get; private set; } = "";
 
+        private StreamWriter? _fileLogger;
+        private string _logFilePath = "";
+        private int _patrolRegionIndex;
+
+        private void InitLogger()
+        {
+            try
+            {
+                var baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                var logDir = Path.Combine(baseDir, "Logs");
+                Directory.CreateDirectory(logDir);
+                _logFilePath = Path.Combine(logDir, "simulacrum_decisions.log");
+                _fileLogger = new StreamWriter(_logFilePath, append: true) { AutoFlush = true };
+                LogDecision($"=== Simulacrum Session Started at {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===");
+            }
+            catch { }
+        }
+
+        private void LogDecision(string message)
+        {
+            try
+            {
+                _fileLogger?.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [W:{_state.CurrentWave}] [P:{_phase}] {message}");
+            }
+            catch { }
+        }
+
+        private void CloseLogger()
+        {
+            try
+            {
+                _fileLogger?.Flush();
+                _fileLogger?.Dispose();
+                _fileLogger = null;
+            }
+            catch { }
+        }
+
         public void OnEnter(BotContext ctx)
         {
             _settings = ctx.Settings.Simulacrum;
@@ -87,6 +125,9 @@ namespace AutoExile.Modes
             _combatEngageTime = DateTime.MinValue;
             _combatEngageCount = 0;
             _blacklistedMonsters.Clear();
+            _patrolRegionIndex = 0;
+
+            InitLogger();
 
             // Enable combat
             ModeHelpers.EnableDefaultCombat(ctx);
@@ -98,16 +139,16 @@ namespace AutoExile.Modes
                 _phase = SimPhase.InHideout;
                 _phaseStartTime = DateTime.Now;
                 StatusText = "In hideout — preparing";
+                LogDecision("Initialized in hideout");
             }
             else
             {
-                // Already in a map — try to find monolith
                 _state.Reset();
                 _phase = SimPhase.FindMonolith;
                 _phaseStartTime = DateTime.Now;
                 StatusText = "In map — finding monolith";
+                LogDecision("Initialized in map — searching for monolith");
 
-                // Initialize exploration if BotCore missed it (plugin reload mid-game)
                 if (!ctx.Exploration.IsInitialized)
                 {
                     var pfGrid = gc.IngameState?.Data?.RawPathfindingData;
@@ -124,9 +165,12 @@ namespace AutoExile.Modes
 
         public void OnExit()
         {
+            LogDecision("Simulacrum mode exiting");
             _state.Reset();
             _phase = SimPhase.Idle;
             _isStashing = false;
+            BotInput.ReleaseAllKeys();
+            CloseLogger();
         }
 
         public void Tick(BotContext ctx)
@@ -141,7 +185,7 @@ namespace AutoExile.Modes
                 _lastAreaName = currentArea;
             }
 
-            // Always tick state when in map; combat only during active phases
+            // Always tick state when in map
             bool inMap = gc.Area?.CurrentArea != null &&
                          !gc.Area.CurrentArea.IsHideout &&
                          !gc.Area.CurrentArea.IsTown;
@@ -149,15 +193,26 @@ namespace AutoExile.Modes
             {
                 _state.Tick(gc, _settings.MinWaveDelaySeconds.Value);
 
-                // Disable combat during LootSweep/ExitMap — we need to navigate freely
-                // to pick up remaining items and reach the portal without being dragged into fights
-                bool combatAllowed = _phase != SimPhase.LootSweep && _phase != SimPhase.ExitMap;
+                // Always allow combat to scan threats in map so enemies (including bosses on re-entry) are never missed
+                bool isWaveActive = _state.IsWaveActive || ctx.Combat.InCombat || ctx.Combat.NearbyMonsterCount > 0;
+                bool combatAllowed = _phase == SimPhase.WaveCycle || isWaveActive;
+
+                ctx.Combat.Profile.Enabled = combatAllowed;
+
                 if (combatAllowed)
                 {
                     // Suppress cursor-moving skills when interaction is busy picking up loot
                     ctx.Combat.SuppressPositioning = ctx.Interaction.IsBusy;
                     ctx.Combat.SuppressTargetedSkills = ctx.Interaction.IsBusy;
                     ctx.Combat.Tick(ctx);
+                }
+                else
+                {
+                    // Release any held attack/channeling keys so navigation and monolith clicking are clean
+                    if (ctx.Combat.IsChanneling)
+                    {
+                        BotInput.ReleaseAllKeys();
+                    }
                 }
             }
 
@@ -319,7 +374,7 @@ namespace AutoExile.Modes
         private void StartHideoutFlow(BotContext ctx)
         {
             var stash = ctx.Settings.Stash;
-            var sim   = ctx.Settings.Simulacrum;
+            var sim = ctx.Settings.Simulacrum;
 
             // No targetMapName — Simulacrum has no atlas node. Forcing named-map flow
             // would loop trying to click a node that doesn't exist. Auto-match flow
@@ -327,14 +382,14 @@ namespace AutoExile.Modes
             // matching the IsSimulacrum filter, open the player inventory if needed,
             // and right-click the Simulacrum to insert + activate.
             _hideoutFlow.Start(MapDeviceSystem.IsSimulacrum,
-                stashItemFilter:    KeepSimulacrumsFilter,
+                stashItemFilter: KeepSimulacrumsFilter,
                 stashItemThreshold: ctx.Settings.Run.StashItemThreshold.Value,
-                dumpTabName:        string.IsNullOrWhiteSpace(stash.DumpTabName.Value)     ? null : stash.DumpTabName.Value,
-                resourceTabName:    string.IsNullOrWhiteSpace(stash.FragmentTabName.Value) ? null : stash.FragmentTabName.Value,
-                withdrawFragmentPath:  FullSimulacrumPath,
+                dumpTabName: string.IsNullOrWhiteSpace(stash.DumpTabName.Value) ? null : stash.DumpTabName.Value,
+                resourceTabName: string.IsNullOrWhiteSpace(stash.FragmentTabName.Value) ? null : stash.FragmentTabName.Value,
+                withdrawFragmentPath: FullSimulacrumPath,
                 inventoryFragmentPath: FullSimulacrumPath,
-                fragmentStock:  sim.SimulacrumStock.Value,
-                minFragments:   1);
+                fragmentStock: sim.SimulacrumStock.Value,
+                minFragments: 1);
         }
 
         // =================================================================
@@ -468,6 +523,17 @@ namespace AutoExile.Modes
                 _betweenWaveStartTime = DateTime.MinValue;
             }
 
+            // Treat wave as active if state machine reports active OR if hostile monsters are nearby / in combat
+            bool isCombatActive = ctx.Combat.InCombat || ctx.Combat.NearbyMonsterCount > 0;
+            bool isWaveActive = _state.IsWaveActive || isCombatActive;
+
+            // If wave activity is detected, reset retry and between-wave timers
+            if (isWaveActive)
+            {
+                _waveStartAttempts = 0;
+                _betweenWaveStartTime = DateTime.MinValue;
+            }
+
             // --- Priority 0: Don't interrupt active loot pickup ---
             // If interaction is busy (navigating to or clicking an item), let it finish.
             // Without this guard, exploration/combat navigation overwrites the loot path.
@@ -481,7 +547,7 @@ namespace AutoExile.Modes
             // --- Priority 1: Pick up nearby loot (during active waves only) ---
             // Between waves, loot is handled exclusively by Priority 4 which blocks
             // all lower priorities until loot is fully cleared.
-            if (_state.IsWaveActive)
+            if (isWaveActive)
             {
                 if ((DateTime.Now - _lastLootScan).TotalMilliseconds >= LootScanIntervalMs)
                 {
@@ -504,7 +570,7 @@ namespace AutoExile.Modes
 
             // --- Priority 2: Wave timeout check ---
             // Sweep loot before exiting — wave timeout shouldn't abandon items on the ground
-            if (_state.IsWaveActive &&
+            if (isWaveActive &&
                 (DateTime.Now - _state.WaveStartedAt).TotalMinutes > _settings.WaveTimeoutMinutes.Value)
             {
                 Decision = "Wave timeout → LootSweep";
@@ -517,9 +583,9 @@ namespace AutoExile.Modes
             }
 
             // --- Priority 3: Wave active — fight and explore ---
-            if (_state.IsWaveActive)
+            if (isWaveActive)
             {
-                // NearbyMonsterCount = within CombatRange — monsters close enough to fight
+                // NearbyMonsterCount = monsters within melee/combat range
                 if (ctx.Combat.NearbyMonsterCount > 0)
                 {
                     // Combat stuck detection: if monster count isn't decreasing, we're
@@ -553,55 +619,47 @@ namespace AutoExile.Modes
                         if (_wasSearching)
                         {
                             _wasSearching = false;
-                            // Stop stale navigation from patrolling — combat handles movement now
                             ctx.Navigation.Stop(gc);
-                            // Restore normal seen radius now that we're fighting
                             ctx.Exploration.SeenRadiusOverride = 0;
                         }
 
-                        // Aggressive positioning: CombatSystem signals WantsToMove with a dense
-                        // cluster target, but defers A* pathfinding to the mode. Without this,
-                        // the bot stands still fighting a few nearby monsters while ignoring
-                        // a much denser pack farther away.
+                        // Aggressive positioning: pathfind to the densest cluster across the whole arena
                         if (ctx.Combat.WantsToMove &&
                             ctx.Combat.Profile.Positioning == CombatPositioning.Aggressive &&
                             !ctx.Interaction.IsBusy)
                         {
                             var combatTarget = ctx.Combat.MoveTargetGrid;
-                            // Only repath if not navigating or current destination is far from new target
                             var navPath = ctx.Navigation.CurrentNavPath;
                             var currentDest = navPath.Count > 0 ? navPath[navPath.Count - 1].Position : playerPos;
-                            if (!ctx.Navigation.IsNavigating ||
-                                Vector2.Distance(currentDest, combatTarget) > 20f)
+
+                            if (!ctx.Navigation.IsNavigating || Vector2.Distance(currentDest, combatTarget) > 15f)
                             {
                                 ctx.Navigation.Stop(gc);
                                 ctx.Navigation.NavigateTo(gc, combatTarget);
                             }
-                            Decision = $"Wave {_state.CurrentWave} — aggressive: pathing to density @ ({combatTarget.X:F0},{combatTarget.Y:F0})";
+                            Decision = $"Wave {_state.CurrentWave} — aggressive: pathing to pack @ ({combatTarget.X:F0},{combatTarget.Y:F0}) ({ctx.Combat.CachedMonsterCount} total)";
                         }
                         else
                         {
                             Decision = $"Wave {_state.CurrentWave} — fighting ({ctx.Combat.NearbyMonsterCount} nearby, {ctx.Combat.CachedMonsterCount} total)";
                         }
-                        StatusText = $"Wave {_state.CurrentWave}/15 — fighting {ctx.Combat.NearbyMonsterCount} monsters";
+                        StatusText = $"Wave {_state.CurrentWave}/15 — fighting {ctx.Combat.NearbyMonsterCount} nearby ({ctx.Combat.CachedMonsterCount} total)";
                     }
                 }
                 else
                 {
-                    // Transition from fighting → searching: reset exploration and use small
-                    // seen radius so the bot must physically visit each region. Simulacrum maps
-                    // are tiny (~15K cells) — the default network bubble (radius 180) covers
-                    // the entire map, making exploration targets useless without this.
+                    // No monsters in melee range — navigate through archways/corridors to distant monsters
                     if (!_wasSearching)
                     {
                         _wasSearching = true;
+                        ctx.Navigation.Stop(gc);
                         ctx.Exploration.SeenRadiusOverride = 40;
                         ctx.Exploration.ResetSeen();
                     }
                     _combatEngageTime = DateTime.MinValue;
                     _combatEngageCount = 0;
 
-                    Decision = $"Wave {_state.CurrentWave} — patrolling ({ctx.Combat.CachedMonsterCount} distant)";
+                    Decision = $"Wave {_state.CurrentWave} — navigating to distant monsters ({ctx.Combat.CachedMonsterCount} total)";
                     TickExploreForMonsters(ctx);
                 }
                 return;
@@ -614,7 +672,7 @@ namespace AutoExile.Modes
             // threshold, stashes one, picks up another, loops forever.
             // Don't start StashSystem here — TickBetweenWaveStash navigates to the
             // cached stash position first so the entity loads into the entity list.
-            if (!_state.IsWaveActive && _state.StashPosition.HasValue && !ctx.Interaction.IsBusy)
+            if (!isWaveActive && _state.StashPosition.HasValue && !ctx.Interaction.IsBusy)
             {
                 // Count only items the filter would actually deposit — full Simulacrums
                 // are kept in inventory for future runs and must NOT trigger a stash trip.
@@ -626,7 +684,7 @@ namespace AutoExile.Modes
                     foreach (var it in slots)
                         if (KeepSimulacrumsFilter(it)) stashableCount++;
 
-                bool shouldStartStashing    = stashableCount >= ctx.Settings.Run.StashItemThreshold.Value;
+                bool shouldStartStashing = stashableCount >= ctx.Settings.Run.StashItemThreshold.Value;
                 bool shouldContinueStashing = _isStashing && stashableCount > 0;
 
                 if (shouldStartStashing || shouldContinueStashing)
@@ -647,7 +705,7 @@ namespace AutoExile.Modes
             // delay for more drops before starting the next wave.
             // Also blocks if interaction is busy (mid-pickup) — stay at spawn zone, don't
             // wander to monolith.
-            if (!_state.IsWaveActive)
+            if (!isWaveActive)
             {
                 // Force a fresh scan every tick between waves (loot can drop at any time)
                 ctx.Loot.Scan(gc);
@@ -686,7 +744,7 @@ namespace AutoExile.Modes
             }
 
             // Priority 6: Wave 15 complete — sweep remaining loot and exit
-            if (_state.CurrentWave >= 15 && !_state.IsWaveActive)
+            if (_state.CurrentWave >= 15 && !isWaveActive)
             {
                 Decision = "Wave 15 complete → LootSweep";
                 _phase = SimPhase.LootSweep;
@@ -746,8 +804,7 @@ namespace AutoExile.Modes
         }
 
         /// <summary>
-        /// Find and navigate to monsters when none are in chase range.
-        /// Three-tier fallback: cached distant monsters → reset exploration and explore → orbit monolith.
+        /// Continuously patrols across all regions of the arena to force underground monsters to unburrow.
         /// </summary>
         private void TickExploreForMonsters(BotContext ctx)
         {
@@ -757,7 +814,7 @@ namespace AutoExile.Modes
             // Expire old blacklist entries
             PruneBlacklist();
 
-            // Tier 1: Known monsters exist — navigate toward the nearest non-blacklisted one
+            // Tier 1: Known visible monsters — navigate toward the nearest non-blacklisted one
             if (ctx.Combat.CachedMonsterCount > 0)
             {
                 var nearestPos = FindNearestNonBlacklisted(gc, playerPos, ctx.Combat.BlacklistedEnemies);
@@ -765,67 +822,67 @@ namespace AutoExile.Modes
                 {
                     _wasSearching = true;
                     var monsterDist = Vector2.Distance(playerPos, nearestPos.Value);
-                    if (monsterDist > 20f)
+                    if (monsterDist > 12f)
                     {
                         if (ctx.Navigation.IsNavigating)
-                            ctx.Navigation.UpdateDestination(gc, nearestPos.Value, driftThreshold: 15f);
+                            ctx.Navigation.UpdateDestination(gc, nearestPos.Value, driftThreshold: 10f);
                         else
                             ctx.Navigation.NavigateTo(gc, nearestPos.Value);
                     }
-                    StatusText = $"Wave {_state.CurrentWave}/15 — chasing nearest monster (dist: {monsterDist:F0}, {ctx.Combat.CachedMonsterCount} alive, {_blacklistedMonsters.Count} blacklisted)";
+                    Decision = $"Chasing visible monster at ({nearestPos.Value.X:F0},{nearestPos.Value.Y:F0}) - {monsterDist:F0}g away";
+                    StatusText = $"Wave {_state.CurrentWave}/15 — chasing monster ({monsterDist:F0}g away)";
+                    LogDecision(Decision);
                     return;
                 }
-                // All cached monsters are blacklisted — fall through to explore
             }
 
-            // Tier 2: No cached monsters — explore to find stragglers
-            // (ResetSeen already called at the fighting→searching transition above)
-
-            // Let current navigation finish before picking a new target
-            if (ctx.Navigation.IsNavigating)
-            {
-                StatusText = $"Wave {_state.CurrentWave}/15 — searching for monsters";
-                return;
-            }
-
-            if (ctx.Exploration.IsInitialized)
+            // Tier 2: Visit un-stepped exploration regions to trigger unburrowing pods
+            if (ctx.Exploration.IsInitialized && ctx.Exploration.ActiveBlob != null)
             {
                 var target = ctx.Exploration.GetNextExplorationTarget(playerPos);
                 if (target.HasValue)
                 {
-                    ctx.Navigation.NavigateTo(gc, target.Value);
-                    StatusText = $"Wave {_state.CurrentWave}/15 — exploring for monsters";
+                    if (!ctx.Navigation.IsNavigating || Vector2.Distance(ctx.Navigation.Destination ?? Vector2.Zero, target.Value) > 20f)
+                    {
+                        ctx.Navigation.NavigateTo(gc, target.Value);
+                    }
+                    Decision = $"Exploring unseen region at ({target.Value.X:F0},{target.Value.Y:F0})";
+                    StatusText = $"Wave {_state.CurrentWave}/15 — sweeping arena pods";
+                    LogDecision(Decision);
+                    return;
+                }
+
+                // Tier 3: If all regions were marked seen, cycle through all region centroids across the entire arena
+                var blob = ctx.Exploration.ActiveBlob;
+                if (blob.Regions.Count > 0)
+                {
+                    if (_patrolRegionIndex >= blob.Regions.Count)
+                    {
+                        _patrolRegionIndex = 0;
+                        ctx.Exploration.ResetSeen();
+                        ctx.Exploration.SeenRadiusOverride = 35;
+                    }
+
+                    var region = blob.Regions[_patrolRegionIndex];
+                    var distToRegion = Vector2.Distance(playerPos, region.Center);
+
+                    if (distToRegion <= 20f || !ctx.Navigation.IsNavigating)
+                    {
+                        _patrolRegionIndex = (_patrolRegionIndex + 1) % blob.Regions.Count;
+                        region = blob.Regions[_patrolRegionIndex];
+                        ctx.Navigation.NavigateTo(gc, region.Center);
+                    }
+
+                    Decision = $"Patrolling whole arena: Region {_patrolRegionIndex + 1}/{blob.Regions.Count} at ({region.Center.X:F0},{region.Center.Y:F0})";
+                    StatusText = $"Wave {_state.CurrentWave}/15 — map-wide sweep ({_patrolRegionIndex + 1}/{blob.Regions.Count})";
+                    LogDecision(Decision);
                     return;
                 }
             }
 
-            // Tier 3: Exploration exhausted — sweep the map around the monolith
-            // Simulacrum maps are small (~18K cells) — the network bubble (radius 180) covers
-            // the entire map, so exploration coverage resets are useless. Instead, physically
-            // patrol at varying radii to find spawned monsters.
-            if (_state.MonolithPosition.HasValue)
-            {
-                var distToMonolith = Vector2.Distance(playerPos, _state.MonolithPosition.Value);
-                if (distToMonolith > 80f)
-                {
-                    ctx.Navigation.NavigateTo(gc, _state.MonolithPosition.Value);
-                    StatusText = $"Wave {_state.CurrentWave}/15 — returning to monolith (dist: {distToMonolith:F0})";
-                    return;
-                }
-
-                if (!ctx.Navigation.IsNavigating)
-                {
-                    // Sweep at varying radius — cycles through the arena to find spawns
-                    var angle = (float)(DateTime.Now.Ticks % 62830) / 10000f;
-                    var radius = 40f + 25f * MathF.Sin(angle * 0.3f); // 15-65 radius sweep
-                    var orbitTarget = _state.MonolithPosition.Value + new Vector2(MathF.Cos(angle), MathF.Sin(angle)) * radius;
-                    ctx.Navigation.NavigateTo(gc, orbitTarget);
-                }
-                StatusText = $"Wave {_state.CurrentWave}/15 — sweeping for monsters";
-                return;
-            }
-
-            StatusText = $"Wave {_state.CurrentWave}/15 — searching (no exploration targets)";
+            Decision = "Searching for monsters (no exploration targets)";
+            StatusText = $"Wave {_state.CurrentWave}/15 — searching";
+            LogDecision(Decision);
         }
 
         // ═══════════════════════════════════════════════════
@@ -1071,7 +1128,7 @@ namespace AutoExile.Modes
                 var dumpTab = ctx.Settings.Stash.DumpTabName.Value;
                 ctx.Stash.Start(
                     storeTabName: string.IsNullOrWhiteSpace(dumpTab) ? null : dumpTab,
-                    itemFilter:   KeepSimulacrumsFilter);
+                    itemFilter: KeepSimulacrumsFilter);
             }
 
             // Step 3: Tick StashSystem
@@ -1182,7 +1239,7 @@ namespace AutoExile.Modes
                         var dumpTab = ctx.Settings.Stash.DumpTabName.Value;
                         ctx.Stash.Start(
                             storeTabName: string.IsNullOrWhiteSpace(dumpTab) ? null : dumpTab,
-                            itemFilter:   KeepSimulacrumsFilter);
+                            itemFilter: KeepSimulacrumsFilter);
                     }
                 }
                 if (ctx.Stash.IsBusy)
@@ -1461,6 +1518,7 @@ namespace AutoExile.Modes
                     screenPos + new Vector2(5, -10), SharpDX.Color.OrangeRed);
             }
         }
+
 
     }
 

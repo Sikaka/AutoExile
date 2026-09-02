@@ -25,8 +25,10 @@ namespace AutoExile.Modes.WaveFarm
         private IFarmPlan _plan = null!;
         private DateTime _lastLootScan = DateTime.MinValue;
         private DateTime _lastMechanicScan = DateTime.MinValue;
-        private const int LootScanIntervalMs = 500;
+        private const int LootScanIntervalMs = 150;
         private const int MechanicScanIntervalMs = 1000;
+        private DateTime _postCombatLootUntil = DateTime.MinValue;
+        private const double PostCombatLootDelaySeconds = 0.6; // 600ms wait after pack kill
 
         // Interactable tracking
         private readonly HashSet<long> _failedInteractables = new();
@@ -149,7 +151,10 @@ namespace AutoExile.Modes.WaveFarm
                     Decision = "Mechanic";
                     return false;
                 }
-                // Mechanic finished — fall through to pick next action
+                
+                // Mechanic finished (or timed out) — clear and continue farming
+                ctx.Mechanics.ForceCompleteActive();
+                _forceReEval = true;
             }
 
             // ── 1b. Eldritch Altar handler ── (separate from IMapMechanic — uses its
@@ -285,7 +290,13 @@ namespace AutoExile.Modes.WaveFarm
                 _engagedInCombat = true;
             }
             if (_engagedInCombat && !ctx.Combat.InCombat)
-                _engagedInCombat = false; // Pack cleared — release
+            {
+                _engagedInCombat = false;
+                // Pack just died — start post-combat linger timer to allow items to drop & labels to spawn
+                _postCombatLootUntil = DateTime.Now.AddSeconds(PostCombatLootDelaySeconds);
+                _forceReEval = true;
+                ctx.Loot.Scan(gc); // Immediate scan
+            }
 
             // Safety: disengage after 10s to prevent infinite lock on unkillable/unreachable mobs
             if (_engagedInCombat && (DateTime.Now - _engageStartTime).TotalSeconds > 10)
@@ -567,6 +578,12 @@ namespace AutoExile.Modes.WaveFarm
                 return WaveAction.PickupLoot(forwardLoot.Entity.Id, forwardLoot.Entity.GridPosNum);
             }
 
+            if (DateTime.Now < _postCombatLootUntil)
+            {
+                Status = "Waiting for loot drops to settle...";
+                return WaveAction.None;
+            }
+
             // P2: Deferred mechanic ready
             var deferredReady = _deferred.GetReadyMechanic(ctx, playerPos, _plan);
             if (deferredReady.HasValue)
@@ -595,21 +612,10 @@ namespace AutoExile.Modes.WaveFarm
             }
 
             // P3b: Missed valuable loot — items we tried to pick up but failed.
-            // Navigate back to their last known position so they re-enter scan range.
-            //
-            // Three kill conditions, in order:
-            //   1. Entity no longer valid in cache → drop (original behavior).
-            //   2. We've dispatched PickupLoot for this entry >= MissedLootMaxAttempts times
-            //      → drop + blacklist via LootSystem.MarkFailed. Stops the
-            //      wait-leave-comeback loop when the entity reference is stale.
-            //   3. We're within the network bubble of the last-known pos for >= 1s AND
-            //      no loot candidate currently exists for that EntityId → the item is
-            //      gone from the world even though the cached Entity may still claim
-            //      IsValid. Drop + blacklist.
             PruneMissedLoot();
             if (_missedLoot.Count > 0)
             {
-                var best = _missedLoot[0]; // highest value first (sorted on insert)
+                var best = _missedLoot[0];
                 var entity = FindEntity(ctx, best.EntityId);
                 if (entity == null || !entity.IsValid)
                 {
@@ -648,10 +654,6 @@ namespace AutoExile.Modes.WaveFarm
                     }
                     else
                     {
-                        // Count this tick's dispatch as an attempt. Actual pickup
-                        // may fail/succeed; the outer interaction-result handler
-                        // will clear this entry on success or let us loop to the
-                        // retry cap on continued failure.
                         best.Attempts++;
                         _missedLoot[0] = best;
                         return WaveAction.PickupLoot(best.EntityId, best.GridPos);
@@ -659,9 +661,7 @@ namespace AutoExile.Modes.WaveFarm
                 }
             }
 
-            // Periodic ThreatMap cleanup — local Reconcile() only sweeps within 200g of the
-            // player, so distant LeftRange entities can accumulate. A periodic global pass
-            // keeps alive counts honest, which matters for ClearPlan's per-chunk clearing check.
+            // Periodic ThreatMap cleanup
             if (ctx.ThreatMap.IsInitialized &&
                 (DateTime.Now - _lastFullReconcile).TotalSeconds > FullReconcileIntervalSeconds)
             {
@@ -674,27 +674,43 @@ namespace AutoExile.Modes.WaveFarm
                 _lastFullReconcile = DateTime.Now;
             }
 
-            // P4 — Chunk-queue exploration. ClearPlan owns "where to go next": it commits to
-            // one chunk at a time, waits for it to clear (or stall out), then pops. Combat,
-            // loot, and mechanics ran as interrupts above this. When the queue empties,
-            // IsComplete fires and we fall straight through to P5/P7.
+            // ── Early Exit Gate: Monster count threshold check ──
+            var maxRemaining = ctx.Settings.Farming.MaxRemainingMonsters.Value;
+            if (maxRemaining > 0)
+            {
+                int serverRemaining = ctx.Game?.IngameState?.ServerData?.MonstersRemaining ?? -1;
+                bool serverThresholdMet = serverRemaining >= 0 && serverRemaining < maxRemaining;
+                bool threatMapThresholdMet = ctx.ThreatMap.IsInitialized &&
+                                             ctx.ThreatMap.TotalTracked >= 40 &&
+                                             ctx.ThreatMap.TotalAlive < maxRemaining;
+
+                if (serverThresholdMet || threatMapThresholdMet)
+                {
+                    ctx.Log($"[Wave] Remaining monster threshold reached (server={serverRemaining}, tracked alive={ctx.ThreatMap.TotalAlive}, target<{maxRemaining}) — finishing map");
+                    
+                    var postClear = _plan.GetPostClearAction(ctx, _deferred);
+                    if (postClear.HasValue)
+                        return postClear.Value;
+
+                    return WaveAction.ExitMap;
+                }
+            }
+
+            // P4 — Chunk-queue exploration.
             if (_clearPlan.IsInitialized && _clearPlan.CurrentTarget.HasValue)
             {
                 var chunkTarget = _clearPlan.CurrentTarget.Value;
                 if (!IsFailedExploreTarget(chunkTarget))
                     return WaveAction.Explore(chunkTarget);
-                // Nav refused this chunk — pop it and try again next tick.
                 _clearPlan.SkipCurrent(ctx);
             }
 
-            // Dormant map-boss approach. ThreatMap doesn't track non-hostile-alive entities,
-            // so the ClearPlan won't route us to a dormant boss — handle it explicitly.
+            // Dormant map-boss approach.
             if (ctx.Combat.NearestDormantPos.HasValue &&
                 !IsFailedExploreTarget(ctx.Combat.NearestDormantPos.Value))
                 return WaveAction.Explore(ctx.Combat.NearestDormantPos.Value);
 
-            // Terrain fallback — only fires if ClearPlan failed to initialize (no active
-            // blob at zone entry). Picks nearest unexplored walkable cell.
+            // Terrain fallback
             if (!_clearPlan.IsInitialized)
             {
                 var terrainTarget = ctx.Exploration.GetNextExplorationTarget(playerPos);
@@ -702,12 +718,7 @@ namespace AutoExile.Modes.WaveFarm
                     return WaveAction.Explore(terrainTarget.Value);
             }
 
-            // P4b: Post-observation hunt. Every region was observed but stragglers
-            // outside combat range didn't get engaged. Chase the densest remaining
-            // ThreatMap chunk — the pack-engagement lock + target-focus timeout
-            // in CombatSystem keep each chase bounded, so this can't loop.
-            // Stops when ThreatMap has no alive chunks OR every remaining cluster
-            // sits in a failed-target zone.
+            // P4b: Post-observation hunt.
             if (_clearPlan.IsInitialized && _clearPlan.IsComplete && ctx.ThreatMap.IsInitialized)
             {
                 var dense = ctx.ThreatMap.GetDensestAliveChunk(playerPos);
@@ -774,6 +785,10 @@ namespace AutoExile.Modes.WaveFarm
                     var lootEntity = FindEntity(ctx, action.TargetEntityId);
                     if (lootEntity != null)
                     {
+                        // Stop continuous exploratory movement before interacting with ground items
+                        if (lootEntity.DistancePlayer <= ctx.Interaction.InteractRadius)
+                            ctx.Navigation.Stop(gc);
+
                         var candidate = FindCandidate(ctx.Loot, action.TargetEntityId);
                         ctx.Interaction.PickupGroundItem(lootEntity, ctx.Navigation,
                             requireProximity: lootEntity.DistancePlayer > ctx.Interaction.InteractRadius);

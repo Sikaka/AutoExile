@@ -86,8 +86,12 @@ namespace AutoExile.Systems
         // Obstacle injection — modes can mark grid positions as blocked (e.g. locked puzzle doors)
         // NavigateTo patches these cells to 0 before running A*, without modifying game memory.
         private readonly List<Vector2> _blockedPositions = new();
-        private const int BlockedRadius = 7; // cells around each blocked position to zero out (covers full puzzle door gap including fringe)
+        private const int BlockedRadius = 1; // 3x3 cells around blocked position (blocks door threshold without wiping out hallways)
 
+        /// <summary>
+        /// Set grid positions that A* should treat as impassable.
+        /// Cleared automatically — caller should re-set each tick or when positions change.
+        /// </summary>
         /// <summary>
         /// Set grid positions that A* should treat as impassable.
         /// Cleared automatically — caller should re-set each tick or when positions change.
@@ -424,7 +428,9 @@ namespace AutoExile.Systems
             // Get current waypoint and determine action
             var waypoint = CurrentNavPath[CurrentWaypointIndex];
             var windowRect = gc.Window.GetWindowRectangle();
-            bool inTown = gc.Area?.CurrentArea?.IsTown == true;
+            bool inTown = gc.Area?.CurrentArea?.IsTown == true
+                || gc.Area?.CurrentArea?.IsHideout == true
+                || gc.Area?.CurrentArea?.Name == "The Rogue Harbour";
 
             if (waypoint.Action == WaypointAction.Blink && !inTown)
             {
@@ -518,12 +524,10 @@ namespace AutoExile.Systems
             if (screenPos.X > 0 && screenPos.X < windowRect.Width &&
                 screenPos.Y > 0 && screenPos.Y < windowRect.Height)
             {
-                // If target is too close to screen center, push it outward along the same
-                // direction so the click produces meaningful movement in PoE.
                 var dir = screenPos - center;
                 if (dir.Length() < MinScreenDist)
                 {
-                    if (dir.Length() < 1f) return; // target is exactly on player
+                    if (dir.Length() < 1f) return;
                     screenPos = center + Vector2.Normalize(dir) * MinScreenDist;
                 }
                 absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
@@ -537,13 +541,12 @@ namespace AutoExile.Systems
                 absPos = new Vector2(windowRect.X + edgePoint.X, windowRect.Y + edgePoint.Y);
             }
 
-            // Continuous movement: hold the move key and update cursor position each tick.
-            // First call starts movement (KeyDown), subsequent calls just reposition cursor.
-            // This replaces the old pulse model: CursorPressKey → wait → CursorPressKey.
+            // Always use MoveKey (synced from PrimaryMoveKey)
+            var moveKey = MoveKey != Keys.None ? MoveKey : Keys.T;
             if (BotInput.IsMovementActive && !BotInput.IsMovementSuspended)
                 BotInput.UpdateMovementCursor(absPos);
             else
-                BotInput.StartMovement(absPos, MoveKey);
+                BotInput.StartMovement(absPos, moveKey);
         }
 
         private void ExecuteBlink(Vector2 screenPos, SharpDX.RectangleF windowRect,
@@ -582,9 +585,7 @@ namespace AutoExile.Systems
         }
 
         /// <summary>
-        /// Use a movement skill to speed up travel when the path ahead is long and straight.
-        /// Measures distance from PLAYER through remaining waypoints (not just waypoint-to-waypoint).
-        /// All distance calculations in grid units.
+        /// Use a movement skill to speed up travel when the path ahead is long, straight, and has wide walkable clearance.
         /// </summary>
         private bool TryDashForSpeed(GameController gc, Vector2 playerGrid,
             SharpDX.RectangleF windowRect)
@@ -657,7 +658,13 @@ namespace AutoExile.Systems
             if (straightDist < DashMinDistance)
                 return false;
 
-            // Find a movement skill to use.
+            // Verify the path ahead has clear walkable LOS (not a narrow bridge/stairs that clips colliders)
+            var aimTarget = playerGrid + travelDir * DashMinDistance;
+            var pfGrid = gc.IngameState.Data.RawFramePathfindingData;
+            if (pfGrid == null || !Pathfinding.HasLineOfSight(pfGrid, playerGrid, aimTarget))
+                return false;
+
+            // Find a movement skill to use
             MovementSkillInfo? dashSkill = null;
             foreach (var ms in MovementSkills)
             {
@@ -678,10 +685,7 @@ namespace AutoExile.Systems
             if (dashSkill == null)
                 return false;
 
-            // Aim along the travel direction (grid coords → screen)
-            var aimTarget = playerGrid + travelDir * DashMinDistance;
             var aimScreen = GridToScreen(gc, aimTarget);
-
             if (aimScreen.X <= 0 || aimScreen.X >= windowRect.Width ||
                 aimScreen.Y <= 0 || aimScreen.Y >= windowRect.Height)
                 return false;
@@ -930,8 +934,8 @@ namespace AutoExile.Systems
         }
 
         /// <summary>
-        /// Escape probing — try random directional probes at escalating distances.
-        /// When stuck at the same spot repeatedly, uses larger probe distances.
+        /// Escape probing — try directional probes at escalating distances using
+        /// Move-Only, non-terrain movement skills (dash), and terrain-crossing blink skills.
         /// </summary>
         private void EscapeProbe(GameController gc, Vector2 playerGrid)
         {
@@ -960,8 +964,62 @@ namespace AutoExile.Systems
             var screenPos = GridToScreen(gc, nudgeTarget);
             var windowRect = gc.Window.GetWindowRectangle();
 
-            ExecuteWalk(screenPos, windowRect);
-            LastRecoveryAction = $"Escape probe ({probeDistance:F0}g, attempt #{_stuckAtSameSpotCount})";
+            if (screenPos.X <= 0 || screenPos.X >= windowRect.Width ||
+                screenPos.Y <= 0 || screenPos.Y >= windowRect.Height)
+            {
+                var center = new Vector2(windowRect.Width / 2f, windowRect.Height / 2f);
+                var dir = screenPos - center;
+                if (dir.Length() > 1f)
+                    screenPos = center + Vector2.Normalize(dir) * Math.Min(center.X, center.Y) * 0.8f;
+            }
+
+            var absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
+
+            bool inSafeZone = gc.Area?.CurrentArea?.IsTown == true
+                || gc.Area?.CurrentArea?.IsHideout == true
+                || gc.Area?.CurrentArea?.Name == "The Rogue Harbour";
+
+            // If in a zone where skills are allowed, attempt movement skill unstick
+            if (!inSafeZone && !WalkOnly && BotInput.CanAct)
+            {
+                // Stage 1: Try terrain-crossing blink (highest escape potential across ledges/corners/traps)
+                var gapCrosser = MovementSkills.FirstOrDefault(m => m.CanCrossTerrain && m.IsReady &&
+                    (m.MinCastIntervalMs <= 0 || (DateTime.Now - m.LastUsedAt).TotalMilliseconds >= m.MinCastIntervalMs));
+
+                if (gapCrosser != null && (_stuckAtSameSpotCount >= 2 || _rng.Next(2) == 0))
+                {
+                    if (BotInput.CursorPressKey(absPos, gapCrosser.Key))
+                    {
+                        gapCrosser.LastUsedAt = DateTime.Now;
+                        _dashActive = true;
+                        _dashStartTime = DateTime.Now;
+                        LastRecoveryAction = $"Unstuck Blink ({gapCrosser.Key}, probe {probeDistance:F0}g, attempt #{_stuckAtSameSpotCount})";
+                        return;
+                    }
+                }
+
+                // Stage 2: Try standard dash/movement skill (non-terrain crosser like Shield Charge/Whirling Blades/Dash)
+                var dashSkill = MovementSkills.FirstOrDefault(m => !m.CanCrossTerrain && m.IsReady &&
+                    (m.MinCastIntervalMs <= 0 || (DateTime.Now - m.LastUsedAt).TotalMilliseconds >= m.MinCastIntervalMs));
+
+                if (dashSkill != null)
+                {
+                    if (BotInput.CursorPressKey(absPos, dashSkill.Key))
+                    {
+                        dashSkill.LastUsedAt = DateTime.Now;
+                        _dashActive = true;
+                        _dashStartTime = DateTime.Now;
+                        LastRecoveryAction = $"Unstuck Dash ({dashSkill.Key}, probe {probeDistance:F0}g, attempt #{_stuckAtSameSpotCount})";
+                        return;
+                    }
+                }
+            }
+
+            // Stage 3: Force restart Move-Only movement (re-presses the key rather than just steering mouse)
+            var moveKey = MoveKey != Keys.None ? MoveKey : Keys.T;
+            BotInput.StopMovement();
+            BotInput.StartMovement(absPos, moveKey);
+            LastRecoveryAction = $"Unstuck MoveKey ({moveKey}, probe {probeDistance:F0}g, attempt #{_stuckAtSameSpotCount})";
         }
 
         // ═══════════════════════════════════════════════════
@@ -1150,7 +1208,11 @@ namespace AutoExile.Systems
             var windowRect = gc.Window.GetWindowRectangle();
 
             // Try movement skills for speed if distance is long enough (needs action gate)
-            if (BotInput.CanAct && TryDirectDash(gc, playerGrid, gridTarget, windowRect))
+            bool inSafeZone = gc.Area?.CurrentArea?.IsTown == true
+                || gc.Area?.CurrentArea?.Name == "The Rogue Harbour";
+
+            // Only try movement skills in skill-enabled zones
+            if (!inSafeZone && !WalkOnly && BotInput.CanAct && TryDirectDash(gc, playerGrid, gridTarget, windowRect))
                 return true;
 
             // Continuous movement doesn't need the action gate

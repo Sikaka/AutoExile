@@ -1,10 +1,16 @@
 using ExileCore;
+using ExileCore.PoEMemory;
+using ExileCore.PoEMemory.Components;
+using ExileCore.PoEMemory.MemoryObjects;
 using ExileCore.Shared.Helpers;
-using ExileCore.Shared.Interfaces;
 using GameOffsets;
 using GameOffsets.Native;
+using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
 using System.Numerics;
+using System.Text.RegularExpressions;
 
 namespace AutoExile.Systems
 {
@@ -23,64 +29,45 @@ namespace AutoExile.Systems
         public string LoadedArea => _loadedArea;
 
         /// <summary>
-        /// Read tile data from terrain. Call once per zone (on area change).
+        /// Read tile data from memory using native TgtDetailStruct inspection.
+        /// Captures all tile detail names, tile paths, and grid coordinates map-wide at zone load.
         /// </summary>
         public bool Load(GameController gc)
         {
             try
             {
-                var terrain = gc.IngameState.Data.Terrain;
-                var memory = gc.Memory;
-
-                if (terrain.NumCols == 0 || terrain.NumRows == 0)
+                var tileList = ReadTilesFromTerrain(gc);
+                if (tileList == null || tileList.Count == 0)
+                {
+                    _loaded = false;
                     return false;
+                }
 
                 var tiles = new ConcurrentDictionary<string, List<Vector2>>();
-                TileStructure[] tileData = memory.ReadStdVector<TileStructure>(terrain.TgtArray);
 
-                if (tileData == null || tileData.Length == 0)
-                    return false;
+                foreach (var (name, path, gridPos) in tileList)
+                {
+                    if (!string.IsNullOrEmpty(name))
+                        tiles.GetOrAdd(name, _ => new List<Vector2>()).Add(gridPos);
 
-                var numCols = (int)terrain.NumCols;
+                    if (!string.IsNullOrEmpty(path))
+                        tiles.GetOrAdd(path, _ => new List<Vector2>()).Add(gridPos);
+                }
 
-                Parallel.ForEach(
-                    System.Collections.Concurrent.Partitioner.Create(0, tileData.Length),
-                    (range, _) =>
-                    {
-                        for (int i = range.Item1; i < range.Item2; i++)
-                        {
-                            try
-                            {
-                                var tgtTileStruct = memory.Read<TgtTileStruct>(tileData[i].TgtFilePtr);
-                                string detailName = memory.Read<TgtDetailStruct>(tgtTileStruct.TgtDetailPtr).name.ToString(memory);
-                                string tilePath = tgtTileStruct.TgtPath.ToString(memory);
+                if (tiles.Count > 0)
+                {
+                    _tiles = tiles;
+                    _loaded = true;
+                    _loadedArea = gc.Area?.CurrentArea?.Name ?? "unknown";
+                    return true;
+                }
 
-                                // Grid position: each tile is 23x23 grid cells
-                                var gridPos = new Vector2(
-                                    i % numCols * 23,
-                                    i / numCols * 23
-                                );
-
-                                if (!string.IsNullOrEmpty(tilePath))
-                                    tiles.GetOrAdd(tilePath, _ => new List<Vector2>()).Add(gridPos);
-
-                                if (!string.IsNullOrEmpty(detailName))
-                                    tiles.GetOrAdd(detailName, _ => new List<Vector2>()).Add(gridPos);
-                            }
-                            catch
-                            {
-                                // Skip tiles with bad pointers
-                            }
-                        }
-                    });
-
-                _tiles = tiles;
-                _loaded = true;
-                _loadedArea = gc.Area?.CurrentArea?.Name ?? "unknown";
-                return true;
+                _loaded = false;
+                return false;
             }
             catch
             {
+                _loaded = false;
                 return false;
             }
         }
@@ -96,15 +83,15 @@ namespace AutoExile.Systems
         }
 
         /// <summary>
-        /// Find tile position by name. Tries exact match first, then substring.
-        /// Returns position in GRID coordinates (multiply by GridToWorld for world coords).
+        /// Find tile position by name or Radar wildcard pattern (e.g. "*Labyrinth*").
+        /// Returns position in GRID coordinates closest to playerGridPos.
         /// </summary>
         public Vector2? FindTilePosition(string searchString, Vector2 playerGridPos)
         {
             if (string.IsNullOrEmpty(searchString) || !_loaded)
                 return null;
 
-            // Exact match first
+            // 1. Exact match
             if (_tiles.TryGetValue(searchString, out var exactResults) && exactResults.Count > 0)
             {
                 return exactResults
@@ -112,14 +99,14 @@ namespace AutoExile.Systems
                     .First();
             }
 
-            // Substring search (case-insensitive)
-            var searchLower = searchString.ToLowerInvariant();
+            // 2. Radar-style wildcard pattern matching (* and ?)
+            var regex = ToLikeRegex(searchString);
             Vector2? bestMatch = null;
             float bestDist = float.MaxValue;
 
             foreach (var kvp in _tiles)
             {
-                if (!kvp.Key.ToLowerInvariant().Contains(searchLower))
+                if (!regex.IsMatch(kvp.Key) && !kvp.Key.Contains(searchString, StringComparison.OrdinalIgnoreCase))
                     continue;
 
                 foreach (var pos in kvp.Value)
@@ -134,6 +121,15 @@ namespace AutoExile.Systems
             }
 
             return bestMatch;
+        }
+
+        private static System.Text.RegularExpressions.Regex ToLikeRegex(string pattern)
+        {
+            return new System.Text.RegularExpressions.Regex("^" +
+                             System.Text.RegularExpressions.Regex.Escape(pattern)
+                                 .Replace(@"\*", ".*")
+                                 .Replace(@"\?", ".")
+                             + "$", System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Singleline);
         }
 
         /// <summary>
@@ -175,6 +171,81 @@ namespace AutoExile.Systems
         public static Vector2 GridToWorld(Vector2 gridPos)
         {
             return gridPos * Pathfinding.GridToWorld;
+        }
+
+        /// <summary>
+        /// Read native terrain tile structures directly from memory using BindingFlags.
+        /// </summary>
+        private List<(string Name, string Path, Vector2 Coordinate)> ReadTilesFromTerrain(GameController gc)
+        {
+            var result = new List<(string Name, string Path, Vector2 Coordinate)>();
+            try
+            {
+                var ingameData = gc.IngameState?.Data;
+                if (ingameData == null) return result;
+
+                var terrain = ingameData.Terrain;
+                var memory = gc.Memory;
+                var terrainType = terrain.GetType();
+
+                // Fix: Include NonPublic and Instance flags to find private/internal fields
+                var fields = terrainType.GetFields(
+                    System.Reflection.BindingFlags.Public | 
+                    System.Reflection.BindingFlags.NonPublic | 
+                    System.Reflection.BindingFlags.Instance);
+
+                System.Reflection.FieldInfo? tgtField = null;
+                foreach (var field in fields)
+                {
+                    if (field.FieldType.Name.Contains("NativeVector") || 
+                        field.FieldType.Name.Contains("Vector") || 
+                        field.FieldType.Name.Contains("NativePtrArray"))
+                    {
+                        tgtField = field;
+                        break;
+                    }
+                }
+
+                if (tgtField == null) return result;
+
+                var vectorPtr = tgtField.GetValue(terrain);
+                if (vectorPtr == null) return result;
+
+                // Read TileStructure vector
+                var readMethod = memory.GetType().GetMethod("ReadStdVector")?.MakeGenericMethod(typeof(TileStructure));
+                if (readMethod == null) return result;
+
+                TileStructure[]? tileData = readMethod.Invoke(memory, new[] { vectorPtr }) as TileStructure[];
+                if (tileData == null || tileData.Length == 0) return result;
+
+                // Calculate tile columns from AreaDimensions (1 tile = 23 grid units)
+                int numCols = (int)(ingameData.AreaDimensions.X / 23);
+                if (numCols <= 0 && ingameData.RawPathfindingData != null && ingameData.RawPathfindingData.Length > 0)
+                    numCols = ingameData.RawPathfindingData[0].Length / 23;
+
+                if (numCols <= 0) return result;
+
+                for (int i = 0; i < tileData.Length; i++)
+                {
+                    try
+                    {
+                        var tgtTileStruct = memory.Read<TgtTileStruct>(tileData[i].TgtFilePtr);
+                        string detailName = memory.Read<TgtDetailStruct>(tgtTileStruct.TgtDetailPtr).name.ToString(memory);
+                        string tilePath = tgtTileStruct.TgtPath.ToString(memory);
+
+                        // Calculate grid position
+                        var gridPos = new Vector2(
+                            (i % numCols) * 23f,
+                            (i / numCols) * 23f
+                        );
+
+                        result.Add((detailName, tilePath, gridPos));
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+            return result;
         }
     }
 }

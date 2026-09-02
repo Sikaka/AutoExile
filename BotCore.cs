@@ -469,55 +469,28 @@ namespace AutoExile
             if (!Settings.Enable || !GameController.InGame)
                 return base.Tick();
 
-            // Web server: push status snapshot + process commands
-            // Runs before all early returns so the dashboard stays live even when
-            // POE is unfocused or an async action is in flight.
             TickWebServer();
-
-            // Update active-runtime accounting on every tick (even when POE is
-            // unfocused) so the timer reflects real elapsed wall time accurately.
-            // Pause edges are based on Settings.Running.Value.
             _runtime.Tick(Settings.Running.Value);
 
-            // Hard stop on max runtime — flips Running off; user must reset the
-            // timer (or bump MaxRuntimeMinutes) to resume.
             if (Settings.Running.Value && _runtime.IsExpired(Settings.Run.MaxRuntimeMinutes.Value))
             {
                 Settings.Running.Value = false;
                 LogMessage($"[AutoExile] Max runtime ({Settings.Run.MaxRuntimeMinutes.Value} min) reached — bot stopped");
             }
 
-            // Periodic config save — persists ImGui setting changes to config.json
-            // so they survive plugin reloads (web UI changes save immediately, but
-            // ImGui changes only live in memory without this).
-            if ((DateTime.Now - _lastConfigSave).TotalSeconds >= ConfigSaveIntervalSec)
-            {
-                _lastConfigSave = DateTime.Now;
-                _profileManager?.SaveActive(Settings);
-            }
-
-            // Don't do anything when POE isn't the active window
             if (!GameController.IsForeGroundCache)
                 return base.Tick();
 
             _ctx.DeltaTime = (float)GameController.DeltaTime;
             _ctx.MinimapIcons = _knownMinimapIcons;
 
-            // Populate map name list from atlas data (once, when Files are ready)
             if (!_mapListPopulated)
                 PopulateMapList();
 
-            // Sync stash tab names into settings dropdowns when stash is visible
             SyncStashTabNames();
 
-            // Toggle running hotkey is now in Render() so it's never blocked by early returns.
-
-            // An async action is in flight (cursor settle, key hold).
-            // Still tick combat for self-cast skills (RF, guards, etc.) and mode for state updates,
-            // but skip navigation which would queue conflicting cursor movements.
             var canAct = Systems.BotInput.CanAct;
 
-            // Retry exploration init if it was missed (terrain data not ready when AreaChange fired)
             if (!_exploration.IsInitialized && GameController.Player != null)
             {
                 var terrainData = GameController.IngameState?.Data?.RawPathfindingData;
@@ -532,7 +505,6 @@ namespace AutoExile
                 }
             }
 
-            // Update exploration coverage each tick
             if (_exploration.IsInitialized && GameController.Player != null)
             {
                 var playerGrid = new Vector2(
@@ -540,34 +512,24 @@ namespace AutoExile
                     GameController.Player.GridPosNum.Y);
                 _exploration.Update(playerGrid);
 
-                // Scan for area transition entities and record them
                 ScanAreaTransitions();
-
-                // Periodic minimap icon scan — tiles load at ~2x network bubble as player moves
                 ScanMinimapIcons();
             }
 
-            // Sync settings → systems
             _navigation.BlinkRange = Settings.Build.BlinkRange.Value;
             _navigation.DashMinDistance = Settings.Build.DashMinDistance.Value;
             _navigation.PathMergeThreshold = Settings.Build.PathMergeThreshold.Value;
             BotInput.ActionCooldownMs = Settings.ActionCooldownMs.Value;
             BotInput.WindowRect = GameController.Window.GetWindowRectangleTimeCache;
-            BotInput.TickHeldKeys(); // Safety watchdog — auto-release stale held keys
-            BotInput.TickMovementLayer(); // Auto-resume movement after discrete actions
+            BotInput.TickHeldKeys();
+            BotInput.TickMovementLayer();
 
-            // Sync primary movement key from skill config → NavigationSystem + CombatSystem
             var primaryMove = Settings.Build.GetPrimaryMovement();
             _navigation.MoveKey = primaryMove?.Key.Value ?? Keys.T;
 
-            // Ensure skill bar is always up to date — NavigationSystem needs MovementSkills
-            // for dash-for-speed even when combat is disabled by the active mode
             _combat.RefreshSkillBar(GameController, Settings.Build);
-
-            // Sync movement skills (dash/blink) from CombatSystem → NavigationSystem
             _navigation.MovementSkills = _combat.MovementSkills;
 
-            // Sync threat settings
             var threatSettings = Settings.Threat;
             _threat.Enabled = threatSettings.Enabled.Value;
             _threat.ThreatRadius = threatSettings.ThreatRadius.Value;
@@ -576,9 +538,6 @@ namespace AutoExile
             _threat.DodgeMaxProgress = threatSettings.DodgeMaxProgress.Value;
             _threat.MonitorRares = threatSettings.MonitorRares.Value;
 
-            // F5 — removed (was Mapping mode toggle, caused accidental mode switches)
-
-            // Debug dump hotkey — F6: dumps game state + recording snapshot + tile signatures
             if (Settings.DumpGameState.PressedOnce())
             {
                 LogMessage("[AutoExile] Dumping all debug data...");
@@ -590,7 +549,6 @@ namespace AutoExile
                 LogMessage($"[AutoExile] Tile signatures: {_tileSignatures.Count}");
             }
 
-            // Gameplay recorder hotkey — F9 (toggle on/off, works for both human and bot play)
             if (Settings.RecordGameplay.PressedOnce())
             {
                 _humanRecorder.Toggle(GameController, Settings.Running.Value);
@@ -598,17 +556,12 @@ namespace AutoExile
                 LogMessage($"[AutoExile] Recorder ({mode}): {(_humanRecorder.IsRecording ? "RECORDING" : "stopped")}");
             }
 
-            // Tick human recorder (captures game state each tick while recording)
             if (_humanRecorder.IsRecording)
                 _humanRecorder.RecordTick(GameController, _ctx);
 
-            // F7/F8 — removed (folded into F6 dump-all)
-
-            // Clear tile signatures on area change
             if (_tileSignatures.Count > 0 && _lastAreaName != _tileSignatureArea)
                 _tileSignatures.Clear();
 
-            // Sync loot settings
             _loot.SkipLowValueUniques = Settings.Loot.SkipLowValueUniques.Value;
             _loot.MinUniqueChaosValue = Settings.Loot.MinUniqueChaosValue.Value;
             _loot.MinChaosPerSlot = Settings.Loot.MinChaosPerSlot.Value;
@@ -619,13 +572,11 @@ namespace AutoExile
             _loot.MinGemChaosValue = Settings.Loot.MinGemChaosValue.Value;
             _loot.AlwaysLoot20QualityGems = Settings.Loot.AlwaysLoot20QualityGems.Value;
             _loot.FilterSynthesisedItems = Settings.Loot.FilterSynthesisedItems.Value;
-            // Parse comma-separated whitelist into trimmed entries
             var whitelistRaw = Settings.Loot.SynthesisedWhitelist.Value ?? "";
             _loot.SynthesisedWhitelist = whitelistRaw
                 .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                 .Where(s => s.Length > 0)
                 .ToList();
-            // Parse must-loot uniques list
             var mustLootRaw = Settings.Loot.MustLootUniques.Value ?? "";
             _loot.MustLootUniques = new HashSet<string>(
                 mustLootRaw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
@@ -636,27 +587,22 @@ namespace AutoExile
             _loot.PriceService = _ninjaPrice;
             _lootTracker.PriceService = _ninjaPrice;
 
-            // Entity cache — prune stale entries every ~1s
             _interaction.Cache = _entityCache;
             if ((DateTime.Now - _lastEntityPrune).TotalMilliseconds > 1000)
             {
                 _entityCache.Prune();
+                _entityCache.SyncWithGame(GameController.EntityListWrapper.OnlyValidEntities);
                 _lastEntityPrune = DateTime.Now;
             }
 
-            // ThreatMap reconciliation — checks nearby chunks for monster deaths.
-            // Internal timer gates to 250ms. Uses EntityCache for O(1) lookups.
             if (GameController.Player != null)
                 _threatMap.Reconcile(GameController.Player.GridPosNum, _entityCache);
 
-            // Sync interact radius (global setting used by all systems)
             _interaction.InteractRadius = Settings.InteractRadius.Value;
             _mapDevice.InteractRadius = Settings.InteractRadius.Value;
             _mapDevice.Interaction = _interaction;
             _stash.InteractRadius = Settings.InteractRadius.Value;
 
-            // Sync latency + click attempts — used by systems for server-response timeouts
-            // If user set ExtraLatencyMs to 0, auto-detect from game's ServerData.Latency
             var extraLatency = Settings.ExtraLatencyMs.Value;
             if (extraLatency == 0)
             {
@@ -670,7 +616,6 @@ namespace AutoExile
             _mapDevice.MaxClickAttempts = Settings.MaxClickAttempts.Value;
             _stash.ExtraLatencySec = extraLatencySec;
             _combat.ExtraLatencySec = extraLatencySec;
-            // Parse enemy blacklist
             var blacklistRaw = Settings.Build.BlacklistedEnemies.Value ?? "";
             _combat.BlacklistedEnemies = new HashSet<string>(
                 blacklistRaw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
@@ -678,17 +623,12 @@ namespace AutoExile
                 StringComparer.OrdinalIgnoreCase);
             _navigation.ExtraLatencyMs = extraLatency;
 
-            // Tick ninja price service (league detection, refresh timer)
             _ninjaPrice.Tick(GameController);
-
-            // Build gem colour map from game data (once)
             _gemValuation.BuildColourMap(GameController);
 
-            // Sync stash/map device settings
             _stash.ActionCooldownMs = Settings.Loot.StashItemCooldownMs.Value;
             _stash.ApplyIncubators = Settings.AutoApplyIncubators.Value;
 
-            // Record tick state BEFORE early returns so recordings capture paused/loading/settle state
             _recorder.RecordTick(GameController, _mode.Name,
                 (_mode as Modes.WaveFarm.WaveFarmMode)?.Status
                 ?? (_mode as BlightMode)?.Phase.ToString()
@@ -709,37 +649,24 @@ namespace AutoExile
                 ?? "",
                 _navigation, _interaction, _loot, _threat);
 
-            // Only run full mode logic when running
             if (!Settings.Running)
             {
                 BotInput.StopMovement();
                 return base.Tick();
             }
 
-            // Global interrupts — handle before mode gets control
             if (!HandleInterrupts())
                 return base.Tick();
 
-            // Area change settle — entity list and game state aren't reliable for
-            // a few seconds after zone transition. Skip mode logic to prevent
-            // stale entity reads (e.g., mechanic re-detection from old zone data).
             if ((DateTime.Now - _areaChangedAt).TotalSeconds < AreaSettleSeconds)
                 return base.Tick();
 
-            // Hard floor — if raw input was sent very recently (async completion,
-            // movement layer resume, etc.), skip all mode/nav/combat logic this tick.
-            // This prevents input floods from race conditions between fire-and-forget
-            // async actions and synchronous tick logic that both pass CanAct.
             if (!BotInput.CanTick)
                 return base.Tick();
 
-            // Tick threat detection (dodge signals consumed by modes)
             _threat.Tick(GameController);
-
-            // Maven fight recorder — always runs, independent of bot mode
             _mavenRecorder.Tick(GameController);
 
-            // Sync follower settings
             if (_followerMode != null)
             {
                 _followerMode.LeaderName = Settings.Follower.LeaderName.Value;
@@ -751,21 +678,22 @@ namespace AutoExile
                 _followerMode.LootNearLeaderOnly = Settings.Follower.LootNearLeaderOnly.Value;
             }
 
-            // Let the active mode decide what to do (may set up navigation paths)
-            _mode.Tick(_ctx);
+            // Exception-safe mode tick
+            try
+            {
+                _mode.Tick(_ctx);
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"[AutoExile] Exception in {_mode.Name}.Tick: {ex.Message}");
+            }
 
-            // Record dodge action (set during mode tick, after recorder snapshot)
             if (_mode is BossMode bm && !string.IsNullOrEmpty(bm.LastDodgeAction))
                 _recorder.SetDodgeAction(bm.LastDodgeAction);
 
-            // Navigation ticks AFTER mode — mode sets up/updates paths, then nav executes movement.
-            // This prevents stale walk commands: the walk command always targets the current path,
-            // not a path that's about to be replaced.
-            // Only tick nav when no async action is in flight (cursor settle / key hold).
             if (canAct)
                 _navigation.Tick(GameController);
 
-            // Auto level gems (global, runs across all modes)
             TickGemLevelUp();
 
             return base.Tick();
@@ -776,7 +704,6 @@ namespace AutoExile
             if (!Settings.Enable || !GameController.InGame)
                 return;
 
-            // Toggle running hotkey — checked in Render so it's never blocked by early returns in Tick
             if (Settings.ToggleRunning.PressedOnce())
             {
                 Settings.Running.Value = !Settings.Running.Value;
@@ -792,58 +719,57 @@ namespace AutoExile
 
             UpdateDebugRangeCircle();
 
-            // Status overlay
             var running = Settings.Running.Value;
             var color = running ? SharpDX.Color.LimeGreen : SharpDX.Color.Yellow;
             var status = running ? $"BOT: {_mode.Name}" : $"BOT: PAUSED ({_mode.Name})";
             Graphics.DrawText(status, new Vector2(100, 80), color);
 
-            // Runtime line — shows elapsed (always) + remaining (when limit set).
-            // Pause time is excluded automatically by RuntimeTracker.
-            var maxMin   = Settings.Run.MaxRuntimeMinutes.Value;
-            var elapsed  = _runtime.ActiveDuration;
+            var maxMin = Settings.Run.MaxRuntimeMinutes.Value;
+            var elapsed = _runtime.ActiveDuration;
             var elapsedStr = $"{(int)elapsed.TotalHours}:{elapsed.Minutes:D2}";
             string runtimeText;
             SharpDX.Color runtimeColor;
             if (maxMin <= 0)
             {
-                runtimeText  = $"Runtime: {elapsedStr} (no limit)";
+                runtimeText = $"Runtime: {elapsedStr} (no limit)";
                 runtimeColor = SharpDX.Color.LightGray;
             }
             else
             {
                 var remaining = _runtime.Remaining(maxMin);
                 var remStr = $"{(int)remaining.TotalHours}:{remaining.Minutes:D2}";
-                runtimeText  = $"Runtime: {elapsedStr} / {maxMin / 60}:{(maxMin % 60):D2}  (stopping in {remStr})";
-                // Amber at last 10%, red at last 5 minutes
+                runtimeText = $"Runtime: {elapsedStr} / {maxMin / 60}:{(maxMin % 60):D2}  (stopping in {remStr})";
                 var pctLeft = (double)remaining.TotalMinutes / maxMin;
                 runtimeColor = remaining.TotalMinutes < 5 ? SharpDX.Color.Red
-                            :  pctLeft < 0.10              ? SharpDX.Color.Orange
-                            :                                SharpDX.Color.LightGray;
+                            : pctLeft < 0.10 ? SharpDX.Color.Orange
+                            : SharpDX.Color.LightGray;
             }
             Graphics.DrawText(runtimeText, new Vector2(100, 96), runtimeColor);
 
-            // Human recorder indicator
             if (_humanRecorder.IsRecording)
             {
                 var recText = $"REC  {_humanRecorder.TicksRecorded} ticks";
                 Graphics.DrawText(recText, new Vector2(100, 116), SharpDX.Color.Red);
             }
 
-            // Loot tracker overlay (top-right area)
             var winWidth = GameController.Window.GetWindowRectangle().Width;
             _lootTracker.Render(Graphics, new Vector2(winWidth - 250, 80));
 
-            // Pass graphics to context for mode rendering
+            // Exception-safe mode render
             _ctx.Graphics = Graphics;
-            _mode.Render(_ctx);
+            try
+            {
+                _mode.Render(_ctx);
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"[AutoExile] Exception in {_mode.Name}.Render: {ex.Message}");
+            }
 
-            // Ritual shop overlay — always render when shop is open, regardless of mode
             RitualMechanic.RenderShopOverlay(_ctx, Graphics, GameController);
 
             _ctx.Graphics = null;
 
-            // Incubator debug overlay — shows when stash/inventory is open and setting enabled
             if (Settings.DebugIncubatorOverlay.Value &&
                 (GameController.IngameState.IngameUi.StashElement?.IsVisible == true ||
                  GameController.IngameState.IngameUi.InventoryPanel?.IsVisible == true))
@@ -851,13 +777,9 @@ namespace AutoExile
                 _stash.RenderDebugIncubators(Graphics, GameController);
             }
 
-            // Tile signature overlay (F8)
             RenderTileSignatures();
-
-            // Boss position overlay (always visible when data exists for current map)
             RenderBossMarker();
 
-            // Debug range circle overlay
             if (DateTime.Now < _debugCircleExpiry && _debugCircleRadius > 0 && GameController.Player != null)
             {
                 var playerPos = GameController.Player.PosNum;
@@ -867,10 +789,13 @@ namespace AutoExile
                     (float)worldRadius, SharpDX.Color.Yellow, 2f);
 
                 var camera = GameController.IngameState.Camera;
-                var labelScreen = camera.WorldToScreen(playerPos);
-                Graphics.DrawText(_debugCircleLabel,
-                    new System.Numerics.Vector2(labelScreen.X - 40, labelScreen.Y - 60),
-                    SharpDX.Color.Yellow);
+                if (camera != null)
+                {
+                    var labelScreen = camera.WorldToScreen(playerPos);
+                    Graphics.DrawText(_debugCircleLabel,
+                        new System.Numerics.Vector2(labelScreen.X - 40, labelScreen.Y - 60),
+                        SharpDX.Color.Yellow);
+                }
             }
         }
 
@@ -1096,6 +1021,8 @@ namespace AutoExile
                 List<float[]>? navPath = null;
                 try { navPath = MapRenderer.CollectNavPath(_navigation); } catch { }
 
+                var heistState = (_mode as HeistMode)?.State;
+
                 _webServer.UpdateStatus(new BotStatusSnapshot
                 {
                     Running = Settings.Running.Value,
@@ -1126,11 +1053,11 @@ namespace AutoExile
                     MapsCompleted = _lootTracker.MapsCompleted,
                     SessionDuration = _lootTracker.SessionDuration.TotalSeconds > 0
                         ? _lootTracker.SessionDuration.ToString(@"hh\:mm\:ss") : "",
-                    RuntimeActiveSeconds    = (int)_runtime.ActiveDuration.TotalSeconds,
+                    RuntimeActiveSeconds = (int)_runtime.ActiveDuration.TotalSeconds,
                     RuntimeRemainingSeconds = Settings.Run.MaxRuntimeMinutes.Value > 0
                         ? (int)_runtime.Remaining(Settings.Run.MaxRuntimeMinutes.Value).TotalSeconds
                         : 0,
-                    RuntimeMaxMinutes       = Settings.Run.MaxRuntimeMinutes.Value,
+                    RuntimeMaxMinutes = Settings.Run.MaxRuntimeMinutes.Value,
                     // Simulacrum stats
                     SimWave = _simulacrumMode?.State.CurrentWave ?? 0,
                     SimWaveActive = _simulacrumMode?.State.IsWaveActive ?? false,
@@ -1158,6 +1085,12 @@ namespace AutoExile
                     FarmStrategy = _mode is Modes.WaveFarm.WaveFarmMode ? "Wave Farm" : "",
                     FarmRuns = (_mode as Modes.WaveFarm.WaveFarmMode)?.RunsCompleted ?? 0,
                     FarmPhase = (_mode as Modes.WaveFarm.WaveFarmMode)?.Status ?? "",
+
+                    // Heist stats
+                    HeistAlertPercent = Sanitize(heistState?.AlertPercent ?? 0f),
+                    HeistLockdown = heistState?.IsLockdown ?? false,
+                    HeistPhase = (_mode as HeistMode)?.Phase.ToString() ?? "",
+                    HeistTarget = heistState?.CurrentTarget?.Label ?? (_mode as HeistMode)?.Decision ?? "",
 
                     // Labyrinth stats
                     LabIzaroEncounters = _labyrinthMode?.State.IzaroEncounterCount ?? 0,
@@ -2069,24 +2002,25 @@ namespace AutoExile
                 options.AddRange(names);
 
                 // Update central stash dropdowns — save/restore current values.
-                // Preserve user-saved names even when not in the current live list:
-                // include them as extra options instead of clearing them. Without
-                // this, opening a stash that doesn't have your supplies tab visible
-                // (premium tabs, scrolled offscreen) would silently wipe the setting.
-                var savedDump     = Settings.Stash.DumpTabName.Value;
+                var savedDump = Settings.Stash.DumpTabName.Value;
                 var savedFragment = Settings.Stash.FragmentTabName.Value;
                 var savedSupplies = Settings.Stash.MappingSuppliesTabName.Value;
+                var savedBlightMap = Settings.Blight.BlightMapTabName.Value;
 
-                var dumpOptions     = WithSavedOption(options, savedDump);
+                var dumpOptions = WithSavedOption(options, savedDump);
                 var fragmentOptions = WithSavedOption(options, savedFragment);
                 var suppliesOptions = WithSavedOption(options, savedSupplies);
+                var blightMapOptions = WithSavedOption(options, savedBlightMap);
 
                 Settings.Stash.DumpTabName.SetListValues(dumpOptions);
                 Settings.Stash.FragmentTabName.SetListValues(fragmentOptions);
                 Settings.Stash.MappingSuppliesTabName.SetListValues(suppliesOptions);
-                Settings.Stash.DumpTabName.Value            = savedDump;
-                Settings.Stash.FragmentTabName.Value        = savedFragment;
+                Settings.Blight.BlightMapTabName.SetListValues(blightMapOptions);
+
+                Settings.Stash.DumpTabName.Value = savedDump;
+                Settings.Stash.FragmentTabName.Value = savedFragment;
                 Settings.Stash.MappingSuppliesTabName.Value = savedSupplies;
+                Settings.Blight.BlightMapTabName.Value = savedBlightMap;
             }
             catch { /* stash API can throw during zone transitions */ }
         }

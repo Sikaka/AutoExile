@@ -106,11 +106,11 @@ namespace AutoExile.Systems
                 return false;
 
             // Reset config — every Start() is a clean slate.
-            StoreTabName         = storeTabName;
-            WithdrawTabName      = withdrawTabName;
+            StoreTabName = storeTabName;
+            WithdrawTabName = withdrawTabName;
             WithdrawFragmentPath = withdrawFragmentPath;
-            WithdrawCount        = withdrawCount;
-            ItemFilter           = itemFilter;
+            WithdrawCount = withdrawCount;
+            ItemFilter = itemFilter;
 
             // Multi-item path: if a list is supplied, that wins over the single-item
             // fields. The single-item API is kept for Boss/Sim where fragmentPath/count
@@ -339,7 +339,7 @@ namespace AutoExile.Systems
                 {
                     _pendingTabSwitch = StoreTabName;
                     _afterTabSwitch = StashPhase.StoreItems;
-        
+
                     _phase = StashPhase.SwitchToStoreTab;
                     _phaseStartTime = DateTime.Now;
                     Status = $"Switching to {StoreTabName} tab for storing";
@@ -464,14 +464,9 @@ namespace AutoExile.Systems
                 return StashResult.Failed;
             }
 
-            // Wait for any in-flight batch to complete before evaluating again.
-            // The batch holds Ctrl down across all clicks; we don't want to start a
-            // second batch while one is mid-flight or it'll race with Ctrl release.
             if (BotInput.IsBatchRunning)
                 return StashResult.InProgress;
 
-            // Resolve the current target — either WithdrawList[index] (multi-item)
-            // or the legacy single-item path. The two are mutually exclusive at Start().
             string? currentPath;
             int wantTotal;
             if (WithdrawList.Count > 0)
@@ -496,25 +491,23 @@ namespace AutoExile.Systems
                 return StashResult.InProgress;
             }
 
-            // Inventory-aware stopping — bail when we have enough. Handles BOTH
-            // stackable items (one ctrl+click transfers the whole stack) and
-            // non-stackable items (one ctrl+click per slot).
-            int haveInInv = CountInventoryItems(gc, currentPath);
+            bool isBlightStandard = currentPath == BlightMapIdentifier;
+            bool isBlightRavaged = currentPath == BlightRavagedMapIdentifier;
+            bool isBlightSearch = isBlightStandard || isBlightRavaged;
+
+            int haveInInv = isBlightSearch
+                ? CountBlightMaps(gc, ravagedOnly: isBlightRavaged)
+                : CountInventoryItems(gc, currentPath);
+
             if (haveInInv >= wantTotal)
             {
                 AdvanceOrFinishWithdraw(gc);
                 return StashResult.InProgress;
             }
 
-            // Settle window after each batch — gives the UI time to update so
-            // CountInventoryItems reflects the just-transferred items before we
-            // launch another batch.
             if ((DateTime.Now - _lastActionTime).TotalMilliseconds < ActionCooldownMs)
                 return StashResult.InProgress;
 
-            // Find ALL matching items in the visible stash tab. Batch-clicking ONE
-            // position N times only works for stacks; for non-stackable items
-            // (maps) each one occupies a different slot and we need to click each.
             var items = stashEl.VisibleStash?.VisibleInventoryItems;
             if (items == null)
             {
@@ -525,30 +518,51 @@ namespace AutoExile.Systems
 
             var windowRect = gc.Window.GetWindowRectangle();
             var positions = new List<Vector2>();
+            int neededDeficit = wantTotal - haveInInv;
+
             foreach (var item in items)
             {
                 var entity = item.Entity;
-                if (entity?.Path?.Contains(currentPath, StringComparison.OrdinalIgnoreCase) == true)
+                if (entity == null) continue;
+
+                bool isMatch = isBlightSearch
+                    ? IsBlightMapEntity(entity, ravagedOnly: isBlightRavaged)
+                    : entity.Path?.Contains(currentPath, StringComparison.OrdinalIgnoreCase) == true;
+
+                if (isMatch)
                 {
                     var rect = item.GetClientRect();
                     positions.Add(new Vector2(
                         windowRect.X + rect.Center.X,
                         windowRect.Y + rect.Center.Y));
+
+                    bool isStackable = entity.TryGetComponent<Stack>(out _);
+                    if (isStackable)
+                    {
+                        break;
+                    }
+                    else
+                    {
+                        if (positions.Count >= neededDeficit)
+                            break;
+                    }
                 }
             }
 
             if (positions.Count == 0)
             {
-                Status = $"'{currentPath}' not found in tab ({haveInInv}/{wantTotal} have) — skipping";
+                string label = isBlightRavaged ? "Blight-Ravaged maps" : isBlightStandard ? "Blighted maps" : $"'{currentPath}'";
+                Status = $"{label} not found in tab ({haveInInv}/{wantTotal} have) — skipping";
                 AdvanceOrFinishWithdraw(gc);
                 return StashResult.InProgress;
             }
 
-            Status = $"Withdrawing '{currentPath}' ({haveInInv}/{wantTotal}, {positions.Count} stash slots)";
-            // CtrlClickBatch holds Ctrl down across every click in one async pass,
-            // then releases. Items get transferred (stacks fully, single items one-per-click).
-            // After the batch completes, IsBatchRunning flips back to false; the
-            // settle window above lets inventory state catch up before we re-evaluate.
+            Status = isBlightRavaged
+                ? $"Withdrawing Blight-Ravaged Maps ({haveInInv}/{wantTotal})"
+                : isBlightStandard
+                    ? $"Withdrawing Blighted Maps ({haveInInv}/{wantTotal})"
+                    : $"Withdrawing '{currentPath}' ({haveInInv}/{wantTotal})";
+
             BotInput.CtrlClickBatch(positions);
             _lastActionTime = DateTime.Now;
             return StashResult.InProgress;
@@ -656,17 +670,23 @@ namespace AutoExile.Systems
         }
 
         /// <summary>
-        /// Count inventory items matching a path substring.
+        /// Count inventory items matching a path substring, respecting stack size.
         /// </summary>
         public static int CountInventoryItems(GameController gc, string? pathSubstring)
         {
             var items = GetInventorySlotItems(gc);
             if (items == null || string.IsNullOrEmpty(pathSubstring)) return 0;
             int count = 0;
-            foreach (var item in items)
+            foreach (var slotItem in items)
             {
-                if (item.Item?.Path?.Contains(pathSubstring, StringComparison.OrdinalIgnoreCase) == true)
-                    count++;
+                var item = slotItem.Item;
+                if (item?.Path?.Contains(pathSubstring, StringComparison.OrdinalIgnoreCase) == true)
+                {
+                    if (item.TryGetComponent<Stack>(out var stack) && stack.Size > 0)
+                        count += stack.Size;
+                    else
+                        count += 1;
+                }
             }
             return count;
         }
@@ -1106,6 +1126,40 @@ namespace AutoExile.Systems
             {
                 g.DrawText($"IncubatorDebug error: {ex.Message}", new Vector2(10, 200), SharpDX.Color.Red);
             }
+        }
+
+        public const string BlightMapIdentifier = "__BlightMap__";
+        public const string BlightRavagedMapIdentifier = "__BlightRavagedMap__";
+
+        /// <summary>
+        /// Identifies if an entity is a standard Blighted Map or a Blight-Ravaged Map.
+        /// </summary>
+        public static bool IsBlightMapEntity(Entity? entity, bool ravagedOnly = false)
+        {
+            if (entity == null) return false;
+            if (entity.Path == null || !entity.Path.Contains("Maps/")) return false;
+            if (!entity.TryGetComponent<Mods>(out var mods) || mods.ItemMods == null) return false;
+
+            bool isRavaged = mods.ItemMods.Any(m => m.RawName.StartsWith("UberInfectedMap"));
+            bool isStandardBlight = mods.ItemMods.Any(m => m.RawName == "InfectedMap") && !isRavaged;
+
+            return ravagedOnly ? isRavaged : isStandardBlight;
+        }
+
+        /// <summary>
+        /// Count either standard Blighted maps or Blight-Ravaged maps in player inventory.
+        /// </summary>
+        public static int CountBlightMaps(GameController gc, bool ravagedOnly = false)
+        {
+            var items = GetInventorySlotItems(gc);
+            if (items == null) return 0;
+            int count = 0;
+            foreach (var slotItem in items)
+            {
+                if (IsBlightMapEntity(slotItem.Item, ravagedOnly))
+                    count++;
+            }
+            return count;
         }
     }
 

@@ -1,3 +1,4 @@
+
 using ExileCore;
 using ExileCore.PoEMemory;
 using ExileCore.PoEMemory.MemoryObjects;
@@ -7,8 +8,8 @@ using System.Numerics;
 namespace AutoExile.Modes.Shared
 {
     /// <summary>
-    /// Shared hideout flow: settle → stash → open map via MapDevice → enter portal.
-    /// Used by BlightMode and SimulacrumMode to replace 5 duplicated hideout methods.
+    /// Shared hideout flow: settle → stash (clean inventory first) → open map via MapDevice → enter portal.
+    /// Used by BlightMode and other modes to handle clean hideout cycling.
     /// </summary>
     public class HideoutFlow
     {
@@ -16,26 +17,19 @@ namespace AutoExile.Modes.Shared
         private DateTime _phaseStartTime = DateTime.Now;
         private DateTime _lastActionTime = DateTime.MinValue;
 
-        // Configuration set via Start()
         private Func<Element, bool>? _mapFilter;
         private Func<ServerInventory.InventSlotItem, bool>? _stashItemFilter;
         private string? _targetMapName;
         private string? _inventoryFragmentPath;
         private int _minMapTier;
-        private int _stashItemThreshold; // only stash when item count >= this (0 = always stash)
+        private int _stashItemThreshold;
         private string? _dumpTabName;
         private string? _resourceTabName;
         private string? _withdrawFragmentPath;
-        private int _fragmentStock; // target number of fragments to maintain in inventory
-        private int _minFragments; // minimum fragments needed to open (0 = any amount works)
+        private int _fragmentStock;
+        private int _minFragments;
 
-        // Multi-item withdrawal (Wave Farming uses this for scarabs + portal scrolls
-        // + maps in one stash trip). Mutually exclusive with the single _withdrawFragmentPath
-        // path — when both are set, the list wins.
         private IReadOnlyList<(string PathSubstring, int Count)>? _withdrawList;
-
-        // Scarab path substrings to insert into the map device after the map is loaded.
-        // Set by Wave Farming; null/empty for Boss/Sim (they don't use scarabs).
         private IReadOnlyList<string>? _scarabPaths;
 
         private const float BasePortalTimeoutSeconds = 15f;
@@ -45,9 +39,6 @@ namespace AutoExile.Modes.Shared
         public string Status { get; private set; } = "";
         public bool IsActive => _phase != HideoutPhase.Idle;
 
-        /// <summary>
-        /// Start a full hideout flow: settle → stash → open map → enter portal.
-        /// </summary>
         public void Start(Func<Element, bool> mapFilter,
             Func<ServerInventory.InventSlotItem, bool>? stashItemFilter = null,
             string? targetMapName = null, int minMapTier = 0,
@@ -79,9 +70,6 @@ namespace AutoExile.Modes.Shared
             Status = "Hideout — settling";
         }
 
-        /// <summary>
-        /// Start portal re-entry flow (after death): find portal → navigate → click.
-        /// </summary>
         public void StartPortalReentry()
         {
             _mapFilter = null;
@@ -90,9 +78,6 @@ namespace AutoExile.Modes.Shared
             Status = "Re-entering map via portal";
         }
 
-        /// <summary>
-        /// Tick the hideout flow. Returns a signal for the mode to act on.
-        /// </summary>
         public HideoutSignal Tick(BotContext ctx)
         {
             switch (_phase)
@@ -129,8 +114,6 @@ namespace AutoExile.Modes.Shared
             Status = "";
         }
 
-        // ── Phases ──
-
         private HideoutSignal TickSettle(BotContext ctx)
         {
             var elapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
@@ -140,10 +123,12 @@ namespace AutoExile.Modes.Shared
                 return HideoutSignal.InProgress;
             }
 
-            // ── Multi-item path (Wave Farming) ────────────────────────────
-            // When _withdrawList is set, compute which entries are still under-stocked
-            // and rebuild the StashSystem withdrawal list accordingly. This is the
-            // "withdraw scarabs + portals + maps each run" path.
+            // Always prioritise checking for loot/stashable items to clean inventory first
+            int lootItems = StashSystem.CountNonMatchingItems(ctx.Game, _withdrawFragmentPath);
+            bool hasStashables = StashSystem.HasStashableItems(ctx.Game, _stashItemFilter);
+            bool needStore = hasStashables && (_stashItemThreshold <= 0 || lootItems >= _stashItemThreshold);
+
+            // Multi-item path
             List<(string PathSubstring, int Count)>? activeWithdrawList = null;
             int totalNeededFromList = 0;
             if (_withdrawList != null && !string.IsNullOrWhiteSpace(_resourceTabName))
@@ -151,7 +136,14 @@ namespace AutoExile.Modes.Shared
                 activeWithdrawList = new List<(string, int)>();
                 foreach (var (path, target) in _withdrawList)
                 {
-                    var have = StashSystem.CountInventoryItems(ctx.Game, path);
+                    int have;
+                    if (path == StashSystem.BlightMapIdentifier)
+                        have = StashSystem.CountBlightMaps(ctx.Game, ravagedOnly: false);
+                    else if (path == StashSystem.BlightRavagedMapIdentifier)
+                        have = StashSystem.CountBlightMaps(ctx.Game, ravagedOnly: true);
+                    else
+                        have = StashSystem.CountInventoryItems(ctx.Game, path);
+
                     var need = target - have;
                     if (need > 0)
                     {
@@ -159,14 +151,18 @@ namespace AutoExile.Modes.Shared
                         totalNeededFromList += need;
                     }
                 }
-                if (activeWithdrawList.Count == 0) activeWithdrawList = null; // fully stocked
+                if (activeWithdrawList.Count == 0) activeWithdrawList = null;
             }
 
-            // Count fragments and non-fragment loot in inventory (single-item path)
-            int fragmentsInInventory = StashSystem.CountInventoryItems(ctx.Game, _withdrawFragmentPath);
-            int lootItems = StashSystem.CountNonMatchingItems(ctx.Game, _withdrawFragmentPath);
+            // Single-item path
+            int fragmentsInInventory;
+            if (_withdrawFragmentPath == StashSystem.BlightMapIdentifier)
+                fragmentsInInventory = StashSystem.CountBlightMaps(ctx.Game, ravagedOnly: false);
+            else if (_withdrawFragmentPath == StashSystem.BlightRavagedMapIdentifier)
+                fragmentsInInventory = StashSystem.CountBlightMaps(ctx.Game, ravagedOnly: true);
+            else
+                fragmentsInInventory = StashSystem.CountInventoryItems(ctx.Game, _withdrawFragmentPath);
 
-            // Only withdraw when below minimum needed — don't top up each run
             bool usesFragments = !string.IsNullOrEmpty(_withdrawFragmentPath);
             int minNeeded = _minFragments > 0 ? _minFragments : 1;
             bool canWithdraw = usesFragments
@@ -177,40 +173,35 @@ namespace AutoExile.Modes.Shared
             bool needMultiWithdraw = activeWithdrawList != null;
             bool needWithdraw = needSingleWithdraw || needMultiWithdraw;
 
-            // Not enough fragments and no way to get more — signal stop (only for modes that use fragments)
-            if (usesFragments && fragmentsInInventory < minNeeded && !canWithdraw)
-            {
-                Status = "No fragments in inventory";
-                _phase = HideoutPhase.Idle;
-                return HideoutSignal.NoFragments;
-            }
-
-            // Stash loot only if non-fragment items exceed threshold
-            bool needStore = false;
-            if (StashSystem.HasStashableItems(ctx.Game, _stashItemFilter))
-                needStore = _stashItemThreshold <= 0 || lootItems >= _stashItemThreshold;
-
-            if (needWithdraw || needStore)
+            // Prioritise cleaning the inventory first if any loot exists
+            if (needStore || needWithdraw)
             {
                 _phase = HideoutPhase.Stash;
                 _phaseStartTime = DateTime.Now;
                 ctx.Stash.Start(
                     storeTabName:         needStore    ? _dumpTabName          : null,
                     withdrawTabName:      needWithdraw ? _resourceTabName      : null,
-                    // Single-item fields only used when there's no multi-item list.
                     withdrawFragmentPath: needMultiWithdraw ? null : (needSingleWithdraw ? _withdrawFragmentPath : null),
                     withdrawCount:        needMultiWithdraw ? 0    : withdrawNeeded,
                     itemFilter:           needStore ? _stashItemFilter : (_ => false),
                     withdrawList:         activeWithdrawList);
+
                 var parts = new List<string>();
-                if (needSingleWithdraw) parts.Add($"withdraw {withdrawNeeded} fragments");
-                if (needMultiWithdraw)  parts.Add($"withdraw {totalNeededFromList} items ({activeWithdrawList!.Count} types)");
-                if (needStore) parts.Add($"stash {lootItems} loot items");
+                if (needStore) parts.Add($"cleaning inventory ({lootItems} items)");
+                if (needSingleWithdraw) parts.Add($"withdraw {withdrawNeeded} items");
+                if (needMultiWithdraw)  parts.Add($"withdraw {totalNeededFromList} items");
                 Status = string.Join(" & ", parts);
                 return HideoutSignal.InProgress;
             }
 
-            // No items — open map
+            if (usesFragments && fragmentsInInventory < minNeeded && !canWithdraw)
+            {
+                Status = "No maps/fragments in inventory";
+                _phase = HideoutPhase.Idle;
+                return HideoutSignal.NoFragments;
+            }
+
+            // No stashing needed — proceed to map device
             _phase = HideoutPhase.OpenMap;
             _phaseStartTime = DateTime.Now;
             StartMapDevice(ctx);
@@ -226,22 +217,28 @@ namespace AutoExile.Modes.Shared
                 case StashResult.Succeeded:
                 case StashResult.Failed:
                 {
-                    // Verify we have enough fragments before proceeding to map device
                     if (!string.IsNullOrEmpty(_withdrawFragmentPath) && !string.IsNullOrEmpty(_resourceTabName))
                     {
-                        int frags = StashSystem.CountInventoryItems(ctx.Game, _withdrawFragmentPath);
+                        int frags;
+                        if (_withdrawFragmentPath == StashSystem.BlightMapIdentifier)
+                            frags = StashSystem.CountBlightMaps(ctx.Game, ravagedOnly: false);
+                        else if (_withdrawFragmentPath == StashSystem.BlightRavagedMapIdentifier)
+                            frags = StashSystem.CountBlightMaps(ctx.Game, ravagedOnly: true);
+                        else
+                            frags = StashSystem.CountInventoryItems(ctx.Game, _withdrawFragmentPath);
+
                         int needed = _minFragments > 0 ? _minFragments : 1;
                         if (frags < needed)
                         {
-                            Status = $"Not enough fragments ({frags}/{needed}) — stopping";
+                            Status = $"Not enough maps/fragments ({frags}/{needed}) — stopping";
                             _phase = HideoutPhase.Idle;
                             return HideoutSignal.NoFragments;
                         }
                     }
 
                     Status = result == StashResult.Succeeded
-                        ? $"Stash done ({ctx.Stash.ItemsStored} stored) — opening map"
-                        : $"Stash issue: {ctx.Stash.Status} — opening map anyway";
+                        ? $"Stash cleaned ({ctx.Stash.ItemsStored} stored) — opening map"
+                        : $"Stash status: {ctx.Stash.Status} — opening map";
                     _phase = HideoutPhase.OpenMap;
                     _phaseStartTime = DateTime.Now;
                     StartMapDevice(ctx);
@@ -274,7 +271,6 @@ namespace AutoExile.Modes.Shared
             {
                 case MapDeviceResult.Succeeded:
                     Status = "Map opened — entering";
-                    // Area change will fire when player enters the portal
                     break;
                 case MapDeviceResult.Failed:
                     Status = $"Map device failed: {ctx.MapDevice.Status}";
@@ -306,7 +302,6 @@ namespace AutoExile.Modes.Shared
                 return HideoutSignal.PortalTimeout;
             }
 
-            // Close any open panels (stash/inventory) before clicking portal
             if (gc.IngameState.IngameUi.StashElement?.IsVisible == true ||
                 gc.IngameState.IngameUi.InventoryPanel?.IsVisible == true)
             {
@@ -319,9 +314,6 @@ namespace AutoExile.Modes.Shared
                 return HideoutSignal.InProgress;
             }
 
-            // Use InteractionSystem for portal clicking — handles navigation,
-            // screen bounds, click verification, and retries automatically.
-            // InteractionSystem is already ticked by the mode before this runs.
             if (ctx.Interaction.IsBusy)
             {
                 Status = $"Entering portal: {ctx.Interaction.Status}";

@@ -155,11 +155,25 @@ namespace AutoExile
             [Menu("Path Merge Threshold", "Merge consecutive walk waypoints closer than this (grid units). Reduces micro-stutter on stairs/gradients. 0 = disabled. Higher = smoother but may clip tight corners.")]
             public RangeNode<int> PathMergeThreshold { get; set; } = new RangeNode<int>(8, 0, 20);
 
+            // ── Periodic Combat Repositioning ──
+
+            [Menu("Enable Periodic Repositioning", "Periodically step to a new position during combat to avoid ground degens, Delirium pods, and corpse explosions.")]
+            public ToggleNode EnablePeriodicReposition { get; set; } = new ToggleNode(true);
+
+            [Menu("Reposition Interval (ms)", "How often in milliseconds to step to a new spot during combat.")]
+            public RangeNode<int> PeriodicRepositionIntervalMs { get; set; } = new RangeNode<int>(2500, 1000, 5000);
+
+            [Menu("Reposition Distance", "Distance in grid units to step when repositioning.")]
+            public RangeNode<float> PeriodicRepositionDistance { get; set; } = new RangeNode<float>(18f, 10f, 30f);
+
             // ── Skill Slots ──
             // Configure each skill on your bar: what key it's bound to, what role it plays,
             // and its priority (higher = checked first during combat).
             // One slot should be PrimaryMovement (your Move Only key).
             // Movement skills (dash/blink) use the MovementSkill role.
+
+            [Menu("Always Attack", "Continuously attack any nearby enemy without strict line-of-sight requirements. Uses movement skills (Blink/Dash) to move.")]
+            public ToggleNode AlwaysAttack { get; set; } = new ToggleNode(true);
 
             public SkillSlotConfig Skill1 { get; set; } = new SkillSlotConfig(Keys.T, SkillRole.PrimaryMovement);
             public SkillSlotConfig Skill2 { get; set; } = new SkillSlotConfig(Keys.Q);
@@ -436,6 +450,9 @@ namespace AutoExile
             [Menu("Min Coverage", "Minimum map exploration % before clearing is considered done. Higher = more thorough clear.")]
             public RangeNode<float> MinCoverage { get; set; } = new RangeNode<float>(0.85f, 0f, 1f);
 
+            [Menu("Exit When Mobs Remaining <", "Instantly exit the map when remaining monsters drop below this threshold. 0 = disabled (clears full map).")]
+            public RangeNode<int> MaxRemainingMonsters { get; set; } = new RangeNode<int>(10, 0, 50);
+
             // ── Atlas setup (pre-populated by strategy defaults, user can override) ──
 
             [Menu("Witness Type", "Which endgame witness to use. Strategies pre-populate this but you can override.")]
@@ -628,31 +645,46 @@ namespace AutoExile
         [Submenu(CollapsedByDefault = true)]
         public class BlightSettings
         {
-            [Menu("Ignore Currency", "Skip currency checks when building/upgrading towers (debug: use if currency UI isn't being read).")]
+            [Menu("Run Blight-Ravaged Maps", "When enabled, runs Blight-Ravaged maps instead of standard Blighted maps. (Runs either/or, never both).")]
+            public ToggleNode RunBlightRavaged { get; set; } = new ToggleNode(false);
+            
+            [Menu("Blight Map Stash Tab", "Stash tab to pull Blighted maps from when the Atlas device and inventory run out. Leave empty to disable auto-refill.")]
+            public ListNode BlightMapTabName { get; set; } = new ListNode { Value = "" };
+
+            [Menu("Blight Map Stock", "How many Blighted maps to withdraw from stash into inventory when running low (1-20).")]
+            public RangeNode<int> BlightMapStock { get; set; } = new RangeNode<int>(1, 1, 20);
+
+            [Menu("Stand at Tower", "When enabled, forces the player to hold position near the blight pump/tower until the timer finishes, preventing early wandering or distant sweeping.")]
+            public ToggleNode StandAtTower { get; set; } = new ToggleNode(false);
+
+            [Menu("Don't Build Towers", "When enabled, disables all tower building and upgrading actions during the Blight encounter.")]
+            public ToggleNode DontBuildTowers { get; set; } = new ToggleNode(false);
+
+            [Menu("Ignore Currency", "Skip currency checks when building/upgrading towers (debug mode for when currency UI is unreadable).")]
             public ToggleNode IgnoreCurrency { get; set; } = new ToggleNode(false);
 
-            [Menu("Tower Build Radius", "Max grid distance from pump to consider foundations for building.")]
+            [Menu("Tower Build Radius (grid units)", "Maximum distance in grid units from the pump to consider foundations for building towers.")]
             public RangeNode<float> TowerBuildRadius { get; set; } = new RangeNode<float>(90f, 40f, 200f);
 
-            [Menu("Tower Build Cooldown (ms)", "Min time between starting new tower builds (not clicks).")]
+            [Menu("Tower Build Cooldown (ms)", "Minimum time in milliseconds between starting new tower builds.")]
             public RangeNode<int> TowerBuildCooldownMs { get; set; } = new RangeNode<int>(3000, 500, 10000);
 
-            [Menu("Tower Click Cooldown (ms)", "Min time between individual click actions (label, menu button).")]
+            [Menu("Tower Click Cooldown (ms)", "Minimum time in milliseconds between individual tower UI click actions.")]
             public RangeNode<int> TowerClickCooldownMs { get; set; } = new RangeNode<int>(200, 50, 1000);
 
-            [Menu("Tower Approach Distance", "Navigate this close to towers before clicking — close enough to see full build/upgrade UI (grid units).")]
+            [Menu("Tower Approach Distance (grid units)", "Distance in grid units the bot must walk to a tower before clicking to open its build/upgrade menu.")]
             public RangeNode<float> TowerApproachDistance { get; set; } = new RangeNode<float>(25f, 10f, 60f);
 
-            [Menu("Sweep Delay After Timer (s)", "Wait this long after timer ends before starting sweep (mobs still spawning).")]
+            [Menu("Sweep Delay After Timer (seconds)", "Time in seconds to wait at the pump after the encounter timer ends before starting to sweep for remaining monsters.")]
             public RangeNode<float> SweepDelayAfterTimerSeconds { get; set; } = new RangeNode<float>(30f, 5f, 60f);
 
-            [Menu("Sweep Timeout (s)", "Max time in sweep phase with no monsters found before giving up. Resets when monsters are found or killed.")]
+            [Menu("Sweep Timeout (seconds)", "Maximum time in seconds allowed in the sweep phase without seeing any monsters before giving up and opening chests.")]
             public RangeNode<float> SweepTimeoutSeconds { get; set; } = new RangeNode<float>(180f, 60f, 600f);
 
-            [Menu("Sweep Pump Return (s)", "Max seconds away from pump before forced return — refreshes encounter state and checks for threats from other directions.")]
+            [Menu("Sweep Pump Return (seconds)", "Maximum time in seconds the bot can spend away from the pump during sweep before forcing a return to refresh state and check threats.")]
             public RangeNode<float> SweepPumpReturnSeconds { get; set; } = new RangeNode<float>(30f, 10f, 60f);
 
-            [Menu("Sweep Pump Radius", "Grid distance from pump considered 'near pump' — resets the return timer when inside this radius.")]
+            [Menu("Sweep Pump Radius (grid units)", "Distance in grid units from the pump considered 'near pump' — resets the return timer when inside this area.")]
             public RangeNode<float> SweepPumpRadius { get; set; } = new RangeNode<float>(80f, 30f, 150f);
 
             public TowerTypeSettings Chilling { get; set; } = new TowerTypeSettings(5, canStack: false, tier3Branch: "None");

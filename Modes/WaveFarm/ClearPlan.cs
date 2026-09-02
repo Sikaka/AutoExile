@@ -125,25 +125,38 @@ namespace AutoExile.Modes.WaveFarm
             ctx.Log($"[ClearPlan] Initialized: {PendingCount} pending of {_regions.Count} regions (bubble={Pathfinding.NetworkBubbleRadius:F0}g)");
         }
 
+        private bool _hasLoggedStall = false;
+
         public void Update(BotContext ctx, Vector2 playerPos)
         {
             if (!_initialized) return;
 
+            // Pause/refresh the 45s exploration timer while an active mechanic is running
+            if (ctx.Mechanics.ActiveMechanic != null || ctx.Interaction.IsBusy)
+            {
+                _planLastProgress = DateTime.Now;
+            }
+
+            // Global safety bail after 45s of genuine no-progress
             if ((DateTime.Now - _planLastProgress).TotalSeconds > PlanStallSeconds)
             {
-                int abandoned = PendingCount;
-                foreach (var r in _regions.Values) if (!r.Visited) r.Visited = true;
-                _currentObserver = null;
-                _currentObserverRegionIndex = -1;
-                Status = "plan stall — giving up";
-                ctx.Log($"[ClearPlan] Global stall after {PlanStallSeconds}s — abandoning {abandoned} regions");
+                if (!_hasLoggedStall)
+                {
+                    int abandoned = PendingCount;
+                    foreach (var r in _regions.Values) if (!r.Visited) r.Visited = true;
+                    _currentObserver = null;
+                    _currentObserverRegionIndex = -1;
+                    Status = "plan stall — giving up";
+                    ctx.Log($"[ClearPlan] Global stall after {PlanStallSeconds}s — abandoning {abandoned} regions");
+                    _hasLoggedStall = true;
+                }
                 return;
             }
 
-            // 1. Dwell check. Any pending region inside the bubble for DwellSeconds
-            //    gets marked observed — full stop. No kill-check, no loot-check.
-            //    Combat is handled by WaveTick's pack engagement as we pass through;
-            //    stragglers get chased by the post-observation hunt phase.
+            // Reset stall flag once making progress
+            _hasLoggedStall = false;
+
+            // 1. Dwell check — mark regions observed when inside bubble
             foreach (var r in _regions.Values)
             {
                 if (r.Visited) continue;
@@ -164,7 +177,7 @@ namespace AutoExile.Modes.WaveFarm
                 _planLastProgress = DateTime.Now;
             }
 
-            // 2. Reselect observer if the current one no longer covers any pending region.
+            // 2. Reselect observer if current one is finished
             if (_currentObserver.HasValue && !CurrentObserverStillUseful(playerPos, _currentObserver.Value))
             {
                 _currentObserver = null;
@@ -210,6 +223,7 @@ namespace AutoExile.Modes.WaveFarm
             _initialized = false;
             _zoneHash = 0;
             _planLastProgress = DateTime.MinValue;
+            _hasLoggedStall = false;
             Status = "";
         }
 

@@ -230,6 +230,10 @@ namespace AutoExile.Systems
         private readonly Keys[] _slotKeys = new Keys[8];
         private bool _keybindsLoaded;
 
+        private DateTime _lastIntersperseAttackAt = DateTime.MinValue;
+        private const int IntersperseAttackIntervalMs = 1000; // pulse attack every 1s while moving
+        private DateTime _lastPeriodicRepositionAt = DateTime.MinValue;
+        
         // ═══════════════════════════════════════════════════
         // Public API
         // ═══════════════════════════════════════════════════
@@ -253,7 +257,6 @@ namespace AutoExile.Systems
 
             if (!Profile.Enabled)
             {
-                // Release any active channel when combat is disabled
                 if (_activeChannel != null)
                 {
                     BotInput.ReleaseKey(_activeChannel.Key);
@@ -261,7 +264,7 @@ namespace AutoExile.Systems
                 }
                 InCombat = false;
                 NearbyMonsterCount = 0;
-            WeightedDensity = 0;
+                WeightedDensity = 0;
                 BestTarget = null;
                 LastAction = "disabled";
                 return false;
@@ -270,29 +273,26 @@ namespace AutoExile.Systems
             // Read vitals
             ReadVitals(gc);
 
-            // Scan threats (use entity cache when available for pre-filtered monster list)
+            // Scan threats (monsters in range)
             ScanThreats(gc, settings, ctx.Entities);
 
-            // Check if active channel should be released (target died, conditions changed, etc.)
+            // Check if active channel should be released
             ReleaseChannelIfNeeded(gc, settings);
 
-            // Refresh skill bar data periodically
+            // Refresh skill bar periodically
             RefreshSkillBar(gc, settings);
 
-            // Flasks (always check, even out of combat)
-            // Only one input per tick — prevent concurrent async input tasks
+            // Flasks
             TickFlasks(gc, settings);
-            if (!BotInput.CanAct) return false;
 
-            // Self-cast skills (buffs, guards, summons) fire regardless of InCombat.
-            // They don't move the cursor, so they're safe during navigation/interaction.
-            // Targeted skills still require InCombat (monsters in range + reachable).
+            // Self-cast skills (buffs, guards, summons)
             bool usedSkill = TickSelfSkills(gc, settings);
-            if (usedSkill) return true; // gate consumed, don't fire more this tick
+            if (usedSkill) return true;
 
-            if (!InCombat)
+            // If AlwaysAttack is enabled or monsters are in combat range, execute attacks
+            bool alwaysAttack = settings.AlwaysAttack.Value;
+            if (!InCombat && !alwaysAttack)
             {
-                // Monsters in range but behind terrain — reposition to get LOS
                 if (NearestBlockedPos.HasValue && !SuppressPositioning && BotInput.CanAct)
                 {
                     WantsToMove = true;
@@ -305,16 +305,14 @@ namespace AutoExile.Systems
                 return false;
             }
 
-            // Execute targeted skills (Enemy/Corpse roles need combat context)
-            if (!BotInput.CanAct) return false;
+            // Execute attack/targeted skills
             usedSkill = TickSkills(gc, settings);
             if (usedSkill) return true;
 
-            // Track attack connectivity — detect unreachable monsters
+            // Track attack connectivity
             TickAttackConnectivity(gc);
 
-            // Positioning — uses cursor + move key (same as NavigationSystem)
-            // Suppressed when another system is navigating (e.g. loot pickup)
+            // Positioning
             if (!SuppressPositioning && BotInput.CanAct)
                 TickPositioning(ctx);
 
@@ -401,7 +399,7 @@ namespace AutoExile.Systems
             EntityCache? entityCache = null)
         {
             if ((DateTime.Now - _lastThreatScan).TotalMilliseconds < ThreatScanIntervalMs)
-                return; // use cached results
+                return;
             _lastThreatScan = DateTime.Now;
 
             var playerGrid = gc.Player.GridPosNum;
@@ -413,9 +411,9 @@ namespace AutoExile.Systems
 
             Entity? bestTarget = null;
             float bestScore = float.MinValue;
-            int combatCount = 0;    // within CombatRange
-            int weightedDensity = 0; // rarity-weighted density for detour decisions
-            int cachedCount = 0;    // all alive hostiles
+            int combatCount = 0;
+            int weightedDensity = 0;
+            int cachedCount = 0;
             var combatSum = Vector2.Zero;
             float nearestDormantDist = float.MaxValue;
             Vector2? nearestDormantPos = null;
@@ -431,8 +429,6 @@ namespace AutoExile.Systems
             _walkableMonsterWeighted.Clear();
             _allMonsterWeighted.Clear();
 
-            // Use EntityCache.Monsters when available (pre-filtered, no type check needed).
-            // Falls back to OnlyValidEntities if cache not wired up.
             IEnumerable<Entity> monsters = entityCache != null
                 ? entityCache.Monsters
                 : gc.EntityListWrapper.OnlyValidEntities.Where(e => e.Type == EntityType.Monster);
@@ -441,12 +437,19 @@ namespace AutoExile.Systems
             {
                 if (!entity.IsHostile) continue;
 
+                var path = entity.Path ?? "";
+
+                // 1. Skip non-combat engine daemons and critters
+                if (path.Contains("Daemon", StringComparison.OrdinalIgnoreCase) ||
+                    path.Contains("Critters", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
                 var dist = Vector2.Distance(entity.GridPosNum, playerGrid);
 
-                // Corpse detection (dead but still in world)
-                if (!entity.IsAlive && dist < combatRange)
+                // 2. Corpse check
+                if (!entity.IsAlive)
                 {
-                    if (dist < nearestCorpseDist)
+                    if (dist < combatRange && dist < nearestCorpseDist)
                     {
                         nearestCorpseDist = dist;
                         nearestCorpse = entity.GridPosNum;
@@ -454,71 +457,37 @@ namespace AutoExile.Systems
                     continue;
                 }
 
-                if (!entity.IsAlive) continue;
-
-                // Track dormant monsters (alive + hostile but not targetable yet).
-                // Map bosses need proximity to activate. Track nearest for approach navigation.
-                // Skip entities whose paths match the learned ignore list (critters, volatiles, etc.).
-                // Also validate the entity has a readable Life component — stale entity references
-                // from zone transitions can report IsAlive=true from garbage memory.
+                // 3. Strict targetable check: entity must be targetable and not invulnerable
                 if (!entity.IsTargetable)
-                {
-                    if (dist < nearestDormantDist && dist < combatRange && entity.Path != null)
-                    {
-                        // Validate entity is real — stale refs from same-name zone transitions
-                        // (e.g. mirage zones) can have recycled memory with garbage properties.
-                        var life = entity.GetComponent<ExileCore.PoEMemory.Components.Life>();
-                        if (life == null || life.CurHP <= 0)
-                            goto skipDormant;
-
-                        bool ignoredPath = false;
-                        foreach (var ignored in _ignoredDormantPaths)
-                        {
-                            if (entity.Path.Contains(ignored, StringComparison.OrdinalIgnoreCase))
-                            {
-                                ignoredPath = true;
-                                break;
-                            }
-                        }
-                        if (!ignoredPath)
-                        {
-                            nearestDormantDist = dist;
-                            nearestDormantPos = entity.GridPosNum;
-                            nearestDormantPath = entity.Path;
-                        }
-                    }
-                    skipDormant:
                     continue;
-                }
 
-                // Skip monsters trapped inside essence monoliths (cannot be damaged until released)
+                var targetable = entity.GetComponent<Targetable>();
+                if (targetable != null && !targetable.isTargeted && !targetable.isTargetable)
+                    continue;
+
+                // 4. Verify entity has valid, positive health
+                var life = entity.GetComponent<Life>();
+                if (life == null || life.MaxHP <= 0 || life.CurHP <= 0)
+                    continue;
+
                 if (IsInsideMonolith(entity)) continue;
-
-                // Skip globally blacklisted enemies (user-configured by render name)
                 if (BlacklistedEnemies.Count > 0 && !string.IsNullOrEmpty(entity.RenderName) &&
                     BlacklistedEnemies.Contains(entity.RenderName)) continue;
-
-                // Skip default path-blacklisted entities (never targetable decorations)
-                if (entity.Path != null)
-                {
-                    bool pathBlocked = false;
-                    foreach (var blocked in DefaultPathBlacklist)
-                    {
-                        if (entity.Path.Contains(blocked))
-                        {
-                            pathBlocked = true;
-                            break;
-                        }
-                    }
-                    if (pathBlocked) continue;
-                }
-
-                // Skip monsters blacklisted as unreachable (attacks don't connect)
                 if (_unreachableMonsters.Contains(entity.Id)) continue;
+
+                bool isBlockedPath = false;
+                foreach (var blocked in DefaultPathBlacklist)
+                {
+                    if (path.Contains(blocked, StringComparison.OrdinalIgnoreCase))
+                    {
+                        isBlockedPath = true;
+                        break;
+                    }
+                }
+                if (isBlockedPath) continue;
 
                 cachedCount++;
 
-                // Rarity weight used for both targeting and density
                 float rarityWeight = entity.Rarity switch
                 {
                     MonsterRarity.Magic => 2f,
@@ -529,28 +498,15 @@ namespace AutoExile.Systems
                 if (IsPriorityTarget(entity))
                     rarityWeight = 100f;
 
-                // Track ALL alive hostiles for Aggressive density (no range/LOS filter)
                 _allMonsterWeighted.Add((entity.GridPosNum, rarityWeight));
 
-                // Track nearest monster (for awareness-tier navigation)
-                if (dist < nearestMonsterDist)
-                {
-                    nearestMonsterDist = dist;
-                    nearestMonsterPos = entity.GridPosNum;
-                }
-
-                // Only count monsters within CombatRange for combat decisions
                 if (dist > combatRange) continue;
 
-                // Reachability classification via terrain LOS
-                bool isWalkable = pfGrid != null && Pathfinding.HasLineOfSight(pfGrid, playerGrid, entity.GridPosNum);
-                bool isTargetable = !isWalkable && tgtGrid != null &&
-                    Pathfinding.HasTargetingLOS(tgtGrid, px, py, (int)entity.GridPosNum.X, (int)entity.GridPosNum.Y);
+                // 5. Line-of-Sight Check: only shoot monsters that projectiles can hit
+                bool hasTargetingLOS = tgtGrid == null || Pathfinding.HasTargetingLOS(tgtGrid, px, py, (int)entity.GridPosNum.X, (int)entity.GridPosNum.Y);
 
-                // Skip unreachable monsters (can't walk to AND can't shoot)
-                if (pfGrid != null && !isWalkable && !isTargetable)
+                if (!hasTargetingLOS)
                 {
-                    // Track nearest in-range monster blocked by LOS for repositioning
                     if (dist < nearestBlockedDist)
                     {
                         nearestBlockedDist = dist;
@@ -559,11 +515,16 @@ namespace AutoExile.Systems
                     continue;
                 }
 
+                if (dist < nearestMonsterDist)
+                {
+                    nearestMonsterDist = dist;
+                    nearestMonsterPos = entity.GridPosNum;
+                }
+
                 combatCount++;
                 combatSum += entity.GridPosNum;
                 _nearbyMonsterPositions.Add(entity.GridPosNum);
 
-                // Rarity-weighted density for detour decisions (separate from cluster scoring)
                 weightedDensity += entity.Rarity switch
                 {
                     MonsterRarity.Magic => 2,
@@ -572,25 +533,16 @@ namespace AutoExile.Systems
                     _ => 1
                 };
 
-                // Track walkable monsters separately for positioning (don't walk into gaps)
-                if (isWalkable || pfGrid == null)
-                    _walkableMonsterWeighted.Add((entity.GridPosNum, rarityWeight));
+                _walkableMonsterWeighted.Add((entity.GridPosNum, rarityWeight));
 
-                float score = rarityWeight - dist * 0.1f;
+                float score = rarityWeight - dist * 0.25f;
 
-                // Target focus timeout — deprioritize monsters we've been attacking too long.
-                // Rarity-based timeouts: normals 2s, magic 3s, rares 5s, uniques 10s.
-                // Once timed out, apply a large penalty so other targets win.
-                // The target isn't blacklisted — it can become BestTarget again if nothing else is alive.
                 if (_deprioritizedTargets.Contains(entity.Id))
-                    score -= 200f; // massive penalty — only wins if nothing else is available
+                    score -= 200f;
 
-                // Defense anchor: heavily favor monsters closer to the objective
                 if (Profile.DefenseAnchor.HasValue)
                 {
                     float distToObjective = Vector2.Distance(entity.GridPosNum, Profile.DefenseAnchor.Value);
-                    // Monsters within 30 grid units of objective get large bonus,
-                    // scaling down with distance. This dominates over rarity for nearby threats.
                     score += MathF.Max(0f, 60f - distToObjective);
                 }
 
@@ -614,19 +566,15 @@ namespace AutoExile.Systems
             NearestMonsterPos = nearestMonsterPos;
             NearestBlockedPos = nearestBlockedPos;
 
-            // Set BestTargetHasLOS — can we shoot the best target from here?
-            BestTargetHasLOS = false;
-            if (bestTarget != null && tgtGrid != null)
-                BestTargetHasLOS = Pathfinding.HasTargetingLOS(tgtGrid, px, py,
-                    (int)bestTarget.GridPosNum.X, (int)bestTarget.GridPosNum.Y);
+            BestTargetHasLOS = bestTarget != null;
 
-            // Build spatial grids from weighted lists for O(1) density queries
             RebuildGrids(playerGrid, combatRange);
 
-            // Dense cluster for positioning — use spatial grid instead of O(n²)
+            // Compute dense cluster using all monsters in awareness range so aggressive positioning
+            // pathfinds to distant monster packs instead of being trapped by small local groups
             if (bestTarget != null && IsPriorityTarget(bestTarget))
                 DenseClusterCenter = bestTarget.GridPosNum;
-            else if (Profile.Positioning == CombatPositioning.Aggressive && _allMonsterGrid.TotalItems > 0)
+            else if (_allMonsterGrid.TotalItems > 0)
                 DenseClusterCenter = _allMonsterGrid.FindDensestPosition(playerGrid);
             else if (_walkableMonsterGrid.TotalItems > 0)
                 DenseClusterCenter = _walkableMonsterGrid.FindDensestPosition(playerGrid);
@@ -739,13 +687,12 @@ namespace AutoExile.Systems
         // ═══════════════════════════════════════════════════
 
         /// <summary>
-        /// Refresh skill bar data — updates MovementSkills readiness every tick,
-        /// full rebuild every 500ms. Public so BotCore can call it even when combat is disabled
-        /// (NavigationSystem needs MovementSkills for dash-for-speed).
+        /// Refresh skill bar data from user Build Settings and in-game SkillBarIds.
+        /// Resolves PrimaryMovement (Move Only) key to match the actual bound key (e.g. Keys.Q).
         /// </summary>
         public void RefreshSkillBar(GameController gc, BotSettings.BuildSettings settings)
         {
-            // Update movement skill readiness every tick (cheap check)
+            // Update movement skill readiness every tick
             foreach (var ms in MovementSkills)
                 ms.IsReady = ms.ActorSkill?.CanBeUsed ?? true;
 
@@ -762,17 +709,102 @@ namespace AutoExile.Systems
             _primaryMovementEntry = null;
             _movementSkillEntries.Clear();
 
-            // Iterate user-configured slots (key-based, not slot-index-based)
+            Keys detectedMoveKey = Keys.None;
+
+            // 1. Scan in-game SkillBarIds to find which key has the "move" skill (e.g. Keys.Q)
+            var actor = gc.Player?.GetComponent<Actor>();
+            if (actor?.ActorSkills != null)
+            {
+                var barIds = gc.IngameState?.ServerData?.SkillBarIds;
+                if (barIds != null)
+                {
+                    for (int bi = 0; bi < 8 && bi < barIds.Count; bi++)
+                    {
+                        var barKey = KeyForSlot(bi);
+                        if (barKey == Keys.None) continue;
+                        if (barIds[bi] != 0)
+                        {
+                            var skill = actor.ActorSkills.FirstOrDefault(s => s.Id == barIds[bi]);
+                            if (skill != null)
+                            {
+                                var internalName = skill.InternalName ?? "";
+                                var name = skill.Name ?? "";
+                                if (internalName.Equals("move", StringComparison.OrdinalIgnoreCase) ||
+                                    name.Equals("Move", StringComparison.OrdinalIgnoreCase) ||
+                                    name.Equals("Move Only", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    detectedMoveKey = barKey;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. Scan user-configured slots in Build Settings for explicitly assigned PrimaryMovement role
+            Keys configMoveKey = Keys.None;
             foreach (var slotConfig in settings.AllSkillSlots)
             {
                 var key = slotConfig.Key.Value;
                 if (key == Keys.None) continue;
 
-                if (!Enum.TryParse<SkillRole>(slotConfig.Role.Value, out var role))
+                var roleStr = (slotConfig.Role.Value ?? "").Trim();
+                if (string.Equals(roleStr, "Move", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(roleStr, "Move Only", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(roleStr, "PrimaryMovement", StringComparison.OrdinalIgnoreCase))
+                {
+                    configMoveKey = key;
+                    break;
+                }
+            }
+
+            // Assign PrimaryMoveKey: prefer explicitly configured non-default key or detected in-game key
+            if (configMoveKey != Keys.None)
+                PrimaryMoveKey = configMoveKey;
+            else if (detectedMoveKey != Keys.None)
+                PrimaryMoveKey = detectedMoveKey;
+
+            // 3. Iterate user-configured slots for attack/buff/movement skills
+            foreach (var slotConfig in settings.AllSkillSlots)
+            {
+                var key = slotConfig.Key.Value;
+                if (key == Keys.None) continue;
+
+                var roleStr = (slotConfig.Role.Value ?? "").Trim();
+
+                SkillRole role;
+                if (string.Equals(roleStr, "Attack", StringComparison.OrdinalIgnoreCase) || 
+                    string.Equals(roleStr, "Enemy", StringComparison.OrdinalIgnoreCase))
+                {
+                    role = SkillRole.Enemy;
+                }
+                else if (string.Equals(roleStr, "Buff", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(roleStr, "Guard", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(roleStr, "Vaal", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(roleStr, "Summon", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(roleStr, "Self", StringComparison.OrdinalIgnoreCase))
+                {
+                    role = SkillRole.Self;
+                }
+                else if (string.Equals(roleStr, "Blink", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(roleStr, "MovementSkill", StringComparison.OrdinalIgnoreCase))
+                {
+                    role = SkillRole.MovementSkill;
+                }
+                else if (string.Equals(roleStr, "Move", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(roleStr, "Move Only", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(roleStr, "PrimaryMovement", StringComparison.OrdinalIgnoreCase))
+                {
+                    role = SkillRole.PrimaryMovement;
+                }
+                else if (!Enum.TryParse<SkillRole>(roleStr, true, out role))
+                {
                     role = SkillRole.Disabled;
+                }
+
                 if (role == SkillRole.Disabled) continue;
 
-                // PrimaryMovement doesn't need an ActorSkill match — it's just a key
                 if (role == SkillRole.PrimaryMovement)
                 {
                     _primaryMovementEntry = new SkillBarEntry
@@ -782,73 +814,39 @@ namespace AutoExile.Systems
                         Role = role,
                         Priority = 0,
                     };
-                    PrimaryMoveKey = key;
                     continue;
                 }
 
-                // Try to find the matching ActorSkill via ServerData.SkillBarIds
-                // SkillBarIds maps bar position (0-7) to skill IDs matching ActorSkill.Id
                 ActorSkill? matchedSkill = null;
-                var actor = gc.Player?.GetComponent<Actor>();
                 if (actor?.ActorSkills != null)
                 {
                     var barIds = gc.IngameState?.ServerData?.SkillBarIds;
                     if (barIds != null)
                     {
-                        // Find the bar position for this key
-                        int targetBarPos = -1;
                         for (int bi = 0; bi < 8 && bi < barIds.Count; bi++)
                         {
-                            if (KeyForSlot(bi) == key) { targetBarPos = bi; break; }
-                        }
-
-                        if (targetBarPos >= 0 && targetBarPos < barIds.Count)
-                        {
-                            var targetId = barIds[targetBarPos];
-                            if (targetId != 0)
+                            if (KeyForSlot(bi) == key && barIds[bi] != 0)
                             {
-                                foreach (var skill in actor.ActorSkills)
-                                {
-                                    if (skill.Id == targetId)
-                                    {
-                                        matchedSkill = skill;
-                                        break;
-                                    }
-                                }
+                                matchedSkill = actor.ActorSkills.FirstOrDefault(s => s.Id == barIds[bi]);
+                                if (matchedSkill != null) break;
                             }
                         }
                     }
 
-                    // Fallback: match by ActorSkill.SkillSlotIndex (legacy)
                     if (matchedSkill == null)
                     {
-                        foreach (var skill in actor.ActorSkills)
-                        {
-                            if (!skill.IsOnSkillBar) continue;
-                            if (skill.InternalName != null && skill.Name != null)
-                            {
-                                // Try direct key name match as last resort
-                                var slotKey = KeyForSlot(skill.SkillSlotIndex);
-                                if (slotKey == key) { matchedSkill = skill; break; }
-                            }
-                        }
+                        matchedSkill = actor.ActorSkills.FirstOrDefault(s => KeyForSlot(s.SkillSlotIndex) == key);
                     }
                 }
 
-                // Skip slots where no actual skill is equipped in-game
-                // (settings may still have Key=Q, Role=Self from a previously equipped skill)
-                if (matchedSkill == null)
-                    continue;
-
-                // Parse condition settings
-                Enum.TryParse<SkillTargetFilter>(slotConfig.TargetFilter.Value, out var targetFilter);
+                Enum.TryParse<SkillTargetFilter>(slotConfig.TargetFilter.Value, true, out var targetFilter);
 
                 var entry = new SkillBarEntry
                 {
                     Skill = matchedSkill,
                     Key = key,
                     Role = role,
-                    Priority = slotConfig.Priority.Value,
+                    Priority = slotConfig.Priority.Value > 0 ? slotConfig.Priority.Value : 5,
                     CanCrossTerrain = slotConfig.CanCrossTerrain.Value,
                     TargetFilter = targetFilter,
                     MinNearbyEnemies = slotConfig.MinNearbyEnemies.Value,
@@ -862,22 +860,17 @@ namespace AutoExile.Systems
                     IsChannel = slotConfig.IsChannel.Value,
                 };
 
-                // Auto-detect properties from skill stats
                 if (matchedSkill != null)
                 {
                     try
                     {
                         var stats = matchedSkill.Stats;
-                        if (stats != null)
-                        {
-                            if (stats.TryGetValue(GameStat.ActiveSkillBaseRadius, out var radius))
-                                entry.AoeRadius = radius;
-                        }
+                        if (stats != null && stats.TryGetValue(GameStat.ActiveSkillBaseRadius, out var radius))
+                            entry.AoeRadius = radius;
                     }
                     catch { }
                 }
 
-                // Restore per-skill cast timestamp from previous refresh
                 if (_lastCastByKey.TryGetValue(key, out var prevCastAt))
                     entry.LastCastAt = prevCastAt;
 
@@ -891,11 +884,8 @@ namespace AutoExile.Systems
                 }
             }
 
-            // Sort combat skills by priority (higher first)
             _skillBar.Sort((a, b) => b.Priority.CompareTo(a.Priority));
 
-            // Build movement skill info list for NavigationSystem
-            // Snapshot LastUsedAt before clearing — preserve across rebuilds
             var prevUsedTimes = new Dictionary<Keys, DateTime>();
             foreach (var ms in MovementSkills)
                 prevUsedTimes[ms.Key] = ms.LastUsedAt;
@@ -914,7 +904,7 @@ namespace AutoExile.Systems
                     LastUsedAt = lastUsed,
                 });
             }
-            // Sort: gap-crossers first, then by priority
+
             _movementSkillEntries.Sort((a, b) =>
             {
                 int crossCompare = b.CanCrossTerrain.CompareTo(a.CanCrossTerrain);
@@ -1075,41 +1065,106 @@ namespace AutoExile.Systems
 
         internal bool TickSkills(GameController gc, BotSettings.BuildSettings settings)
         {
-            // If channeling, update cursor toward target each tick.
-            // Don't block the skill loop — higher-priority skills (curses, debuffs) can
-            // interrupt the channel via CursorPressKey (which calls ReleaseAllKeys).
-            // The channel auto-restarts next tick when the interrupted skill's gate clears.
             if (_activeChannel != null && BotInput.IsHeld(_activeChannel.Key))
             {
                 var targetGridPos = GetSkillTargetGrid(gc, _activeChannel);
                 if (targetGridPos.HasValue)
-                    UseSkill(gc, _activeChannel, targetGridPos); // Just updates cursor
-                // Fall through — let other skills fire if their conditions are met
+                {
+                    UseSkill(gc, _activeChannel, targetGridPos);
+                }
+                else if (settings.AlwaysAttack.Value && InCombat)
+                {
+                    var forward = gc.Player != null ? gc.Player.GridPosNum + Vector2.UnitY * 20f : Vector2.Zero;
+                    UseSkill(gc, _activeChannel, forward);
+                }
             }
 
-            if (!BotInput.CanAct) return false;
-            if ((DateTime.Now - _lastSkillUseAt).TotalMilliseconds < MinSkillIntervalMs) return false;
+            if (!BotInput.CanAct)
+            {
+                LastSkillAction = "waiting for input gate (CanAct=false)";
+                return false;
+            }
+
+            if ((DateTime.Now - _lastSkillUseAt).TotalMilliseconds < MinSkillIntervalMs)
+            {
+                LastSkillAction = "min skill interval cooldown";
+                return false;
+            }
+
+            if (_skillBar.Count == 0)
+            {
+                LastSkillAction = "skill bar empty (no skills parsed)";
+                return false;
+            }
 
             foreach (var entry in _skillBar)
             {
-                // Self-role already handled by TickSelfSkills
                 if (entry.Role == SkillRole.Self) continue;
 
-                // Universal gate: game says skill can't be used (cooldown/mana/souls)
-                if (entry.Skill != null && !entry.Skill.CanBeUsed) continue;
-
-                // Suppress cursor-moving skills during loot pickup to avoid cursor interference
                 if (SuppressTargetedSkills && (entry.Role == SkillRole.Enemy || entry.Role == SkillRole.Corpse))
+                {
+                    LastSkillAction = "targeted skills suppressed (interaction busy)";
                     continue;
+                }
 
-                // Targeting prerequisite: Enemy needs a target, Corpse needs a corpse
-                if (entry.Role == SkillRole.Enemy && (BestTarget == null || !InCombat)) continue;
-                if (entry.Role == SkillRole.Corpse && !NearestCorpse.HasValue) continue;
+                // Attack target selection
+                if (entry.Role == SkillRole.Enemy)
+                {
+                    Vector2? targetPos = null;
+                    bool isDistantIntersperse = false;
 
-                // All "when to fire" logic is in conditions
-                if (!CheckSkillConditions(gc, entry, settings)) continue;
+                    if (BestTarget != null && BestTarget.IsAlive)
+                    {
+                        targetPos = BestTarget.GridPosNum;
+                    }
+                    else if (NearestMonsterPos.HasValue)
+                    {
+                        targetPos = NearestMonsterPos.Value;
+                    }
+                    else if (settings.AlwaysAttack.Value && gc.Player != null)
+                    {
+                        // AlwaysAttack enabled with no monsters in combat range:
+                        // Pulse attack periodically (every 1000ms) while traveling so leech stays active
+                        var elapsedIntersperse = (DateTime.Now - _lastIntersperseAttackAt).TotalMilliseconds;
+                        if (elapsedIntersperse >= IntersperseAttackIntervalMs)
+                        {
+                            targetPos = gc.Player.GridPosNum + Vector2.UnitY * 20f;
+                            isDistantIntersperse = true;
+                        }
+                    }
+
+                    if (!targetPos.HasValue)
+                    {
+                        LastSkillAction = "no enemy target in range";
+                        continue;
+                    }
+
+                    if (isDistantIntersperse)
+                        _lastIntersperseAttackAt = DateTime.Now;
+
+                    UseSkill(gc, entry, targetPos.Value);
+                    return true;
+                }
+
+                if (entry.Role == SkillRole.Corpse && !NearestCorpse.HasValue)
+                {
+                    LastSkillAction = "no corpse nearby";
+                    continue;
+                }
+
+                if (!CheckSkillConditions(gc, entry, settings))
+                {
+                    LastSkillAction = $"conditions not met for {entry.Key}";
+                    continue;
+                }
 
                 var targetGridPos = GetSkillTargetGrid(gc, entry);
+                if (!targetGridPos.HasValue)
+                {
+                    LastSkillAction = "no valid target position";
+                    continue;
+                }
+
                 UseSkill(gc, entry, targetGridPos);
                 return true;
             }
@@ -1302,8 +1357,8 @@ namespace AutoExile.Systems
 
             bool shouldRelease = false;
 
-            // No more targets
-            if (_activeChannel.Role == SkillRole.Enemy && (BestTarget == null || !InCombat))
+            // No more targets in range
+            if (_activeChannel.Role == SkillRole.Enemy && BestTarget == null && !InCombat)
                 shouldRelease = true;
 
             // Conditions no longer met (target died, moved out of range, etc.)
@@ -1478,71 +1533,80 @@ namespace AutoExile.Systems
             var gc = ctx.Game;
             var settings = ctx.Settings.Build;
 
-            if (BestTarget == null || NearbyMonsterCount == 0) return;
-
-            // If no walkable monsters exist, handle gap-only combat
-            if (_walkableMonsterWeighted.Count == 0)
-            {
-                if (BestTargetHasLOS)
-                    LastAction = "attacking across gap";
-                else
-                    LastAction = "no reachable targets";
-                return; // skills fire via TickSkills, no movement needed
-            }
+            if (CachedMonsterCount == 0 && NearbyMonsterCount == 0) return;
 
             var playerGrid = gc.Player.GridPosNum;
             float dist = Vector2.Distance(playerGrid, DenseClusterCenter);
             float fightRange = settings.FightRange.Value;
 
+            // ── Periodic micro-repositioning for ground effect / corpse explosion avoidance ──
+            bool periodicTriggered = false;
+            if (settings.EnablePeriodicReposition.Value && InCombat)
+            {
+                var elapsedRepose = (DateTime.Now - _lastPeriodicRepositionAt).TotalMilliseconds;
+                if (elapsedRepose >= settings.PeriodicRepositionIntervalMs.Value)
+                {
+                    periodicTriggered = true;
+                    _lastPeriodicRepositionAt = DateTime.Now;
+                }
+            }
+
             Vector2? desiredGridPos = null;
 
-            switch (Profile.Positioning)
+            if (periodicTriggered)
             {
-                case CombatPositioning.Aggressive:
-                    // Aggressive: expose DenseClusterCenter for mode to A* pathfind to.
-                    // Only use cursor-walk for very short range (already nearly on top of cluster).
-                    if (dist > 15f)
-                    {
-                        // Far away — signal the mode to pathfind there, don't cursor-walk
-                        WantsToMove = true;
-                        MoveTargetGrid = DenseClusterCenter;
-                        MoveTarget = ToWorld(DenseClusterCenter);
-                        LastAction = $"aggressive: pathfind to density @ ({DenseClusterCenter.X:F0},{DenseClusterCenter.Y:F0}) dist={dist:F0}";
-                        return;
-                    }
-                    if (dist > 3f)
-                        desiredGridPos = DenseClusterCenter;
-                    break;
+                // Select a step-aside position perpendicular to the cluster center
+                var toCluster = DenseClusterCenter - playerGrid;
+                if (toCluster.Length() < 1f) toCluster = Vector2.UnitY;
+                var perp = new Vector2(-toCluster.Y, toCluster.X);
+                perp = SafeNormalize(perp);
 
-                case CombatPositioning.Melee:
-                    // Walk toward pack until within fight range
-                    if (dist > fightRange)
-                        desiredGridPos = DenseClusterCenter;
-                    break;
+                // Alternate left/right side steps
+                if ((DateTime.Now.Ticks & 1) == 0) perp = -perp;
 
-                case CombatPositioning.Ranged:
-                    // Orbit around pack at roughly fight range
-                    // Move perpendicular to pack direction — never retreat, just circle
-                    if (dist > fightRange * 1.5f)
-                    {
-                        // Too far — close in
-                        desiredGridPos = DenseClusterCenter;
-                    }
-                    else if (dist > fightRange * 0.5f)
-                    {
-                        // In orbit zone — move perpendicular to pack direction
-                        var toPack = DenseClusterCenter - playerGrid;
-                        var perpendicular = new Vector2(-toPack.Y, toPack.X); // 90 degree rotation
-                        perpendicular = SafeNormalize(perpendicular);
-                        desiredGridPos = playerGrid + perpendicular * fightRange * 0.5f;
-                    }
-                    // else: inside fight range — don't retreat, let skills fire
-                    break;
+                desiredGridPos = playerGrid + perp * settings.PeriodicRepositionDistance.Value;
+                LastAction = $"periodic reposition: stepping out of ground effects/corpses";
+            }
+            else
+            {
+                switch (Profile.Positioning)
+                {
+                    case CombatPositioning.Aggressive:
+                        if (dist > 15f)
+                        {
+                            WantsToMove = true;
+                            MoveTargetGrid = DenseClusterCenter;
+                            MoveTarget = ToWorld(DenseClusterCenter);
+                            LastAction = $"aggressive: pathfind to density @ ({DenseClusterCenter.X:F0},{DenseClusterCenter.Y:F0}) dist={dist:F0}";
+                            return;
+                        }
+                        if (dist > 3f)
+                            desiredGridPos = DenseClusterCenter;
+                        break;
+
+                    case CombatPositioning.Melee:
+                        if (dist > fightRange)
+                            desiredGridPos = DenseClusterCenter;
+                        break;
+
+                    case CombatPositioning.Ranged:
+                        if (dist > fightRange * 1.5f)
+                        {
+                            desiredGridPos = DenseClusterCenter;
+                        }
+                        else if (dist > fightRange * 0.5f)
+                        {
+                            var toPack = DenseClusterCenter - playerGrid;
+                            var perpendicular = new Vector2(-toPack.Y, toPack.X);
+                            perpendicular = SafeNormalize(perpendicular);
+                            desiredGridPos = playerGrid + perpendicular * fightRange * 0.5f;
+                        }
+                        break;
+                }
             }
 
             if (!desiredGridPos.HasValue) return;
 
-            // Enforce leash constraint — clamp desired position to stay within anchor radius
             if (Profile.LeashAnchor.HasValue)
             {
                 var anchor = Profile.LeashAnchor.Value;
@@ -1550,14 +1614,12 @@ namespace AutoExile.Systems
                 var distFromAnchor = Vector2.Distance(desiredGridPos.Value, anchor);
                 if (distFromAnchor > radius)
                 {
-                    // Pull position back toward anchor to stay within radius
                     var toDesired = desiredGridPos.Value - anchor;
                     toDesired = SafeNormalize(toDesired);
                     desiredGridPos = anchor + toDesired * radius;
                 }
             }
 
-            // Validate the desired position: must be walkable and have targeting LOS to monsters
             var pfGrid2 = gc.IngameState.Data.RawFramePathfindingData;
             bool canWalkToDesired = pfGrid2 != null &&
                 Pathfinding.HasLineOfSight(pfGrid2, playerGrid, desiredGridPos.Value);
@@ -1566,12 +1628,10 @@ namespace AutoExile.Systems
             if (canWalkToDesired)
                 validPos = ctx.Navigation.FindWalkableWithLOS(gc, desiredGridPos.Value, DenseClusterCenter);
             else
-                // Can't walk to desired pos — search near player for a position with targeting LOS
                 validPos = ctx.Navigation.FindWalkableWithLOS(gc, playerGrid, DenseClusterCenter, 20);
 
             if (!validPos.HasValue) return;
 
-            // Final safety: verify straight-line walkability from player to valid position
             if (pfGrid2 != null && !Pathfinding.HasLineOfSight(pfGrid2, playerGrid, validPos.Value))
                 return;
 
@@ -1582,8 +1642,8 @@ namespace AutoExile.Systems
         }
 
         /// <summary>
-        /// Move toward a grid position using cursor + move key (same as NavigationSystem).
-        /// Never clicks — prevents accidental item/entity interactions.
+        /// Move toward a grid position using cursor + move key or dash skill for aggressive repositioning.
+        /// Only dashes when straight-line walkable LOS is clear; uses Move Only on narrow bridges/stairs.
         /// </summary>
         private void ExecuteMove(GameController gc, Vector2 gridTarget)
         {
@@ -1595,7 +1655,6 @@ namespace AutoExile.Systems
             if (screenPos.X > 0 && screenPos.X < windowRect.Width &&
                 screenPos.Y > 0 && screenPos.Y < windowRect.Height)
             {
-                // Push outward if too close to screen center — same guard as NavigationSystem
                 var dir = screenPos - center;
                 if (dir.Length() < NavigationSystem.MinScreenDist)
                 {
@@ -1613,8 +1672,28 @@ namespace AutoExile.Systems
                 absPos = new Vector2(windowRect.X + edgePoint.X, windowRect.Y + edgePoint.Y);
             }
 
+            var playerGrid = gc.Player.GridPosNum;
+            var pfGrid = gc.IngameState.Data.RawFramePathfindingData;
+
+            // Only dash if we have verified unobstructed walkable LOS — never dash into railings or narrow bridge corners
+            bool hasClearWalkableLOS = pfGrid != null && Pathfinding.HasLineOfSight(pfGrid, playerGrid, gridTarget);
+
+            if (hasClearWalkableLOS && Vector2.Distance(playerGrid, gridTarget) > 18f)
+            {
+                var readyDash = MovementSkills.FirstOrDefault(m => m.IsReady &&
+                    (m.MinCastIntervalMs <= 0 || (DateTime.Now - m.LastUsedAt).TotalMilliseconds >= m.MinCastIntervalMs));
+
+                if (readyDash != null && BotInput.CanAct)
+                {
+                    if (BotInput.CursorPressKey(absPos, readyDash.Key))
+                    {
+                        readyDash.LastUsedAt = DateTime.Now;
+                        return;
+                    }
+                }
+            }
+
             var moveKey = PrimaryMoveKey ?? Keys.T;
-            // Use continuous movement when available, fall back to pulse for compatibility
             if (BotInput.IsMovementActive && !BotInput.IsMovementSuspended)
                 BotInput.UpdateMovementCursor(absPos);
             else

@@ -134,6 +134,8 @@ namespace AutoExile.Systems
             foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
             {
                 if (entity?.Path == null) continue;
+                if (!entity.HasComponent<ExileCore.PoEMemory.Components.Positioned>()) continue;
+
                 var path = entity.Path;
                 var gridPos = new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y);
 
@@ -208,7 +210,7 @@ namespace AutoExile.Systems
                 bool found = false;
                 foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
                 {
-                    if (entity.Id == IzaroId.Value && entity.IsAlive && entity.IsTargetable)
+                    if (entity.Id == IzaroId.Value && entity.IsAlive && entity.IsTargetable && entity.HasComponent<ExileCore.PoEMemory.Components.Positioned>())
                     {
                         found = true;
                         IzaroPosition = new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y);

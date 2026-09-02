@@ -268,6 +268,18 @@ namespace AutoExile.WebServer
                         await ServeEmbeddedFile(resp, "index.html", "text/html");
                         break;
 
+                    case "/style.css":
+                        await ServeEmbeddedFile(resp, "style.css", "text/css");
+                        break;
+
+                    case "/script.js":
+                        await ServeEmbeddedFile(resp, "script.js", "text/javascript");
+                        break;
+
+                    case "/favicon.ico":
+                        resp.StatusCode = 204;
+                        break;
+
                     // Status
                     case "/api/status" when method == "GET":
                         await ServeJson(resp, _currentStatus);
@@ -906,7 +918,10 @@ namespace AutoExile.WebServer
                         name = g.Key,
                         rarity = g.OrderByDescending(m => m.Rarity switch
                         {
-                            "Unique" => 3, "Rare" => 2, "Magic" => 1, _ => 0
+                            "Unique" => 3,
+                            "Rare" => 2,
+                            "Magic" => 1,
+                            _ => 0
                         }).First().Rarity,
                         distance = g.Min(m => m.Distance),
                         count = g.Count()
@@ -1144,6 +1159,12 @@ namespace AutoExile.WebServer
         public int LabGemsTransformed { get; init; }
         public float LabTotalProfit { get; init; }
         public string LabSelectedGem { get; init; } = "";
+
+        // Heist stats
+        public float HeistAlertPercent { get; init; }
+        public bool HeistLockdown { get; init; }
+        public string HeistPhase { get; init; } = "";
+        public string HeistTarget { get; init; } = "";
 
         public long Timestamp { get; init; }
 

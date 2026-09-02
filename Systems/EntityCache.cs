@@ -90,14 +90,51 @@ namespace AutoExile.Systems
         }
 
         /// <summary>
-        /// Prune dead/invalid entities from type lists. Call periodically (~every 1s)
-        /// to clean up entities that became invalid without a Remove event.
-        /// Does NOT remove from _byId — entities may become valid again.
+        /// Synchronizes the cache with the live entity list if discrepancies or missed entities occur.
+        /// Call periodically or during settle/re-entry phases.
+        /// </summary>
+        public void SyncWithGame(IEnumerable<Entity> liveEntities)
+        {
+            var liveIds = new HashSet<long>();
+            foreach (var entity in liveEntities)
+            {
+                if (entity?.Id == 0) continue;
+                liveIds.Add(entity.Id);
+
+                if (!_byId.ContainsKey(entity.Id))
+                {
+                    _byId[entity.Id] = entity;
+                    GetListForType(entity.Type)?.Add(entity);
+                }
+            }
+
+            // Remove tracked entities that are no longer in the valid entities list
+            if (_byId.Count > liveIds.Count)
+            {
+                var stale = new List<long>();
+                foreach (var id in _byId.Keys)
+                {
+                    if (!liveIds.Contains(id))
+                        stale.Add(id);
+                }
+
+                foreach (var id in stale)
+                {
+                    if (_byId.TryGetValue(id, out var ent))
+                    {
+                        _byId.Remove(id);
+                        GetListForType(ent.Type)?.RemoveAll(e => e.Id == id);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Prune dead/invalid entities from type lists. Call periodically (~every 1s).
         /// </summary>
         public void Prune()
         {
             PruneList(_monsters, e => e.IsValid && e.IsAlive && e.Type == EntityType.Monster);
-            // Chests/icons: keep until explicitly removed (they go IsTargetable=false, not invalid)
             PruneList(_worldItems, e => e.IsValid);
             PruneList(_areaTransitions, e => e.IsValid);
             PruneList(_shrines, e => e.IsValid);
