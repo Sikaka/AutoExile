@@ -1090,7 +1090,7 @@ namespace AutoExile.Modes
             if (gfx == null) return;
 
             var hudX = 100f;
-            var hudY = 100f;
+            var hudY = 200f;
             var lineH = 20f;
 
             // Status with color-coded state

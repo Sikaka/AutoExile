@@ -127,6 +127,9 @@ namespace AutoExile.Systems
         /// <summary>
         /// Tick entity tracking and wave state. Call every tick while in simulacrum map.
         /// </summary>
+        /// <summary>
+        /// Tick entity tracking and wave state. Call every tick while in simulacrum map.
+        /// </summary>
         public void Tick(GameController gc, float minWaveDelay)
         {
             // --- Track portal ---
@@ -169,11 +172,17 @@ namespace AutoExile.Systems
                 if (IsPositionSane(freshPos, MonolithPosition))
                     MonolithPosition = freshPos;
 
-                if (monolith.TryGetComponent<StateMachine>(out var state))
+                if (monolith.TryGetComponent<StateMachine>(out var state) && state.States != null)
                 {
-                    var isActive = state.States.FirstOrDefault(s => s.Name == "active")?.Value > 0 &&
-                                   state.States.FirstOrDefault(s => s.Name == "goodbye")?.Value == 0;
-                    var wave = (int)(state.States.FirstOrDefault(s => s.Name == "wave")?.Value ?? 0);
+                    var activeState = state.States.FirstOrDefault(s => s.Name == "active");
+                    var goodbyeState = state.States.FirstOrDefault(s => s.Name == "goodbye");
+
+                    // Active when "active" state is > 0 and goodbye is either absent or 0
+                    var isActive = activeState != null && activeState.Value > 0 &&
+                                   (goodbyeState == null || goodbyeState.Value == 0);
+
+                    var waveState = state.States.FirstOrDefault(s => s.Name == "wave");
+                    var wave = (int)(waveState?.Value ?? 0);
 
                     // Wave just ended — enforce delay before next start
                     if (IsWaveActive && !isActive)

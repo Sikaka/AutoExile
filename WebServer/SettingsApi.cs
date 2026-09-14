@@ -337,16 +337,29 @@ namespace AutoExile.WebServer
             var menuAttr = prop.GetCustomAttribute<MenuAttribute>();
             if (menuAttr != null)
             {
-                // MenuAttribute stores name and tooltip — try known property names
                 var attrType = menuAttr.GetType();
-                var nameProp = attrType.GetProperty("MenuName")
-                    ?? attrType.GetProperty("Name");
-                var descProp = attrType.GetProperty("Tooltip")
-                    ?? attrType.GetProperty("Description");
+                string? name = null;
+                string? desc = null;
 
-                var name = nameProp?.GetValue(menuAttr)?.ToString() ?? FormatName(prop.Name);
-                var desc = descProp?.GetValue(menuAttr)?.ToString();
-                return (name, desc);
+                var nameProp = attrType.GetProperty("MenuName") ?? attrType.GetProperty("Name") ?? attrType.GetProperty("label");
+                if (nameProp != null) name = nameProp.GetValue(menuAttr)?.ToString();
+
+                var descProp = attrType.GetProperty("Tooltip") ?? attrType.GetProperty("ToolTip") ?? attrType.GetProperty("Description") ?? attrType.GetProperty("tooltip");
+                if (descProp != null) desc = descProp.GetValue(menuAttr)?.ToString();
+
+                if (string.IsNullOrEmpty(name))
+                {
+                    var nameField = attrType.GetField("MenuName") ?? attrType.GetField("Name") ?? attrType.GetField("label");
+                    if (nameField != null) name = nameField.GetValue(menuAttr)?.ToString();
+                }
+
+                if (string.IsNullOrEmpty(desc))
+                {
+                    var descField = attrType.GetField("Tooltip") ?? attrType.GetField("ToolTip") ?? attrType.GetField("Description") ?? attrType.GetField("tooltip");
+                    if (descField != null) desc = descField.GetValue(menuAttr)?.ToString();
+                }
+
+                return (name ?? FormatName(prop.Name), string.IsNullOrEmpty(desc) ? null : desc);
             }
 
             return (FormatName(prop.Name), null);

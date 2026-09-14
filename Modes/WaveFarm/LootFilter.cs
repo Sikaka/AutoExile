@@ -16,7 +16,9 @@ namespace AutoExile.Modes.WaveFarm
         public int PickupsFailed { get; private set; }
         public float SuccessRate => PickupAttempts > 0 ? (float)PickupSuccesses / PickupAttempts : 0;
 
-        private float _grabRadius = 25f;
+        // Expanded from 25f to 40f so items from recent kills in the same room/pack
+        // are picked up immediately without being classified as "backtrack" loot.
+        private float _grabRadius = 40f;
 
         /// <summary>
         /// Find the best forward loot candidate (ahead of player or within grab radius).
@@ -56,7 +58,11 @@ namespace AutoExile.Modes.WaveFarm
                 if (c.ChaosValue < valueThreshold) continue;
 
                 var itemPos = c.Entity.GridPosNum;
-                // Only consider items that are behind us
+                var dist = Vector2.Distance(playerPos, itemPos);
+
+                // Items within grab radius are already handled by GetForwardLoot
+                if (dist <= _grabRadius) continue;
+
                 if (!dir.IsAhead(playerPos, itemPos, forwardAngle) && c.ChaosValue > bestValue)
                 {
                     bestValue = c.ChaosValue;

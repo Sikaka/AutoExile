@@ -377,28 +377,60 @@ namespace AutoExile.Modes.WaveFarm
             ModeHelpers.CancelAllSystems(ctx);
             ModeHelpers.EnableDefaultCombat(ctx);
 
+            var gc = ctx.Game;
             var stash = ctx.Settings.Stash;
 
-            // ── Build the per-stash-trip withdrawal list ──────────────────────
-            //
-            // BATCH model: pull enough consumables for ~20 runs in one trip so we
-            // don't spend half our time round-tripping to stash. Every entry below
-            // counts CURRENT inventory and only withdraws the deficit, so a partially-
-            // stocked inventory just tops up.
-            //
-            // PATH TRANSLATION: the user's MapDevice slots store display names
-            // ("Divination Scarab of The Cloister"). Entity paths use suffixes
-            // ("ScarabDivinationCardsNew1"). ScarabDatabase translates one to the
-            // other; without this, every scarab withdrawal silently fails because
-            // the substring match on entity path never hits.
+            // ── 1. Count current items in player inventory ──────────────
+            int currentPortalCount = 0;
+            int currentMapCount = 0;
+            try
+            {
+                var playerInv = gc?.IngameState?.ServerData?.PlayerInventories;
+                if (playerInv != null && playerInv.Count > 0)
+                {
+                    var invItems = playerInv[0]?.Inventory?.InventorySlotItems;
+                    if (invItems != null)
+                    {
+                        foreach (var slotItem in invItems)
+                        {
+                            var item = slotItem.Item;
+                            var path = item?.Path;
+                            if (path == null) continue;
+
+                            if (path.Contains("CurrencyPortal", StringComparison.OrdinalIgnoreCase))
+                            {
+                                if (item.TryGetComponent<ExileCore.PoEMemory.Components.Stack>(out var stack))
+                                    currentPortalCount += stack.Size;
+                                else
+                                    currentPortalCount += 1;
+                            }
+                            else if (path.Contains("Maps/MapKey", StringComparison.OrdinalIgnoreCase))
+                            {
+                                if (item.TryGetComponent<ExileCore.PoEMemory.Components.Mods>(out var mods) && mods.Identified)
+                                    currentMapCount++;
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            // ── 2. Check Faustus Restock for Portal Scrolls ─────────────
+            // If completely out of portal scrolls (0 in inventory) and Faustus restock is enabled
+            if (currentPortalCount == 0 && ctx.Settings.Faustus.EnableFaustusRestock.Value)
+            {
+                var payCurrency = ctx.Settings.Faustus.FaustusPayCurrency.Value;
+                ctx.Log($"[WaveFarm] Out of portal scrolls — starting Faustus exchange (1 {payCurrency})");
+                ctx.Faustus.Start("CurrencyPortal", 1, string.IsNullOrWhiteSpace(payCurrency) ? "Chaos Orb" : payCurrency);
+            }
+
+            // ── 3. Build stash withdrawal list ──────────────────────────
             const int RunsPerStashTrip = 20;
             var displayNames = ctx.Settings.MapDevice.ActiveSlots();
             var resolvedScarabPaths = new List<string>();
             var withdrawals = new List<(string PathSubstring, int Count)>();
 
-            // De-dupe slot entries by resolved path — if all 5 slots are the same
-            // scarab type (Stacked Deck case), we want one withdrawal of 5 × runs,
-            // not five separate withdrawals each demanding 1 × runs.
+            // Scarabs
             var perPathPerRun = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             foreach (var displayName in displayNames)
             {
@@ -409,28 +441,31 @@ namespace AutoExile.Modes.WaveFarm
             foreach (var (path, perRun) in perPathPerRun)
                 withdrawals.Add((path, perRun * RunsPerStashTrip));
 
-            // Maps: 1 per run. We match on "Maps/MapKey" — generic enough to match
-            // any map in the supplies tab, narrow enough to ignore non-map items.
-            // Assumes the user keeps only the map type they want in this tab.
-            withdrawals.Add(("Maps/MapKey", RunsPerStashTrip));
+            // Maps: Only withdraw if we need more maps
+            if (currentMapCount < 5)
+            {
+                withdrawals.Add(("Maps/MapKey", RunsPerStashTrip));
+            }
 
-            // Portal scrolls — single stack covers a session. PoE1 path:
-            // Metadata/Items/Currency/CurrencyPortal
-            withdrawals.Add(("CurrencyPortal", 20));
+            // Portal scrolls: Only withdraw if we have fewer than 20 scrolls (less than 1/2 stack)
+            if (currentPortalCount < 20)
+            {
+                withdrawals.Add(("CurrencyPortal", 40));
+                ctx.Log($"[WaveFarm] Low on portal scrolls ({currentPortalCount} in inventory) — requesting 1 stack from stash");
+            }
+            else
+            {
+                ctx.Log($"[WaveFarm] Portal scrolls sufficient ({currentPortalCount} in inventory) — skipping stash withdrawal");
+            }
 
             ctx.Log($"[WaveFarm] Stash trip: {withdrawals.Count} entries, supply tab='{stash.MappingSuppliesTabName.Value}'");
             foreach (var (p, c) in withdrawals)
                 ctx.Log($"[WaveFarm]   want {c}× '{p}'");
 
-            // Build the "keep in inventory" filter: every withdrawal entry's path
-            // becomes a keep-keyword. Without this the StashSystem deposits ALL
-            // inventory contents (including the maps/scarabs/portals we just pulled)
-            // into the dump tab the moment storing kicks in.
+            // ── 4. Build "Keep in Inventory" filter ─────────────────────
             var keepPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var (path, _) in withdrawals)
                 keepPaths.Add(path);
-            // Also explicit broad categories in case a withdrawal path is more
-            // specific than the inventory item path (e.g. plan-specific scarab).
             keepPaths.Add("Maps/MapKey");
             keepPaths.Add("Metadata/Items/Scarabs/");
             keepPaths.Add("CurrencyPortal");
@@ -441,49 +476,44 @@ namespace AutoExile.Modes.WaveFarm
                 var path = entity?.Path;
                 if (path == null) return true;
 
-                // Maps: only keep IDENTIFIED maps (= our pre-rolled supplies). Maps
-                // that drop in the world are unidentified — those are loot, dump them.
-                // Without this gate, the bot would happily run a random unidentified
-                // map dropped by a mob instead of our pre-rolled City Square stack.
+                // Maps: keep identified pre-rolled maps
                 if (path.Contains("Maps/MapKey", StringComparison.OrdinalIgnoreCase))
                 {
                     if (entity!.TryGetComponent<ExileCore.PoEMemory.Components.Mods>(out var mods)
                         && mods.Identified)
                     {
-                        return false; // KEEP — pre-rolled map
+                        return false; // KEEP
                     }
-                    return true; // STASH — unidentified drop
+                    return true; // STASH unidentified drop
                 }
 
                 foreach (var keep in keepPaths)
                     if (path.Contains(keep, StringComparison.OrdinalIgnoreCase))
-                        return false; // KEEP — don't stash
-                return true;          // stash this loot item
+                        return false; // KEEP
+
+                return true; // STASH
             };
 
-            // Map filter: if user picked a specific map name, the device's named-map
-            // flow handles it via TargetMapName. Plan-driven flow uses _ => true so
-            // any in-stash map matches as a fallback.
-            var targetMapName = ctx.Settings.Farming.MapName.Value;
+            // ── 5. Clean map name (Strip ★ unicode prefix) ─────────────
+            var rawMapName = ctx.Settings.Farming.MapName.Value;
+            var targetMapName = string.IsNullOrWhiteSpace(rawMapName)
+                ? null
+                : rawMapName.TrimStart('\u2605', ' ').Trim();
+
+            if (!string.IsNullOrEmpty(targetMapName))
+                ctx.Log($"[WaveFarm] Target map set to: '{targetMapName}' (raw: '{rawMapName}')");
 
             _hideoutFlow.Start(
                 mapFilter: _ => true,
                 stashItemFilter: stashFilter,
-                targetMapName: string.IsNullOrWhiteSpace(targetMapName) ? null : targetMapName,
-                // Tells MapDevice to look in player INVENTORY for the map (not just
-                // the device's stash panel) when the named-flow can't find it in
-                // stash. Required because we just withdrew the maps to inventory
-                // — they're not in the device's view anymore.
+                targetMapName: targetMapName,
                 inventoryFragmentPath: "Maps/MapKey",
                 stashItemThreshold: 0,
-                dumpTabName:     string.IsNullOrWhiteSpace(stash.DumpTabName.Value)
+                dumpTabName: string.IsNullOrWhiteSpace(stash.DumpTabName.Value)
                                     ? null : stash.DumpTabName.Value,
                 resourceTabName: string.IsNullOrWhiteSpace(stash.MappingSuppliesTabName.Value)
                                     ? null : stash.MappingSuppliesTabName.Value,
                 withdrawList: withdrawals,
-                // After map insertion, ctrl+click each of these into device slots
-                // before pressing activate. Use resolved paths so the substring
-                // match against inventory entity paths actually works.
                 scarabPaths: resolvedScarabPaths.Count > 0 ? resolvedScarabPaths : null);
 
             Status = "Hideout — preparing next run";

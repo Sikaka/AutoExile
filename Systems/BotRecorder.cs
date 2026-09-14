@@ -47,8 +47,9 @@ namespace AutoExile.Systems
         {
             _tickNumber++;
 
-            var player = gc.Player;
-            if (player == null) return;
+            var player = gc?.Player;
+            if (player == null || !player.HasComponent<ExileCore.PoEMemory.Components.Positioned>()) return;
+            if (gc?.IngameState?.Data == null) return;
 
             var life = player.GetComponent<Life>();
             var playerGrid = player.GridPosNum;
@@ -62,6 +63,7 @@ namespace AutoExile.Systems
                 foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
                 {
                     if (entity == null || !entity.IsHostile || !entity.IsAlive) continue;
+                    if (!entity.HasComponent<ExileCore.PoEMemory.Components.Positioned>()) continue;
                     if (entity.DistancePlayer > 80) continue;
 
                     var ePos = entity.GridPosNum;
@@ -75,7 +77,6 @@ namespace AutoExile.Systems
                         Rarity = entity.Rarity.ToString()
                     };
 
-                    // Try to read action state
                     try
                     {
                         var actor = entity.GetComponent<Actor>();
@@ -85,7 +86,6 @@ namespace AutoExile.Systems
                             snap.IsMoving = actor.isMoving;
                             snap.Action = actor.Action.ToString();
 
-                            // For unique/rare: capture animation data for dodge troubleshooting
                             if (entity.Rarity >= ExileCore.Shared.Enums.MonsterRarity.Rare)
                             {
                                 snap.Animation = actor.Animation.ToString();
@@ -101,12 +101,11 @@ namespace AutoExile.Systems
                     catch { }
 
                     threats.Add(snap);
-                    if (threats.Count >= 20) break; // cap to avoid perf issues
+                    if (threats.Count >= 20) break;
                 }
             }
             catch { }
 
-            // Get last action from BotInput
             var recentActions = BotInput.GetRecentActions(1);
             var lastAction = recentActions.Count > 0 ? recentActions[0] : null;
 
@@ -124,7 +123,6 @@ namespace AutoExile.Systems
                 ModeDecision = modeDecision,
                 ModeStatus = modeStatus,
 
-                // Navigation state
                 IsNavigating = nav.IsNavigating,
                 NavWaypointIndex = nav.CurrentWaypointIndex,
                 NavPathLength = nav.CurrentNavPath?.Count ?? 0,
@@ -135,29 +133,24 @@ namespace AutoExile.Systems
                     nav.CurrentNavPath[nav.CurrentWaypointIndex].Action == WaypointAction.Blink,
                 NavLastRecovery = nav.LastRecoveryAction,
 
-                // Threats
                 NearbyThreats = threats,
 
-                // Last action
                 LastActionType = lastAction?.Type ?? "",
                 LastActionAccepted = lastAction?.Accepted ?? false,
                 LastActionKey = lastAction?.Key?.ToString() ?? "",
 
-                // Interaction state — tracks loot pickup lifecycle
                 InteractionBusy = interaction?.IsBusy ?? false,
                 InteractionStatus = interaction?.Status ?? "",
                 InteractionLastFailReason = interaction?.LastFailReason ?? "",
 
-                // Loot state — tracks what's available and what's been blacklisted
                 LootCandidateCount = loot?.LootableCount ?? 0,
                 LootFailedCount = loot?.FailedCount ?? 0,
                 LootHasNearby = loot?.HasLootNearby ?? false,
 
-                // Dodge state
                 DodgeUrgent = threat?.DodgeUrgent ?? false,
                 DodgeSkill = threat?.ThreatSkillName ?? "",
                 DodgeProgress = threat?.ThreatProgress ?? 0,
-                DodgeTracked = threat?.TrackedMonsters.Count ?? 0,
+                DodgeTracked = threat?.TrackedMonsters?.Count ?? 0,
                 DodgeCastsDetected = threat?.CastsDetected ?? 0,
                 DodgesTriggered = threat?.DodgesTriggered ?? 0,
                 ThreatStatus = threat?.LastAction ?? "",
@@ -167,7 +160,6 @@ namespace AutoExile.Systems
             _writeIndex = (_writeIndex + 1) % BufferSize;
             if (_count < BufferSize) _count++;
 
-            // Auto-dump triggers
             CheckTriggers(gc, hpPercent, player.IsAlive, nav);
             _lastHpPercent = hpPercent;
         }

@@ -22,6 +22,12 @@
     <EmbeddedResource Include="WebServer\wwwroot\index.html">
       <LogicalName>webui.index.html</LogicalName>
     </EmbeddedResource>
+    <EmbeddedResource Include="WebServer\wwwroot\style.css">
+      <LogicalName>webui.style.css</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="WebServer\wwwroot\script.js">
+      <LogicalName>webui.script.js</LogicalName>
+    </EmbeddedResource>
   </ItemGroup>
 
   <ItemGroup>

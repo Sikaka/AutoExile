@@ -1,11 +1,14 @@
 using ExileCore;
+using ExileCore.PoEMemory;
 using ExileCore.PoEMemory.Components;
+using ExileCore.PoEMemory.Elements;
 using ExileCore.PoEMemory.MemoryObjects;
 using ExileCore.Shared.Enums;
 using AutoExile.Systems;
 using AutoExile.Modes.Shared;
 using System.Linq;
 using System.Numerics;
+using System.Windows.Forms;
 using Pathfinding = AutoExile.Systems.Pathfinding;
 
 namespace AutoExile.Modes
@@ -27,43 +30,97 @@ namespace AutoExile.Modes
         private DateTime _phaseStartTime = DateTime.Now;
         private DateTime _lastActionTime = DateTime.MinValue;
         private DateTime _lastRepathTime = DateTime.MinValue;
-        private const int RepathCooldownMs = 1250; // min time between A* pathfinding calls
+        private const int RepathCooldownMs = 1250;
+        private const float MajorActionCooldownMs = 500f;
+
+        // Harbour & Adiyah interaction state
+        private int _adiyahClickAttempts;
+        private int _contractInsertAttempts;
+        private int _signClickAttempts;
 
         // Companion wait tracking
         private long _waitingOnEntityId;
         private DateTime _companionWaitStart = DateTime.MinValue;
         private DateTime _lastCompanionClickTime = DateTime.MinValue;
         private int _companionClickAttempts;
-        private HeistPhase _returnPhaseAfterDoor; // which phase to return to after door/chest opens
+        private HeistPhase _returnPhaseAfterDoor;
 
         // Loot
         private readonly LootPickupTracker _lootTracker = new();
         private DateTime _lastLootScanTime = DateTime.MinValue;
-        private DateTime _chestLootWindowEnd = DateTime.MinValue; // pause to loot after chest opens
+        private DateTime _chestLootWindowEnd = DateTime.MinValue;
 
-        // Curio display evaluation (grand heist reward room)
+        // Curio display evaluation
         private List<CurioDisplayInfo> _curioDisplays = new();
         private DateTime _lastCurioScanTime = DateTime.MinValue;
 
         // Navigation / exploration tracking
         private long _pendingInteractionEntityId;
-        private int _lastStuckCount;           // track NavigationSystem stuck recoveries
-        private int _lastRouteIndex = -1;      // detect route target changes for stuck reset
-        private Vector2? _currentExploreTarget; // current explore/pathnode target (fallback)
-        private readonly HashSet<Vector2> _visitedPathNodes = new(); // pathnode positions we've reached or failed (fallback)
+        private int _lastStuckCount;
+        private int _lastRouteIndex = -1;
+        private Vector2? _currentExploreTarget;
+        private readonly HashSet<Vector2> _visitedPathNodes = new();
+
+        private string? _heistLogPath;
+
+        private void HeistLog(string msg)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(_heistLogPath))
+                {
+                    var dir = Path.GetDirectoryName(typeof(HeistMode).Assembly.Location) ?? ".";
+                    _heistLogPath = Path.Combine(dir, "heist_debug.log");
+                }
+                var line = $"[{DateTime.Now:HH:mm:ss.fff}] [Phase:{_phase}] {msg}\n";
+                File.AppendAllText(_heistLogPath, line);
+            }
+            catch { }
+        }
 
         public void OnEnter(BotContext ctx)
         {
-            _phase = HeistPhase.Idle;
             _state.Reset();
+            _lootTracker.Reset();
+            _visitedPathNodes.Clear();
+            _currentExploreTarget = null;
             _status = "Heist mode entered";
-            // Heist curio drops are "quest" items — must pick them up
             ctx.Loot.IgnoreQuestItems = false;
+
+            // Initialize/reset heist_debug.log on session start
+            try
+            {
+                var dir = Path.GetDirectoryName(typeof(HeistMode).Assembly.Location) ?? ".";
+                _heistLogPath = Path.Combine(dir, "heist_debug.log");
+                File.WriteAllText(_heistLogPath, $"=== HEIST LOG STARTED {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===\n");
+            }
+            catch { }
+
+            var gc = ctx.Game;
+            var currentArea = gc.Area?.CurrentArea?.Name ?? "";
+            _lastAreaName = currentArea;
+
+            if (currentArea == "The Rogue Harbour" || gc.Area?.CurrentArea?.IsHideout == true || gc.Area?.CurrentArea?.IsTown == true)
+            {
+                _phase = HeistPhase.InHarbour;
+                _phaseStartTime = DateTime.Now;
+                _status = "In Rogue Harbour — preparing contract";
+                HeistLog("Started in Rogue Harbour");
+            }
+            else
+            {
+                ModeHelpers.EnableDefaultCombat(ctx);
+                _phase = HeistPhase.Initializing;
+                _phaseStartTime = DateTime.Now;
+                _status = "In contract — initializing";
+                HeistLog($"Started in contract: {currentArea}");
+            }
         }
 
         public void OnExit()
         {
             _phase = HeistPhase.Idle;
+            _state.Reset();
         }
 
         public void Tick(BotContext ctx)
@@ -77,135 +134,546 @@ namespace AutoExile.Modes
                 return;
             }
 
-            // Detect area changes
             var currentArea = gc.Area?.CurrentArea?.Name ?? "";
             if (!string.IsNullOrEmpty(currentArea) && currentArea != _lastAreaName)
             {
-                if (!string.IsNullOrEmpty(_lastAreaName))
-                    OnAreaChanged(ctx);
+                OnAreaChanged(ctx, currentArea);
                 _lastAreaName = currentArea;
             }
 
-            // In hideout/town — idle
             var isHideout = gc.Area?.CurrentArea?.IsHideout == true;
             var isTown = gc.Area?.CurrentArea?.IsTown == true;
-            if (isHideout || isTown)
+            var isRogueHarbour = currentArea == "The Rogue Harbour";
+            bool inContract = !isHideout && !isTown && !isRogueHarbour;
+
+            if (inContract)
             {
-                if (_phase != HeistPhase.Idle && _phase != HeistPhase.Done)
+                ctx.Navigation.WalkOnly = false;
+
+                if (!ctx.Combat.Profile.Enabled)
+                    ModeHelpers.EnableDefaultCombat(ctx);
+
+                ctx.Combat.SuppressPositioning = ctx.Interaction.IsBusy;
+                ctx.Combat.SuppressTargetedSkills = ctx.Interaction.IsBusy && ctx.Combat.NearbyMonsterCount == 0;
+                ctx.Combat.Tick(ctx);
+
+                var interactionResult = ctx.Interaction.Tick(gc);
+                _lootTracker.HandleResult(interactionResult, ctx);
+
+                if (_pendingInteractionEntityId != 0 && interactionResult != InteractionResult.None && interactionResult != InteractionResult.InProgress)
                 {
-                    _phase = _state.DeathCount > 0 ? HeistPhase.Done : HeistPhase.Idle;
-                    _status = isHideout ? "In hideout" : "In town";
-                    Decision = "hideout";
+                    if (interactionResult == InteractionResult.Succeeded)
+                        _state.OpenedEntities.Add(_pendingInteractionEntityId);
+                    _pendingInteractionEntityId = 0;
                 }
-                return;
+
+                _state.Tick(gc);
+
+                if ((DateTime.Now - _lastCurioScanTime).TotalSeconds > 2)
+                {
+                    _lastCurioScanTime = DateTime.Now;
+                    ScanCurioDisplays(gc);
+                }
             }
-
-            // Tick combat — heist corridors are tight, suppress positioning always (walks
-            // into walls). Allow targeted skills when standing still (at doors, waiting) or
-            // when monsters are nearby, so the build can fight while navigating.
-            ctx.Combat.SuppressPositioning = true;
-            var activelyMoving = ctx.Navigation.IsNavigating;
-            ctx.Combat.SuppressTargetedSkills = activelyMoving && ctx.Combat.NearbyMonsterCount == 0;
-            ctx.Combat.Tick(ctx);
-
-            // Tick interaction
-            var interactionResult = ctx.Interaction.Tick(gc);
-            _lootTracker.HandleResult(interactionResult, ctx);
-
-            // Handle pending entity interaction results (doors, chests, curio, exit)
-            if (_pendingInteractionEntityId != 0 && interactionResult != InteractionResult.None
-                && interactionResult != InteractionResult.InProgress)
+            else
             {
-                if (interactionResult == InteractionResult.Succeeded)
-                    _state.OpenedEntities.Add(_pendingInteractionEntityId);
-                _pendingInteractionEntityId = 0;
+                ctx.Navigation.WalkOnly = true;
             }
 
-            // Always tick state
-            _state.Tick(gc);
-
-            // Scan curio displays for valuation overlay (every 2s)
-            if ((DateTime.Now - _lastCurioScanTime).TotalSeconds > 2)
-            {
-                _lastCurioScanTime = DateTime.Now;
-                ScanCurioDisplays(gc);
-            }
-
-            // Phase machine
+            // Phase State Machine
             switch (_phase)
             {
-                case HeistPhase.Idle:
-                    // Detect heist map — companion present
-                    if (_state.CompanionEntityId == 0)
-                    {
-                        // Try to find companion
-                        foreach (var e in gc.EntityListWrapper.OnlyValidEntities)
-                        {
-                            if (e?.Path?.Contains("LeagueHeist/NPCAllies") == true && !e.IsHostile && e.IsAlive)
-                            {
-                                _phase = HeistPhase.Initializing;
-                                _phaseStartTime = DateTime.Now;
-                                break;
-                            }
-                        }
-                        if (_phase == HeistPhase.Idle)
-                        {
-                            _status = "Not in heist map (no companion found)";
-                            Decision = "idle";
-                        }
-                    }
-                    else
-                    {
-                        _phase = HeistPhase.Initializing;
-                        _phaseStartTime = DateTime.Now;
-                    }
+                case HeistPhase.InHarbour:
+                    TickInHarbour(ctx, gc);
+                    break;
+                case HeistPhase.StashItems:
+                    TickStashItems(ctx, gc);
+                    break;
+                case HeistPhase.OpenAdiyah:
+                    TickOpenAdiyah(ctx, gc);
+                    break;
+                case HeistPhase.InsertContract:
+                    TickInsertContract(ctx, gc);
+                    break;
+                case HeistPhase.SelectRogue:
+                    TickSelectRogue(ctx, gc);
+                    break;
+                case HeistPhase.SignContract:
+                    TickSignContract(ctx, gc);
+                    break;
+                case HeistPhase.WaitForPortal:
+                    TickWaitForPortal(ctx, gc);
+                    break;
+                case HeistPhase.EnterPortal:
+                    TickEnterPortal(ctx, gc);
                     break;
 
                 case HeistPhase.Initializing:
                     TickInitializing(ctx, gc);
                     break;
-
                 case HeistPhase.Infiltrating:
                     TickInfiltrating(ctx, gc);
                     break;
-
                 case HeistPhase.AtDoor:
                     TickAtDoor(ctx, gc);
                     break;
-
                 case HeistPhase.AtChest:
                     TickAtChest(ctx, gc);
                     break;
-
                 case HeistPhase.GrabCurio:
                     TickGrabCurio(ctx, gc);
                     break;
-
                 case HeistPhase.Escaping:
                     TickEscaping(ctx, gc);
                     break;
-
                 case HeistPhase.ExitingMap:
                     TickExitingMap(ctx, gc);
                     break;
 
                 case HeistPhase.Done:
-                    _status = "Heist complete";
+                    _status = "Heist cycle complete";
                     Decision = "done";
+                    break;
+                case HeistPhase.Idle:
+                    if (isRogueHarbour)
+                    {
+                        _phase = HeistPhase.InHarbour;
+                        _phaseStartTime = DateTime.Now;
+                    }
+                    else
+                    {
+                        _status = "Idle";
+                        Decision = "idle";
+                    }
                     break;
             }
         }
 
+        private void OnAreaChanged(BotContext ctx, string newArea)
+        {
+            ModeHelpers.CancelAllSystems(ctx);
+            _state.OnAreaChanged();
+            _lootTracker.ResetCount();
+            ctx.Loot.ClearFailed();
+            _waitingOnEntityId = 0;
+            _pendingInteractionEntityId = 0;
+            _visitedPathNodes.Clear();
+            _currentExploreTarget = null;
+            _adiyahClickAttempts = 0;
+            _contractInsertAttempts = 0;
+            _signClickAttempts = 0;
+
+            if (newArea == "The Rogue Harbour" || ctx.Game.Area?.CurrentArea?.IsHideout == true || ctx.Game.Area?.CurrentArea?.IsTown == true)
+            {
+                // If an existing contract portal is still open after death, re-enter it
+                var existingPortal = FindHeistPortal(ctx.Game);
+                if (existingPortal != null)
+                {
+                    _phase = HeistPhase.EnterPortal;
+                    _phaseStartTime = DateTime.Now;
+                    _status = "Contract portal still open — re-entering after death";
+                    Decision = "reenter_portal";
+                }
+                else
+                {
+                    _phase = HeistPhase.InHarbour;
+                    _phaseStartTime = DateTime.Now;
+                    _status = "Returned to Harbour — checking inventory";
+                    Decision = "harbour_entered";
+                }
+            }
+            else
+            {
+                // In contract: re-enable combat system
+                ModeHelpers.EnableDefaultCombat(ctx);
+                _phase = HeistPhase.Initializing;
+                _phaseStartTime = DateTime.Now;
+                _status = "Entered contract — initializing";
+                Decision = "contract_entered";
+            }
+        }
+
+        // =====================================================================
+        // Rogue Harbour Automation: Stash -> Adiyah -> Contract -> Portal
+        // =====================================================================
+
+        private void TickInHarbour(BotContext ctx, GameController gc)
+        {
+            // Close any open inventory panels
+            if (gc.IngameState.IngameUi.InventoryPanel?.IsVisible == true)
+                BotInput.PressKey(Keys.Escape);
+
+            // Step 1: If an open portal exists, re-enter it immediately
+            var existingPortal = FindHeistPortal(gc);
+            if (existingPortal != null)
+            {
+                _phase = HeistPhase.EnterPortal;
+                _phaseStartTime = DateTime.Now;
+                _status = "Open contract portal found — entering";
+                Decision = "enter_existing_portal";
+                return;
+            }
+
+            // Step 2: Check if contract board is already open on screen
+            var openPanel = FindHeistContractPanel(gc);
+            if (openPanel != null)
+            {
+                ctx.Navigation.Stop(gc);
+                _phase = HeistPhase.InsertContract;
+                _phaseStartTime = DateTime.Now;
+                _status = "Contract UI open — preparing contract";
+                return;
+            }
+
+            // Step 3: Check if we need to stash loot
+            int stashableCount = 0;
+            var slotItems = StashSystem.GetInventorySlotItems(gc);
+            if (slotItems != null)
+            {
+                foreach (var item in slotItems)
+                    if (StashFilterKeepContractsAndMarkers(item)) stashableCount++;
+            }
+
+            if (stashableCount >= ctx.Settings.Run.StashItemThreshold.Value)
+            {
+                _phase = HeistPhase.StashItems;
+                _phaseStartTime = DateTime.Now;
+                _status = $"Stashing loot ({stashableCount} items)";
+                return;
+            }
+
+            // Step 4: Check if we have a contract in inventory
+            var contract = FindContractInInventory(gc);
+            if (contract == null)
+            {
+                _status = "No Heist Contracts found in inventory — stopping";
+                Decision = "no_contracts";
+                _phase = HeistPhase.Done;
+                return;
+            }
+
+            // Step 5: Go to Adiyah
+            _phase = HeistPhase.OpenAdiyah;
+            _phaseStartTime = DateTime.Now;
+            _adiyahClickAttempts = 0;
+            _status = "Heading to Adiyah";
+            Decision = "goto_adiyah";
+        }
+
+        private void TickStashItems(BotContext ctx, GameController gc)
+        {
+            if (!ctx.Stash.IsBusy)
+            {
+                var dumpTab = ctx.Settings.Stash.DumpTabName.Value;
+                ctx.Stash.Start(
+                    storeTabName: string.IsNullOrWhiteSpace(dumpTab) ? null : dumpTab,
+                    itemFilter: StashFilterKeepContractsAndMarkers);
+            }
+
+            var result = ctx.Stash.Tick(gc, ctx.Navigation);
+            if (result == StashResult.Succeeded || result == StashResult.Failed)
+            {
+                _phase = HeistPhase.InHarbour;
+                _phaseStartTime = DateTime.Now;
+            }
+            _status = $"Stashing items: {ctx.Stash.Status}";
+        }
+
+        private void TickOpenAdiyah(BotContext ctx, GameController gc)
+        {
+            // Check if Adiyah's window is open
+            if (IsHeistWindowOpen(gc))
+            {
+                ctx.Navigation.Stop(gc);
+                _phase = HeistPhase.InsertContract;
+                _phaseStartTime = DateTime.Now;
+                _contractInsertAttempts = 0;
+                _status = "Adiyah UI open — inserting contract";
+                return;
+            }
+
+            var adiyah = FindAdiyah(gc);
+            if (adiyah == null)
+            {
+                _status = "Searching for Adiyah...";
+                return;
+            }
+
+            var dist = Vector2.Distance(gc.Player.GridPosNum, adiyah.GridPosNum);
+            if (dist > 25f)
+            {
+                if (!ctx.Navigation.IsNavigating)
+                    ctx.Navigation.NavigateTo(gc, adiyah.GridPosNum);
+                _status = $"Walking to Adiyah (dist: {dist:F0})";
+                return;
+            }
+
+            if (!ModeHelpers.CanAct(_lastActionTime, MajorActionCooldownMs)) return;
+
+            ctx.Navigation.Stop(gc);
+
+            // Compute exact target on Adiyah
+            var pos = adiyah.BoundsCenterPosNum;
+            if (pos == Vector3.Zero || float.IsNaN(pos.X))
+                pos = adiyah.PosNum;
+
+            pos.Z -= 15f; // Target upper body
+
+            var camera = gc.IngameState.Camera;
+            var screenPos = camera.WorldToScreen(pos);
+            var windowRect = gc.Window.GetWindowRectangle();
+            var absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
+
+            if (BotInput.CtrlClick(absPos))
+            {
+                _lastActionTime = DateTime.Now;
+                _adiyahClickAttempts++;
+                _status = $"Ctrl+clicking Adiyah (attempt {_adiyahClickAttempts})";
+            }
+        }
+
+        private void TickInsertContract(BotContext ctx, GameController gc)
+        {
+            if (!IsHeistWindowOpen(gc))
+            {
+                _phase = HeistPhase.OpenAdiyah;
+                return;
+            }
+
+            // If the board has expanded to show details / "SIGN CONTRACT", contract is socketed
+            if (IsContractSocketed(gc))
+            {
+                _phase = HeistPhase.SelectRogue;
+                _phaseStartTime = DateTime.Now;
+                _status = "Contract socketed — selecting rogue";
+                HeistLog("Contract socketed successfully -> SelectRogue");
+                return;
+            }
+
+            if (!ModeHelpers.CanAct(_lastActionTime, MajorActionCooldownMs)) return;
+
+            // Safety: If cursor is currently holding an item, press Escape to drop it back to inventory
+            try
+            {
+                if (gc.IngameState.IngameUi.Cursor?.ChildCount > 0)
+                {
+                    BotInput.PressKey(Keys.Escape);
+                    _lastActionTime = DateTime.Now;
+                    _status = "Clearing item from cursor...";
+                    return;
+                }
+            }
+            catch { }
+
+            var contract = FindContractInInventory(gc);
+            if (contract == null)
+            {
+                _status = "No contracts in inventory";
+                _phase = HeistPhase.Done;
+                return;
+            }
+
+            // Guaranteed Ctrl+Click: calculate absolute screen coordinates
+            var rect = contract.GetClientRect();
+            var windowRect = gc.Window.GetWindowRectangle();
+            var absPos = new Vector2(windowRect.X + rect.Center.X, windowRect.Y + rect.Center.Y);
+
+            // Send discrete Ctrl+Click with explicit keydown
+            ExileCore.Input.KeyDown(Keys.LControlKey);
+            ExileCore.Input.SetCursorPos(absPos);
+            BotInput.CtrlClick(absPos);
+            ExileCore.Input.KeyUp(Keys.LControlKey);
+
+            _lastActionTime = DateTime.Now;
+            _contractInsertAttempts++;
+            _status = "Ctrl+clicking contract into socket...";
+            HeistLog($"Ctrl+clicked contract in inventory (attempt {_contractInsertAttempts})");
+        }
+
+        private void TickSelectRogue(BotContext ctx, GameController gc)
+        {
+            if (!IsHeistWindowOpen(gc))
+            {
+                _phase = HeistPhase.OpenAdiyah;
+                return;
+            }
+
+            var ui = gc.IngameState?.IngameUi;
+            var p105 = ui?.GetChildAtIndex(105);
+            if (p105 == null) return;
+
+            if (!ModeHelpers.CanAct(_lastActionTime, MajorActionCooldownMs)) return;
+
+            var windowRect = gc.Window.GetWindowRectangle();
+
+            // Step 1: If the Rogue list popup is open (105->2->1->0->2->0), click the first rogue
+            var firstRogue = FindRogueSelectionList(gc);
+            if (firstRogue != null && firstRogue.IsVisible)
+            {
+                var r = firstRogue.GetClientRect();
+                var clickPos = new Vector2(windowRect.X + r.Center.X, windowRect.Y + r.Center.Y);
+                BotInput.Click(clickPos);
+                _lastActionTime = DateTime.Now;
+                _status = "Selected first rogue member";
+                _phase = HeistPhase.SignContract;
+                _phaseStartTime = DateTime.Now;
+                return;
+            }
+
+            // Step 2: Click the team slot button (105->2->0->0->2->1) to open the rogue list
+            var slotBtn = FindRogueSlotButton(p105);
+            if (slotBtn != null && slotBtn.IsVisible)
+            {
+                var r = slotBtn.GetClientRect();
+                var clickPos = new Vector2(windowRect.X + r.Center.X, windowRect.Y + r.Center.Y);
+                BotInput.Click(clickPos);
+                _lastActionTime = DateTime.Now;
+                _status = "Clicked team slot — opening rogue list";
+                return;
+            }
+
+            _status = "Waiting for team slot button...";
+        }
+
+        private void TickSignContract(BotContext ctx, GameController gc)
+        {
+            var ui = gc.IngameState?.IngameUi;
+
+            // Once the window closes, the contract has been signed
+            if (!IsHeistWindowOpen(gc) || ui == null || ui.ChildCount <= 105)
+            {
+                _phase = HeistPhase.WaitForPortal;
+                _phaseStartTime = DateTime.Now;
+                _status = "Contract signed — waiting for portal";
+                return;
+            }
+
+            var p105 = ui.GetChildAtIndex(105);
+            if (p105 == null || !p105.IsVisible) return;
+
+            if (!ModeHelpers.CanAct(_lastActionTime, MajorActionCooldownMs)) return;
+
+            // Click the SIGN CONTRACT button (105->2->2->0->0)
+            var signBtn = FindSignContractButton(p105);
+            if (signBtn != null && signBtn.IsVisible)
+            {
+                var r = signBtn.GetClientRect();
+                var windowRect = gc.Window.GetWindowRectangle();
+                var clickPos = new Vector2(windowRect.X + r.Center.X, windowRect.Y + r.Center.Y);
+
+                BotInput.Click(clickPos);
+                _lastActionTime = DateTime.Now;
+                _signClickAttempts++;
+                _status = $"Clicking SIGN CONTRACT (attempt {_signClickAttempts})";
+                return;
+            }
+
+            if ((DateTime.Now - _phaseStartTime).TotalSeconds > 10)
+            {
+                _phase = HeistPhase.WaitForPortal;
+                _phaseStartTime = DateTime.Now;
+            }
+        }
+
+        private void TickWaitForPortal(BotContext ctx, GameController gc)
+        {
+            var elapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
+
+            // Wait 2.5 seconds for the portal opening animation to complete
+            if (elapsed < 2.5f)
+            {
+                _status = $"Waiting for portal to open ({2.5f - elapsed:F1}s)...";
+                return;
+            }
+
+            var portal = FindHeistPortal(gc);
+            if (portal != null)
+            {
+                _phase = HeistPhase.EnterPortal;
+                _phaseStartTime = DateTime.Now;
+                _status = $"Heist portal found ({portal.RenderName ?? "Portal"}) — entering";
+                return;
+            }
+
+            if (elapsed > 12)
+            {
+                _phase = HeistPhase.InHarbour;
+                _status = "Portal wait timeout — retrying";
+            }
+            else
+            {
+                _status = "Looking for Heist portal near Adiyah...";
+            }
+        }
+
+        private void TickEnterPortal(BotContext ctx, GameController gc)
+        {
+            if (gc.IsLoading || gc.Area?.CurrentArea?.Name != "The Rogue Harbour")
+            {
+                _status = "Entering contract...";
+                return;
+            }
+
+            if (!ModeHelpers.CanAct(_lastActionTime, MajorActionCooldownMs)) return;
+
+            var portal = FindHeistPortal(gc);
+            if (portal == null)
+            {
+                _phase = HeistPhase.WaitForPortal;
+                _phaseStartTime = DateTime.Now;
+                return;
+            }
+
+            var dist = Vector2.Distance(gc.Player.GridPosNum, portal.GridPosNum);
+            if (dist > ctx.Interaction.InteractRadius)
+            {
+                if (!ctx.Navigation.IsNavigating)
+                    ctx.Navigation.NavigateTo(gc, portal.GridPosNum);
+                _status = $"Walking to portal (dist: {dist:F0})";
+                return;
+            }
+
+            ctx.Navigation.Stop(gc);
+            ModeHelpers.ClickEntity(gc, portal, ref _lastActionTime);
+            _status = $"Clicking portal '{portal.RenderName ?? "Portal"}' to enter Heist";
+        }
+
+        // =====================================================================
+        // In-Contract Execution: Infiltrate -> Curio -> Escape -> Exit
+        // =====================================================================
+
         private void TickInitializing(BotContext ctx, GameController gc)
         {
-            // Wait for entities to settle after zone load
             if ((DateTime.Now - _phaseStartTime).TotalSeconds < ctx.Settings.AreaSettleSeconds.Value)
             {
-                _status = "Initializing... waiting for entities";
+                _status = "Initializing... waiting for area settle";
                 Decision = "init_wait";
                 return;
             }
 
+            // Step 1: Find entrance transition (live entities or TileEntities)
+            var entrance = FindHeistEntranceTransition(gc);
+            if (entrance != null)
+            {
+                var shortName = entrance.RenderName ?? entrance.Path.Split('/').LastOrDefault() ?? "Entrance";
+                var dist = Vector2.Distance(gc.Player.GridPosNum, entrance.GridPosNum);
+
+                if (!ctx.Interaction.IsBusy)
+                {
+                    ctx.Interaction.InteractWithEntity(entrance, ctx.Navigation, requireProximity: true);
+                    _status = $"Entering facility via {shortName} (dist: {dist:F0})...";
+                    Decision = "enter_facility_transition";
+                    HeistLog($"Found entrance transition: {entrance.Path} (RenderName='{entrance.RenderName}', Type={entrance.Type}, dist={dist:F0}) -> moving to click");
+                }
+                else
+                {
+                    _status = $"Walking to entrance transition (dist: {dist:F0})...";
+                }
+                return; // Stay in Initializing until through
+            }
+
+            // Step 2: Once inside the facility, initialize route and start infiltration
+            HeistLog("No entrance transition found in staging — initializing route for main facility");
             _state.Initialize(gc);
             _state.BuildRoute(ctx.Settings.Heist);
             ModeHelpers.EnableDefaultCombat(ctx);
@@ -213,18 +681,16 @@ namespace AutoExile.Modes
             var routeDesc = string.Join(" → ", _state.PlannedRoute.Select(t => t.Label));
             ctx.Log($"Heist initialized: {_state.Status}");
             ctx.Log($"Route ({_state.PlannedRoute.Count} targets): {routeDesc}");
+            HeistLog($"Inside facility — route: {routeDesc}");
 
-            // Detect mid-lockdown start: no alert panel, no curio entity, companion present.
-            // This happens when bot starts after curio was already grabbed.
-            if (!_state.IsAlertPanelVisible && _state.FindCurioEntity(gc) == null
-                && _state.CompanionEntityId != 0)
+            // Mid-lockdown check
+            if (!_state.IsAlertPanelVisible && _state.FindCurioEntity(gc) == null && _state.CompanionEntityId != 0)
             {
                 _state.ForceLockdown();
                 _phase = HeistPhase.Escaping;
                 _phaseStartTime = DateTime.Now;
                 _status = "Lockdown detected (mid-start)";
                 Decision = "init_lockdown";
-                ctx.Log("Heist: detected lockdown at init — skipping to escape");
                 return;
             }
 
@@ -236,22 +702,20 @@ namespace AutoExile.Modes
 
         private void TickInfiltrating(BotContext ctx, GameController gc)
         {
-            // Check lockdown — curio was broken, loot the drop before escaping
             if (_state.IsLockdown)
             {
-                ctx.Log("Lockdown detected — grabbing curio loot before escape");
                 ctx.Navigation.Stop(gc);
-                _visitedPathNodes.Clear(); // doors re-lock, need to re-traverse corridor
+                _visitedPathNodes.Clear();
                 _currentExploreTarget = null;
-                _phase = HeistPhase.GrabCurio; // loot the quest item drop first
+                _phase = HeistPhase.GrabCurio;
                 _phaseStartTime = DateTime.Now;
                 Decision = "lockdown_detected";
+                HeistLog("Lockdown started — grabbing curio before escape");
                 return;
             }
 
             var playerGrid = gc.Player.GridPosNum;
 
-            // Check for curio entity nearby — if we've reached it, switch to GrabCurio
             var curio = _state.FindCurioEntity(gc);
             if (curio != null && curio.DistancePlayer < 25)
             {
@@ -259,84 +723,65 @@ namespace AutoExile.Modes
                 _phase = HeistPhase.GrabCurio;
                 _phaseStartTime = DateTime.Now;
                 Decision = "at_curio";
+                HeistLog("Curio room reached");
                 return;
             }
 
-            // Loot nearby items (every 500ms)
+            var currentRouteTarget = _state.CurrentTarget;
+            bool nearChestTarget = currentRouteTarget != null && currentRouteTarget.Type == RouteTargetType.RewardChest && Vector2.Distance(playerGrid, currentRouteTarget.GridPos) < 40;
+
+            // Priority 1: Clear nearby active monsters
+            if (ctx.Combat.InCombat && ctx.Combat.NearbyMonsterCount > 0 && !nearChestTarget)
+            {
+                if (ctx.Navigation.IsNavigating)
+                    ctx.Navigation.Stop(gc);
+
+                _status = $"Clearing enemies ({ctx.Combat.NearbyMonsterCount} nearby)...";
+                Decision = "clearing_pack";
+
+                // Log enemy breakdown every 2.5s while actively engaged
+                if ((DateTime.Now - _lastActionTime).TotalSeconds > 2.5)
+                {
+                    LogNearbyEnemiesDebug(gc);
+                    _lastActionTime = DateTime.Now;
+                }
+                return;
+            }
+
+            // Priority 2: Loot ground items only when clear of threats
             if ((DateTime.Now - _lastLootScanTime).TotalMilliseconds > 500 && !ctx.Interaction.IsBusy)
             {
                 _lastLootScanTime = DateTime.Now;
                 TryPickupLoot(ctx, gc);
             }
 
-            // After opening a chest, pause to loot dropped items before resuming navigation
             if (DateTime.Now < _chestLootWindowEnd)
             {
                 _status = "Looting chest drops...";
                 Decision = "chest_loot_window";
-                return; // keep scanning loot above, but don't navigate away
+                return;
             }
 
-            // Check for blocking doors nearby — but NOT when we're close to a chest route target.
-            // Otherwise the bot opens the door to a chest room, then immediately detects the NEXT
-            // locked door further down the corridor and walks past the chest to open that one.
-            var currentRouteTarget = _state.CurrentTarget;
-            bool nearChestTarget = currentRouteTarget != null
-                && currentRouteTarget.Type == RouteTargetType.RewardChest
-                && Vector2.Distance(playerGrid, currentRouteTarget.GridPos) < 60;
-
+            // Priority 3: Check for blocking doors in the corridor
             if (!ctx.Interaction.IsBusy && !nearChestTarget)
             {
                 var blockingDoor = FindBlockingDoor(gc, playerGrid);
                 if (blockingDoor != null)
                 {
-                    ctx.Navigation.Stop(gc);
                     StartDoorInteraction(ctx, gc, blockingDoor, HeistPhase.Infiltrating);
                     return;
                 }
             }
 
-            // --- Route following ---
-
-            // Advance past completed/skipped route targets
+            // Priority 4: Route navigation & chest interaction
             while (_state.CurrentRouteIndex < _state.PlannedRoute.Count)
             {
                 var t = _state.PlannedRoute[_state.CurrentRouteIndex];
-                if (t.Reached || t.Skipped)
-                {
-                    _state.CurrentRouteIndex++;
-                    continue;
-                }
-                if (t.Type == RouteTargetType.RewardChest)
-                {
-                    // Check by ID (if IDs match) or by checking if any opened chest is near this position
-                    if (_state.OpenedEntities.Contains(t.EntityId))
-                    {
-                        t.Reached = true;
-                        _state.CurrentRouteIndex++;
-                        continue;
-                    }
-                    // Position-based check: any opened chest within 15 grid units of route target?
-                    bool opened = false;
-                    foreach (var id in _state.OpenedEntities)
-                    {
-                        if (_state.RewardChests.TryGetValue(id, out var c) && Vector2.Distance(c.GridPos, t.GridPos) < 15)
-                        {
-                            opened = true;
-                            break;
-                        }
-                    }
-                    if (opened)
-                    {
-                        t.Reached = true;
-                        _state.CurrentRouteIndex++;
-                        continue;
-                    }
-                }
+                if (t.Reached || t.Skipped) { _state.CurrentRouteIndex++; continue; }
+                if (t.Type == RouteTargetType.RewardChest && _state.OpenedEntities.Contains(t.EntityId)) { t.Reached = true; _state.CurrentRouteIndex++; continue; }
                 break;
             }
 
-            // Reset stuck count when route target changes
             if (_state.CurrentRouteIndex != _lastRouteIndex)
             {
                 _lastStuckCount = ctx.Navigation.StuckRecoveries;
@@ -347,44 +792,29 @@ namespace AutoExile.Modes
 
             if (target != null && target.Type == RouteTargetType.RewardChest)
             {
-                // Check alert budget before committing to this chest
                 if (_state.AlertPercent > ctx.Settings.Heist.AlertThreshold.Value)
                 {
                     target.Skipped = true;
                     _status = $"Skipping {target.Label} — alert {_state.AlertPercent:F0}%";
                     Decision = "skip_chest_alert";
-                    return; // next tick advances past this
+                    HeistLog($"Skipping chest {target.Label} — alert { _state.AlertPercent:F0}%");
+                    return;
                 }
 
-                // Check if we're close enough to interact
                 var distToChest = Vector2.Distance(playerGrid, target.GridPos);
-                if (distToChest < 25)
+                if (distToChest < 35)
                 {
-                    // Find live entity — match by ID first, fall back to nearest HeistChest by position.
-                    // TileEntity IDs may not match live entity IDs.
                     Entity? chestEntity = null;
-                    float bestChestDist = 15f; // max distance to match a chest to its route target
+                    float bestChestDist = 25f;
                     foreach (var e in gc.EntityListWrapper.OnlyValidEntities)
                     {
-                        if (e?.Path == null || !e.IsTargetable) continue;
-                        if (!e.Path.Contains("HeistChest")) continue;
-
-                        if (e.Id == target.EntityId)
-                        {
-                            chestEntity = e;
-                            break; // exact ID match
-                        }
-
-                        // Position match — closest HeistChest to the route target position
+                        if (e?.Path == null || !e.IsTargetable || !e.Path.Contains("HeistChest")) continue;
+                        if (e.Id == target.EntityId) { chestEntity = e; break; }
                         var d = Vector2.Distance(e.GridPosNum, target.GridPos);
                         if (d < bestChestDist)
                         {
                             var ch = e.GetComponent<Chest>();
-                            if (ch?.IsOpened != true)
-                            {
-                                bestChestDist = d;
-                                chestEntity = e;
-                            }
+                            if (ch?.IsOpened != true) { bestChestDist = d; chestEntity = e; }
                         }
                     }
 
@@ -393,50 +823,27 @@ namespace AutoExile.Modes
                         var chest = chestEntity.GetComponent<Chest>();
                         if (chest?.IsOpened != true && !ctx.Interaction.IsBusy)
                         {
-                            ctx.Navigation.Stop(gc);
                             StartChestInteraction(ctx, gc, chestEntity);
                             return;
                         }
                     }
-                    else
+                    else if ((DateTime.Now - _phaseStartTime).TotalSeconds > 10)
                     {
-                        // Entity not loaded yet — wait a bit before giving up (might be loading in)
-                        if ((DateTime.Now - _phaseStartTime).TotalSeconds > 10)
-                        {
-                            target.Reached = true;
-                            Decision = "chest_not_found";
-                            return;
-                        }
-                        _status = $"Waiting for chest entity near ({target.GridPos.X:F0},{target.GridPos.Y:F0})...";
-                        Decision = "chest_loading";
+                        target.Reached = true;
                         return;
                     }
                 }
 
-                // Navigate toward the chest
                 NavigateToRouteTarget(ctx, gc, playerGrid, target);
             }
             else if (target != null && target.Type == RouteTargetType.Curio)
             {
-                // If at the curio marker but no entity, marker was stale
-                if (Vector2.Distance(playerGrid, target.GridPos) < 15 && _state.FindCurioEntity(gc) == null)
-                {
-                    target.Reached = true;
-                    _state.ClearCurioTarget();
-                    Decision = "curio_marker_reached";
-                    return;
-                }
-
-                // Update curio position if actual entity appeared
                 var curioEntity = _state.FindCurioEntity(gc);
-                if (curioEntity != null)
-                    target.GridPos = curioEntity.GridPosNum;
-
+                if (curioEntity != null) target.GridPos = curioEntity.GridPosNum;
                 NavigateToRouteTarget(ctx, gc, playerGrid, target);
             }
             else
             {
-                // Route exhausted — fall back to pathnode exploration
                 FallbackExplore(ctx, gc, playerGrid);
             }
         }
@@ -446,69 +853,36 @@ namespace AutoExile.Modes
             var elapsed = (DateTime.Now - _companionWaitStart).TotalSeconds;
             var settings = ctx.Settings.Heist;
 
-            // Find the door entity
             Entity? doorEntity = null;
             foreach (var e in gc.EntityListWrapper.OnlyValidEntities)
                 if (e.Id == _waitingOnEntityId) { doorEntity = e; break; }
 
             if (doorEntity == null || !doorEntity.IsTargetable)
             {
-                // Door opened or despawned
                 _state.OpenedEntities.Add(_waitingOnEntityId);
                 _waitingOnEntityId = 0;
                 _phase = _returnPhaseAfterDoor;
                 _phaseStartTime = DateTime.Now;
-                Decision = "door_opened";
+                HeistLog($"Door {_waitingOnEntityId} opened successfully");
                 return;
             }
 
             var distToDoor = doorEntity.DistancePlayer;
+            bool isClickDoor = doorEntity.Path == "Metadata/MiscellaneousObjects/Door" || doorEntity.Path?.Contains("Door_Basic") == true;
 
-            // Check if it's a click-to-open door (basic or generic) — navigate to it and click
-            bool isClickDoor = doorEntity.Path == "Metadata/MiscellaneousObjects/Door"
-                || doorEntity.Path?.Contains("Door_Basic") == true;
             if (isClickDoor)
             {
-                var sm = doorEntity.GetComponent<StateMachine>();
-                var open = HeistState.GetStateValue(sm, "open");
-                if (open == 1 || !doorEntity.IsTargetable)
-                {
-                    _state.OpenedEntities.Add(_waitingOnEntityId);
-                    _waitingOnEntityId = 0;
-                    _phase = _returnPhaseAfterDoor;
-                    _phaseStartTime = DateTime.Now;
-                    Decision = "basic_door_opened";
-                    return;
-                }
-
-                // Navigate closer if far, then click — InteractWithEntity handles final approach
                 if (distToDoor > 40)
                 {
-                    // Too far for interaction — navigate closer first
                     if (!ctx.Navigation.IsNavigating)
                     {
                         var nearWalkable = ctx.Navigation.FindNearestWalkable(gc, doorEntity.GridPosNum, 20);
-                        bool started = false;
-                        if (nearWalkable.HasValue)
-                            started = ctx.Navigation.NavigateTo(gc, nearWalkable.Value);
-                        if (!started)
-                        {
-                            var stepNode = FindPathNodeToward(gc, gc.Player.GridPosNum, doorEntity.GridPosNum);
-                            if (stepNode.HasValue)
-                                ctx.Navigation.NavigateTo(gc, stepNode.Value);
-                        }
+                        if (nearWalkable.HasValue) ctx.Navigation.NavigateTo(gc, nearWalkable.Value);
                     }
-                    _status = $"Moving to basic door... dist: {distToDoor:F0}";
-                    Decision = "basic_door_approach";
                     return;
                 }
 
-                // Close enough — click the door (InteractWithEntity handles proximity)
-                if (ctx.Navigation.IsNavigating)
-                    ctx.Navigation.Stop(gc);
-
-                _status = $"Opening basic door... dist: {distToDoor:F0}";
-                Decision = "basic_door_clicking";
+                if (ctx.Navigation.IsNavigating) ctx.Navigation.Stop(gc);
 
                 if (!ctx.Interaction.IsBusy && (DateTime.Now - _lastCompanionClickTime).TotalSeconds > 2)
                 {
@@ -516,18 +890,15 @@ namespace AutoExile.Modes
                     _lastCompanionClickTime = DateTime.Now;
                 }
 
-                // Timeout
                 if (elapsed > 30)
                 {
                     _waitingOnEntityId = 0;
                     _phase = _returnPhaseAfterDoor;
                     _phaseStartTime = DateTime.Now;
-                    Decision = "basic_door_timeout";
                 }
                 return;
             }
 
-            // NPC/Vault door — poll companion progress
             var sm2 = doorEntity.GetComponent<StateMachine>();
             var locked = HeistState.GetStateValue(sm2, "heist_locked");
 
@@ -537,82 +908,47 @@ namespace AutoExile.Modes
                 _waitingOnEntityId = 0;
                 _phase = _returnPhaseAfterDoor;
                 _phaseStartTime = DateTime.Now;
-                Decision = "npc_door_opened";
                 return;
             }
 
-            // Ensure we're close enough to the door for companion to work.
-            // V key works from any distance — companion walks to the entity himself.
-            // Stay at 30 grid units to avoid cursor-on-door UI issues during approach.
-            distToDoor = doorEntity.DistancePlayer;
             if (distToDoor > 30)
             {
                 if (!ctx.Navigation.IsNavigating)
                 {
-                    // Navigate toward door but stop ~25 units away (between player and door)
                     var dir = Vector2.Normalize(doorEntity.GridPosNum - gc.Player.GridPosNum);
                     var approachTarget = doorEntity.GridPosNum - dir * 25;
                     var nearWalkable = ctx.Navigation.FindNearestWalkable(gc, approachTarget, 15);
-                    bool started = false;
-                    if (nearWalkable.HasValue)
-                        started = ctx.Navigation.NavigateTo(gc, nearWalkable.Value);
-                    if (!started)
-                    {
-                        var stepNode = FindPathNodeToward(gc, gc.Player.GridPosNum, doorEntity.GridPosNum);
-                        if (stepNode.HasValue)
-                            ctx.Navigation.NavigateTo(gc, stepNode.Value);
-                    }
+                    if (nearWalkable.HasValue) ctx.Navigation.NavigateTo(gc, nearWalkable.Value);
                 }
-                _status = $"Moving to door... dist: {distToDoor:F0}";
-                Decision = "door_approach";
                 return;
             }
-            else
-            {
-                // Close enough — stop nav so we stand still for companion
-                if (ctx.Navigation.IsNavigating)
-                    ctx.Navigation.Stop(gc);
-            }
 
-            // Check door's own heist_locked state — 2=untouched, 1=companion assigned, 0=opened
-            var doorAccepted = locked < 2; // V was accepted if heist_locked dropped from 2
+            var doorAccepted = locked < 2;
             var companionWorking = _state.CompanionLockPickProgress > 0 || _state.CompanionIsBusy || doorAccepted;
 
-            _status = $"Waiting for companion... locked:{locked:F0} progress:{_state.CompanionLockPickProgress:F0}% busy:{_state.CompanionIsBusy} ({elapsed:F0}s) dist:{distToDoor:F0}";
-            Decision = companionWorking ? "companion_channeling" : "companion_idle";
-
-            // Re-press V if companion hasn't accepted the job yet.
-            // Door heist_locked still at 2 means V wasn't received or no companion picked it up.
             if (!companionWorking)
             {
                 var timeSinceClick = (DateTime.Now - _lastCompanionClickTime).TotalSeconds;
-
-                // First retry after 2s (initial V may have been eaten by input gate),
-                // subsequent retries every 3s
-                var retryDelay = _companionClickAttempts == 0 ? 0.5 : 3.0;
+                var retryDelay = _companionClickAttempts == 0 ? 0.3 : 1.5;
                 if (timeSinceClick > retryDelay)
                 {
-                    var sent = BotInput.PressKey(settings.CompanionInteractKey);
+                    var sent = BotInput.PressKeyOverlay(settings.CompanionInteractKey);
                     if (sent)
                     {
                         _lastCompanionClickTime = DateTime.Now;
                         _companionClickAttempts++;
                     }
                 }
-
-                // Reset wait timer periodically so timeout doesn't fire while still retrying
                 if (elapsed > settings.CompanionRetryDelay.Value)
                     _companionWaitStart = DateTime.Now;
             }
 
-            // Timeout
             if (elapsed > settings.CompanionWaitTimeout.Value)
             {
-                ctx.Log($"Companion wait timeout on door {_waitingOnEntityId}");
+                HeistLog($"Companion door timeout on {_waitingOnEntityId}");
                 _waitingOnEntityId = 0;
                 _phase = _returnPhaseAfterDoor;
                 _phaseStartTime = DateTime.Now;
-                Decision = "companion_timeout";
             }
         }
 
@@ -625,153 +961,99 @@ namespace AutoExile.Modes
             foreach (var e in gc.EntityListWrapper.OnlyValidEntities)
                 if (e.Id == _waitingOnEntityId) { chestEntity = e; break; }
 
-            if (chestEntity == null || !chestEntity.IsTargetable)
+            if (chestEntity == null || !chestEntity.IsTargetable || chestEntity.GetComponent<Chest>()?.IsOpened == true)
             {
                 _state.OpenedEntities.Add(_waitingOnEntityId);
                 _waitingOnEntityId = 0;
-                _chestLootWindowEnd = DateTime.Now.AddSeconds(3); // pause to loot drops
+                _chestLootWindowEnd = DateTime.Now.AddSeconds(3);
                 _phase = HeistPhase.Infiltrating;
                 _phaseStartTime = DateTime.Now;
                 Decision = "chest_opened";
+                HeistLog($"Chest {_waitingOnEntityId} opened successfully");
                 return;
             }
 
-            var chest = chestEntity.GetComponent<Chest>();
-            if (chest?.IsOpened == true)
-            {
-                _state.OpenedEntities.Add(_waitingOnEntityId);
-                _waitingOnEntityId = 0;
-                _chestLootWindowEnd = DateTime.Now.AddSeconds(3); // pause to loot drops
-                _phase = HeistPhase.Infiltrating;
-                _phaseStartTime = DateTime.Now;
-                Decision = "chest_looted";
-                return;
-            }
-
-            // Navigate closer if too far
             var distToChest = chestEntity.DistancePlayer;
-            if (distToChest > 15)
+            if (distToChest > 35)
             {
                 if (!ctx.Navigation.IsNavigating)
-                {
-                    var nearWalkable = ctx.Navigation.FindNearestWalkable(gc, chestEntity.GridPosNum, 20);
-                    if (nearWalkable.HasValue)
-                        ctx.Navigation.NavigateTo(gc, nearWalkable.Value);
-                }
-                _status = $"Moving to chest... dist: {distToChest:F0}";
-                Decision = "chest_approach";
+                    ctx.Navigation.MoveToward(gc, chestEntity.GridPosNum);
                 return;
             }
-            else if (ctx.Navigation.IsNavigating)
-            {
-                ctx.Navigation.Stop(gc);
-            }
 
-            // Check if chest is heist_locked (needs companion) vs unlocked (direct click)
             var sm = chestEntity.GetComponent<StateMachine>();
             var heistLocked = HeistState.GetStateValue(sm, "heist_locked");
-
-            // heist_locked: 2=untouched, 1=companion assigned, 0=unlocked
             var chestAccepted = heistLocked > 0 && heistLocked < 2;
             var companionWorking = _state.CompanionLockPickProgress > 0 || _state.CompanionIsBusy || chestAccepted;
 
-            _status = $"Opening chest... locked:{heistLocked:F0} progress:{_state.CompanionLockPickProgress:F0}% ({elapsed:F0}s)";
-            Decision = companionWorking ? "chest_channeling" : (heistLocked > 0 ? "chest_waiting" : "chest_clicking");
-
             if (heistLocked > 0 && !companionWorking)
             {
-                // Companion hasn't picked up the job — re-press V
                 var timeSinceClick = (DateTime.Now - _lastCompanionClickTime).TotalSeconds;
-                var retryDelay = _companionClickAttempts == 0 ? 0.5 : 3.0;
+                var retryDelay = _companionClickAttempts == 0 ? 0.3 : 1.5;
                 if (timeSinceClick > retryDelay)
                 {
-                    var sent = BotInput.PressKey(settings.CompanionInteractKey);
-                    if (sent) _lastCompanionClickTime = DateTime.Now;
-                    _companionClickAttempts++;
+                    var sent = BotInput.PressKeyOverlay(settings.CompanionInteractKey);
+                    if (sent)
+                    {
+                        _lastCompanionClickTime = DateTime.Now;
+                        _companionClickAttempts++;
+                    }
                 }
-
                 if (elapsed > settings.CompanionRetryDelay.Value)
                     _companionWaitStart = DateTime.Now;
             }
             else if (heistLocked <= 0 && !ctx.Interaction.IsBusy)
             {
-                // Unlocked chest — click directly
-                ctx.Interaction.InteractWithEntity(chestEntity, ctx.Navigation, requireProximity: true);
+                ctx.Interaction.InteractWithEntity(chestEntity, ctx.Navigation, requireProximity: false);
             }
 
-            // Timeout
             if (elapsed > settings.CompanionWaitTimeout.Value)
             {
-                ctx.Log($"Chest interaction timeout on {_waitingOnEntityId}");
+                HeistLog($"Chest interaction timeout on {_waitingOnEntityId}");
                 _state.OpenedEntities.Add(_waitingOnEntityId);
                 _waitingOnEntityId = 0;
                 _phase = HeistPhase.Infiltrating;
                 _phaseStartTime = DateTime.Now;
-                Decision = "chest_timeout";
             }
         }
 
         private void TickGrabCurio(BotContext ctx, GameController gc)
         {
-            // Check lockdown — if already triggered, loot drops then escape
             if (_state.IsLockdown)
             {
-                // Wait a moment for items to drop after curio break
                 var timeSinceLockdown = (DateTime.Now - _phaseStartTime).TotalSeconds;
-
-                // Try to pick up any nearby items
                 if ((DateTime.Now - _lastLootScanTime).TotalMilliseconds > 500 && !ctx.Interaction.IsBusy)
                 {
                     _lastLootScanTime = DateTime.Now;
                     TryPickupLoot(ctx, gc);
                 }
 
-                // Give at least 3 seconds for items to appear on ground, then wait until
-                // no more loot is being picked up
                 if (timeSinceLockdown > 3 && !ctx.Interaction.IsBusy && !_lootTracker.HasPending)
                 {
-                    // Check if there are still items visible nearby
                     ctx.Loot.Scan(gc);
                     var (hasLoot, _) = ctx.Loot.PickupNext(ctx.Interaction, ctx.Navigation);
                     if (!ctx.Interaction.IsBusy)
                     {
-                        // No more loot — start escape
                         ctx.Navigation.Stop(gc);
                         _phase = HeistPhase.Escaping;
                         _phaseStartTime = DateTime.Now;
-                        Decision = "curio_done_escaping";
                         return;
                     }
                 }
-
-                _status = $"Looting curio drops... ({timeSinceLockdown:F0}s)";
-                Decision = "curio_looting";
                 return;
             }
 
-            // Find curio entity and click it
             var curio = _state.FindCurioEntity(gc);
             if (curio != null && !ctx.Interaction.IsBusy)
             {
                 ctx.Interaction.InteractWithEntity(curio, ctx.Navigation, requireProximity: true);
-                _status = "Breaking curio display...";
-                Decision = "curio_clicking";
                 return;
             }
 
-            if (curio == null)
+            if (curio == null && (DateTime.Now - _phaseStartTime).TotalSeconds > 30)
             {
-                // Curio may have despawned (already opened) — lockdown should follow
-                _status = "Curio gone — waiting for lockdown";
-                Decision = "curio_despawned";
-
-                // Safety timeout — if lockdown never triggers, escape anyway
-                if ((DateTime.Now - _phaseStartTime).TotalSeconds > 30)
-                {
-                    _phase = HeistPhase.Escaping;
-                    _phaseStartTime = DateTime.Now;
-                    Decision = "curio_timeout";
-                }
+                _phase = HeistPhase.Escaping;
+                _phaseStartTime = DateTime.Now;
             }
         }
 
@@ -779,17 +1061,39 @@ namespace AutoExile.Modes
         {
             var playerGrid = gc.Player.GridPosNum;
 
-            // Detect navigation stuck — likely a re-locked door blocking the path
+            // Priority 1: Clear enemies blocking our escape path
+            if (ctx.Combat.InCombat && ctx.Combat.NearbyMonsterCount > 0)
+            {
+                if (ctx.Navigation.IsNavigating)
+                    ctx.Navigation.Stop(gc);
+
+                _status = $"Clearing escape path ({ctx.Combat.NearbyMonsterCount} nearby)...";
+                Decision = "escape_combat";
+                HeistLog($"Fighting {ctx.Combat.NearbyMonsterCount} enemies in escape path (Target: {ctx.Combat.BestTarget?.RenderName})");
+                return;
+            }
+
+            // Priority 2: Check for re-locked doors blocking the path
+            var blockingDoor = FindBlockingDoor(gc, playerGrid);
+            if (blockingDoor != null && !ctx.Interaction.IsBusy)
+            {
+                ctx.Navigation.Stop(gc);
+                HeistLog($"Found blocking door {blockingDoor.Id} during escape — opening");
+                StartDoorInteraction(ctx, gc, blockingDoor, HeistPhase.Escaping);
+                return;
+            }
+
+            // Priority 3: Check for stuck navigation
             if (ctx.Navigation.IsNavigating)
             {
                 var stuckDelta = ctx.Navigation.StuckRecoveries - _lastStuckCount;
                 if (stuckDelta >= 2)
                 {
                     ctx.Navigation.Stop(gc);
-                    // Look for any locked door nearby (wider range during escape)
                     var nextDoor = FindNextLockedDoor(gc, playerGrid);
                     if (nextDoor != null)
                     {
+                        HeistLog($"Stuck navigation — diverting to door {nextDoor.Id}");
                         StartDoorInteraction(ctx, gc, nextDoor, HeistPhase.Escaping);
                         return;
                     }
@@ -797,90 +1101,48 @@ namespace AutoExile.Modes
                 }
             }
 
-            // Always check for blocking doors first — lockdown re-locks doors
-            if (!ctx.Interaction.IsBusy)
-            {
-                var blockingDoor = FindBlockingDoor(gc, playerGrid);
-                if (blockingDoor != null)
-                {
-                    ctx.Navigation.Stop(gc);
-                    StartDoorInteraction(ctx, gc, blockingDoor, HeistPhase.Escaping);
-                    return;
-                }
-            }
-
-            // Try to find exit if we don't have it yet
             if (_state.ExitPosition == null)
-            {
                 _state.ScanForExit(gc);
-            }
-
-            // Loot nearby items while escaping (quick grabs only)
-            if ((DateTime.Now - _lastLootScanTime).TotalMilliseconds > 500 && !ctx.Interaction.IsBusy)
-            {
-                _lastLootScanTime = DateTime.Now;
-                TryPickupLoot(ctx, gc);
-            }
 
             if (_state.ExitPosition != null)
             {
-                // Check if we're near exit
                 var distToExit = Vector2.Distance(playerGrid, _state.ExitPosition.Value);
                 if (distToExit < 20)
                 {
                     _phase = HeistPhase.ExitingMap;
                     _phaseStartTime = DateTime.Now;
-                    Decision = "at_exit";
+                    HeistLog("Arrived at escape exit — transitioning to ExitingMap");
                     return;
                 }
 
-                // Navigate to exit — try direct path first, fall back to pathnode stepping stones
                 if (!ctx.Navigation.IsNavigating)
                 {
                     _lastStuckCount = ctx.Navigation.StuckRecoveries;
                     if (!ctx.Navigation.NavigateTo(gc, _state.ExitPosition.Value))
                     {
-                        // Direct path blocked — check for door first
+                        // Direct A* blocked by closed doors — search wider for the next door
                         var nextDoor = FindNextLockedDoor(gc, playerGrid);
                         if (nextDoor != null)
                         {
+                            HeistLog($"A* to exit blocked — heading to next locked door {nextDoor.Id}");
                             StartDoorInteraction(ctx, gc, nextDoor, HeistPhase.Escaping);
                             return;
                         }
 
-                        // No door — use nearest pathnode toward exit
-                        var stepNode = FindPathNodeToward(gc, playerGrid, _state.ExitPosition.Value);
-                        if (stepNode.HasValue)
-                        {
-                                ctx.Navigation.NavigateTo(gc, stepNode.Value);
-                            Decision = $"escape_step ({stepNode.Value.X:F0},{stepNode.Value.Y:F0})";
-                        }
-                        else
-                        {
-                            Decision = "escape_no_path";
-                        }
+                        // Fallback: move directly in the direction of the exit
+                        HeistLog($"A* blocked and no door visible — moving toward exit");
+                        ctx.Navigation.MoveToward(gc, _state.ExitPosition.Value);
                     }
                 }
-
                 _status = $"Escaping — dist to exit: {distToExit:F0}";
-                if (string.IsNullOrEmpty(Decision)) Decision = "escaping";
             }
-            else
+            else if (!ctx.Navigation.IsNavigating)
             {
-                // No exit position — navigate toward exit using pathnodes
-                // (nearest to exit = closest to where we entered = lowest distance pathnodes
-                // that we haven't been to recently)
-                _status = "Escaping — searching for exit...";
-                Decision = "escape_searching";
-                if (!ctx.Navigation.IsNavigating)
+                var nextDoor = FindNextLockedDoor(gc, playerGrid);
+                if (nextDoor != null)
                 {
-                    // Try to find a locked door to open first
-                    var nextDoor = FindNextLockedDoor(gc, playerGrid);
-                    if (nextDoor != null)
-                    {
-                        StartDoorInteraction(ctx, gc, nextDoor, HeistPhase.Escaping);
-                        return;
-                    }
+                    HeistLog($"Searching for exit — opening door {nextDoor.Id}");
+                    StartDoorInteraction(ctx, gc, nextDoor, HeistPhase.Escaping);
                 }
             }
         }
@@ -892,23 +1154,223 @@ namespace AutoExile.Modes
             {
                 ctx.Interaction.InteractWithEntity(exit, ctx.Navigation, requireProximity: true);
                 _status = "Clicking exit...";
-                Decision = "clicking_exit";
                 return;
             }
 
-            _status = "Waiting for exit interaction...";
-            Decision = "exit_wait";
-
             if ((DateTime.Now - _phaseStartTime).TotalSeconds > 15)
             {
-                // Retry — navigate to exit position and try again
                 if (_state.ExitPosition != null)
                     ctx.Navigation.NavigateTo(gc, _state.ExitPosition.Value);
                 _phaseStartTime = DateTime.Now;
             }
         }
 
-        // --- Helpers ---------------------------------------------------------
+        // =====================================================================
+        // Helpers
+        // =====================================================================
+
+        private bool IsHeistWindowOpen(GameController gc)
+        {
+            var ui = gc.IngameState?.IngameUi;
+            if (ui == null || ui.ChildCount <= 105) return false;
+
+            var p105 = ui.GetChildAtIndex(105);
+            return p105 != null && p105.IsVisible && p105.GetClientRect().Width > 300;
+        }
+
+        private Element? FindHeistContractPanel(GameController gc)
+        {
+            var ui = gc.IngameState?.IngameUi;
+            if (ui == null) return null;
+
+            if (ui.ChildCount > 105)
+            {
+                var p105 = ui.GetChildAtIndex(105);
+                if (p105 != null && p105.IsVisible && p105.GetClientRect().Width > 400)
+                    return p105;
+            }
+
+            for (int i = 0; i < ui.ChildCount; i++)
+            {
+                var child = ui.GetChildAtIndex(i);
+                if (child == null || !child.IsVisible) continue;
+                var rect = child.GetClientRect();
+                if (rect.Width < 400 || rect.Height < 300) continue;
+
+                if (FindElementByText(child, "Contract Details") != null ||
+                    FindElementByText(child, "SIGN CONTRACT") != null ||
+                    FindElementByText(child, "The Ring's Cut") != null)
+                {
+                    return child;
+                }
+            }
+
+            return null;
+        }
+
+        private bool IsContractSocketed(GameController gc)
+        {
+            var ui = gc.IngameState?.IngameUi;
+            if (ui == null || ui.ChildCount <= 105) return false;
+
+            var p105 = ui.GetChildAtIndex(105);
+            if (p105 == null || !p105.IsVisible || p105.ChildCount <= 2) return false;
+
+            // [105][2] is the expanded details board which only becomes visible when a contract is socketed
+            var child2 = p105.GetChildAtIndex(2);
+            return child2 != null && child2.IsVisible;
+        }
+
+        private Entity? FindAdiyah(GameController gc)
+        {
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (entity.IsTargetable && entity.Path != null &&
+                    (entity.Path.Contains("HeistPortalNPC") || entity.Path.Contains("NPC/League/Heist/Adiyah") || entity.RenderName == "Adiyah, the Wayfinder"))
+                {
+                    return entity;
+                }
+            }
+            return null;
+        }
+
+        private Entity? FindHeistPortal(GameController gc)
+        {
+            var adiyah = FindAdiyah(gc);
+            var adiyahPos = adiyah?.GridPosNum ?? gc.Player.GridPosNum;
+
+            Entity? bestPortal = null;
+            float bestDist = 40f; // Adiyah's portal is always within 40 units of her
+
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (!entity.IsTargetable || entity.Path == null) continue;
+
+                // Explicitly ignore Planning Room and Harbour zone transitions
+                var renderName = entity.RenderName ?? "";
+                if (renderName.Equals("Planning Room", StringComparison.OrdinalIgnoreCase) ||
+                    renderName.Equals("The Rogue Harbour", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                // Match MissionEntryPortal, HeistPortal, or portals spawned near Adiyah
+                bool isHeistPortal = entity.Path.Contains("MissionEntryPortal", StringComparison.OrdinalIgnoreCase)
+                    || entity.Path.Contains("HeistPortal", StringComparison.OrdinalIgnoreCase)
+                    || entity.Path.Contains("Heist/Objects", StringComparison.OrdinalIgnoreCase)
+                    || entity.Type == EntityType.TownPortal
+                    || (entity.Type == EntityType.AreaTransition && entity.Path.Contains("Portal", StringComparison.OrdinalIgnoreCase));
+
+                if (isHeistPortal)
+                {
+                    var distToAdiyah = Vector2.Distance(entity.GridPosNum, adiyahPos);
+                    if (distToAdiyah < bestDist)
+                    {
+                        bestDist = distToAdiyah;
+                        bestPortal = entity;
+                    }
+                }
+            }
+
+            return bestPortal;
+        }
+
+        private static ServerInventory.InventSlotItem? FindContractInInventory(GameController gc)
+        {
+            var invItems = StashSystem.GetInventorySlotItems(gc);
+            if (invItems == null) return null;
+
+            foreach (var slotItem in invItems)
+            {
+                var item = slotItem.Item;
+                if (item?.Path == null) continue;
+                if (item.Path.Contains("Items/Heist/HeistContract") || item.Path.Contains("HeistContract"))
+                    return slotItem;
+            }
+            return null;
+        }
+
+        private static bool StashFilterKeepContractsAndMarkers(ServerInventory.InventSlotItem item)
+        {
+            var path = item.Item?.Path;
+            if (path == null) return true;
+            if (path.Contains("HeistContract") || path.Contains("CurrencyHeistCoinage")) return false;
+            return true;
+        }
+
+        private Element? FindRogueSlotButton(Element panel105)
+        {
+            if (panel105 == null || !panel105.IsVisible) return null;
+
+            // Safe navigation of: 105->2->0->0->2->1->0
+            var c2 = SafeGetChild(panel105, 2);
+            var c0 = SafeGetChild(c2, 0);
+            var c0_2 = SafeGetChild(c0, 0);
+            var c2_2 = SafeGetChild(c0_2, 2);
+            var c1 = SafeGetChild(c2_2, 1);
+            var btn = SafeGetChild(c1, 0) ?? c1;
+
+            if (btn != null && btn.IsVisible && btn.GetClientRect().Width > 30)
+                return btn;
+
+            return null;
+        }
+
+        private Element? FindRogueSelectionList(GameController gc)
+        {
+            var ui = gc.IngameState?.IngameUi;
+            if (ui == null) return null;
+
+            var p105 = SafeGetChild(ui, 105);
+            if (p105 == null || !p105.IsVisible) return null;
+
+            // Safe navigation of: 105->2->1->0->2->0->0
+            var c2 = SafeGetChild(p105, 2);
+            var c1 = SafeGetChild(c2, 1);
+            var c0 = SafeGetChild(c1, 0);
+            var c2_2 = SafeGetChild(c0, 2);
+            var c0_2 = SafeGetChild(c2_2, 0);
+            var rogueBtn = SafeGetChild(c0_2, 0) ?? c0_2;
+
+            if (rogueBtn != null && rogueBtn.IsVisible && rogueBtn.GetClientRect().Width > 30)
+                return rogueBtn;
+
+            return null;
+        }
+
+        private Element? FindSignContractButton(Element panel105)
+        {
+            if (panel105 == null || !panel105.IsVisible) return null;
+
+            // Safe navigation of: 105->2->2->0->0
+            var c2 = SafeGetChild(panel105, 2);
+            var c2_2 = SafeGetChild(c2, 2);
+            var c0 = SafeGetChild(c2_2, 0);
+            var btn = SafeGetChild(c0, 0) ?? c0 ?? c2_2;
+
+            if (btn != null && btn.IsVisible && btn.GetClientRect().Width > 30)
+                return btn;
+
+            return null;
+        }
+
+        private static Element? FindElementByText(Element parent, string text, bool checkVisibility = true)
+        {
+            if (parent == null) return null;
+            if (checkVisibility && !parent.IsVisible) return null;
+
+            if (parent.Text != null && parent.Text.Contains(text, StringComparison.OrdinalIgnoreCase))
+                return parent;
+
+            for (int i = 0; i < parent.ChildCount; i++)
+            {
+                var child = parent.GetChildAtIndex(i);
+                if (child == null) continue;
+                var res = FindElementByText(child, text, checkVisibility);
+                if (res != null) return res;
+            }
+            return null;
+        }
 
         private void StartDoorInteraction(BotContext ctx, GameController gc, Entity door, HeistPhase returnPhase)
         {
@@ -920,9 +1382,7 @@ namespace AutoExile.Modes
             _phase = HeistPhase.AtDoor;
             _phaseStartTime = DateTime.Now;
 
-            // Generic doors and Door_Basic: click directly. NPC/Vault doors: press V for companion.
-            bool isClickDoor = door.Path == "Metadata/MiscellaneousObjects/Door"
-                || door.Path?.Contains("Door_Basic") == true;
+            bool isClickDoor = door.Path == "Metadata/MiscellaneousObjects/Door" || door.Path?.Contains("Door_Basic") == true;
 
             if (isClickDoor)
             {
@@ -932,19 +1392,13 @@ namespace AutoExile.Modes
                     _lastCompanionClickTime = DateTime.Now;
                 }
             }
-            else if (door.DistancePlayer < 40)
+            else if (door.DistancePlayer < 45)
             {
-                // Press V — TickAtDoor will verify it was accepted via heist_locked state
-                var sent = BotInput.PressKey(ctx.Settings.Heist.CompanionInteractKey);
-                if (sent)
-                    _lastCompanionClickTime = DateTime.Now;
-                // If not sent (input gate blocked), _lastCompanionClickTime stays at MinValue
-                // so TickAtDoor will retry quickly
+                // Send V concurrently without stopping movement or interrupting skill channeling
+                var sent = BotInput.PressKeyOverlay(ctx.Settings.Heist.CompanionInteractKey);
+                if (sent) _lastCompanionClickTime = DateTime.Now;
+                HeistLog($"Triggered companion (V) overlay for door {door.Id} (dist: {door.DistancePlayer:F0})");
             }
-            // else: TickAtDoor will navigate closer first
-
-            _status = $"Opening door {door.Path?.Split('/').LastOrDefault()}";
-            Decision = "start_door";
         }
 
         private void StartChestInteraction(BotContext ctx, GameController gc, Entity chest)
@@ -956,24 +1410,19 @@ namespace AutoExile.Modes
             _phase = HeistPhase.AtChest;
             _phaseStartTime = DateTime.Now;
 
-            // Only press V for locked chests — unlocked chests are clicked directly
             var sm = chest.GetComponent<StateMachine>();
             var heistLocked = HeistState.GetStateValue(sm, "heist_locked");
-            if (heistLocked > 0 && chest.DistancePlayer < 40)
+            if (heistLocked > 0)
             {
-                var sent = BotInput.PressKey(ctx.Settings.Heist.CompanionInteractKey);
-                if (sent)
-                    _lastCompanionClickTime = DateTime.Now;
+                // Send V concurrently without stopping movement
+                var sent = BotInput.PressKeyOverlay(ctx.Settings.Heist.CompanionInteractKey);
+                if (sent) _lastCompanionClickTime = DateTime.Now;
+                HeistLog($"Triggered companion (V) overlay for chest {chest.Id} (dist: {chest.DistancePlayer:F0})");
             }
-
-            _status = $"Opening reward chest";
-            Decision = "start_chest";
         }
 
-        /// <summary>Navigate toward a route target with door/stepping-stone fallbacks and stuck handling.</summary>
         private void NavigateToRouteTarget(BotContext ctx, GameController gc, Vector2 playerGrid, RouteTarget target)
         {
-            // Stuck handling — skip target if stuck too many times
             if (ctx.Navigation.IsNavigating)
             {
                 var stuckDelta = ctx.Navigation.StuckRecoveries - _lastStuckCount;
@@ -981,14 +1430,9 @@ namespace AutoExile.Modes
                 {
                     target.Skipped = true;
                     ctx.Navigation.Stop(gc);
-                    _status = $"Skipping {target.Label} — stuck";
-                    Decision = "route_stuck_skip";
                     return;
                 }
 
-                // While navigating, also check for locked doors in our path.
-                // NavigationSystem may have pathed around a door or tried to blink over it.
-                // If we detect a locked door nearby and roughly in our travel direction, stop and open it.
                 if (stuckDelta >= 1)
                 {
                     var blockingDoor = FindBlockingDoor(gc, playerGrid);
@@ -1003,14 +1447,8 @@ namespace AutoExile.Modes
 
             if (!ctx.Navigation.IsNavigating)
             {
-                // Throttle A* pathfinding to avoid lag
-                if ((DateTime.Now - _lastRepathTime).TotalMilliseconds < RepathCooldownMs)
-                {
-                    Decision = $"route_wait → {target.Label}";
-                    return;
-                }
+                if ((DateTime.Now - _lastRepathTime).TotalMilliseconds < RepathCooldownMs) return;
 
-                // Before pathfinding, check for locked doors — they block A* and cause failures
                 var nearbyDoor = FindNextLockedDoor(gc, playerGrid);
                 if (nearbyDoor != null)
                 {
@@ -1021,18 +1459,8 @@ namespace AutoExile.Modes
 
                 if (!ctx.Navigation.NavigateTo(gc, target.GridPos))
                 {
-                    _lastRepathTime = DateTime.Now;
-
-                    // Can't path directly — use stepping stones to get closer
                     var stepNode = FindPathNodeToward(gc, playerGrid, target.GridPos);
-                    if (stepNode.HasValue && ctx.Navigation.NavigateTo(gc, stepNode.Value))
-                    {
-                        Decision = $"route_step → {target.Label}";
-                    }
-                    else
-                    {
-                        Decision = $"route_blocked → {target.Label}";
-                    }
+                    if (stepNode.HasValue) ctx.Navigation.NavigateTo(gc, stepNode.Value);
                 }
                 _lastRepathTime = DateTime.Now;
             }
@@ -1040,14 +1468,8 @@ namespace AutoExile.Modes
             {
                 ctx.Navigation.UpdateDestination(gc, target.GridPos, 12);
             }
-
-            var idx = _state.CurrentRouteIndex + 1;
-            var total = _state.PlannedRoute.Count;
-            _status = $"Route [{idx}/{total}]: → {target.Label} — alert: {_state.AlertPercent:F0}%";
-            if (string.IsNullOrEmpty(Decision)) Decision = $"route_{target.Label}";
         }
 
-        /// <summary>Fallback exploration using pathnodes when planned route is exhausted.</summary>
         private void FallbackExplore(BotContext ctx, GameController gc, Vector2 playerGrid)
         {
             if (ctx.Navigation.IsNavigating && _currentExploreTarget.HasValue)
@@ -1061,22 +1483,11 @@ namespace AutoExile.Modes
                     _visitedPathNodes.Add(_currentExploreTarget.Value);
                     ctx.Navigation.Stop(gc);
                     _currentExploreTarget = null;
-                    Decision = "explore_stuck";
-                }
-                else
-                {
-                    _status = $"Exploring — alert: {_state.AlertPercent:F0}%";
-                    Decision = "exploring";
                 }
             }
             else if (!ctx.Navigation.IsNavigating)
             {
-                // Throttle A* pathfinding
-                if ((DateTime.Now - _lastRepathTime).TotalMilliseconds < RepathCooldownMs)
-                {
-                    Decision = "explore_wait";
-                    return;
-                }
+                if ((DateTime.Now - _lastRepathTime).TotalMilliseconds < RepathCooldownMs) return;
 
                 var bestNode = FindNextPathNode(gc, playerGrid);
                 if (bestNode.HasValue)
@@ -1085,13 +1496,10 @@ namespace AutoExile.Modes
                     {
                         _currentExploreTarget = bestNode.Value;
                         _lastStuckCount = ctx.Navigation.StuckRecoveries;
-                        _status = $"Exploring — alert: {_state.AlertPercent:F0}%";
-                        Decision = $"explore ({bestNode.Value.X:F0},{bestNode.Value.Y:F0})";
                     }
                     else
                     {
                         _visitedPathNodes.Add(bestNode.Value);
-                        Decision = "explore_fail";
                     }
                 }
                 else
@@ -1107,49 +1515,25 @@ namespace AutoExile.Modes
                         else
                         {
                             var nearWalkable = ctx.Navigation.FindNearestWalkable(gc, nextDoor.GridPosNum, 20);
-                            if (nearWalkable.HasValue)
-                            {
-                                ctx.Navigation.NavigateTo(gc, nearWalkable.Value);
-                                _currentExploreTarget = nearWalkable.Value;
-                                _lastStuckCount = ctx.Navigation.StuckRecoveries;
-                            }
-                            _status = $"Navigating to locked door";
-                            Decision = "nav_to_door";
+                            if (nearWalkable.HasValue) ctx.Navigation.NavigateTo(gc, nearWalkable.Value);
                         }
-                    }
-                    else
-                    {
-                        _status = "No path forward";
-                        Decision = "no_path_forward";
                     }
                 }
             }
         }
 
-        /// <summary>
-        /// Find the best HeistPathNode to navigate to next. Uses the full map-wide path
-        /// node list from TileEntities. Picks the farthest unvisited node from the exit
-        /// (deepest into the heist) that's within pathfinding range of the player.
-        /// </summary>
         private Vector2? FindNextPathNode(GameController gc, Vector2 playerGrid)
         {
             var exitPos = _state.ExitPosition ?? playerGrid;
             Vector2? best = null;
             float bestDistFromExit = 0;
 
-            // Use map-wide path nodes from TileEntities
             foreach (var nodeGrid in _state.PathNodes)
             {
-                // Skip nodes we've already visited or are very close to
                 if (_visitedPathNodes.Contains(nodeGrid)) continue;
                 var distToPlayer = Vector2.Distance(playerGrid, nodeGrid);
-                if (distToPlayer < 15) continue;
+                if (distToPlayer < 15 || distToPlayer > Pathfinding.NetworkBubbleRadius) continue;
 
-                // Only consider nodes within reasonable pathfinding range
-                // (too far = pathfinder can't reach across doors/walls anyway)
-                if (distToPlayer > Pathfinding.NetworkBubbleRadius) continue;
-
-                // Pick the node farthest from exit (deepest into heist)
                 var distFromExit = Vector2.Distance(nodeGrid, exitPos);
                 if (distFromExit > bestDistFromExit)
                 {
@@ -1157,37 +1541,9 @@ namespace AutoExile.Modes
                     best = nodeGrid;
                 }
             }
-
-            // Fallback: also check live entities for any pathnodes not in TileEntities
-            if (best == null)
-            {
-                foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
-                {
-                    if (entity?.Path == null) continue;
-                    if (!entity.Path.Contains("HeistPathNode") && !entity.Path.Contains("HeistPathEndpoint"))
-                        continue;
-
-                    var nodeGrid = entity.GridPosNum;
-                    if (_visitedPathNodes.Contains(nodeGrid)) continue;
-                    if (Vector2.Distance(playerGrid, nodeGrid) < 15) continue;
-
-                    var distFromExit = Vector2.Distance(nodeGrid, exitPos);
-                    if (distFromExit > bestDistFromExit)
-                    {
-                        bestDistFromExit = distFromExit;
-                        best = nodeGrid;
-                    }
-                }
-            }
-
             return best;
         }
 
-        /// <summary>
-        /// Find the nearest closed/locked door in the visible entity list.
-        /// Includes both NPC doors (need companion key) and basic doors (need clicking).
-        /// Used when pathnodes run out — the door is the gateway to the next corridor section.
-        /// </summary>
         private Entity? FindNextLockedDoor(GameController gc, Vector2 playerGrid)
         {
             Entity? nearest = null;
@@ -1195,32 +1551,16 @@ namespace AutoExile.Modes
 
             foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
             {
-                if (entity?.Path == null || !entity.IsTargetable) continue;
-                if (_state.OpenedEntities.Contains(entity.Id)) continue;
-
+                if (entity?.Path == null || !entity.IsTargetable || _state.OpenedEntities.Contains(entity.Id)) continue;
                 bool isDoor = false;
 
-                // Generic doors (Metadata/MiscellaneousObjects/Door) — targetable = closed
-                if (entity.Path == "Metadata/MiscellaneousObjects/Door")
+                if (entity.Path == "Metadata/MiscellaneousObjects/Door") isDoor = true;
+                else if (entity.Path.Contains("Door_Basic") && HeistState.GetStateValue(entity.GetComponent<StateMachine>(), "open") == 0) isDoor = true;
+                else if ((entity.Path.Contains("Door_NPC") && !entity.Path.Contains("Alternate")) || entity.Path.Contains("Vault"))
                 {
-                    isDoor = true;
-                }
-                // Basic doors — check open state
-                else if (entity.Path.Contains("Door_Basic"))
-                {
-                    var sm = entity.GetComponent<StateMachine>();
-                    if (HeistState.GetStateValue(sm, "open") == 0)
-                        isDoor = true;
-                }
-                // NPC/Vault doors — check heist_locked state
-                else if ((entity.Path.Contains("Door_NPC") && !entity.Path.Contains("Alternate"))
-                    || entity.Path.Contains("Vault"))
-                {
-                    var sm = entity.GetComponent<StateMachine>();
-                    if (HeistState.GetStateValue(sm, "heist_locked") > 0)
+                    if (HeistState.GetStateValue(entity.GetComponent<StateMachine>(), "heist_locked") > 0)
                     {
                         isDoor = true;
-                        // During lockdown, doors re-lock — clear stale opened state
                         _state.OpenedEntities.Remove(entity.Id);
                     }
                 }
@@ -1234,11 +1574,6 @@ namespace AutoExile.Modes
             return nearest;
         }
 
-        /// <summary>
-        /// Find the nearest HeistPathNode that's closer to the target than the player is.
-        /// Used as a stepping stone when direct pathfinding to a distant target fails.
-        /// Uses map-wide TileEntities path nodes filtered to pathfinding range.
-        /// </summary>
         private Vector2? FindPathNodeToward(GameController gc, Vector2 playerGrid, Vector2 target)
         {
             var playerDistToTarget = Vector2.Distance(playerGrid, target);
@@ -1247,15 +1582,9 @@ namespace AutoExile.Modes
 
             foreach (var nodeGrid in _state.PathNodes)
             {
-                var nodeDistToTarget = Vector2.Distance(nodeGrid, target);
-
-                // Must be closer to target than we are
-                if (nodeDistToTarget >= playerDistToTarget) continue;
-                // Skip nodes very close to us (already there)
+                if (Vector2.Distance(nodeGrid, target) >= playerDistToTarget) continue;
                 var distToPlayer = Vector2.Distance(playerGrid, nodeGrid);
-                if (distToPlayer < 15) continue;
-                // Must be within pathfinding range
-                if (distToPlayer > Pathfinding.NetworkBubbleRadius) continue;
+                if (distToPlayer < 15 || distToPlayer > Pathfinding.NetworkBubbleRadius) continue;
 
                 if (distToPlayer < bestDist)
                 {
@@ -1273,30 +1602,16 @@ namespace AutoExile.Modes
 
             foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
             {
-                if (entity?.Path == null || !entity.IsTargetable) continue;
-                if (entity.DistancePlayer > 50) continue;
-
+                if (entity?.Path == null || !entity.IsTargetable || entity.DistancePlayer > 50) continue;
                 bool isDoor = false;
 
-                // Generic doors — targetable = closed, click to open
-                if (entity.Path == "Metadata/MiscellaneousObjects/Door")
+                if (entity.Path == "Metadata/MiscellaneousObjects/Door") isDoor = true;
+                else if (entity.Path.Contains("Door_Basic") && HeistState.GetStateValue(entity.GetComponent<StateMachine>(), "open") == 0) isDoor = true;
+                else if ((entity.Path.Contains("Door_NPC") && !entity.Path.Contains("Alternate")) || entity.Path.Contains("Vault"))
                 {
-                    isDoor = true;
-                }
-                else if (entity.Path.Contains("Door_Basic"))
-                {
-                    var sm = entity.GetComponent<StateMachine>();
-                    if (HeistState.GetStateValue(sm, "open") == 0)
-                        isDoor = true;
-                }
-                else if ((entity.Path.Contains("Door_NPC") && !entity.Path.Contains("Alternate"))
-                    || entity.Path.Contains("Vault"))
-                {
-                    var sm = entity.GetComponent<StateMachine>();
-                    if (HeistState.GetStateValue(sm, "heist_locked") > 0)
+                    if (HeistState.GetStateValue(entity.GetComponent<StateMachine>(), "heist_locked") > 0)
                     {
                         isDoor = true;
-                        // During lockdown doors re-lock — clear stale opened state
                         _state.OpenedEntities.Remove(entity.Id);
                     }
                 }
@@ -1310,76 +1625,23 @@ namespace AutoExile.Modes
             return nearest;
         }
 
-        private Entity? FindWorthyChest(GameController gc, Vector2 playerGrid, BotSettings.HeistSettings settings)
-        {
-            if (_state.AlertPercent > settings.AlertThreshold.Value)
-                return null;
-
-            Entity? best = null;
-            float bestDist = float.MaxValue;
-
-            foreach (var cached in _state.RewardChests.Values)
-            {
-                if (_state.OpenedEntities.Contains(cached.Id)) continue;
-
-                // Skip filler side chests (HeistPathChest) — only open reward room/smuggler chests
-                if (cached.ChestType == HeistChestType.Normal) continue;
-
-                // Filter by user's per-reward-type toggles
-                if (cached.RewardType != HeistRewardType.None && !settings.IsRewardTypeEnabled(cached.RewardType))
-                    continue;
-
-                var dist = Vector2.Distance(playerGrid, cached.GridPos);
-                if (dist > settings.MaxChestDetour.Value) continue;
-                if (dist < bestDist)
-                {
-                    // Find the live entity
-                    foreach (var e in gc.EntityListWrapper.OnlyValidEntities)
-                    {
-                        if (e.Id == cached.Id && e.IsTargetable)
-                        {
-                            var chest = e.GetComponent<Chest>();
-                            if (chest?.IsOpened != true)
-                            {
-                                best = e;
-                                bestDist = dist;
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-            return best;
-        }
-
         private void TryPickupLoot(BotContext ctx, GameController gc)
         {
             if (_lootTracker.HasPending || ctx.Interaction.IsBusy) return;
 
+            // Priority: never pick up loot while enemies are nearby or actively engaged
+            if (ctx.Combat.InCombat || ctx.Combat.NearbyMonsterCount > 0) return;
+
             ctx.Loot.Scan(gc);
             var (wasInRadius, candidate) = ctx.Loot.PickupNext(ctx.Interaction, ctx.Navigation);
             if (candidate != null && ctx.Interaction.IsBusy)
-            {
                 _lootTracker.SetPending(candidate.Entity.Id, candidate.ItemName, candidate.ChaosValue);
-            }
         }
 
-        private void OnAreaChanged(BotContext ctx)
-        {
-            ModeHelpers.CancelAllSystems(ctx);
-            _state.OnAreaChanged();
-            _lootTracker.ResetCount();
-            ctx.Loot.ClearFailed();
-            _waitingOnEntityId = 0;
-            _pendingInteractionEntityId = 0;
-            _visitedPathNodes.Clear();
-            _currentExploreTarget = null;
-            _phase = HeistPhase.Idle;
-            _phaseStartTime = DateTime.Now;
-            _status = "Area changed";
-            Decision = "area_changed";
-            ctx.Log("Heist: area changed — reset state");
-        }
+        // =====================================================================
+        // Rendering
+        // =====================================================================
+
 
         public void Render(BotContext ctx)
         {
@@ -1389,111 +1651,79 @@ namespace AutoExile.Modes
             if (!gc.InGame) return;
 
             var cam = gc.IngameState.Camera;
-
-            // ═══ HUD Panel ═══
             var hudX = 20f;
-            var hudY = 100f;
+            var hudY = 200f;
             var lineH = 16f;
 
-            g.DrawText("=== HEIST ===", new Vector2(hudX, hudY), SharpDX.Color.Cyan);
-            hudY += lineH;
-
-            var phaseColor = _phase switch
+            void DrawTextWithBg(string text, Vector2 pos, SharpDX.Color textColor, SharpDX.Color? bgColor = null)
             {
-                HeistPhase.Infiltrating => SharpDX.Color.Yellow,
-                HeistPhase.AtDoor => SharpDX.Color.Orange,
-                HeistPhase.AtChest => SharpDX.Color.Orange,
-                HeistPhase.GrabCurio => SharpDX.Color.LimeGreen,
-                HeistPhase.Escaping => SharpDX.Color.Red,
-                HeistPhase.ExitingMap => SharpDX.Color.Red,
-                HeistPhase.Done => SharpDX.Color.Gray,
-                _ => SharpDX.Color.White,
-            };
-            g.DrawText($"Phase: {_phase}", new Vector2(hudX, hudY), phaseColor);
+                var bg = bgColor ?? new SharpDX.Color(0, 0, 0, 210);
+                var textSize = text.Length * 7.2f + 10f;
+                g.DrawBox(new SharpDX.RectangleF(pos.X - 2, pos.Y - 1, textSize, lineH), bg);
+                g.DrawText(text, pos, textColor);
+            }
+
+            DrawTextWithBg("=== COMBAT & HEIST DEBUG ===", new Vector2(hudX, hudY), SharpDX.Color.Cyan, new SharpDX.Color(0, 20, 40, 240));
+            hudY += lineH + 2;
+
+            var area = gc.Area?.CurrentArea;
+            var areaName = area?.Name ?? "NULL";
+            bool isTown = area?.IsTown == true;
+            bool isHideout = area?.IsHideout == true;
+            bool isRogueHarbour = areaName == "The Rogue Harbour";
+            bool isSafeZone = isTown || isHideout || isRogueHarbour;
+
+            DrawTextWithBg($"Area: \"{areaName}\" | Phase: {_phase}", new Vector2(hudX, hudY), SharpDX.Color.White);
             hudY += lineH;
 
-            g.DrawText($"Decision: {Decision}", new Vector2(hudX, hudY), SharpDX.Color.Gray);
+            // Combat State
+            var c = ctx.Combat;
+            var combatColor = c.InCombat ? SharpDX.Color.Red : SharpDX.Color.Gray;
+            DrawTextWithBg($"Combat: InCombat={c.InCombat} | Nearby={c.NearbyMonsterCount} | Target={c.BestTarget?.RenderName ?? "(none)"}",
+                new Vector2(hudX, hudY), combatColor);
             hudY += lineH;
 
-            g.DrawText(_status, new Vector2(hudX, hudY), SharpDX.Color.White);
+            DrawTextWithBg($"Action: \"{c.LastAction}\" | SkillAction: \"{c.LastSkillAction}\"",
+                new Vector2(hudX, hudY), SharpDX.Color.Yellow);
             hudY += lineH;
 
-            // Alert bar
+            DrawTextWithBg($"InputGate: CanAct={BotInput.CanAct} | MoveActive={BotInput.IsMovementActive} | MoveKey={ctx.Navigation.MoveKey}",
+                new Vector2(hudX, hudY), BotInput.CanAct ? SharpDX.Color.LimeGreen : SharpDX.Color.OrangeRed);
+            hudY += lineH;
+
+            DrawTextWithBg($"Status: {_status}", new Vector2(hudX, hudY), SharpDX.Color.Orange);
+            hudY += lineH;
+
+            if (isSafeZone)
+                return;
+
+            // Visual overlay for detected entrance transition in staging room
+            if (_phase == HeistPhase.Initializing)
+            {
+                var entrance = FindHeistEntranceTransition(gc);
+                if (entrance != null)
+                {
+                    var eWorld = Pathfinding.GridToWorld3D(gc, entrance.GridPosNum);
+                    var eScreen = cam.WorldToScreen(eWorld);
+                    g.DrawCircleInWorld(eWorld, 35f, SharpDX.Color.LimeGreen, 2.5f);
+                    g.DrawText($"ENTRANCE: {entrance.RenderName ?? entrance.Path.Split('/').LastOrDefault()}", eScreen + new Vector2(-40, -20), SharpDX.Color.LimeGreen);
+                }
+            }
+
+            // Alert bar (in contract)
             if (_state.IsAlertPanelVisible || _state.AlertPercent > 0)
             {
                 var barWidth = 200f;
                 var barHeight = 14f;
                 var alertPct = _state.AlertPercent / 100f;
-                var alertColor = _state.IsLockdown
-                    ? new SharpDX.Color(255, 0, 0, 200)
-                    : alertPct > 0.7f
-                        ? new SharpDX.Color(255, 100, 0, 200)
-                        : new SharpDX.Color(200, 200, 0, 200);
-                g.DrawBox(new SharpDX.RectangleF(hudX, hudY, barWidth, barHeight),
-                    new SharpDX.Color(40, 40, 40, 200));
-                g.DrawBox(new SharpDX.RectangleF(hudX, hudY, barWidth * Math.Min(alertPct, 1f), barHeight),
-                    alertColor);
-                var alertLabel = _state.IsLockdown ? "LOCKDOWN" : $"Alert: {_state.AlertPercent:F0}%";
-                g.DrawText(alertLabel, new Vector2(hudX + barWidth + 8, hudY - 1), SharpDX.Color.White);
+                var alertColor = _state.IsLockdown ? new SharpDX.Color(255, 0, 0, 200) : new SharpDX.Color(200, 200, 0, 200);
+                g.DrawBox(new SharpDX.RectangleF(hudX, hudY, barWidth, barHeight), new SharpDX.Color(40, 40, 40, 200));
+                g.DrawBox(new SharpDX.RectangleF(hudX, hudY, barWidth * Math.Min(alertPct, 1f), barHeight), alertColor);
+                g.DrawText(_state.IsLockdown ? "LOCKDOWN" : $"Alert: {_state.AlertPercent:F0}%", new Vector2(hudX + barWidth + 8, hudY - 1), SharpDX.Color.White);
                 hudY += barHeight + 4;
             }
 
-            // Nav state
-            var navStatus = ctx.Navigation.IsNavigating
-                ? (ctx.Navigation.IsPaused ? "PAUSED" : "navigating")
-                : "idle";
-            g.DrawText($"Nav: {navStatus} | Stuck: {ctx.Navigation.StuckRecoveries}", new Vector2(hudX, hudY), SharpDX.Color.White);
-            hudY += lineH;
-
-            // Combat state
-            g.DrawText($"Combat: {(ctx.Combat.InCombat ? "FIGHTING" : "clear")} | Nearby: {ctx.Combat.NearbyMonsterCount}",
-                new Vector2(hudX, hudY), ctx.Combat.InCombat ? SharpDX.Color.Red : SharpDX.Color.White);
-            hudY += lineH;
-
-            // Key positions
-            var curioStr = _state.CurioTargetPosition.HasValue
-                ? $"({_state.CurioTargetPosition.Value.X:F0},{_state.CurioTargetPosition.Value.Y:F0})"
-                : "unknown";
-            g.DrawText($"Curio: {curioStr}", new Vector2(hudX, hudY), SharpDX.Color.LimeGreen);
-            hudY += lineH;
-
-            var exitStr = _state.ExitPosition.HasValue
-                ? $"({_state.ExitPosition.Value.X:F0},{_state.ExitPosition.Value.Y:F0})"
-                : "unknown";
-            g.DrawText($"Exit: {exitStr}", new Vector2(hudX, hudY), SharpDX.Color.Aqua);
-            hudY += lineH;
-
-            // Exploration
-            if (ctx.Exploration.IsInitialized)
-            {
-                var blob = ctx.Exploration.ActiveBlob;
-                if (blob != null)
-                    g.DrawText($"Coverage: {blob.Coverage:P1}", new Vector2(hudX, hudY), SharpDX.Color.White);
-                hudY += lineH;
-            }
-
-            // Route progress
-            if (_state.PlannedRoute.Count > 0)
-            {
-                var completed = _state.PlannedRoute.Count(t => t.Reached);
-                var skipped = _state.PlannedRoute.Count(t => t.Skipped);
-                var currentLabel = _state.CurrentTarget?.Label ?? "done";
-                g.DrawText($"Route: {completed}/{_state.PlannedRoute.Count} done ({skipped} skipped) → {currentLabel}",
-                    new Vector2(hudX, hudY), SharpDX.Color.Gold);
-                hudY += lineH;
-            }
-
-            // Doors/chests
-            var openedCount = _state.OpenedEntities.Count;
-            g.DrawText($"Doors: {_state.Doors.Count} | Chests: {_state.RewardChests.Count} | Opened: {openedCount}",
-                new Vector2(hudX, hudY), SharpDX.Color.White);
-            hudY += lineH;
-
-            // ═══ World Overlays ═══
-            if (gc.Area.CurrentArea.IsHideout || gc.Area.CurrentArea.IsTown)
-                return;
-
-            // Navigation path
+            // In-contract route and markers overlay
             if (ctx.Navigation.IsNavigating)
             {
                 var path = ctx.Navigation.CurrentNavPath;
@@ -1501,158 +1731,29 @@ namespace AutoExile.Modes
                 {
                     var from = Pathfinding.GridToScreen(gc, path[i].Position);
                     var to = Pathfinding.GridToScreen(gc, path[i + 1].Position);
-                    if (from.X < -200 || from.X > 2400 || to.X < -200 || to.X > 2400) continue;
-                    var isBlink = path[i + 1].Action == WaypointAction.Blink;
-                    g.DrawLine(from, to, isBlink ? 3f : 2f, isBlink ? SharpDX.Color.Magenta : SharpDX.Color.Orange);
+                    g.DrawLine(from, to, 2f, SharpDX.Color.Orange);
                 }
             }
 
-            // Route target markers
             for (int i = 0; i < _state.PlannedRoute.Count; i++)
             {
                 var rt = _state.PlannedRoute[i];
                 var rtWorld = Pathfinding.GridToWorld3D(gc, rt.GridPos);
                 var rtScreen = cam.WorldToScreen(rtWorld);
-                if (rtScreen.X < -200 || rtScreen.X > 2400) continue;
-
-                var isActive = i == _state.CurrentRouteIndex;
-                var color = rt.Reached ? SharpDX.Color.DarkGray
-                    : rt.Skipped ? SharpDX.Color.DarkRed
-                    : isActive ? SharpDX.Color.White
-                    : SharpDX.Color.Gold;
-
-                g.DrawCircleInWorld(rtWorld, isActive ? 35f : 25f, color, isActive ? 3f : 1.5f);
+                var color = rt.Reached ? SharpDX.Color.DarkGray : SharpDX.Color.Gold;
+                g.DrawCircleInWorld(rtWorld, 25f, color, 1.5f);
                 g.DrawText($"{i + 1}:{rt.Label}", rtScreen + new Vector2(-20, -25), color);
             }
 
-            // Fallback explore target (when route is exhausted)
-            if (_currentExploreTarget.HasValue && _state.CurrentTarget == null)
-            {
-                var expWorld = Pathfinding.GridToWorld3D(gc, _currentExploreTarget.Value);
-                var expScreen = cam.WorldToScreen(expWorld);
-                if (expScreen.X > -200 && expScreen.X < 2400)
-                {
-                    g.DrawCircleInWorld(expWorld, 30f, SharpDX.Color.Cyan, 2f);
-                    g.DrawText("EXPLORE", expScreen + new Vector2(-28, -25), SharpDX.Color.Cyan);
-                }
-            }
-
-            // Exit marker
-            if (_state.ExitPosition.HasValue)
-            {
-                var exitWorld = Pathfinding.GridToWorld3D(gc, _state.ExitPosition.Value);
-                var exitScreen = cam.WorldToScreen(exitWorld);
-                if (exitScreen.X > -200 && exitScreen.X < 2400)
-                {
-                    g.DrawCircleInWorld(exitWorld, 40f, SharpDX.Color.Aqua, 2f);
-                    g.DrawText("EXIT", exitScreen + new Vector2(-14, -25), SharpDX.Color.Aqua);
-                }
-            }
-
-            // Doors (closed = red, open = green)
-            foreach (var door in _state.Doors.Values)
-            {
-                var doorWorld = Pathfinding.GridToWorld3D(gc, door.GridPos);
-                var doorScreen = cam.WorldToScreen(doorWorld);
-                if (doorScreen.X < -200 || doorScreen.X > 2400) continue;
-                var isOpen = _state.OpenedEntities.Contains(door.Id);
-                var doorColor = isOpen ? SharpDX.Color.Green : SharpDX.Color.Red;
-                g.DrawCircleInWorld(doorWorld, 15f, doorColor, 1.5f);
-                if (!isOpen)
-                    g.DrawText("DOOR", doorScreen + new Vector2(-16, -20), doorColor);
-            }
-
-            // Reward chests (unopened only)
-            foreach (var chest in _state.RewardChests.Values)
-            {
-                if (_state.OpenedEntities.Contains(chest.Id)) continue;
-                var chestWorld = Pathfinding.GridToWorld3D(gc, chest.GridPos);
-                var chestScreen = cam.WorldToScreen(chestWorld);
-                if (chestScreen.X < -200 || chestScreen.X > 2400) continue;
-                var circleColor = chest.ChestType == HeistChestType.RewardRoom ? SharpDX.Color.Gold
-                    : chest.ChestType == HeistChestType.Smugglers ? SharpDX.Color.LimeGreen
-                    : SharpDX.Color.Yellow;
-                g.DrawCircleInWorld(chestWorld, 15f, circleColor, 1.5f);
-                var chestColor = chest.ChestType == HeistChestType.RewardRoom ? SharpDX.Color.Gold
-                    : chest.ChestType == HeistChestType.Smugglers ? SharpDX.Color.LimeGreen
-                    : SharpDX.Color.Yellow;
-                g.DrawText(chest.RewardLabel, chestScreen + new Vector2(-20, -20), chestColor);
-            }
-
-            // Companion marker
-            if (_state.CompanionPosition.HasValue)
-            {
-                var compScreen = Pathfinding.GridToScreen(gc, _state.CompanionPosition.Value);
-                if (compScreen.X > -200 && compScreen.X < 2400)
-                    g.DrawText("NPC", compScreen + new Vector2(-10, -20), SharpDX.Color.Yellow);
-            }
-
-            // ═══ Curio Display Valuation Overlay ═══
-            if (_curioDisplays.Count > 0)
-            {
-                // Find the best value for highlighting
-                double bestValue = 0;
-                foreach (var cd in _curioDisplays)
-                    if (!cd.IsOpened && cd.ChaosValue > bestValue) bestValue = cd.ChaosValue;
-
-                // World markers on each curio display
-                foreach (var cd in _curioDisplays)
-                {
-                    var cdWorld = Pathfinding.GridToWorld3D(gc, cd.GridPos);
-                    var cdScreen = cam.WorldToScreen(cdWorld);
-                    if (cdScreen.X < -200 || cdScreen.X > 2400) continue;
-
-                    bool isBest = !cd.IsOpened && cd.ChaosValue > 0 && cd.ChaosValue >= bestValue;
-                    var color = cd.IsOpened ? SharpDX.Color.DarkGray
-                        : isBest ? SharpDX.Color.LimeGreen
-                        : SharpDX.Color.White;
-
-                    var priceStr = cd.ChaosValue > 0 ? $"{cd.ChaosValue:F0}c" : "?";
-                    var label = $"{cd.ItemName} — {priceStr}";
-
-                    g.DrawCircleInWorld(cdWorld, isBest ? 30f : 20f, color, isBest ? 3f : 1.5f);
-                    g.DrawText(label, cdScreen + new Vector2(-40, -30), color);
-                    if (!string.IsNullOrEmpty(cd.ClassName))
-                        g.DrawText($"({cd.Rarity} {cd.ClassName})", cdScreen + new Vector2(-40, -15), SharpDX.Color.Gray);
-                }
-
-                // HUD list panel (sorted by value)
-                var listX = hudX;
-                var listY = hudY + 8;
-                g.DrawText("=== CURIO REWARDS ===", new Vector2(listX, listY), SharpDX.Color.Gold);
-                listY += lineH;
-
-                foreach (var cd in _curioDisplays)
-                {
-                    bool isBest = !cd.IsOpened && cd.ChaosValue > 0 && cd.ChaosValue >= bestValue;
-                    var color = cd.IsOpened ? SharpDX.Color.DarkGray
-                        : isBest ? SharpDX.Color.LimeGreen
-                        : SharpDX.Color.White;
-
-                    var prefix = isBest ? ">> " : "   ";
-                    var priceStr = cd.ChaosValue > 0 ? $"{cd.ChaosValue:F0}c" : "?c";
-                    var suffix = cd.IsOpened ? " [OPENED]" : "";
-                    g.DrawText($"{prefix}{priceStr} — {cd.ItemName}{suffix}", new Vector2(listX, listY), color);
-                    listY += lineH;
-                }
-            }
-
-            // ═══ Minimap Route Overlay (ImGui) ═══
             RenderMinimapRoute(gc);
         }
 
-        /// <summary>
-        /// Draw numbered route targets on the large minimap using ImGui, similar to DieselBot's
-        /// grid explorer overlay. Shows transparent boxes with numbers at each route target position.
-        /// </summary>
         private void RenderMinimapRoute(GameController gc)
         {
             if (_state.PlannedRoute.Count == 0) return;
-
             try
             {
-                var largeMap = gc.IngameState.IngameUi.Map.LargeMap
-                    .AsObject<ExileCore.PoEMemory.Elements.SubMap>();
+                var largeMap = gc.IngameState.IngameUi.Map.LargeMap.AsObject<ExileCore.PoEMemory.Elements.SubMap>();
                 if (largeMap == null || !largeMap.IsVisible) return;
 
                 var mapCenter = largeMap.MapCenter;
@@ -1662,21 +1763,12 @@ namespace AutoExile.Modes
 
                 var playerPos = gc.Player.GridPosNum;
                 var playerHeight = -playerRender.RenderStruct.Height;
-
                 var heightData = gc.IngameState?.Data?.RawTerrainHeightData;
 
                 var rect = gc.Window.GetWindowRectangle();
                 ImGuiNET.ImGui.SetNextWindowSize(new Vector2(rect.Width, rect.Height));
                 ImGuiNET.ImGui.SetNextWindowPos(new Vector2(rect.Left, rect.Top));
-                ImGuiNET.ImGui.Begin("heist_route_overlay",
-                    ImGuiNET.ImGuiWindowFlags.NoDecoration |
-                    ImGuiNET.ImGuiWindowFlags.NoInputs |
-                    ImGuiNET.ImGuiWindowFlags.NoMove |
-                    ImGuiNET.ImGuiWindowFlags.NoScrollWithMouse |
-                    ImGuiNET.ImGuiWindowFlags.NoSavedSettings |
-                    ImGuiNET.ImGuiWindowFlags.NoFocusOnAppearing |
-                    ImGuiNET.ImGuiWindowFlags.NoBringToFrontOnFocus |
-                    ImGuiNET.ImGuiWindowFlags.NoBackground);
+                ImGuiNET.ImGui.Begin("heist_route_overlay", ImGuiNET.ImGuiWindowFlags.NoDecoration | ImGuiNET.ImGuiWindowFlags.NoInputs | ImGuiNET.ImGuiWindowFlags.NoMove | ImGuiNET.ImGuiWindowFlags.NoBackground);
 
                 var dl = ImGuiNET.ImGui.GetWindowDrawList();
                 const float boxHalf = 12f;
@@ -1688,47 +1780,18 @@ namespace AutoExile.Modes
                 }
 
                 uint white = ImGuiNET.ImGui.ColorConvertFloat4ToU32(new Vector4(1f, 1f, 1f, 0.9f));
-
                 for (int i = 0; i < _state.PlannedRoute.Count; i++)
                 {
                     var rt = _state.PlannedRoute[i];
-                    var isActive = i == _state.CurrentRouteIndex;
-
-                    uint fill;
-                    if (rt.Reached)
-                        fill = ImGuiNET.ImGui.ColorConvertFloat4ToU32(new Vector4(0f, 0.7f, 0f, 0.5f));    // green = done
-                    else if (rt.Skipped)
-                        fill = ImGuiNET.ImGui.ColorConvertFloat4ToU32(new Vector4(0.5f, 0f, 0f, 0.5f));    // dark red = skipped
-                    else if (isActive)
-                        fill = ImGuiNET.ImGui.ColorConvertFloat4ToU32(new Vector4(1f, 1f, 0f, 0.7f));      // yellow = current
-                    else
-                        fill = ImGuiNET.ImGui.ColorConvertFloat4ToU32(new Vector4(0.9f, 0.7f, 0f, 0.5f));  // gold = pending
-
-                    uint outline = ImGuiNET.ImGui.ColorConvertFloat4ToU32(new Vector4(1f, 1f, 1f, 0.3f));
-
+                    uint fill = rt.Reached ? ImGuiNET.ImGui.ColorConvertFloat4ToU32(new Vector4(0f, 0.7f, 0f, 0.5f)) : ImGuiNET.ImGui.ColorConvertFloat4ToU32(new Vector4(0.9f, 0.7f, 0f, 0.5f));
                     var center = ToMap(rt.GridPos);
-                    var tl = center + new Vector2(-boxHalf, -boxHalf);
-                    var br = center + new Vector2(boxHalf, boxHalf);
-
-                    dl.AddRectFilled(tl, br, fill, 3f);
-                    dl.AddRect(tl, br, outline, 3f);
+                    dl.AddRectFilled(center - new Vector2(boxHalf, boxHalf), center + new Vector2(boxHalf, boxHalf), fill, 3f);
                     dl.AddText(center - new Vector2(4, 6), white, (i + 1).ToString());
-
-                    // Connect to next target with a line
-                    if (i + 1 < _state.PlannedRoute.Count && !rt.Reached && !rt.Skipped)
-                    {
-                        var nextCenter = ToMap(_state.PlannedRoute[i + 1].GridPos);
-                        uint lineColor = ImGuiNET.ImGui.ColorConvertFloat4ToU32(new Vector4(0.6f, 0.6f, 0.6f, 0.4f));
-                        dl.AddLine(center, nextCenter, lineColor, 1f);
-                    }
                 }
-
                 ImGuiNET.ImGui.End();
             }
             catch { }
         }
-
-        // --- Curio Display Evaluation ---
 
         private class CurioDisplayInfo
         {
@@ -1742,67 +1805,19 @@ namespace AutoExile.Modes
             public bool IsOpened;
         }
 
-        /// <summary>
-        /// Scan nearby HeistChestPrimaryTarget entities, read their HeistRewardDisplay items,
-        /// and price them via the NinjaPrice PluginBridge.
-        /// </summary>
         private void ScanCurioDisplays(GameController gc)
         {
             _curioDisplays.Clear();
-
-            Func<Entity, double>? getPrice = null;
-            try { getPrice = gc.PluginBridge.GetMethod<Func<Entity, double>>("NinjaPrice.GetValue"); }
-            catch { }
-
             foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
             {
-                if (entity?.Path == null || !entity.Path.Contains("HeistChestPrimaryTarget"))
-                    continue;
-
-                var info = new CurioDisplayInfo
-                {
-                    EntityId = entity.Id,
-                    GridPos = entity.GridPosNum,
-                };
-
+                if (entity?.Path == null || !entity.Path.Contains("HeistChestPrimaryTarget")) continue;
+                var info = new CurioDisplayInfo { EntityId = entity.Id, GridPos = entity.GridPosNum };
                 var chest = entity.GetComponent<Chest>();
                 info.IsOpened = chest?.IsOpened == true || !entity.IsTargetable;
-
-                try
-                {
-                    var hrd = entity.GetComponent<HeistRewardDisplay>();
-                    var rewardItem = hrd?.RewardItem;
-                    if (rewardItem != null && rewardItem.IsValid)
-                    {
-                        var baseType = gc.Files.BaseItemTypes.Translate(rewardItem.Path);
-                        info.BaseName = baseType?.BaseName ?? "";
-                        info.ClassName = baseType?.ClassName ?? "";
-
-                        var mods = rewardItem.GetComponent<Mods>();
-                        if (mods != null)
-                        {
-                            info.Rarity = mods.ItemRarity.ToString();
-                            info.ItemName = mods.UniqueName ?? info.BaseName;
-                        }
-                        else
-                        {
-                            info.ItemName = info.BaseName;
-                        }
-
-                        if (getPrice != null)
-                            info.ChaosValue = getPrice(rewardItem);
-                    }
-                }
-                catch { }
-
                 _curioDisplays.Add(info);
             }
-
-            // Sort by value descending
-            _curioDisplays.Sort((a, b) => b.ChaosValue.CompareTo(a.ChaosValue));
         }
 
-        // Camera projection constants for minimap overlay
         private const float GridToWorldMultiplier = 250f / 23f;
         private const double CameraAngle = 38.7 * Math.PI / 180;
         private static readonly float CamCos = (float)Math.Cos(CameraAngle);
@@ -1811,9 +1826,7 @@ namespace AutoExile.Modes
         private static Vector2 GridDeltaToMap(Vector2 delta, float deltaZ, float mapScale)
         {
             deltaZ /= GridToWorldMultiplier;
-            return mapScale * new Vector2(
-                (delta.X - delta.Y) * CamCos,
-                (deltaZ - (delta.X + delta.Y)) * CamSin);
+            return mapScale * new Vector2((delta.X - delta.Y) * CamCos, (deltaZ - (delta.X + delta.Y)) * CamSin);
         }
 
         private static float GetTerrainHeight(float[][]? heightData, Vector2 pos)
@@ -1824,11 +1837,106 @@ namespace AutoExile.Modes
                 return heightData[y][x];
             return 0f;
         }
+
+        private static Element? SafeGetChild(Element? parent, int index)
+        {
+            if (parent == null || index < 0 || index >= (int)parent.ChildCount) return null;
+            return parent.GetChildAtIndex(index);
+        }
+
+        private void LogNearbyEnemiesDebug(GameController gc)
+        {
+            try
+            {
+                var playerPos = gc.Player.GridPosNum;
+                var enemies = gc.EntityListWrapper.OnlyValidEntities
+                    .Where(e => e.Type == EntityType.Monster && e.IsHostile && e.IsAlive && e.DistancePlayer < 100)
+                    .OrderBy(e => e.DistancePlayer)
+                    .ToList();
+
+                if (enemies.Count == 0) return;
+
+                var lines = new List<string> { $"--- ENEMY THREAT BREAKDOWN ({enemies.Count} nearby) ---" };
+                foreach (var e in enemies)
+                {
+                    var life = e.GetComponent<Life>();
+                    var hp = life != null ? $"{life.CurHP}/{life.MaxHP}" : "no-life";
+                    var name = !string.IsNullOrEmpty(e.RenderName) ? e.RenderName : (e.Path?.Split('/').LastOrDefault() ?? "?");
+                    var targetable = e.IsTargetable;
+                    lines.Add($"  - [{e.Rarity}] {name} (Id={e.Id}, Dist={e.DistancePlayer:F0}, HP={hp}, Targetable={targetable}, Path={e.Path})");
+                }
+                HeistLog(string.Join("\n", lines));
+            }
+            catch { }
+        }
+
+        private Entity? FindHeistEntranceTransition(GameController gc)
+        {
+            var playerPos = gc.Player.GridPosNum;
+            Entity? best = null;
+            float bestDist = 120f; // Staging entrance is always within 120 units
+
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (!entity.IsTargetable || entity.Path == null) continue;
+
+                var renderName = entity.RenderName ?? "";
+                var path = entity.Path;
+
+                // Ignore return portals, Harbour transitions, and Escape Route transitions
+                if (entity.Type == EntityType.TownPortal ||
+                    renderName.Equals("The Rogue Harbour", StringComparison.OrdinalIgnoreCase) ||
+                    renderName.Contains("Escape Route", StringComparison.OrdinalIgnoreCase) ||
+                    path.Contains("MissionExitPortal", StringComparison.OrdinalIgnoreCase) ||
+                    path.Contains("heist_exit_portal", StringComparison.OrdinalIgnoreCase) ||
+                    path.Contains("AdiyahPortal", StringComparison.OrdinalIgnoreCase) ||
+                    path.Contains("HeistEscapeRoute", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                // Match staging entrance transitions (bulkhead doors, pipes, grates)
+                bool isTransition = entity.Type == EntityType.AreaTransition
+                    || path.Contains("SewersGrate", StringComparison.OrdinalIgnoreCase)
+                    || path.Contains("AreaTransition", StringComparison.OrdinalIgnoreCase)
+                    || path.Contains("aqueduct_sewer_entrance", StringComparison.OrdinalIgnoreCase)
+                    || path.Contains("slum_sewer_entrance", StringComparison.OrdinalIgnoreCase)
+                    || path.Contains("garden_wall_entrance", StringComparison.OrdinalIgnoreCase)
+                    || path.Contains("slaveden_IronCageOpened", StringComparison.OrdinalIgnoreCase)
+                    || path.Contains("templar_to_innocents", StringComparison.OrdinalIgnoreCase)
+                    || path.Contains("templar_oriath_transition", StringComparison.OrdinalIgnoreCase)
+                    || path.Contains("HeistEntranceTransition", StringComparison.OrdinalIgnoreCase);
+
+                if (isTransition)
+                {
+                    var dist = Vector2.Distance(entity.GridPosNum, playerPos);
+                    if (dist < bestDist)
+                    {
+                        bestDist = dist;
+                        best = entity;
+                    }
+                }
+            }
+
+            return best;
+        }
     }
 
     public enum HeistPhase
     {
         Idle,
+
+        // Harbour & Adiyah Automation
+        InHarbour,
+        StashItems,
+        OpenAdiyah,
+        InsertContract,
+        SelectRogue,
+        SignContract,
+        WaitForPortal,
+        EnterPortal,
+
+        // In-Contract
         Initializing,
         Infiltrating,
         AtDoor,

@@ -55,18 +55,25 @@ namespace AutoExile.Systems
 
         /// <summary>
         /// Convert grid position to world Vector3 using ExileCore's terrain height lookup.
-        /// This is more accurate than manual GridToWorld multiplication because it includes
-        /// proper terrain elevation from the game's height map.
+        /// Safely falls back if Data is null during area transitions.
         /// </summary>
-        public static Vector3 GridToWorld3D(GameController gc, Vector2 gridPos) =>
-            gc.IngameState.Data.ToWorldWithTerrainHeight(gridPos);
+        public static Vector3 GridToWorld3D(GameController gc, Vector2 gridPos)
+        {
+            if (gc?.IngameState?.Data == null)
+                return new Vector3(gridPos.X * GridToWorld, gridPos.Y * GridToWorld, 0f);
+            return gc.IngameState.Data.ToWorldWithTerrainHeight(gridPos);
+        }
 
         /// <summary>
         /// Convert grid position to screen coordinates via ToWorldWithTerrainHeight.
-        /// Preferred over manual GridToWorld * 10.88 + manual height lookup.
+        /// Safely returns Vector2.Zero if Camera or Data is null during area transitions.
         /// </summary>
-        public static Vector2 GridToScreen(GameController gc, Vector2 gridPos) =>
-            gc.IngameState.Camera.WorldToScreen(gc.IngameState.Data.ToWorldWithTerrainHeight(gridPos));
+        public static Vector2 GridToScreen(GameController gc, Vector2 gridPos)
+        {
+            if (gc?.IngameState?.Camera == null || gc?.IngameState?.Data == null)
+                return Vector2.Zero;
+            return gc.IngameState.Camera.WorldToScreen(gc.IngameState.Data.ToWorldWithTerrainHeight(gridPos));
+        }
 
         /// <summary>
         /// Run A* from start to goal on the pathfinding grid.
@@ -513,7 +520,7 @@ namespace AutoExile.Systems
         }
 
         private static bool HasLineOfSight(int[][] grid, Vector2 a, Vector2 b, int rows, int cols,
-            int minWalkable = 4)
+    int minWalkable = 4)
         {
             var ax = (int)a.X;
             var ay = (int)a.Y;
@@ -535,11 +542,26 @@ namespace AutoExile.Systems
                     return false;
 
                 var e2 = 2 * err;
-                if (e2 > -dy) { err -= dy; cx += sx; }
-                if (e2 < dx) { err += dx; cy += sy; }
+                var stepX = e2 > -dy;
+                var stepY = e2 < dx;
+
+                // Prevent diagonal ray-cutting through thin corners/walls:
+                // If moving diagonally, both orthogonal neighbors must also be walkable.
+                if (stepX && stepY)
+                {
+                    var ox = cx + sx;
+                    var oy = cy + sy;
+                    if (ox < 0 || ox >= cols || oy < 0 || oy >= rows)
+                        return false;
+                    if (grid[cy][ox] < minWalkable || grid[oy][cx] < minWalkable)
+                        return false;
+                }
+
+                if (stepX) { err -= dy; cx += sx; }
+                if (stepY) { err += dx; cy += sy; }
             }
 
-            return true;
+            return cx >= 0 && cx < cols && cy >= 0 && cy < rows && grid[cy][cx] >= minWalkable;
         }
 
         /// <summary>

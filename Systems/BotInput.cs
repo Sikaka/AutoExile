@@ -605,10 +605,10 @@ namespace AutoExile.Systems
             const int mask = unchecked((short)0x8000);
             return (GetAsyncKeyState((int)Keys.LControlKey) & mask) != 0
                 || (GetAsyncKeyState((int)Keys.RControlKey) & mask) != 0
-                || (GetAsyncKeyState((int)Keys.LShiftKey)   & mask) != 0
-                || (GetAsyncKeyState((int)Keys.RShiftKey)   & mask) != 0
-                || (GetAsyncKeyState((int)Keys.LMenu)       & mask) != 0
-                || (GetAsyncKeyState((int)Keys.RMenu)       & mask) != 0;
+                || (GetAsyncKeyState((int)Keys.LShiftKey) & mask) != 0
+                || (GetAsyncKeyState((int)Keys.RShiftKey) & mask) != 0
+                || (GetAsyncKeyState((int)Keys.LMenu) & mask) != 0
+                || (GetAsyncKeyState((int)Keys.RMenu) & mask) != 0;
         }
 
         /// <summary>Force-release any tracked modifier keys AND flush any OS-level
@@ -631,10 +631,10 @@ namespace AutoExile.Systems
             if (!OsHasModifierHeld()) return;
             SendKeyUp(Keys.LControlKey, "movement-guard");
             SendKeyUp(Keys.RControlKey, "movement-guard");
-            SendKeyUp(Keys.LShiftKey,   "movement-guard");
-            SendKeyUp(Keys.RShiftKey,   "movement-guard");
-            SendKeyUp(Keys.LMenu,       "movement-guard");
-            SendKeyUp(Keys.RMenu,       "movement-guard");
+            SendKeyUp(Keys.LShiftKey, "movement-guard");
+            SendKeyUp(Keys.RShiftKey, "movement-guard");
+            SendKeyUp(Keys.LMenu, "movement-guard");
+            SendKeyUp(Keys.RMenu, "movement-guard");
         }
 
         private static void ReleaseTrackedModifiers()
@@ -644,8 +644,8 @@ namespace AutoExile.Systems
             foreach (var k in _heldKeys.Keys)
             {
                 if (k == Keys.LControlKey || k == Keys.RControlKey || k == Keys.ControlKey ||
-                    k == Keys.LShiftKey   || k == Keys.RShiftKey   || k == Keys.ShiftKey   ||
-                    k == Keys.LMenu       || k == Keys.RMenu       || k == Keys.Menu)
+                    k == Keys.LShiftKey || k == Keys.RShiftKey || k == Keys.ShiftKey ||
+                    k == Keys.LMenu || k == Keys.RMenu || k == Keys.Menu)
                     toRelease.Add(k);
             }
             foreach (var k in toRelease)
@@ -667,7 +667,7 @@ namespace AutoExile.Systems
         {
             if (WindowRect.Width < 10 || WindowRect.Height < 10) return absScreenPos;
             var center = new Vector2(
-                WindowRect.X + WindowRect.Width  / 2f,
+                WindowRect.X + WindowRect.Width / 2f,
                 WindowRect.Y + WindowRect.Height / 2f);
             var dir = absScreenPos - center;
             var len = dir.Length();
@@ -695,20 +695,15 @@ namespace AutoExile.Systems
         /// Start continuous movement: hold the movement key and set cursor toward target.
         /// Call UpdateMovementCursor() each tick to steer. Movement stays active until
         /// StopMovement() is called or it's suspended by a discrete action.
-        /// Does NOT go through the action gate — movement is a background layer.
         /// </summary>
         public static bool StartMovement(Vector2 absScreenPos, Keys moveKey)
         {
             if (TryCaptureReplay("StartMovement", absScreenPos, moveKey)) return true;
             if (!ClampToWindow(ref absScreenPos)) return false;
 
-            // Move-only walks TO the cursor. If the target is on the player the
-            // character stands still. Safety-nudge every call, including the
-            // steer-only fast path below.
             absScreenPos = NudgeOffPlayer(absScreenPos);
 
-            // If already moving with the same key and not suspended, just steer cursor.
-            // No key release/press needed — the key is already held.
+            // If already moving with the same key and NOT suspended, just steer cursor
             if (IsMovementActive && _movementKey == moveKey && !IsMovementSuspended)
             {
                 Input.SetCursorPos(absScreenPos);
@@ -716,42 +711,31 @@ namespace AutoExile.Systems
                 return true;
             }
 
-            // If suspended with the same key, just update the stored cursor position.
-            // TickMovementLayer will resume when the minimum delay has elapsed.
-            // Don't press KeyDown here — let ResumeMovement handle it with proper timing.
-            if (IsMovementActive && _movementKey == moveKey && IsMovementSuspended)
-            {
-                _movementCursorPos = absScreenPos;
-                return true;
-            }
-
-            // Switching to a different key — release old, press new
+            // Switching to a different key — release old key
             if (IsMovementActive && _movementKey != moveKey)
             {
                 SendKeyUp(_movementKey, "movement");
+                IsMovementActive = false;
+                IsMovementSuspended = false;
             }
 
-            // Flush any held modifiers so the move key doesn't register as
-            // Ctrl+move (attack-in-place) / Shift+move / Alt+move.
+            // Flush any held modifiers so move key doesn't register as Ctrl+move / Shift+move
             ReleaseAllModifiersBeforeMove();
 
             Input.SetCursorPos(absScreenPos);
             _movementCursorPos = absScreenPos;
             _movementKey = moveKey;
-
             IsMovementActive = true;
 
-            // Press the movement key if the input rate allows.
-            // If too soon after the last input event, start in suspended state —
-            // TickMovementLayer will retry on the next frame via ResumeMovement.
-            if (!IsMovementSuspended && CanSendInputEvent)
+            // Try to press the movement key if allowed by rate limit
+            if (CanSendInputEvent)
             {
                 SendKeyDown(moveKey, "movement");
                 IsMovementSuspended = false;
             }
             else
             {
-                IsMovementSuspended = true;
+                IsMovementSuspended = true; // Will be resumed by TickMovementLayer or next StartMovement tick
             }
 
             LogAction("StartMovement", absScreenPos, moveKey, true);
@@ -832,9 +816,6 @@ namespace AutoExile.Systems
         /// <summary>
         /// Resume movement after a discrete action completes.
         /// Re-presses the movement key and restores cursor to last movement position.
-        /// Enforces a minimum delay since the key was released (SuspendMovement)
-        /// to avoid rapid KeyUp→KeyDown patterns that trigger anti-cheat.
-        /// Called automatically by TickMovementLayer().
         /// </summary>
         public static void ResumeMovement()
         {
@@ -843,7 +824,6 @@ namespace AutoExile.Systems
             // Enforce global input rate limit before re-pressing the movement key
             if (!CanSendInputEvent) return;
 
-            // Same guards as StartMovement — cursor off player, no stuck modifiers.
             var target = NudgeOffPlayer(_movementCursorPos);
             _movementCursorPos = target;
             ReleaseAllModifiersBeforeMove();
@@ -854,25 +834,24 @@ namespace AutoExile.Systems
 
         /// <summary>
         /// Tick the movement layer. Call once per frame from BotCore.
-        /// Auto-resumes movement after discrete actions complete.
+        /// Auto-resumes movement as soon as input rate limits allow.
         /// </summary>
         public static void TickMovementLayer()
         {
             if (!IsMovementActive || !IsMovementSuspended) return;
 
-            // Don't resume movement while modifier keys are held (e.g. Ctrl for batch stash transfers).
-            // Resuming would press the movement key with Ctrl still down, sending Ctrl+moveKey.
-            // Held skill keys (channel attacks) are fine — only actual modifiers cause combo issues.
-            if (HasHeldModifiers) return;
-
-            // Auto-resume when the discrete action's gate has cleared.
-            // ResumeMovement internally checks CanSendInputEvent for rate limiting.
-            if (CanAct)
+            // Auto-resume movement as soon as the input rate limit allows
+            if (CanSendInputEvent)
+            {
                 ResumeMovement();
+                return;
+            }
 
-            // Safety: force-resume if suspended too long (action got stuck)
-            if (IsMovementSuspended && (DateTime.Now - _lastInputEvent).TotalMilliseconds > 2000)
+            // Safety: force-resume if suspended too long
+            if (IsMovementSuspended && (DateTime.Now - _lastInputEvent).TotalMilliseconds > 300)
+            {
                 ResumeMovement();
+            }
         }
 
         // ══════════════════════════════════════════════════════════════
