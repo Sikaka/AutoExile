@@ -90,10 +90,42 @@ namespace AutoExile.Systems
             {
                 if (string.Equals(_lastRecoveryAction, value, StringComparison.Ordinal)) return;
                 _lastRecoveryAction = value;
-                if (!string.IsNullOrWhiteSpace(value))
-                    Stats?.RecordRuntimeEvent("navigation", "recovery", "attempted", value,
-                        new { destination = Destination, waypoint = CurrentWaypointIndex });
+                if (string.IsNullOrWhiteSpace(value)) return;
+                var kind = RecoveryKind(value);
+                var now = Environment.TickCount64;
+                _recoveryEmits.TryGetValue(kind, out var last);
+                if (last.AtMs != 0 && now - last.AtMs < RecoveryEventIntervalMs)
+                {
+                    _recoveryEmits[kind] = (last.AtMs, last.Suppressed + 1);
+                    return;
+                }
+                _recoveryEmits[kind] = (now, 0);
+                Stats?.RecordRuntimeEvent("navigation", "recovery", "attempted", kind,
+                    new
+                    {
+                        text = value,
+                        destination = Destination,
+                        waypoint = CurrentWaypointIndex,
+                        totalRecoveries = _totalStuckRecoveries,
+                        sameSpot = _stuckAtSameSpotCount,
+                        suppressed = last.Suppressed
+                    });
             }
+        }
+        private const long RecoveryEventIntervalMs = 5000;
+        private readonly Dictionary<string, (long AtMs, int Suppressed)> _recoveryEmits = new();
+
+        private static string RecoveryKind(string action)
+        {
+            if (action.Contains("escape probe", StringComparison.OrdinalIgnoreCase)) return "escape_probe";
+            if (action.StartsWith("Backtrack", StringComparison.Ordinal)) return "backtrack";
+            if (action.StartsWith("Blink crossed", StringComparison.Ordinal)) return "blink_crossed";
+            if (action.StartsWith("Blink timeout", StringComparison.Ordinal)) return "blink_timeout";
+            if (action.StartsWith("Interact", StringComparison.Ordinal)) return "interact";
+            if (action.StartsWith("Periodic repath", StringComparison.Ordinal)) return "periodic_repath";
+            if (action.StartsWith("No waypoint progress", StringComparison.Ordinal)) return "no_progress_repath";
+            if (action.StartsWith("Repath", StringComparison.Ordinal)) return "repath";
+            return "other";
         }
         private static readonly Random _rng = new();
 
@@ -237,7 +269,7 @@ namespace AutoExile.Systems
                     _stuckTimer = 0;
                     LastRecoveryAction = "Blink crossed";
                     if (Destination.HasValue)
-                        NavigateTo(gc, Destination.Value);
+                        NavigateTo(gc, Destination.Value, 0, useFailureMemo: false);
                 }
                 else if (elapsed > BaseBlinkPendingTimeoutMs + ExtraLatencyMs)
                 {
@@ -248,7 +280,7 @@ namespace AutoExile.Systems
                         ? "Blink timeout (still on origin side), repath"
                         : "Blink timeout (on wall?), repath";
                     if (Destination.HasValue)
-                        NavigateTo(gc, Destination.Value);
+                        NavigateTo(gc, Destination.Value, 0, useFailureMemo: false);
                 }
             }
 
@@ -332,7 +364,7 @@ namespace AutoExile.Systems
                     else
                     {
                         LastRecoveryAction = $"Periodic repath (no waypoint advance in {PeriodicRepathIntervalSec:F0}s)";
-                        NavigateTo(gc, Destination.Value);
+                        NavigateTo(gc, Destination.Value, 0, useFailureMemo: false);
                     }
                     return;
                 }
@@ -365,7 +397,7 @@ namespace AutoExile.Systems
                         else
                         {
                             LastRecoveryAction = "Repath";
-                            NavigateTo(gc, Destination.Value);
+                            NavigateTo(gc, Destination.Value, 0, useFailureMemo: false);
                         }
                         return;
                     }
@@ -428,7 +460,7 @@ namespace AutoExile.Systems
                         else
                         {
                             LastRecoveryAction = "No waypoint progress, repath";
-                            NavigateTo(gc, Destination.Value);
+                            NavigateTo(gc, Destination.Value, 0, useFailureMemo: false);
                         }
                         return;
                     }
@@ -714,14 +746,58 @@ namespace AutoExile.Systems
         /// Navigate to a grid position using A* pathfinding.
         /// </summary>
         public bool NavigateTo(GameController gc, Vector2 gridTarget, int maxNodes = 0)
+            => NavigateTo(gc, gridTarget, maxNodes, useFailureMemo: true);
+
+        private const long FailureMemoTtlMs = 750;
+        private const long NavigateEventIntervalMs = 1000;
+        private (int Tx, int Ty, int Px, int Py, long Area, int BlockedCount, int BlockedHash, bool Relaxed, bool Blink, int MaxNodes) _failMemoKey;
+        private long _failMemoAtMs;
+        private int _navEvtX, _navEvtY, _navEvtSuppressed;
+        private long _navEvtArea, _navEvtAtMs;
+        private bool _navEvtResult;
+
+        private void RecordNavigateTo(Vector2 gridTarget, long area, int maxNodes, bool result)
         {
+            int x = (int)gridTarget.X, y = (int)gridTarget.Y;
+            var now = Environment.TickCount64;
+            if (_navEvtAtMs != 0 && x == _navEvtX && y == _navEvtY && area == _navEvtArea
+                && result == _navEvtResult && now - _navEvtAtMs < NavigateEventIntervalMs)
+            {
+                _navEvtSuppressed++;
+                return;
+            }
+            var suppressed = _navEvtSuppressed;
+            _navEvtX = x;
+            _navEvtY = y;
+            _navEvtArea = area;
+            _navEvtResult = result;
+            _navEvtAtMs = now;
+            _navEvtSuppressed = 0;
             Stats?.RecordRuntimeEvent("navigation", "navigate_to", "attempted", null,
-                new { x = gridTarget.X, y = gridTarget.Y, maxNodes });
+                new { x = gridTarget.X, y = gridTarget.Y, maxNodes, result, suppressed });
+        }
+
+        private bool NavigateTo(GameController gc, Vector2 gridTarget, int maxNodes, bool useFailureMemo)
+        {
             var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
+            long areaHash = gc.IngameState.Data.CurrentAreaHash;
+            var requestedMaxNodes = maxNodes;
+            int blockedHash = 0;
+            foreach (var bp in _blockedPositions)
+                blockedHash = HashCode.Combine(blockedHash, (int)bp.X, (int)bp.Y);
+            var memoKey = ((int)gridTarget.X, (int)gridTarget.Y, (int)playerGrid.X, (int)playerGrid.Y, areaHash,
+                _blockedPositions.Count, blockedHash, RelaxedPathing, BlinkEnabled, maxNodes);
+            if (useFailureMemo && _failMemoAtMs != 0 && memoKey == _failMemoKey
+                && Environment.TickCount64 - _failMemoAtMs < FailureMemoTtlMs)
+                return false;
+
             var pfGrid = gc.IngameState.Data.RawFramePathfindingData;
 
             if (pfGrid == null || pfGrid.Length == 0)
+            {
+                RecordNavigateTo(gridTarget, areaHash, requestedMaxNodes, false);
                 return false;
+            }
 
             // Patch grid with blocked positions (e.g. locked puzzle doors).
             // Create a shallow copy of the row array, then clone+zero only affected rows.
@@ -792,7 +868,15 @@ namespace AutoExile.Systems
             LastPathfindMs = sw.ElapsedMilliseconds;
 
             if (rawPath.Count == 0)
+            {
+                if (useFailureMemo)
+                {
+                    _failMemoKey = memoKey;
+                    _failMemoAtMs = Environment.TickCount64;
+                }
+                RecordNavigateTo(gridTarget, areaHash, requestedMaxNodes, false);
                 return false;
+            }
 
             CurrentNavPath = Pathfinding.SmoothNavPath(pfGrid, rawPath, minWalkable);
             if (PathMergeThreshold > 0)
@@ -828,6 +912,7 @@ namespace AutoExile.Systems
             _lastRepathTime = DateTime.Now;
             _lastRepathWaypointIndex = CurrentWaypointIndex;
 
+            RecordNavigateTo(gridTarget, areaHash, requestedMaxNodes, true);
             return true;
         }
 
@@ -1090,7 +1175,7 @@ namespace AutoExile.Systems
             if (tileGridPos == null)
                 return false;
 
-            return NavigateTo(gc, tileGridPos.Value, maxNodes: 500000);
+            return NavigateTo(gc, tileGridPos.Value, 500000, useFailureMemo: false);
         }
 
         /// <summary>
