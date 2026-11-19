@@ -28,6 +28,16 @@ namespace AutoExile.Systems
         private string _lastDumpStatus = "";
         private DateTime _lastDumpTime = DateTime.MinValue;
         private const int DumpCooldownMs = 5000; // don't dump more than once per 5s
+        private const int MaxAutoDumpsPerHour = 12;
+        private const int MaxFolderRecordings = 200;
+        private const long FolderCountRefreshMs = 60_000;
+        private const long SkipLogIntervalMs = 600_000;
+        private int _lastDumpedRecoveryCount = -1;
+        private readonly Queue<long> _autoDumpTicks = new();
+        private int _folderRecordingCount = -1;
+        private long _folderCountCheckedAt = long.MinValue;
+        private int _folderCountRefreshing;
+        private long _lastSkipLogAt = long.MinValue;
 
         public string LastDumpStatus => _lastDumpStatus;
         public long TickNumber => _tickNumber;
@@ -188,7 +198,7 @@ namespace AutoExile.Systems
         /// </summary>
         public void ForceDump(string reason)
         {
-            DumpToFile(reason);
+            DumpToFile(reason, false);
         }
 
         private void CheckTriggers(GameController gc, float hpPercent, bool isAlive, NavigationSystem nav)
@@ -196,16 +206,69 @@ namespace AutoExile.Systems
             if ((DateTime.Now - _lastDumpTime).TotalMilliseconds < DumpCooldownMs)
                 return;
 
-            // Navigation stuck recovery
-            if (nav.StuckRecoveries > 0 && nav.LastRecoveryAction == "Repath")
+            // Navigation stuck recovery (one dump per Repath episode)
+            if (nav.StuckRecoveries <= 0 || nav.LastRecoveryAction != "Repath")
             {
-                DumpToFile("nav_stuck_repath");
+                _lastDumpedRecoveryCount = -1;
+                return;
+            }
+            if (nav.StuckRecoveries == _lastDumpedRecoveryCount) return;
+            if (string.IsNullOrEmpty(_outputDir) || _count == 0) return;
+
+            var now = Environment.TickCount64;
+            while (_autoDumpTicks.Count > 0 && now - _autoDumpTicks.Peek() >= 3_600_000)
+                _autoDumpTicks.Dequeue();
+
+            RefreshFolderCount(now);
+            string? skipReason = null;
+            if (_autoDumpTicks.Count >= MaxAutoDumpsPerHour)
+                skipReason = $"{MaxAutoDumpsPerHour} automatic dumps already written in the last hour";
+            else if (_folderRecordingCount >= MaxFolderRecordings)
+                skipReason = $"{_folderRecordingCount} recording_*.json files in {_outputDir}";
+            else if (_folderRecordingCount < 0)
+                return;
+
+            if (skipReason != null)
+            {
+                if (now - _lastSkipLogAt >= SkipLogIntervalMs)
+                {
+                    _lastSkipLogAt = now;
+                    DebugWindow.LogMsg($"[BotRecorder] Automatic dump skipped: {skipReason}. Deleting old recordings resumes it.");
+                }
+                return;
+            }
+
+            if (DumpToFile("nav_stuck_repath", true))
+            {
+                _lastDumpedRecoveryCount = nav.StuckRecoveries;
+                _autoDumpTicks.Enqueue(now);
+                _folderRecordingCount++;
             }
         }
 
-        private void DumpToFile(string reason)
+        private void RefreshFolderCount(long now)
         {
-            if (string.IsNullOrEmpty(_outputDir) || _count == 0) return;
+            if (now - _folderCountCheckedAt < FolderCountRefreshMs) return;
+            if (Interlocked.Exchange(ref _folderCountRefreshing, 1) == 1) return;
+            _folderCountCheckedAt = now;
+            var dir = _outputDir;
+            Task.Run(() =>
+            {
+                try
+                {
+                    var n = Directory.Exists(dir)
+                        ? Directory.EnumerateFiles(dir, "recording_*.json", SearchOption.TopDirectoryOnly).Count()
+                        : 0;
+                    Volatile.Write(ref _folderRecordingCount, n);
+                }
+                catch { }
+                finally { Volatile.Write(ref _folderCountRefreshing, 0); }
+            });
+        }
+
+        private bool DumpToFile(string reason, bool automatic = false)
+        {
+            if (string.IsNullOrEmpty(_outputDir) || _count == 0) return false;
             _lastDumpTime = DateTime.Now;
 
             try
@@ -214,6 +277,8 @@ namespace AutoExile.Systems
                 var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
                 var safeReason = reason.Replace(" ", "_").Replace("/", "_");
                 var filename = $"recording_{safeReason}_{timestamp}.json";
+                for (int n = 2; File.Exists(Path.Combine(_outputDir, filename)); n++)
+                    filename = $"recording_{safeReason}_{timestamp}_{n}.json";
                 var path = Path.Combine(_outputDir, filename);
 
                 // Extract ring buffer in chronological order
@@ -237,20 +302,28 @@ namespace AutoExile.Systems
                     Snapshots = snapshots
                 };
 
-                var json = JsonSerializer.Serialize(dump, new JsonSerializerOptions
-                {
-                    PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-                    WriteIndented = false,
-                    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingDefault
-                });
-
                 var count = snapshots.Count;
-                Task.Run(() => { try { File.WriteAllText(path, json); } catch { } });
+                Task.Run(() =>
+                {
+                    try
+                    {
+                        var json = JsonSerializer.Serialize(dump, new JsonSerializerOptions
+                        {
+                            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                            WriteIndented = false,
+                            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingDefault
+                        });
+                        File.WriteAllText(path, json);
+                    }
+                    catch { }
+                });
                 _lastDumpStatus = $"Dumped {count} ticks to {filename} ({reason})";
+                return true;
             }
             catch (Exception ex)
             {
                 _lastDumpStatus = $"Dump failed: {ex.Message}";
+                return false;
             }
         }
 
