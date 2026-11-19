@@ -476,7 +476,13 @@ WHERE loot_id=$loot
                     if (!_writes.TryTake(out var item, WriterIdleWaitMs))
                     {
                         if (_writes.IsCompleted) break;
-                        // Idle: publish what an earlier cycle deferred or what Pulse asked for.
+                        // Idle: store a drop total an earlier cycle could not write, then publish
+                        // what that cycle deferred or what Pulse asked for.
+                        if (Interlocked.Read(ref _pendingForensicOverflowEvents) > 0)
+                        {
+                            try { FlushForensicOverflow(db); }
+                            catch (Exception ex) { LogWriteError(ex.Message); }
+                        }
                         PublishSnapshotIfDue(db, null);
                         continue;
                     }
@@ -840,6 +846,7 @@ VALUES($path,$hash,$now,$seen,$imported,'complete')",
         {
             string? error = null;
             var handled = 0;
+            var cycleStart = Environment.TickCount64;
             do
             {
                 try
@@ -850,7 +857,13 @@ VALUES($path,$hash,$now,$seen,$imported,'complete')",
                     }
                     else
                     {
-                        CommitRuntimeEventBatch();
+                        // A failed event batch must not take the accounting command behind it down with it.
+                        try { CommitRuntimeEventBatch(); }
+                        catch (Exception ex)
+                        {
+                            error = ex.Message;
+                            LogWriteError(ex.Message);
+                        }
                         if (item.Command != null)
                         {
                             item.Command(db);
@@ -870,7 +883,11 @@ VALUES($path,$hash,$now,$seen,$imported,'complete')",
                     item.Flush?.TrySetResult(false);
                 }
             }
-            while (++handled < WriterCycleItemLimit && _writes.TryTake(out item));
+            // An error or a long cycle ends here so health and the snapshot are published without waiting for the backlog.
+            while (error == null
+                   && ++handled < WriterCycleItemLimit
+                   && Environment.TickCount64 - cycleStart < SnapshotMinIntervalMs
+                   && _writes.TryTake(out item));
 
             try
             {
