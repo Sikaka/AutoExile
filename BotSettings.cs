@@ -2,7 +2,7 @@ using ExileCore.PoEMemory;
 using ExileCore.Shared.Attributes;
 using ExileCore.Shared.Interfaces;
 using ExileCore.Shared.Nodes;
-using ImGuiNET;
+using Hexa.NET.ImGui;
 using AutoExile.Mechanics;
 using AutoExile.Systems;
 using System.Windows.Forms;

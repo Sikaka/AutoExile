@@ -4,7 +4,7 @@ using ExileCore.Shared;
 using ExileCore.Shared.Helpers;
 using GameOffsets;
 using GameOffsets.Native;
-using ImGuiNET;
+using Hexa.NET.ImGui;
 using AutoExile.Mechanics;
 using AutoExile.Modes;
 using AutoExile.Modes.BossEncounters;

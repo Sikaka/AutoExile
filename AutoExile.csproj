@@ -38,8 +38,8 @@
     <Reference Include="GameOffsets">
       <HintPath>$(ExapiPackage)\GameOffsets.dll</HintPath>
     </Reference>
-    <Reference Include="ImGui.NET">
-      <HintPath>$(ExapiPackage)\ImGui.NET.dll</HintPath>
+    <Reference Include="Hexa.NET.ImGui">
+      <HintPath>$(ExapiPackage)\Hexa.NET.ImGui.dll</HintPath>
     </Reference>
     <Reference Include="SharpDX">
       <HintPath>$(ExapiPackage)\SharpDX.dll</HintPath>
