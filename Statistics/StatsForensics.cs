@@ -15,51 +15,195 @@ public sealed partial class StatsService
     private long _droppedForensicEvents;
     private long _pendingForensicOverflowEvents;
 
+    /// <summary>One runtime event waiting for the writer. Plain data: nothing is captured from the caller.</summary>
+    private sealed class RuntimeEventRecord
+    {
+        public long OccurredAtMs { get; init; }
+        public string OccurredAtUtc { get; init; } = "";
+        public int ProducerThreadId { get; init; }
+        public string Category { get; init; } = "";
+        public string EventName { get; init; } = "";
+        public string Outcome { get; init; } = "";
+        public string? Reason { get; init; }
+        public string? ContextJson { get; init; }
+        /// <summary>Set for critical events; completed only after the row is committed.</summary>
+        public TaskCompletionSource<bool>? Acknowledged { get; init; }
+        public Exception? Failure { get; set; }
+    }
+
+    // Writer thread only: the open batch of consecutive runtime events.
+    private readonly List<RuntimeEventRecord> _eventBatch = new(RuntimeEventBatchSize);
+    private SqliteTransaction? _eventTx;
+    private SqliteCommand? _eventInsert;
+
+    /// <summary>
+    /// Queues one runtime event. Never throws into the caller: this runs on the game thread.
+    /// A critical event is acknowledged only after its row is committed.
+    /// </summary>
     public bool RecordRuntimeEvent(string category, string eventName, string outcome,
         string? reason = null, object? context = null, bool critical = false,
         TimeSpan? timeout = null)
     {
         if (string.IsNullOrWhiteSpace(category) || string.IsNullOrWhiteSpace(eventName)) return false;
-        var occurredAt = DateTimeOffset.UtcNow;
-        var producerThreadId = Environment.CurrentManagedThreadId;
-        var contextJson = context == null ? null : JsonSerializer.Serialize(context);
-        Action<SqliteConnection> write = db =>
+        try
         {
-            using var tx = db.BeginTransaction();
-            var committedAt = DateTimeOffset.UtcNow;
-            Execute(db, tx, @"INSERT INTO runtime_events(occurred_at_ms,occurred_at_utc,committed_at_ms,producer_thread_id,session_id,run_id,category,event_name,outcome,reason,context_json)
-VALUES($at,$utc,$committed,$thread,(SELECT session_id FROM sessions WHERE ended_at_ms IS NULL ORDER BY started_at_ms DESC LIMIT 1),
-(SELECT run_id FROM runs WHERE state='open' ORDER BY activated_at_ms DESC LIMIT 1),$category,$event,$outcome,$reason,$context)",
-                ("$at", occurredAt.ToUnixTimeMilliseconds()), ("$utc", occurredAt.ToString("O")),
-                ("$committed", committedAt.ToUnixTimeMilliseconds()), ("$thread", producerThreadId),
-                ("$category", category), ("$event", eventName), ("$outcome", outcome),
-                ("$reason", (object?)reason ?? DBNull.Value), ("$context", (object?)contextJson ?? DBNull.Value));
-            tx.Commit();
-        };
-        if (critical) return EnqueueAcknowledged(write, timeout ?? TimeSpan.FromMilliseconds(250));
-        return EnqueueForensics(write);
+            var occurredAt = DateTimeOffset.UtcNow;
+            var record = new RuntimeEventRecord
+            {
+                OccurredAtMs = occurredAt.ToUnixTimeMilliseconds(),
+                OccurredAtUtc = occurredAt.ToString("O"),
+                ProducerThreadId = Environment.CurrentManagedThreadId,
+                Category = category,
+                EventName = eventName,
+                Outcome = outcome ?? "",
+                Reason = reason,
+                ContextJson = SerializeRuntimeContext(context),
+                Acknowledged = critical
+                    ? new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously)
+                    : null,
+            };
+            if (!EnqueueRuntimeEvent(record, critical)) return false;
+            if (record.Acknowledged == null) return true;
+
+            if (!record.Acknowledged.Task.Wait(timeout ?? TimeSpan.FromMilliseconds(250)))
+            {
+                _log("Critical forensic event was not acknowledged before timeout.");
+                return false;
+            }
+            if (!record.Acknowledged.Task.Result)
+            {
+                _log($"Critical forensic event failed: {record.Failure?.Message}");
+                return false;
+            }
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
     }
 
-    private bool EnqueueForensics(Action<SqliteConnection> command)
+    private static string? SerializeRuntimeContext(object? context)
+    {
+        if (context == null) return null;
+        try { return JsonSerializer.Serialize(context); }
+        catch (Exception ex) { return JsonSerializer.Serialize(new { contextError = ex.GetType().Name }); }
+    }
+
+    private bool EnqueueRuntimeEvent(RuntimeEventRecord record, bool critical)
     {
         if (Volatile.Read(ref _disposed) != 0 || Volatile.Read(ref _acceptingWrites) == 0 || _writes.IsAddingCompleted)
             return false;
         try
         {
-            if (!_writes.TryAdd(command))
-            {
-                Interlocked.Increment(ref _droppedWrites);
-                Interlocked.Increment(ref _droppedForensicEvents);
-                Interlocked.Increment(ref _pendingForensicOverflowEvents);
-                return false;
-            }
-            return true;
+            // Non-critical events stop at the allowance; the reserve belongs to accounting and critical events.
+            if ((critical || _writes.Count < RuntimeEventQueueAllowance) && _writes.TryAdd(new WriteItem(record)))
+                return true;
+            Interlocked.Increment(ref _droppedWrites);
+            Interlocked.Increment(ref _droppedForensicEvents);
+            Interlocked.Increment(ref _pendingForensicOverflowEvents);
+            return false;
         }
         catch (InvalidOperationException)
         {
             _log("Forensic event rejected because the stats writer is unavailable.");
             return false;
         }
+    }
+
+    /// <summary>Adds one event to the open batch; commits when the batch is full or the event is critical.</summary>
+    private void AppendRuntimeEvent(SqliteConnection db, RuntimeEventRecord record)
+    {
+        try
+        {
+            // Listed first so a failure to open the transaction still accounts for this event.
+            _eventBatch.Add(record);
+            if (_eventTx == null) BeginRuntimeEventBatch(db);
+            var insert = _eventInsert!;
+            insert.Parameters["$at"].Value = record.OccurredAtMs;
+            insert.Parameters["$utc"].Value = record.OccurredAtUtc;
+            insert.Parameters["$committed"].Value = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            insert.Parameters["$thread"].Value = record.ProducerThreadId;
+            insert.Parameters["$category"].Value = record.Category;
+            insert.Parameters["$event"].Value = record.EventName;
+            insert.Parameters["$outcome"].Value = record.Outcome;
+            insert.Parameters["$reason"].Value = (object?)record.Reason ?? DBNull.Value;
+            insert.Parameters["$context"].Value = (object?)record.ContextJson ?? DBNull.Value;
+            insert.ExecuteNonQuery();
+        }
+        catch (Exception ex)
+        {
+            AbortRuntimeEventBatch(ex);
+            throw;
+        }
+
+        if (record.Acknowledged != null || _eventBatch.Count >= RuntimeEventBatchSize)
+            CommitRuntimeEventBatch();
+    }
+
+    private void BeginRuntimeEventBatch(SqliteConnection db)
+    {
+        _eventTx = db.BeginTransaction();
+        // No accounting command runs while a batch is open, so session and run are constant for the batch.
+        var sessionId = ScalarString(db, _eventTx,
+            "SELECT session_id FROM sessions WHERE ended_at_ms IS NULL ORDER BY started_at_ms DESC LIMIT 1");
+        var runId = ScalarString(db, _eventTx,
+            "SELECT run_id FROM runs WHERE state='open' ORDER BY activated_at_ms DESC LIMIT 1");
+        var insert = db.CreateCommand();
+        _eventInsert = insert;
+        insert.Transaction = _eventTx;
+        insert.CommandText = @"INSERT INTO runtime_events(occurred_at_ms,occurred_at_utc,committed_at_ms,producer_thread_id,session_id,run_id,category,event_name,outcome,reason,context_json)
+VALUES($at,$utc,$committed,$thread,$session,$run,$category,$event,$outcome,$reason,$context)";
+        insert.Parameters.AddWithValue("$session", (object?)sessionId ?? DBNull.Value);
+        insert.Parameters.AddWithValue("$run", (object?)runId ?? DBNull.Value);
+        foreach (var name in new[] { "$at", "$utc", "$committed", "$thread", "$category", "$event", "$outcome", "$reason", "$context" })
+            insert.Parameters.AddWithValue(name, DBNull.Value);
+    }
+
+    /// <summary>Commits the open batch, then acknowledges its critical events.</summary>
+    private void CommitRuntimeEventBatch()
+    {
+        if (_eventTx == null) return;
+        try
+        {
+            _eventTx.Commit();
+        }
+        catch (Exception ex)
+        {
+            AbortRuntimeEventBatch(ex);
+            throw;
+        }
+
+        foreach (var record in _eventBatch)
+            record.Acknowledged?.TrySetResult(true);
+        ReleaseRuntimeEventBatch();
+    }
+
+    /// <summary>Rolls the open batch back, fails its acknowledgements and counts its rows as lost.</summary>
+    private void AbortRuntimeEventBatch(Exception failure)
+    {
+        var lost = _eventBatch.Count;
+        foreach (var record in _eventBatch)
+        {
+            if (record.Acknowledged == null) continue;
+            record.Failure = failure;
+            record.Acknowledged.TrySetResult(false);
+        }
+        try { _eventTx?.Rollback(); } catch { }
+        ReleaseRuntimeEventBatch();
+        if (lost <= 0) return;
+        Interlocked.Add(ref _droppedWrites, lost);
+        Interlocked.Add(ref _droppedForensicEvents, lost);
+        Interlocked.Add(ref _pendingForensicOverflowEvents, lost);
+    }
+
+    private void ReleaseRuntimeEventBatch()
+    {
+        _eventBatch.Clear();
+        try { _eventInsert?.Dispose(); } catch { }
+        try { _eventTx?.Dispose(); } catch { }
+        _eventInsert = null;
+        _eventTx = null;
     }
 
     private void FlushForensicOverflow(SqliteConnection db)
@@ -96,25 +240,6 @@ ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(stats_meta.value AS INTEGER)+$cou
             "SELECT value FROM stats_meta WHERE key=$key", ("$key", RuntimeDroppedTotalMetaKey));
         Interlocked.Exchange(ref _droppedForensicEvents,
             long.TryParse(persisted, out var value) && value > 0 ? value : 0);
-    }
-
-    private bool EnqueueAcknowledged(Action<SqliteConnection> command, TimeSpan timeout)
-    {
-        var acknowledged = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        Exception? failure = null;
-        if (!EnqueueForensics(db =>
-        {
-            try { command(db); }
-            catch (Exception ex) { failure = ex; }
-            finally { acknowledged.TrySetResult(true); }
-        })) return false;
-        if (!acknowledged.Task.Wait(timeout))
-        {
-            _log("Critical forensic event was not acknowledged before timeout.");
-            return false;
-        }
-        if (failure != null) { _log($"Critical forensic event failed: {failure.Message}"); return false; }
-        return true;
     }
 
     private void RetainRuntimeEvents(SqliteConnection db)

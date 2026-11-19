@@ -307,9 +307,18 @@ FROM runtime_events WHERE category IN ('input','movement','navigation','simulacr
     using (var recovered = new StatsService(logs.Add, crashDb))
     {
         Require(recovered.Initialize(pluginDirectory), "abrupt crash: SQLite recovery failed");
-        var report = recovered.ReadRuntimeEventReport(limit: 500, windowHours: 6);
-        Require(report.Events.Any(x => x.Category == "crash" && x.EventName == "committed_marker"),
-            "abrupt crash lost the acknowledged committed marker");
+        // Filtered on purpose: the batched writer commits thousands of in-flight rows after the
+        // marker before the kill lands, so the marker is no longer among the newest unfiltered rows.
+        var report = recovered.ReadRuntimeEventReport(new RuntimeEventQuery
+        {
+            Limit = 20,
+            WindowHours = 6,
+            Category = "crash",
+            EventName = "committed_marker",
+        });
+        Require(report.Error == null &&
+                report.Events.Any(x => x.Category == "crash" && x.EventName == "committed_marker"),
+            $"abrupt crash lost the acknowledged committed marker: {report.Error}");
         Require(recovered.Snapshot.CurrentRun == null &&
                 recovered.Snapshot.RecentRuns.Any(x => x.TerminalReason == "plugin_restarted"),
             "abrupt crash did not recover the stale run boundary");
@@ -377,6 +386,69 @@ WHERE category='telemetry' AND event_name='queue_overflow' AND outcome='dropped'
     }
     RequireQuickCheck(overflowDb, "overflow restart");
 
+    // Integration/stress: runtime-event saturation must not cost accounting writes.
+    var floodDb = Path.Combine(root, "flood", "stats.db");
+    using (var flood = new StatsService(logs.Add, floodDb))
+    {
+        Require(flood.Initialize(pluginDirectory), "flood: initialization failed");
+        flood.SetRunning(true);
+        flood.BeginRun("Mapping", "flood-run", "Hideout");
+        flood.ObserveRunEntry("Mapping", 5151, "Strand");
+        Flush(flood, "flood setup");
+
+        const int floodLoot = 200;
+        var floodRejected = 0;
+        using (var blocker = new SqliteConnection($"Data Source={floodDb};Pooling=False"))
+        {
+            blocker.Open();
+            using (var begin = blocker.CreateCommand())
+            {
+                begin.CommandText = "PRAGMA busy_timeout=100; BEGIN IMMEDIATE";
+                begin.ExecuteNonQuery();
+            }
+
+            for (var i = 0; i < 9_000; i++)
+                if (!flood.RecordRuntimeEvent("flood", "event", "queued", context: new { index = i })) floodRejected++;
+            Require(floodRejected > 0, "flood did not saturate the runtime-event allowance");
+            for (var i = 1; i <= floodLoot; i++)
+                flood.RecordLoot($"Flood Item {i}", 1, 1, i, 5151, "Strand");
+
+            using (var commit = blocker.CreateCommand())
+            {
+                commit.CommandText = "COMMIT";
+                commit.ExecuteNonQuery();
+            }
+        }
+        FlushDegraded(flood, "flood recovery");
+        Require(flood.Snapshot.Lifetime.ItemsLooted == floodLoot && flood.Snapshot.CurrentRun?.ItemsLooted == floodLoot,
+            $"runtime-event saturation dropped accounting writes: lifetime={flood.Snapshot.Lifetime.ItemsLooted}, " +
+            $"run={flood.Snapshot.CurrentRun?.ItemsLooted}, expected={floodLoot}");
+
+        // A context that cannot be serialized must not throw into the producer.
+        bool badContextAccepted;
+        try
+        {
+            badContextAccepted = flood.RecordRuntimeEvent("flood", "bad_context", "observed",
+                context: new { value = double.NaN });
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"unserializable context threw into the producer: {ex.GetType().Name}");
+        }
+        Require(badContextAccepted, "unserializable context rejected the event");
+        Require(flood.Flush(TimeSpan.FromSeconds(30)), "flood bad context: stats queue did not flush");
+        Require(ScalarLong(floodDb, @"SELECT COUNT(*) FROM runtime_events
+WHERE category='flood' AND event_name='bad_context' AND context_json LIKE '%contextError%'") == 1,
+            "unserializable context was not replaced by an error marker");
+
+        // An idle writer still refreshes the snapshot when the game loop pulses.
+        var pulseBaseline = flood.Snapshot.Revision;
+        flood.Pulse();
+        Require(SpinWait.SpinUntil(() => flood.Snapshot.Revision > pulseBaseline, TimeSpan.FromSeconds(5)),
+            "Pulse did not refresh the snapshot of an idle writer");
+    }
+    RequireQuickCheck(floodDb, "flood recovery");
+
     // Integration/boundary: startup maintenance enforces both age and 500k row caps.
     var retentionDb = Path.Combine(root, "retention", "stats.db");
     using (var setup = new StatsService(logs.Add, retentionDb))
@@ -415,7 +487,7 @@ VALUES(1,'1970-01-01T00:00:00.0000000Z',1,1,'retention','expired','seed');";
     }
     RequireQuickCheck(retentionDb, "retention cleanup");
 
-    Console.WriteLine("Forensics smoke passed: schema/index/WAL, event matrix, ordering/correlation, report bounds, HTTP contract, restart, abrupt-kill WAL recovery, shutdown drain, nonblocking overflow, restart-persistent overflow total, quick_check, age and 500k retention.");
+    Console.WriteLine("Forensics smoke passed: schema/index/WAL, event matrix, ordering/correlation, report bounds, HTTP contract, restart, abrupt-kill WAL recovery, shutdown drain, nonblocking overflow, restart-persistent overflow total, accounting under runtime-event saturation, unserializable context, idle pulse, quick_check, age and 500k retention.");
 }
 finally
 {

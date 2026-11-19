@@ -1,5 +1,6 @@
 using Microsoft.Data.Sqlite;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text.Json;
 
@@ -24,10 +25,30 @@ namespace AutoExile.Statistics
             public bool Completed { get; set; }
         }
 
+        /// <summary>One queued unit of writer work: an accounting command, a runtime event or a flush marker.</summary>
+        private readonly struct WriteItem
+        {
+            public WriteItem(Action<SqliteConnection> command) { Command = command; Event = null; Flush = null; }
+            public WriteItem(RuntimeEventRecord runtimeEvent) { Command = null; Event = runtimeEvent; Flush = null; }
+            public WriteItem(TaskCompletionSource<bool> flush) { Command = null; Event = null; Flush = flush; }
+
+            public Action<SqliteConnection>? Command { get; }
+            public RuntimeEventRecord? Event { get; }
+            public TaskCompletionSource<bool>? Flush { get; }
+        }
+
         private const int CurrentSchemaVersion = 4;
         private const int StatsWriteQueueCapacity = 8192;
+        // Non-critical runtime events are refused beyond this depth, so the rest of the queue
+        // stays free for accounting writes, critical events and flush markers.
+        private const int RuntimeEventQueueAllowance = 6144;
+        private const int RuntimeEventBatchSize = 512;
+        private const int WriterCycleItemLimit = 2048;
+        private const int WriterIdleWaitMs = 250;
+        private const long SnapshotMinIntervalMs = 1000;
+        private const long QueueFullLogIntervalMs = 10_000;
         private readonly Action<string> _log;
-        private readonly BlockingCollection<Action<SqliteConnection>> _writes = new(StatsWriteQueueCapacity);
+        private readonly BlockingCollection<WriteItem> _writes = new(StatsWriteQueueCapacity);
         private readonly ManualResetEventSlim _initialized = new(false);
         private Thread? _worker;
         private volatile StatsSnapshot _snapshot = new();
@@ -42,6 +63,11 @@ namespace AutoExile.Statistics
         private long _droppedWrites;
         private int _acceptingWrites = 1;
         private long _lastPulseMs;
+        private int _snapshotRequested;
+        private long _lastSnapshotTickMs;   // writer thread only
+        private bool _snapshotStale;        // writer thread only
+        private long _lastQueueFullLogTickMs;
+        private long _queueFullSinceLastLog;
         private int _bestFindsMinimumChaos = 100;
 
         public StatsService(Action<string> log, string? databasePathOverride = null)
@@ -93,7 +119,8 @@ namespace AutoExile.Statistics
             var previous = Volatile.Read(ref _lastPulseMs);
             if (now - previous < 1000 || Interlocked.CompareExchange(ref _lastPulseMs, now, previous) != previous)
                 return;
-            Enqueue(_ => { });
+            // A flag, not a queued item: the writer picks it up on its next cycle or idle wake-up.
+            Volatile.Write(ref _snapshotRequested, 1);
         }
 
         public void BeginSimulacrumActivation(string activationKey, string areaName)
@@ -329,18 +356,27 @@ WHERE loot_id=$loot
             });
         }
 
+        /// <summary>
+        /// Waits until everything queued before this call is committed and a snapshot that
+        /// includes it is published.
+        /// </summary>
         public bool Flush(TimeSpan timeout)
         {
-            if (Volatile.Read(ref _disposed) != 0) return false;
-            var baseline = Snapshot.Revision;
-            Enqueue(_ => { });
-            var deadline = DateTime.UtcNow + timeout;
-            while (DateTime.UtcNow < deadline)
+            if (Volatile.Read(ref _disposed) != 0 || Volatile.Read(ref _acceptingWrites) == 0) return false;
+            var completed = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var clock = Stopwatch.StartNew();
+            try
             {
-                if (_writes.Count == 0 && Snapshot.Revision > baseline) return true;
-                Thread.Sleep(10);
+                // The marker is never dropped: it waits for a free slot instead.
+                while (!_writes.TryAdd(new WriteItem(completed)))
+                {
+                    if (clock.Elapsed >= timeout) return false;
+                    Thread.Sleep(5);
+                }
             }
-            return false;
+            catch (InvalidOperationException) { return false; }
+            var remaining = timeout - clock.Elapsed;
+            return completed.Task.Wait(remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero) && completed.Task.Result;
         }
 
         private void WithOpenRun(Action<SqliteConnection, SqliteTransaction, string, string, long> action)
@@ -368,15 +404,24 @@ WHERE loot_id=$loot
                 return false;
             try
             {
-                if (!_writes.TryAdd(command))
-                {
-                    Interlocked.Increment(ref _droppedWrites);
-                    _log("Stats queue is full; stats health is degraded.");
-                    return false;
-                }
-                return true;
+                if (_writes.TryAdd(new WriteItem(command))) return true;
+                Interlocked.Increment(ref _droppedWrites);
+                LogQueueFull();
+                return false;
             }
             catch (InvalidOperationException) { return false; }
+        }
+
+        /// <summary>Reports dropped accounting writes at most once per interval instead of once per write.</summary>
+        private void LogQueueFull()
+        {
+            Interlocked.Increment(ref _queueFullSinceLastLog);
+            var now = Math.Max(1, Environment.TickCount64);
+            var last = Volatile.Read(ref _lastQueueFullLogTickMs);
+            if (last != 0 && now - last < QueueFullLogIntervalMs) return;
+            if (Interlocked.CompareExchange(ref _lastQueueFullLogTickMs, now, last) != last) return;
+            var dropped = Interlocked.Exchange(ref _queueFullSinceLastLog, 0);
+            _log($"Stats queue is full; stats health is degraded ({dropped} accounting write(s) dropped since the last report).");
         }
 
         private void WorkerMain()
@@ -400,29 +445,21 @@ WHERE loot_id=$loot
                 _log($"Stats database initialized at {_databasePath}");
                 _initialized.Set();
 
-                foreach (var command in _writes.GetConsumingEnumerable())
+                while (true)
                 {
-                    try
+                    if (!_writes.TryTake(out var item, WriterIdleWaitMs))
                     {
-                        command(db);
-                        // Coalesce bursts so HUD/API aggregation never runs once per loot item.
-                        for (var i = 0; i < 255 && _writes.TryTake(out var next); i++)
-                        {
-                            next(db);
-                        }
-                        FlushForensicOverflow(db);
-                        RetainRuntimeEvents(db);
-                        PublishSnapshot(db, null);
+                        if (_writes.IsCompleted) break;
+                        // Idle: publish what an earlier cycle deferred or what Pulse asked for.
+                        PublishSnapshotIfDue(db, null);
+                        continue;
                     }
-                    catch (Exception ex)
-                    {
-                        _log($"Stats write error: {ex.Message}");
-                        PublishSnapshot(db, ex.Message);
-                    }
+                    RunWriterCycle(db, item);
                 }
             }
             catch (Exception ex)
             {
+                AbortRuntimeEventBatch(ex);
                 Volatile.Write(ref _acceptingWrites, 0);
                 try { _writes.CompleteAdding(); } catch (InvalidOperationException) { }
                 _snapshot = Unavailable("unavailable", ex.Message);
@@ -485,6 +522,7 @@ CREATE TABLE IF NOT EXISTS loot_events(
  chaos_value_milli INTEGER NOT NULL DEFAULT 0,valuation_source TEXT NOT NULL DEFAULT 'unknown');
 CREATE INDEX IF NOT EXISTS ix_loot_time ON loot_events(picked_at_ms DESC);
 CREATE INDEX IF NOT EXISTS ix_loot_value ON loot_events(chaos_value_milli DESC,picked_at_ms DESC);
+CREATE INDEX IF NOT EXISTS ix_loot_run ON loot_events(run_id);
 CREATE TABLE IF NOT EXISTS legacy_imports(
  source_path TEXT NOT NULL,source_sha256 TEXT NOT NULL,imported_at_ms INTEGER NOT NULL,
  rows_seen INTEGER NOT NULL,rows_imported INTEGER NOT NULL,status TEXT NOT NULL,
@@ -765,8 +803,82 @@ VALUES($path,$hash,$now,$seen,$imported,'complete')",
             tx.Commit();
         }
 
+        /// <summary>
+        /// Drains queued work in arrival order. Consecutive runtime events share one transaction;
+        /// it is committed before any accounting command runs, so order and run correlation stay exact.
+        /// </summary>
+        private void RunWriterCycle(SqliteConnection db, WriteItem item)
+        {
+            string? error = null;
+            var handled = 0;
+            do
+            {
+                try
+                {
+                    if (item.Event != null)
+                    {
+                        AppendRuntimeEvent(db, item.Event);
+                    }
+                    else
+                    {
+                        CommitRuntimeEventBatch();
+                        if (item.Command != null)
+                        {
+                            item.Command(db);
+                        }
+                        else if (item.Flush != null)
+                        {
+                            FlushForensicOverflow(db);
+                            PublishSnapshot(db, error);
+                            item.Flush.TrySetResult(true);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    error = ex.Message;
+                    _log($"Stats write error: {ex.Message}");
+                    item.Flush?.TrySetResult(false);
+                }
+            }
+            while (++handled < WriterCycleItemLimit && _writes.TryTake(out item));
+
+            try
+            {
+                CommitRuntimeEventBatch();
+                FlushForensicOverflow(db);
+                RetainRuntimeEvents(db);
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                _log($"Stats write error: {ex.Message}");
+            }
+
+            _snapshotStale = true;
+            PublishSnapshotIfDue(db, error);
+        }
+
+        /// <summary>
+        /// Publishes at most once per interval so HUD/API aggregation never runs once per write burst.
+        /// An error is published immediately.
+        /// </summary>
+        private void PublishSnapshotIfDue(SqliteConnection db, string? error)
+        {
+            if (error == null)
+            {
+                if (!_snapshotStale && Volatile.Read(ref _snapshotRequested) == 0) return;
+                if (Environment.TickCount64 - _lastSnapshotTickMs < SnapshotMinIntervalMs) return;
+            }
+            PublishSnapshot(db, error);
+        }
+
         private void PublishSnapshot(SqliteConnection db, string? error)
         {
+            _lastSnapshotTickMs = Environment.TickCount64;
+            // A snapshot that carries an error is replaced by a clean one after the interval.
+            _snapshotStale = error != null;
+            Volatile.Write(ref _snapshotRequested, 0);
             try
             {
                 var currentSession = ScalarString(db, null,
@@ -780,7 +892,7 @@ VALUES($path,$hash,$now,$seen,$imported,'complete')",
                     {
                         Status = error == null && Volatile.Read(ref _droppedWrites) == 0 ? "healthy" : "degraded",
                         Error = error ?? (Volatile.Read(ref _droppedWrites) > 0
-                            ? $"{Volatile.Read(ref _droppedWrites)} writes were dropped because the queue was full."
+                            ? $"{Volatile.Read(ref _droppedWrites)} writes were dropped (queue full or write failure)."
                             : null),
                         DatabasePath = _databasePath,
                         PendingWrites = _writes.Count,
