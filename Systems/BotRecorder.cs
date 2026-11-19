@@ -35,9 +35,9 @@ namespace AutoExile.Systems
         private int _lastDumpedRecoveryCount = -1;
         private readonly Queue<long> _autoDumpTicks = new();
         private int _folderRecordingCount = -1;
-        private long _folderCountCheckedAt = long.MinValue;
+        private long _folderCountCheckedAt = long.MinValue / 2;
         private int _folderCountRefreshing;
-        private long _lastSkipLogAt = long.MinValue;
+        private long _lastSkipLogAt = long.MinValue / 2;
 
         public string LastDumpStatus => _lastDumpStatus;
         public long TickNumber => _tickNumber;
