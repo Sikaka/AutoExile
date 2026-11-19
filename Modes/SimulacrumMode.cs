@@ -58,6 +58,8 @@ namespace AutoExile.Modes
         private int _lastStatsWaveStarted;
         private int _lastStatsWaveCompleted;
         private bool _lastStatsWaveActive;
+        private long _nextMonolithPathAtMs;
+        private bool _monolithPathFailing;
         private DateTime _lastMapEntryAt = DateTime.MinValue;
         private int _rapidReentryDeaths;
         private const float RapidReentryDeathSeconds = 15f;
@@ -104,6 +106,7 @@ namespace AutoExile.Modes
             _lastStatsWaveStarted = 0;
             _lastStatsWaveCompleted = 0;
             _lastStatsWaveActive = false;
+            _monolithPathFailing = false;
             _lastMapEntryAt = DateTime.MinValue;
             _rapidReentryDeaths = 0;
             _wasSearching = false;
@@ -179,6 +182,9 @@ namespace AutoExile.Modes
                 ctx.Stats.BeginSimulacrumActivation(
                     $"sim:{confirmed.Ticks}:{_lastActivationSequence}",
                     gc.Area?.CurrentArea?.Name ?? "");
+                _lastStatsWaveStarted = 0;
+                _lastStatsWaveCompleted = 0;
+                _lastStatsWaveActive = false;
             }
 
             // Detect area changes
@@ -489,6 +495,7 @@ namespace AutoExile.Modes
             {
                 _phase = SimPhase.NavigateToMonolith;
                 _phaseStartTime = DateTime.Now;
+                _monolithPathFailing = false;
                 StatusText = "Monolith found — navigating";
                 return;
             }
@@ -503,6 +510,26 @@ namespace AutoExile.Modes
                 return;
             }
 
+            ExploreForMonolith(ctx);
+
+            StatusText = "Exploring to find monolith...";
+
+            // Use the wave timeout setting for the overall FindMonolith phase too.
+            // The 60s hardcoded timeout was too short for some maps and too generous
+            // for a true stuck condition — use the user-configured wave timeout instead.
+            if (elapsed > _settings.WaveTimeoutMinutes.Value * 60)
+            {
+                ctx.Navigation.Stop(gc);
+                ctx.Exploration.ResetSeen();
+                _phaseStartTime = DateTime.Now;
+                Decision = "Monolith search timeout → reset exploration";
+                StatusText = "No monolith found — restarting search inside the instance";
+            }
+        }
+
+        private void ExploreForMonolith(BotContext ctx)
+        {
+            var gc = ctx.Game;
             // Explore the map until the monolith entity enters the network bubble.
             if (ctx.Exploration.IsInitialized)
             {
@@ -526,20 +553,6 @@ namespace AutoExile.Modes
                         ctx.Navigation.NavigateTo(gc, target.Value);
                     }
                 }
-            }
-
-            StatusText = "Exploring to find monolith...";
-
-            // Use the wave timeout setting for the overall FindMonolith phase too.
-            // The 60s hardcoded timeout was too short for some maps and too generous
-            // for a true stuck condition — use the user-configured wave timeout instead.
-            if (elapsed > _settings.WaveTimeoutMinutes.Value * 60)
-            {
-                ctx.Navigation.Stop(gc);
-                ctx.Exploration.ResetSeen();
-                _phaseStartTime = DateTime.Now;
-                Decision = "Monolith search timeout → reset exploration";
-                StatusText = "No monolith found — restarting search inside the instance";
             }
         }
 
@@ -575,18 +588,30 @@ namespace AutoExile.Modes
 
             if (!ctx.Navigation.IsNavigating)
             {
+                var now = Environment.TickCount64;
+                if (_monolithPathFailing && now < _nextMonolithPathAtMs)
+                {
+                    ExploreForMonolith(ctx);
+                    StatusText = "No path to monolith — exploring, retrying";
+                    return;
+                }
+
                 var success = ctx.Navigation.NavigateTo(ctx.Game,
                     _state.MonolithPosition.Value);
                 if (!success)
                 {
-                    ctx.Navigation.Stop(ctx.Game);
-                    ctx.Exploration.ResetSeen();
-                    _phase = SimPhase.FindMonolith;
-                    _phaseStartTime = DateTime.Now;
-                    Decision = "Monolith path failed → restart search";
-                    StatusText = "No path to monolith — searching again inside the instance";
+                    _nextMonolithPathAtMs = now + 1000;
+                    if (!_monolithPathFailing)
+                    {
+                        _monolithPathFailing = true;
+                        ctx.Navigation.Stop(ctx.Game);
+                        ctx.Exploration.ResetSeen();
+                    }
+                    Decision = "Monolith path failed → exploring, retrying";
+                    StatusText = "No path to monolith — exploring, retrying";
                     return;
                 }
+                _monolithPathFailing = false;
             }
 
             StatusText = $"Navigating to monolith (dist: {dist:F0})";
