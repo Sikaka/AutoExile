@@ -68,6 +68,9 @@ namespace AutoExile.Statistics
         private bool _snapshotStale;        // writer thread only
         private long _lastQueueFullLogTickMs;
         private long _queueFullSinceLastLog;
+        private string? _lastWriteErrorMessage;
+        private long _lastWriteErrorLogTickMs;
+        private int _writeErrorsSinceLastLog;
         private int _bestFindsMinimumChaos = 100;
 
         public StatsService(Action<string> log, string? databasePathOverride = null)
@@ -107,7 +110,12 @@ namespace AutoExile.Statistics
         {
             var value = running ? 1 : 0;
             if (Interlocked.Exchange(ref _lastRunning, value) == value) return;
-            Enqueue(db => SetSessionRunning(db, running, NowMs()));
+            if (!Enqueue(db => SetSessionRunning(db, running, NowMs())))
+            {
+                // The transition was not stored; forget it so the next call tries again.
+                Volatile.Write(ref _lastRunning, -1);
+                return;
+            }
             RecordRuntimeEvent("session", "running_state", running ? "running" : "stopped", "state_transition",
                 new { origin = "BotCore.SetRunning" }, critical: true);
         }
@@ -424,6 +432,24 @@ WHERE loot_id=$loot
             _log($"Stats queue is full; stats health is degraded ({dropped} accounting write(s) dropped since the last report).");
         }
 
+        /// <summary>Writer thread only. Logs a new error at once and a repeating one at most once per interval.</summary>
+        private void LogWriteError(string message)
+        {
+            var now = Environment.TickCount64;
+            if (message == _lastWriteErrorMessage && now - _lastWriteErrorLogTickMs < QueueFullLogIntervalMs)
+            {
+                _writeErrorsSinceLastLog++;
+                return;
+            }
+            var repeats = _writeErrorsSinceLastLog;
+            _writeErrorsSinceLastLog = 0;
+            _lastWriteErrorMessage = message;
+            _lastWriteErrorLogTickMs = now;
+            _log(repeats > 0
+                ? $"Stats write error: {message} ({repeats} more since the last report)"
+                : $"Stats write error: {message}");
+        }
+
         private void WorkerMain()
         {
             SqliteConnection? db = null;
@@ -507,6 +533,8 @@ CREATE TABLE IF NOT EXISTS runs(
  wall_duration_ms INTEGER NOT NULL DEFAULT 0,data_quality TEXT NOT NULL DEFAULT 'native');
 CREATE UNIQUE INDEX IF NOT EXISTS ux_runs_one_open_sim ON runs(mode) WHERE mode='Simulacrum' AND state='open';
 CREATE UNIQUE INDEX IF NOT EXISTS ux_runs_one_open ON runs(state) WHERE state='open';
+CREATE INDEX IF NOT EXISTS ix_runs_session ON runs(session_id);
+CREATE INDEX IF NOT EXISTS ix_runs_state_activated ON runs(state,activated_at_ms DESC);
 CREATE TABLE IF NOT EXISTS simulacrum_runs(
  run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,consumed INTEGER NOT NULL DEFAULT 0,
  highest_wave_started INTEGER NOT NULL DEFAULT 0 CHECK(highest_wave_started BETWEEN 0 AND 15),
@@ -523,6 +551,7 @@ CREATE TABLE IF NOT EXISTS loot_events(
 CREATE INDEX IF NOT EXISTS ix_loot_time ON loot_events(picked_at_ms DESC);
 CREATE INDEX IF NOT EXISTS ix_loot_value ON loot_events(chaos_value_milli DESC,picked_at_ms DESC);
 CREATE INDEX IF NOT EXISTS ix_loot_run ON loot_events(run_id);
+CREATE INDEX IF NOT EXISTS ix_loot_session ON loot_events(session_id);
 CREATE TABLE IF NOT EXISTS legacy_imports(
  source_path TEXT NOT NULL,source_sha256 TEXT NOT NULL,imported_at_ms INTEGER NOT NULL,
  rows_seen INTEGER NOT NULL,rows_imported INTEGER NOT NULL,status TEXT NOT NULL,
@@ -837,7 +866,7 @@ VALUES($path,$hash,$now,$seen,$imported,'complete')",
                 catch (Exception ex)
                 {
                     error = ex.Message;
-                    _log($"Stats write error: {ex.Message}");
+                    LogWriteError(ex.Message);
                     item.Flush?.TrySetResult(false);
                 }
             }
@@ -852,7 +881,7 @@ VALUES($path,$hash,$now,$seen,$imported,'complete')",
             catch (Exception ex)
             {
                 error = ex.Message;
-                _log($"Stats write error: {ex.Message}");
+                LogWriteError(ex.Message);
             }
 
             _snapshotStale = true;
