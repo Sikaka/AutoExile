@@ -127,8 +127,11 @@ namespace AutoExile.Systems
         private readonly HashSet<long> _loggedSkipIds = new();
         private readonly HashSet<string> _loggedScanFaults = new(StringComparer.Ordinal);
         private readonly Dictionary<string, ScanFaultWindow> _scanFaultWindows = new(StringComparer.Ordinal);
-        private string _lastScanMismatchFingerprint = "";
-        private DateTime _lastScanMismatchLoggedAtUtc = DateTime.MinValue;
+        private uint _loggedSkipAreaHash;
+        private readonly Dictionary<string, long> _scanMismatchLoggedAtMs = new(StringComparer.Ordinal);
+        private int _scanMismatchSuppressed;
+        private const long ScanMismatchWindowMs = 30000;
+        private const int ScanMismatchMaxFingerprints = 16;
         private static readonly TimeSpan ScanFaultProgressBlockDuration = TimeSpan.FromSeconds(15);
         private static readonly TimeSpan ScanFaultWindowResetAfter = TimeSpan.FromSeconds(5);
 
@@ -156,11 +159,10 @@ namespace AutoExile.Systems
         public void ClearFailed()
         {
             _failedEntities.Clear();
-            _loggedSkipIds.Clear();
             _loggedScanFaults.Clear();
             _scanFaultWindows.Clear();
-            _lastScanMismatchFingerprint = "";
-            _lastScanMismatchLoggedAtUtc = DateTime.MinValue;
+            _scanMismatchLoggedAtMs.Clear();
+            _scanMismatchSuppressed = 0;
             _scanCache.Clear();
         }
 
@@ -191,6 +193,13 @@ namespace AutoExile.Systems
 
         public void Scan(GameController gc)
         {
+            var areaHash = gc?.IngameState?.Data?.CurrentAreaHash ?? 0;
+            if (areaHash != 0 && areaHash != _loggedSkipAreaHash)
+            {
+                _loggedSkipAreaHash = areaHash;
+                _loggedSkipIds.Clear();
+            }
+
             _candidates.Clear();
             HasLootNearby = false;
             HasUnresolvedLootNearby = false;
@@ -872,18 +881,58 @@ namespace AutoExile.Systems
 
         private void RecordScanMismatch(LootScanEvidence evidence)
         {
-            var fingerprint = $"{evidence.LabelEntries}:{evidence.VisibleLabels}:{evidence.NullLabels}:" +
-                $"{evidence.InvisibleLabels}:{evidence.NullEntities}:{evidence.FailedCooldownLabels}:" +
-                $"{evidence.AutoPickupLabels}:{evidence.CacheHits}:{evidence.EvaluatedLabels}:" +
-                $"{evidence.PricePendingLabels}:{evidence.FilteredLabels}:{evidence.ScanFaults}:" +
-                evidence.FirstFault;
-            var now = DateTime.UtcNow;
-            if (fingerprint == _lastScanMismatchFingerprint &&
-                now - _lastScanMismatchLoggedAtUtc < TimeSpan.FromSeconds(30))
+            if (evidence.NullLabels == 0 && evidence.NullEntities == 0 && evidence.ScanFaults == 0 &&
+                evidence.PricePendingLabels == 0 && !evidence.Unresolved &&
+                evidence.VisibleLabels == evidence.FilteredLabels + evidence.AutoPickupLabels + evidence.FailedCooldownLabels)
                 return;
 
-            _lastScanMismatchFingerprint = fingerprint;
-            _lastScanMismatchLoggedAtUtc = now;
+            var fingerprint = $"{evidence.NullLabels > 0}:{evidence.NullEntities > 0}:{evidence.ScanFaults > 0}:" +
+                $"{evidence.PricePendingLabels > 0}:{evidence.Unresolved}:{evidence.FirstFault}";
+            var now = Environment.TickCount64;
+            if (_scanMismatchLoggedAtMs.TryGetValue(fingerprint, out var last) &&
+                now - last < ScanMismatchWindowMs)
+            {
+                _scanMismatchSuppressed++;
+                return;
+            }
+
+            if (!_scanMismatchLoggedAtMs.ContainsKey(fingerprint) &&
+                _scanMismatchLoggedAtMs.Count >= ScanMismatchMaxFingerprints)
+            {
+                var oldestKey = "";
+                var oldest = long.MaxValue;
+                foreach (var kv in _scanMismatchLoggedAtMs)
+                    if (kv.Value < oldest) { oldest = kv.Value; oldestKey = kv.Key; }
+                _scanMismatchLoggedAtMs.Remove(oldestKey);
+            }
+            _scanMismatchLoggedAtMs[fingerprint] = now;
+
+            if (_scanMismatchSuppressed > 0)
+            {
+                var labels = new string[evidence.SampleLabels.Length + 1];
+                evidence.SampleLabels.CopyTo(labels, 0);
+                labels[^1] = $"suppressedCount={_scanMismatchSuppressed}";
+                evidence = new LootScanEvidence
+                {
+                    LabelEntries = evidence.LabelEntries,
+                    VisibleLabels = evidence.VisibleLabels,
+                    NullLabels = evidence.NullLabels,
+                    InvisibleLabels = evidence.InvisibleLabels,
+                    NullEntities = evidence.NullEntities,
+                    FailedCooldownLabels = evidence.FailedCooldownLabels,
+                    AutoPickupLabels = evidence.AutoPickupLabels,
+                    CacheHits = evidence.CacheHits,
+                    EvaluatedLabels = evidence.EvaluatedLabels,
+                    PricePendingLabels = evidence.PricePendingLabels,
+                    FilteredLabels = evidence.FilteredLabels,
+                    Candidates = evidence.Candidates,
+                    ScanFaults = evidence.ScanFaults,
+                    Unresolved = evidence.Unresolved,
+                    FirstFault = evidence.FirstFault,
+                    SampleLabels = labels,
+                };
+                _scanMismatchSuppressed = 0;
+            }
             try { OnScanMismatch?.Invoke(evidence); }
             catch { }
         }
