@@ -568,6 +568,7 @@ namespace AutoExile.Modes
             if (_state.IsWaveActive)
             {
                 ctx.Navigation.Stop(ctx.Game);
+                _monolithPathFailing = false;
                 _phase = SimPhase.WaveCycle;
                 _phaseStartTime = DateTime.Now;
                 StatusText = "Wave already active — joining combat";
@@ -580,11 +581,17 @@ namespace AutoExile.Modes
             if (dist < 18f)
             {
                 ctx.Navigation.Stop(ctx.Game);
+                _monolithPathFailing = false;
                 _phase = SimPhase.WaveCycle;
                 _phaseStartTime = DateTime.Now;
                 StatusText = "Near monolith — entering wave cycle";
                 return;
             }
+
+            // While the path is failing, keep exploration bookkeeping running every frame
+            // even during an exploration leg (ExploreForMonolith starts no navigation while one is active).
+            if (_monolithPathFailing && ctx.Navigation.IsNavigating)
+                ExploreForMonolith(ctx);
 
             if (!ctx.Navigation.IsNavigating)
             {
