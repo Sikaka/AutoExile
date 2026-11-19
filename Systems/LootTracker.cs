@@ -134,7 +134,7 @@ namespace AutoExile.Systems
             var chaosValue = 0.0;
             if (PriceService != null && PriceService.IsLoaded && itemEntity != null)
             {
-                try { chaosValue = PriceService.GetPrice(gc, itemEntity).MaxChaosValue; }
+                try { chaosValue = PriceService.GetPrice(gc, itemEntity).EstimatedChaosValue; }
                 catch { }
             }
 

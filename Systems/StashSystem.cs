@@ -2,6 +2,7 @@ using ExileCore;
 using ExileCore.PoEMemory.Components;
 using ExileCore.PoEMemory.MemoryObjects;
 using ExileCore.Shared.Enums;
+using AutoExile.Statistics;
 using Input = ExileCore.Input;
 using SharpDX;
 using System.Numerics;
@@ -35,9 +36,12 @@ namespace AutoExile.Systems
         public float InteractRadius { get; set; } = 20f;
         private const int MaxConsecutiveFailures = 3;
         private int _consecutiveFailures;
+        private string _lastWithdrawScanFingerprint = "";
+        private DateTime _lastWithdrawScanLoggedAtUtc = DateTime.MinValue;
 
         // Configurable cooldown — set from settings before ticking
         public int ActionCooldownMs { get; set; } = 450;
+        public StatsService? Stats { get; set; }
 
         /// <summary>Whether to apply incubators from stash to equipment after storing items.</summary>
         public bool ApplyIncubators { get; set; }
@@ -128,6 +132,8 @@ namespace AutoExile.Systems
             _itemsStored = 0;
             _attempts = 0;
             _prevItemCount = -1;
+            _lastWithdrawScanFingerprint = "";
+            _lastWithdrawScanLoggedAtUtc = DateTime.MinValue;
             _consecutiveFailures = 0;
             _cursorHasIncubator = false;
             _incubatorBatchRunning = false;
@@ -237,6 +243,20 @@ namespace AutoExile.Systems
             {
                 EnterFirstStashPhase(gc);
                 Status = "Stash already open";
+                return StashResult.InProgress;
+            }
+
+            // A failed map-device attempt can leave Atlas + Inventory open. Those
+            // panels intercept stash clicks, so clear them before navigating/clicking
+            // instead of hammering the stash entity until this phase times out.
+            var atlasVisible = gc.IngameState.IngameUi.Atlas?.IsVisible == true;
+            var inventoryVisible = gc.IngameState.IngameUi.InventoryPanel?.IsVisible == true;
+            if (atlasVisible || inventoryVisible)
+            {
+                nav.Stop(gc);
+                var sent = BotInput.PressKey(Keys.Escape);
+                _lastActionTime = DateTime.Now;
+                Status = $"Closing panels before stash (atlas={atlasVisible} inv={inventoryVisible} sent={sent})";
                 return StashResult.InProgress;
             }
 
@@ -523,25 +543,64 @@ namespace AutoExile.Systems
                 // skips withdrawal and later produces a false NoFragments stop.
                 // Stay in this phase; the existing phase timeout keeps the wait bounded.
                 Status = $"Waiting for withdraw tab contents ({haveInInv}/{wantTotal} have)";
+                RecordWithdrawScanEvidence(currentPath, haveInInv, wantTotal,
+                    listReadable: false, entryCount: 0, nullEntities: 0,
+                    emptyPaths: 0, itemFaults: 0, matches: 0,
+                    firstFault: "visible_inventory_items:null", samplePaths: Array.Empty<string>());
                 return StashResult.InProgress;
             }
 
             var windowRect = gc.Window.GetWindowRectangle();
             var positions = new List<Vector2>();
+            int stashEntryCount = 0;
+            int nullEntities = 0;
+            int emptyPaths = 0;
+            int itemFaults = 0;
+            string firstItemFault = "";
+            var samplePaths = new List<string>(5);
             foreach (var item in items)
             {
-                var entity = item.Entity;
-                if (entity?.Path?.Contains(currentPath, StringComparison.OrdinalIgnoreCase) == true)
+                stashEntryCount++;
+                try
                 {
-                    var rect = item.GetClientRect();
-                    positions.Add(new Vector2(
-                        windowRect.X + rect.Center.X,
-                        windowRect.Y + rect.Center.Y));
+                    var entity = item.Entity;
+                    if (entity == null)
+                    {
+                        nullEntities++;
+                        continue;
+                    }
+
+                    var path = entity.Path;
+                    if (string.IsNullOrWhiteSpace(path))
+                    {
+                        emptyPaths++;
+                        continue;
+                    }
+                    if (samplePaths.Count < 5)
+                        samplePaths.Add(PathSuffix(path));
+
+                    if (path.Contains(currentPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        var rect = item.GetClientRect();
+                        positions.Add(new Vector2(
+                            windowRect.X + rect.Center.X,
+                            windowRect.Y + rect.Center.Y));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    itemFaults++;
+                    if (string.IsNullOrEmpty(firstItemFault))
+                        firstItemFault = ex.GetType().Name;
                 }
             }
 
             if (positions.Count == 0)
             {
+                RecordWithdrawScanEvidence(currentPath, haveInInv, wantTotal,
+                    listReadable: true, entryCount: stashEntryCount, nullEntities,
+                    emptyPaths, itemFaults, matches: 0, firstFault: firstItemFault,
+                    samplePaths: samplePaths.ToArray());
                 // Multi-item queues intentionally tolerate an unavailable entry and
                 // continue to the next requested type. The single fragment path used
                 // by Simulacrum must be verified instead of silently skipped.
@@ -668,6 +727,86 @@ namespace AutoExile.Systems
             catch { return null; }
         }
 
+        public static InventoryScanEvidence InspectInventory(GameController gc, string? pathSubstring)
+        {
+            var evidence = new InventoryScanEvidence();
+            try
+            {
+                evidence.Stage = "player_inventories";
+                var playerInv = gc.IngameState.ServerData?.PlayerInventories;
+                if (playerInv == null)
+                {
+                    evidence.ErrorType = "null_player_inventories";
+                    return evidence;
+                }
+                evidence.HolderCount = playerInv.Count;
+                if (playerInv.Count == 0)
+                {
+                    evidence.ErrorType = "empty_player_inventories";
+                    return evidence;
+                }
+
+                evidence.Stage = "inventory";
+                var inventory = playerInv[0].Inventory;
+                if (inventory == null)
+                {
+                    evidence.ErrorType = "null_inventory";
+                    return evidence;
+                }
+
+                evidence.Stage = "inventory_slot_items";
+                var items = inventory.InventorySlotItems;
+                if (items == null)
+                {
+                    evidence.ErrorType = "null_inventory_slot_items";
+                    return evidence;
+                }
+
+                evidence.Readable = true;
+                foreach (var item in items)
+                {
+                    evidence.SlotCount++;
+                    try
+                    {
+                        var entity = item.Item;
+                        if (entity == null)
+                        {
+                            evidence.NullItems++;
+                            evidence.NonMatchCount++;
+                            continue;
+                        }
+                        var path = entity.Path;
+                        if (string.IsNullOrWhiteSpace(path))
+                        {
+                            evidence.EmptyPaths++;
+                            evidence.NonMatchCount++;
+                            continue;
+                        }
+                        if (evidence.SamplePaths.Count < 5)
+                            evidence.SamplePaths.Add(PathSuffix(path));
+                        if (!string.IsNullOrEmpty(pathSubstring) &&
+                            path.Contains(pathSubstring, StringComparison.OrdinalIgnoreCase))
+                            evidence.MatchCount++;
+                        else
+                            evidence.NonMatchCount++;
+                    }
+                    catch (Exception ex)
+                    {
+                        evidence.SlotFaults++;
+                        evidence.NonMatchCount++;
+                        if (string.IsNullOrEmpty(evidence.ErrorType))
+                            evidence.ErrorType = ex.GetType().Name;
+                    }
+                }
+                evidence.Stage = "complete";
+            }
+            catch (Exception ex)
+            {
+                evidence.ErrorType = ex.GetType().Name;
+            }
+            return evidence;
+        }
+
         /// <summary>
         /// Check if player has any inventory items (static helper for use by modes).
         /// </summary>
@@ -682,15 +821,8 @@ namespace AutoExile.Systems
         /// </summary>
         public static int CountInventoryItems(GameController gc, string? pathSubstring)
         {
-            var items = GetInventorySlotItems(gc);
-            if (items == null || string.IsNullOrEmpty(pathSubstring)) return 0;
-            int count = 0;
-            foreach (var item in items)
-            {
-                if (item.Item?.Path?.Contains(pathSubstring, StringComparison.OrdinalIgnoreCase) == true)
-                    count++;
-            }
-            return count;
+            if (string.IsNullOrEmpty(pathSubstring)) return 0;
+            return InspectInventory(gc, pathSubstring).MatchCount;
         }
 
         /// <summary>
@@ -698,16 +830,48 @@ namespace AutoExile.Systems
         /// </summary>
         public static int CountNonMatchingItems(GameController gc, string? pathSubstring)
         {
-            var items = GetInventorySlotItems(gc);
-            if (items == null) return 0;
-            if (string.IsNullOrEmpty(pathSubstring)) return items.Count;
-            int count = 0;
-            foreach (var item in items)
-            {
-                if (item.Item?.Path?.Contains(pathSubstring, StringComparison.OrdinalIgnoreCase) != true)
-                    count++;
-            }
-            return count;
+            var evidence = InspectInventory(gc, pathSubstring);
+            return string.IsNullOrEmpty(pathSubstring)
+                ? evidence.SlotCount
+                : evidence.NonMatchCount;
+        }
+
+        private void RecordWithdrawScanEvidence(string currentPath, int haveInInventory,
+            int wantTotal, bool listReadable, int entryCount, int nullEntities,
+            int emptyPaths, int itemFaults, int matches, string firstFault,
+            string[] samplePaths)
+        {
+            var fingerprint = $"{currentPath}:{listReadable}:{entryCount}:{nullEntities}:" +
+                $"{emptyPaths}:{itemFaults}:{matches}:{firstFault}";
+            var now = DateTime.UtcNow;
+            if (fingerprint == _lastWithdrawScanFingerprint &&
+                now - _lastWithdrawScanLoggedAtUtc < TimeSpan.FromSeconds(30))
+                return;
+
+            _lastWithdrawScanFingerprint = fingerprint;
+            _lastWithdrawScanLoggedAtUtc = now;
+            Stats?.RecordRuntimeEvent("stash", "withdraw_scan_mismatch", "observed",
+                "configured_item_not_matched", new
+                {
+                    targetPath = currentPath,
+                    withdrawTab = WithdrawTabName,
+                    haveInInventory,
+                    wantTotal,
+                    listReadable,
+                    entryCount,
+                    nullEntities,
+                    emptyPaths,
+                    itemFaults,
+                    matches,
+                    firstFault,
+                    samplePaths,
+                });
+        }
+
+        private static string PathSuffix(string path)
+        {
+            const int maxLength = 96;
+            return path.Length <= maxLength ? path : path[^maxLength..];
         }
 
         /// <summary>
@@ -1129,6 +1293,21 @@ namespace AutoExile.Systems
                 g.DrawText($"IncubatorDebug error: {ex.Message}", new Vector2(10, 200), SharpDX.Color.Red);
             }
         }
+    }
+
+    public sealed class InventoryScanEvidence
+    {
+        public bool Readable { get; set; }
+        public string Stage { get; set; } = "start";
+        public string ErrorType { get; set; } = "";
+        public int HolderCount { get; set; }
+        public int SlotCount { get; set; }
+        public int MatchCount { get; set; }
+        public int NonMatchCount { get; set; }
+        public int NullItems { get; set; }
+        public int EmptyPaths { get; set; }
+        public int SlotFaults { get; set; }
+        public List<string> SamplePaths { get; } = new(5);
     }
 
     public enum StashPhase

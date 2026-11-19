@@ -199,14 +199,26 @@ tr:hover td { background:var(--surface2); }
 .history-filter-count { margin-left:auto; padding:0 4px 9px; color:var(--text-dim); font-size:11px; white-space:nowrap; }
 .history-reset { height:34px; padding:0 12px; }
 .history-sort { display:inline-flex; align-items:center; gap:6px; width:100%; padding:0; border:0; background:none; color:inherit; font:inherit; font-weight:inherit; letter-spacing:inherit; text-transform:inherit; cursor:pointer; text-align:left; }
-.history-sort:hover, .history-sort.active { color:var(--text); }
-.history-sort-arrow { min-width:10px; color:var(--accent); font-size:11px; }
+.history-sort:hover { color:var(--text); }
+.history-sort.active { color:var(--accent); }
+.history-sort-arrow { min-width:10px; color:var(--text-dim); font-size:11px; opacity:.5; }
+.history-sort.active .history-sort-arrow { color:var(--accent); opacity:1; }
 .history-mobile-sort { display:none; align-items:end; gap:6px; }
 
 .history-tabs { display:flex; gap:6px; margin-bottom:16px; }
 .history-tab { padding:7px 16px; border-radius:6px; cursor:pointer; font-size:12px; font-weight:500; background:var(--surface2); border:1px solid var(--border); color:var(--text-dim); transition:all .2s; }
 .history-tab:hover { border-color:var(--accent); color:var(--text); }
 .history-tab.active { background:var(--accent); border-color:var(--accent); color:#fff; box-shadow:0 2px 10px var(--accent-glow); }
+.forensics-summary { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; margin-bottom:12px; }
+.forensics-metric { min-width:0; padding:10px 12px; border:1px solid var(--border); border-radius:7px; background:var(--surface2); }
+.forensics-metric span { display:block; margin-bottom:5px; color:var(--text-dim); font-size:8px; font-weight:650; letter-spacing:.7px; text-transform:uppercase; }
+.forensics-metric strong { display:block; overflow:hidden; color:var(--text); font-size:15px; text-overflow:ellipsis; white-space:nowrap; }
+.forensics-breakdown { display:flex; flex-wrap:wrap; gap:6px; margin:0 0 12px; }
+.forensics-chip { padding:4px 8px; border:1px solid var(--border); border-radius:999px; background:var(--surface); color:var(--text-dim); font-size:10px; }
+.forensics-chip b { color:var(--text); }
+.forensics-context { max-width:430px; }
+.forensics-context summary { color:var(--accent); cursor:pointer; font-size:10px; }
+.forensics-context code { display:block; max-height:180px; margin-top:6px; padding:8px; overflow:auto; border:1px solid var(--border); border-radius:5px; background:var(--bg); color:var(--text-dim); font-size:9px; line-height:1.45; white-space:pre-wrap; word-break:break-word; }
 
 /* ---- Operational dashboard ---- */
 .dashboard-stage { display:grid; grid-template-columns:minmax(0,2.15fr) minmax(300px,.85fr); grid-template-areas:'map rail'; gap:14px; align-items:start; }
@@ -430,6 +442,8 @@ tr:hover td { background:var(--surface2); }
   .loot-summary-title { grid-column:1/-1; padding:0 0 9px; border-right:0; border-bottom:1px solid var(--border); }
   .loot-summary .btn { grid-column:auto; justify-self:start; }
   .history-card { padding:10px; overflow:visible; background:transparent; border:0; }
+  .forensics-summary { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .forensics-context { max-width:none; }
   .history-toolbar { align-items:stretch; padding:9px; }
   .history-filter { flex:1 1 calc(50% - 4px); min-width:0; }
   .history-filter.search { flex-basis:100%; min-width:0; }
@@ -560,9 +574,9 @@ tr:hover td { background:var(--surface2); }
   </div>
 
   <div class="card loot-summary">
-    <div class="loot-summary-title"><strong>Loot Tracker</strong><span>Current session</span></div>
-    <div class="ledger-metric"><span>Session div</span><strong id="sessionDiv">0</strong></div>
-    <div class="ledger-metric"><span>Div / hour</span><strong id="divPerHour">0</strong></div>
+    <div class="loot-summary-title"><strong>Loot Tracker</strong><span>Since tracker reset</span></div>
+    <div class="ledger-metric"><span>Chaos value</span><strong id="sessionDiv">0c</strong></div>
+    <div class="ledger-metric"><span>Chaos / hour</span><strong id="divPerHour">0c</strong></div>
     <div class="ledger-metric"><span>Items looted</span><strong id="itemsLooted">0</strong></div>
     <div id="statMapsDone" class="ledger-metric"><span>Maps done</span><strong id="mapsCompleted">0</strong></div>
     <div class="ledger-metric"><span>Session time</span><strong id="sessionTime">--</strong></div>
@@ -750,6 +764,7 @@ tr:hover td { background:var(--surface2); }
     <div class="history-tab" onclick="switchHistory('best-finds',this)">Best Finds</div>
     <div class="history-tab" onclick="switchHistory('runs',this)">Run Sessions</div>
     <div class="history-tab" onclick="switchHistory('events',this)">Events</div>
+    <div class="history-tab" onclick="switchHistory('forensics',this)">Forensics</div>
   </div>
   <div id="historyFilters" class="history-toolbar"></div>
   <div class="card history-card">
@@ -858,14 +873,8 @@ function updateDashboard(s) {
 
   document.getElementById('coverage').textContent = (s.explorationCoverage*100).toFixed(1)+'%';
   document.getElementById('regions').textContent = s.explorationRegions;
-  const cpd = s.chaosPerDivine || 0;
-  if (cpd > 0) {
-    document.getElementById('sessionDiv').textContent = (s.sessionChaos / cpd).toFixed(2);
-    document.getElementById('divPerHour').textContent = (s.chaosPerHour / cpd).toFixed(2);
-  } else {
-    document.getElementById('sessionDiv').textContent = s.sessionChaos.toFixed(1) + 'c';
-    document.getElementById('divPerHour').textContent = s.chaosPerHour.toFixed(1) + 'c';
-  }
+  document.getElementById('sessionDiv').textContent = formatNumber(s.sessionChaos || 0, 1) + 'c';
+  document.getElementById('divPerHour').textContent = formatNumber(s.chaosPerHour || 0, 1) + 'c';
   document.getElementById('itemsLooted').textContent = s.itemsLooted;
   document.getElementById('mapsCompleted').textContent = s.mapsCompleted;
   document.getElementById('sessionTime').textContent = s.sessionDuration || '--';
@@ -2811,12 +2820,15 @@ function createFarmSettingInput(key, meta) {
 
 let currentHistoryType = 'loot';
 let historyLimit = 20;
+let forensicsWindowHours = 6;
 const historyData = {};
+const historyReports = {};
 const historyViewState = {
   loot: { query:'', mode:'', minValue:'', sortKey:'time', sortDir:'desc' },
   'best-finds': { query:'', mode:'', minValue:'', sortKey:'value', sortDir:'desc' },
   runs: { query:'', mode:'', result:'', minChaos:'', maxDeaths:'', sortKey:'start', sortDir:'desc' },
   events: { query:'', type:'', sortKey:'time', sortDir:'desc' },
+  forensics: { query:'', category:'', outcome:'', sortKey:'sequence', sortDir:'desc' },
 };
 const historySorts = {
   loot: [
@@ -2840,6 +2852,11 @@ const historySorts = {
     {key:'time',label:'Time',dir:'desc'}, {key:'type',label:'Type',dir:'asc'},
     {key:'message',label:'Message',dir:'asc'},
   ],
+  forensics: [
+    {key:'sequence',label:'Seq',dir:'desc'}, {key:'time',label:'Time',dir:'desc'},
+    {key:'category',label:'Category',dir:'asc'}, {key:'event',label:'Event',dir:'asc'},
+    {key:'outcome',label:'Outcome',dir:'asc'}, {key:'latency',label:'Commit',dir:'desc'},
+  ],
 };
 
 async function loadHistory(type) {
@@ -2847,19 +2864,24 @@ async function loadHistory(type) {
   const container = document.getElementById('historyContent');
   const more = document.getElementById('historyLoadMore');
   try {
-    const r = await fetch(`/api/history/${type}?limit=${historyLimit}`);
-    const data = await r.json();
+    const suffix = type === 'forensics' ? `&hours=${forensicsWindowHours}` : '';
+    const fetchLimit = type === 'best-finds' ? 20 : type === 'forensics' ? 500 : 100;
+    const r = await fetch(`/api/history/${type}?limit=${fetchLimit}${suffix}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const payload = await r.json();
+    const data = type === 'forensics' ? (payload.events || []) : payload;
+    if (type === 'forensics') historyReports[type] = payload;
     if (!data || data.length === 0) {
       historyData[type] = [];
       renderHistoryControls(type, []);
-      container.innerHTML = '<div class="empty-state">No data yet</div>';
+      if (type === 'forensics') renderForensicsTable([], payload);
+      else container.innerHTML = '<div class="empty-state">No data yet</div>';
       more.classList.remove('visible');
       return;
     }
     historyData[type] = data;
     renderHistoryControls(type, data);
     applyHistoryView();
-    more.classList.toggle('visible', type !== 'best-finds' && data.length >= historyLimit && historyLimit < 100);
   } catch(e) {
     document.getElementById('historyFilters').innerHTML = '';
     container.innerHTML = `<div class="empty-state">Error: ${esc(e.message)}</div>`;
@@ -2868,8 +2890,10 @@ async function loadHistory(type) {
 }
 
 function loadMoreHistory() {
-  historyLimit = historyLimit < 50 ? 50 : 100;
-  loadHistory(currentHistoryType);
+  historyLimit = currentHistoryType === 'forensics'
+    ? (historyLimit < 100 ? 100 : historyLimit < 250 ? 250 : 500)
+    : (historyLimit < 50 ? 50 : 100);
+  applyHistoryView();
 }
 
 function renderHistoryControls(type, data) {
@@ -2886,6 +2910,10 @@ function renderHistoryControls(type, data) {
     controls += historySelectControl('result', 'Result', data.map(runResultText), state.result, 'All results');
     controls += `<label class="history-filter"><span class="history-filter-label">Minimum chaos</span><input type="number" min="0" step="0.1" value="${escAttr(state.minChaos)}" placeholder="0" oninput="setHistoryFilter('minChaos',this.value)"></label>`;
     controls += `<label class="history-filter"><span class="history-filter-label">Maximum deaths</span><input type="number" min="0" step="1" value="${escAttr(state.maxDeaths)}" placeholder="Any" oninput="setHistoryFilter('maxDeaths',this.value)"></label>`;
+  } else if (type === 'forensics') {
+    controls += historySelectControl('category', 'Category', data.map(r=>r.category||''), state.category, 'All categories');
+    controls += historySelectControl('outcome', 'Outcome', data.map(r=>r.outcome||''), state.outcome, 'All outcomes');
+    controls += `<label class="history-filter"><span class="history-filter-label">Window</span><select onchange="setForensicsWindow(this.value)"><option value="1" ${forensicsWindowHours===1?'selected':''}>1 hour</option><option value="6" ${forensicsWindowHours===6?'selected':''}>6 hours</option><option value="24" ${forensicsWindowHours===24?'selected':''}>24 hours</option><option value="72" ${forensicsWindowHours===72?'selected':''}>3 days</option><option value="168" ${forensicsWindowHours===168?'selected':''}>7 days</option></select></label>`;
   } else {
     controls += historySelectControl('type', 'Type', data.map(r=>r.eventType||r.type||''), state.type, 'All types');
   }
@@ -2894,6 +2922,12 @@ function renderHistoryControls(type, data) {
   controls += `<span id="historyFilterCount" class="history-filter-count"></span><button class="btn history-reset" type="button" onclick="resetHistoryFilters()">Reset</button>`;
   document.getElementById('historyFilters').innerHTML = controls;
   syncHistorySortControls();
+}
+
+function setForensicsWindow(value) {
+  forensicsWindowHours = Number(value) || 6;
+  historyLimit = 100;
+  loadHistory('forensics');
 }
 
 function historySelectControl(key, label, values, selected, allLabel) {
@@ -2912,6 +2946,8 @@ function resetHistoryFilters() {
     ? {query:'',mode:'',result:'',minChaos:'',maxDeaths:'',sortKey:'start',sortDir:'desc'}
     : type === 'events'
       ? {query:'',type:'',sortKey:'time',sortDir:'desc'}
+      : type === 'forensics'
+        ? {query:'',category:'',outcome:'',sortKey:'sequence',sortDir:'desc'}
       : {query:'',mode:'',minValue:'',sortKey:type==='best-finds'?'value':'time',sortDir:'desc'};
   historyViewState[type] = defaults;
   renderHistoryControls(type, historyData[type] || []);
@@ -2962,17 +2998,30 @@ function applyHistoryView() {
   const query = state.query.trim().toLowerCase();
   const rows = source.filter(row => historyRowMatches(type, row, state, query));
   const sort = historySorts[type].find(value=>value.key===state.sortKey) || historySorts[type][0];
-  rows.sort((a,b) => compareHistoryValues(historySortValue(type,a,sort.key), historySortValue(type,b,sort.key), state.sortDir));
+  rows.sort((a,b) => {
+    const primary = compareHistoryValues(historySortValue(type,a,sort.key), historySortValue(type,b,sort.key), state.sortDir);
+    if (primary !== 0) return primary;
+    const newestFirst = historySortTimestamp(type,b) - historySortTimestamp(type,a);
+    if (newestFirst !== 0) return newestFirst;
+    return historySortIdentity(type,a).localeCompare(historySortIdentity(type,b), undefined, {numeric:true,sensitivity:'base'});
+  });
+  const visibleRows = type === 'best-finds' ? rows : rows.slice(0, historyLimit);
   const count = document.getElementById('historyFilterCount');
-  if (count) count.textContent = `${rows.length} of ${source.length}`;
+  if (count) count.textContent = rows.length === source.length
+    ? `${visibleRows.length} of ${source.length}`
+    : `${visibleRows.length} of ${rows.length} matches`;
+  const more = document.getElementById('historyLoadMore');
+  if (more) more.classList.toggle('visible', type !== 'best-finds' && visibleRows.length < rows.length);
   if (rows.length === 0) {
-    document.getElementById('historyContent').innerHTML = '<div class="empty-state">No matching records</div>';
+    if (type === 'forensics') renderForensicsTable([], historyReports.forensics || {});
+    else document.getElementById('historyContent').innerHTML = '<div class="empty-state">No matching records</div>';
     return;
   }
-  if (type === 'loot') renderLootTable(rows);
-  else if (type === 'best-finds') renderLootTable(rows, true);
-  else if (type === 'runs') renderRunsTable(rows);
-  else renderEventsTable(rows);
+  if (type === 'loot') renderLootTable(visibleRows);
+  else if (type === 'best-finds') renderLootTable(visibleRows, true);
+  else if (type === 'runs') renderRunsTable(visibleRows);
+  else if (type === 'events') renderEventsTable(visibleRows);
+  else renderForensicsTable(visibleRows, historyReports.forensics || {});
 }
 
 function historyRowMatches(type, row, state, query) {
@@ -2990,6 +3039,11 @@ function historyRowMatches(type, row, state, query) {
       (state.minChaos==='' || Number(row.chaosValue??row.totalChaos??0) >= Number(state.minChaos)) &&
       (state.maxDeaths==='' || Number(row.deathCount??row.deaths??0) <= Number(state.maxDeaths));
   }
+  if (type === 'forensics') {
+    const searchable = [row.sequence,row.category,row.eventName,row.outcome,row.reason,row.contextJson,formatTimestamp(row.occurredAtUtc)].join(' ').toLowerCase();
+    return (!query || searchable.includes(query)) && (!state.category || row.category===state.category) &&
+      (!state.outcome || row.outcome===state.outcome);
+  }
   const eventType = row.eventType||row.type||'';
   const searchable = [eventType,row.message||row.details,formatTimestamp(row.occurredAtUtc||row.time)].join(' ').toLowerCase();
   return (!query || searchable.includes(query)) && (!state.type || eventType===state.type);
@@ -3004,7 +3058,23 @@ function historySortValue(type, row, key) {
     const end = Date.parse(row.endedAtUtc||row.endTime)||0;
     return {start,mode:row.mode||'',area:row.areaName||row.area||'',duration:Number(row.wallDurationMs||Math.max(0,end-start)),wave:Number(row.wavesCompleted??row.highestWaveStarted??row.highestWave??0),deaths:Number(row.deathCount??row.deaths??0),chaos:Number(row.chaosValue??row.totalChaos??0),items:Number(row.itemsLooted||0),result:runResultText(row)}[key];
   }
+  if (type === 'forensics') {
+    return {sequence:Number(row.sequence||0),time:Date.parse(row.occurredAtUtc)||0,category:row.category||'',event:row.eventName||'',outcome:row.outcome||'',latency:Number(row.commitLatencyMs||0)}[key];
+  }
   return {time:Date.parse(row.occurredAtUtc||row.time)||0,type:row.eventType||row.type||'',message:String(row.message||row.details||'')}[key];
+}
+
+function historySortTimestamp(type, row) {
+  if (type === 'loot' || type === 'best-finds') return Date.parse(row.pickedAtUtc||row.time)||0;
+  if (type === 'runs') return Date.parse(row.activatedAtUtc||row.startTime)||0;
+  return Date.parse(row.occurredAtUtc||row.time)||0;
+}
+
+function historySortIdentity(type, row) {
+  if (type === 'loot' || type === 'best-finds') return String(row.lootId||row.itemName||'');
+  if (type === 'runs') return String(row.runId||'');
+  if (type === 'forensics') return String(row.sequence||'');
+  return String(row.eventId||row.message||row.details||'');
 }
 
 function compareHistoryValues(a, b, direction) {
@@ -3069,6 +3139,33 @@ function renderEventsTable(data) {
   }
   html += '</tbody></table></div>';
   document.getElementById('historyContent').innerHTML = html;
+}
+
+function renderForensicsTable(data, report) {
+  const storage = report.storage || {};
+  const fileBytes = Number(storage.databaseBytes||0) + Number(storage.walBytes||0) + Number(storage.shmBytes||0);
+  const size = fileBytes >= 1073741824 ? `${(fileBytes/1073741824).toFixed(2)} GB` : `${(fileBytes/1048576).toFixed(1)} MB`;
+  const categories = (report.categories||[]).slice(0,8).map(x=>`<span class="forensics-chip">${esc(x.name)} <b>${Number(x.count||0).toLocaleString()}</b></span>`).join('');
+  const outcomes = (report.outcomes||[]).slice(0,6).map(x=>`<span class="forensics-chip">${esc(x.name)} <b>${Number(x.count||0).toLocaleString()}</b></span>`).join('');
+  let html = `<div class="forensics-summary">
+    <div class="forensics-metric"><span>Events · ${Number(report.windowHours||forensicsWindowHours)}h</span><strong>${Number(report.totalEvents||0).toLocaleString()}</strong></div>
+    <div class="forensics-metric"><span>SQLite footprint</span><strong>${esc(size)}</strong></div>
+    <div class="forensics-metric"><span>Queue / dropped</span><strong>${Number(storage.pendingWrites||0).toLocaleString()} / ${Number(storage.droppedEvents||0).toLocaleString()}</strong></div>
+    <div class="forensics-metric"><span>Retention</span><strong>${Number(storage.retentionDays||0)}d / ${Number(storage.retentionRows||0).toLocaleString()}</strong></div>
+  </div><div class="forensics-breakdown">${categories}${outcomes}</div>`;
+  if (report.error) html += `<div class="empty-state">${esc(report.error)}</div>`;
+  html += `<div class="history-table-wrap"><table><thead><tr>${historySortHeader('Seq','sequence')}${historySortHeader('Time','time')}${historySortHeader('Category','category')}${historySortHeader('Event','event')}${historySortHeader('Outcome','outcome')}${historySortHeader('Commit','latency')}<th>Reason / Context</th></tr></thead><tbody>`;
+  for (const r of data) {
+    const context = r.contextJson ? `<details class="forensics-context"><summary>${esc(r.reason||'Context')}</summary><code>${esc(formatForensicsContext(r.contextJson))}</code></details>` : esc(r.reason||'-');
+    html += `<tr><td data-label="Seq">${Number(r.sequence||0)}</td><td data-label="Time">${esc(formatTimestamp(r.occurredAtUtc))}</td><td data-label="Category">${esc(r.category||'')}</td><td data-label="Event">${esc(r.eventName||'')}</td><td data-label="Outcome">${esc(r.outcome||'')}</td><td data-label="Commit">${Number(r.commitLatencyMs||0)}ms</td><td data-label="Reason / Context">${context}</td></tr>`;
+  }
+  html += '</tbody></table></div>';
+  document.getElementById('historyContent').innerHTML = html;
+}
+
+function formatForensicsContext(value) {
+  try { return JSON.stringify(JSON.parse(value), null, 2); }
+  catch { return String(value); }
 }
 
 function formatTimestamp(value) {

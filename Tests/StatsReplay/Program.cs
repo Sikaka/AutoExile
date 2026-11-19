@@ -45,6 +45,32 @@ try
         stats.ObserveSimulacrumEntry(101, "Simulacrum");
         Thread.Sleep(20);
         Flush(stats);
+        Require(stats.RecordRuntimeEvent("test", "input", "sent", context: new { key = "A" }, critical: true),
+            "critical runtime event was not acknowledged");
+        Require(stats.RecordRuntimeEvent("test", "input", "dropped", "rate_limit",
+            new { key = "B" }, critical: true), "dropped runtime event was not acknowledged");
+        Flush(stats);
+        using (var runtimeReader = new SqliteConnection($"Data Source={database};Pooling=False"))
+        {
+            runtimeReader.Open();
+            using var command = runtimeReader.CreateCommand();
+            command.CommandText = @"SELECT sequence,outcome,occurred_at_ms,committed_at_ms,producer_thread_id
+FROM runtime_events WHERE category='test' ORDER BY sequence";
+            using var rows = command.ExecuteReader();
+            Require(rows.Read() && rows.GetString(1) == "sent", "sent runtime event was not persisted");
+            var firstSequence = rows.GetInt64(0);
+            Require(rows.GetInt64(3) >= rows.GetInt64(2) && rows.GetInt32(4) > 0,
+                "runtime event producer/commit timing metadata was not persisted");
+            Require(rows.Read() && rows.GetString(1) == "dropped" && rows.GetInt64(0) > firstSequence,
+                "runtime event sequence/outcome ordering was not durable");
+        }
+        var forensicReport = stats.ReadRuntimeEventReport(limit: 50, windowHours: 6);
+        Require(forensicReport.Error == null && forensicReport.TotalEvents >= 2,
+            $"runtime report failed: {forensicReport.Error}");
+        Require(forensicReport.Events.Count >= 2 && forensicReport.Categories.Any(x => x.Name == "test"),
+            "runtime report omitted event detail or category breakdown");
+        Require(forensicReport.Storage.RetentionDays == 7 && forensicReport.Storage.RetentionRows == 500_000,
+            "runtime report exposed incorrect retention policy");
         Require(stats.Snapshot.CurrentRun?.WallDurationMs > 0,
             "open run wall duration did not advance");
         for (var wave = 1; wave <= 15; wave++)
@@ -160,6 +186,71 @@ try
             "restart lost map metadata");
         Require(restarted.ReadLabExitMemory(today).Single().DestinationName == "Sanctum",
             "restart lost lab exit memory");
+        Require(restarted.RecordRuntimeEvent("test", "restart", "persisted", critical: true),
+            "runtime event failed after restart");
+        Flush(restarted);
+    }
+
+    var retentionDb = Path.Combine(root, "retention", "stats.db");
+    using (var retentionSetup = new StatsService(logs.Add, retentionDb))
+    {
+        Require(retentionSetup.Initialize(pluginDirectory), "retention setup failed");
+        Flush(retentionSetup);
+    }
+    using (var seed = new SqliteConnection($"Data Source={retentionDb};Pooling=False"))
+    {
+        seed.Open();
+        using var command = seed.CreateCommand();
+        command.CommandText = @"INSERT INTO runtime_events(
+occurred_at_ms,occurred_at_utc,committed_at_ms,producer_thread_id,category,event_name,outcome)
+VALUES($old,'1970-01-01T00:00:00.0000000Z',$old,0,'test','old','seed')";
+        command.Parameters.AddWithValue("$old", 1L);
+        command.ExecuteNonQuery();
+    }
+    using (var retained = new StatsService(logs.Add, retentionDb))
+    {
+        Require(retained.Initialize(pluginDirectory), "retention restart failed");
+        Flush(retained);
+        using var verify = new SqliteConnection($"Data Source={retentionDb};Pooling=False");
+        verify.Open();
+        using var count = verify.CreateCommand();
+        count.CommandText = "SELECT COUNT(*) FROM runtime_events WHERE event_name='old'";
+        Require(Convert.ToInt32(count.ExecuteScalar()) == 0, "age retention did not remove expired runtime event");
+    }
+
+    var valuationRepairDb = Path.Combine(root, "valuation-repair", "stats.db");
+    using (var valuationRepair = new StatsService(logs.Add, valuationRepairDb))
+    {
+        Require(valuationRepair.Initialize(pluginDirectory), "valuation repair setup failed");
+        valuationRepair.RecordLoot("Large Cluster Jewel", 93400, 1, 8801, 501, "Simulacrum");
+        valuationRepair.RecordLoot("Large Cluster Jewel", 40, 1, 8802, 501, "Simulacrum");
+        valuationRepair.RecordLoot("Large Cluster Jewel", 95590, 1, 8804, 501, "Simulacrum");
+        valuationRepair.RecordLoot("Crimson Jewel", 12000, 1, 8803, 501, "Simulacrum");
+        Flush(valuationRepair);
+        var outlierLootId = valuationRepair.Snapshot.RecentLoot
+            .Single(item => item.ItemName == "Large Cluster Jewel" && item.ChaosValueMilli == 93_400_000)
+            .LootId;
+        var secondOutlierLootId = valuationRepair.Snapshot.RecentLoot
+            .Single(item => item.ItemName == "Large Cluster Jewel" && item.ChaosValueMilli == 95_590_000)
+            .LootId;
+        valuationRepair.CorrectUnidentifiedVoicesOutliers(954.5, outlierLootId, secondOutlierLootId);
+        Flush(valuationRepair);
+
+        var largeClusterValues = valuationRepair.Snapshot.RecentLoot
+            .Where(item => item.ItemName == "Large Cluster Jewel")
+            .Select(item => item.ChaosValueMilli)
+            .OrderBy(value => value)
+            .ToArray();
+        Require(largeClusterValues.SequenceEqual(new long[] { 40_000, 954_500, 954_500 }),
+            "unidentified Voices repair changed the wrong Large Cluster Jewel row");
+        Require(valuationRepair.Snapshot.RecentLoot.Single(item => item.ItemName == "Crimson Jewel").ChaosValueMilli == 12_000_000,
+            "unidentified Voices repair changed a different jewel type");
+
+        valuationRepair.CorrectUnidentifiedVoicesOutliers(800, outlierLootId);
+        Flush(valuationRepair);
+        Require(valuationRepair.Snapshot.RecentLoot
+                .Any(item => item.LootId == outlierLootId && item.ChaosValueMilli == 954_500),
+            "unidentified Voices repair was not idempotent");
     }
 
     File.WriteAllText(Path.Combine(pluginData, "loot.jsonl"),
@@ -257,7 +348,7 @@ INSERT INTO simulacrum_runs(run_id,consumed) VALUES('old-run',1);";
     {
         Require(upgraded.Initialize(upgradePluginDirectory), "v2 database upgrade failed");
         Flush(upgraded);
-        Require(upgraded.Snapshot.SchemaVersion == 3 && upgraded.Snapshot.Lifetime.Consumed == 1,
+        Require(upgraded.Snapshot.SchemaVersion == 4 && upgraded.Snapshot.Lifetime.Consumed == 1,
             $"v2 consumed data was not migrated to the generic run schema: schema={upgraded.Snapshot.SchemaVersion}, consumed={upgraded.Snapshot.Lifetime.Consumed}, health={upgraded.Snapshot.Health.Status}, error={upgraded.Snapshot.Health.Error}");
     }
 

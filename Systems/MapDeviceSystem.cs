@@ -74,10 +74,11 @@ namespace AutoExile.Systems
         private int _invOpenAttempts;
         private const int MaxInvOpenAttempts = 5;
 
-        // Auto-match insertion compatibility: try the native right-click first,
-        // then one Ctrl+click only when slot/activate confirmation never appears.
+        // Auto-match insertion uses the game's native right-click behavior only.
+        // Named-map and scarab flows still use Ctrl+click where the UI requires it.
         private bool _autoMatchRightClickAttempted;
-        private bool _autoMatchCtrlFallbackAttempted;
+        private bool _activateClickAttempted;
+        private bool _activatePanelRecoveryAttempted;
 
         /// <summary>
         /// After a Ctrl+click or right-click on a map/fragment, wait at least this
@@ -87,7 +88,10 @@ namespace AutoExile.Systems
         /// causing the bot to click again and double-load (or close the panel).
         /// </summary>
         private const int InsertSettleMs = 800;
-        private const int AutoMatchFallbackSettleMs = 2000;
+        private const int AutoMatchRightClickSettleMs = 3000;
+        private const int AtlasOpenSettleMs = 1500;
+        private const int ActivateUiSettleMs = 1500;
+        private const int ActivatePostClickWaitMs = 5000;
 
         // Portal spawn settle
         private DateTime? _portalFirstSeenAt;
@@ -110,6 +114,7 @@ namespace AutoExile.Systems
         public bool IsBusy => _phase != MapDevicePhase.Idle;
         public long ActivationSequence { get; private set; }
         public DateTime? LastActivationConfirmedAtUtc { get; private set; }
+        public bool RequestedItemUnavailable { get; private set; }
 
         /// <summary>
         /// Start the map creation flow with a filter for which map to select.
@@ -136,9 +141,11 @@ namespace AutoExile.Systems
             _nodeClickAttempts = 0;
             _invOpenAttempts = 0;
             _autoMatchRightClickAttempted = false;
-            _autoMatchCtrlFallbackAttempted = false;
+            _activateClickAttempted = false;
+            _activatePanelRecoveryAttempted = false;
             _portalFirstSeenAt = null;
             LastActivationConfirmedAtUtc = null;
+            RequestedItemUnavailable = false;
             Status = "Starting map creation";
             return true;
         }
@@ -154,7 +161,9 @@ namespace AutoExile.Systems
             TargetMapName = null;
             MinMapTier = 0;
             _autoMatchRightClickAttempted = false;
-            _autoMatchCtrlFallbackAttempted = false;
+            _activateClickAttempted = false;
+            _activatePanelRecoveryAttempted = false;
+            RequestedItemUnavailable = false;
             Status = "Cancelled";
         }
 
@@ -344,6 +353,22 @@ namespace AutoExile.Systems
                 return MapDeviceResult.Failed;
             }
 
+            // The atlas root becomes visible before its selected-node/device subtree is
+            // stable. Reading slot/button paths during that window can observe stale data
+            // from the previous panel and advance to Activate without a real button.
+            var atlasSettleMs = AtlasOpenSettleMs + (int)Math.Ceiling(ExtraLatencySec * 1000f);
+            if ((DateTime.Now - _phaseStartTime).TotalMilliseconds < atlasSettleMs)
+            {
+                Status = $"[Select] Waiting {atlasSettleMs}ms for atlas device panel to settle";
+                return MapDeviceResult.InProgress;
+            }
+
+            // Two distinct flows:
+            // A) Named map (farming/mapping): must select atlas node first → device panel opens → Ctrl+click map key
+            // B) Auto-match (blight/simulacrum/boss): right-click fragment in inventory → game handles node selection + insertion
+            // ForceCtrlClick prevents accidental right-click on map keys (farming mode without map name selected)
+            bool namedMapFlow = !string.IsNullOrEmpty(TargetMapName);
+
             // PRIMARY check — if the activate button is showing, something is loaded
             // (auto-inserted on atlas open OR placed by a prior tick that we're racing
             // against). Skip ALL map insertion logic. If scarabs are configured for
@@ -358,9 +383,11 @@ namespace AutoExile.Systems
                 return MapDeviceResult.InProgress;
             }
 
-            // Secondary check — slot 0 occupied (covers cases where activate button
-            // hasn't rendered yet but the slot already shows the item).
-            if (IsMapInDevice(atlas))
+            // Named-map insertion can use slot occupancy while the activate button
+            // finishes rendering. Auto-match must not: ExileCore can expose stale
+            // slot children from the previous atlas panel, which skips the required
+            // inventory right-click and leaves us on a non-activatable view.
+            if ((namedMapFlow || ForceCtrlClick) && IsMapInDevice(atlas))
             {
                 _phase = NextPhaseAfterMapLoaded();
                 _phaseStartTime = DateTime.Now;
@@ -370,20 +397,13 @@ namespace AutoExile.Systems
                 return MapDeviceResult.InProgress;
             }
 
-            // Two distinct flows:
-            // A) Named map (farming/mapping): must select atlas node first → device panel opens → Ctrl+click map key
-            // B) Auto-match (blight/simulacrum/boss): right-click fragment in stash → game handles node selection + insertion
-            // ForceCtrlClick prevents accidental right-click on map keys (farming mode without map name selected)
-            bool namedMapFlow = !string.IsNullOrEmpty(TargetMapName);
-
             // Settle window — if we just clicked a fragment, give the UI time to update
             // before re-checking. Otherwise we re-enter this phase, see no activate
             // button yet (still rendering), and click the same/next fragment again.
-            // Auto-match's Ctrl+click compatibility fallback must wait longer because a
-            // successful right-click can take multiple server round trips to confirm.
+            // Auto-match right-click can take multiple server round trips to confirm.
             var settleMs = !namedMapFlow && !ForceCtrlClick &&
                            _autoMatchRightClickAttempted
-                ? AutoMatchFallbackSettleMs + (int)Math.Ceiling(ExtraLatencySec * 1000f)
+                ? AutoMatchRightClickSettleMs + (int)Math.Ceiling(ExtraLatencySec * 1000f)
                 : InsertSettleMs;
             if ((DateTime.Now - _lastActionTime).TotalMilliseconds < settleMs)
             {
@@ -391,10 +411,22 @@ namespace AutoExile.Systems
                 return MapDeviceResult.InProgress;
             }
 
-            if (!namedMapFlow && !ForceCtrlClick &&
-                _autoMatchRightClickAttempted && _autoMatchCtrlFallbackAttempted)
+            if (!namedMapFlow && !ForceCtrlClick && _autoMatchRightClickAttempted)
             {
-                Status = "[Select] Map insertion unconfirmed after right-click + Ctrl+click fallback";
+                if (!CanAct())
+                {
+                    Status = "[Select] Waiting to close atlas after unconfirmed right-click";
+                    return MapDeviceResult.InProgress;
+                }
+
+                if (!BotInput.PressKey(Keys.Escape))
+                {
+                    Status = "[Select] Escape input was not accepted after unconfirmed right-click";
+                    return MapDeviceResult.InProgress;
+                }
+
+                _lastActionTime = DateTime.Now;
+                Status = "[Select] Right-click unconfirmed — closed atlas for a clean retry";
                 _phase = MapDevicePhase.Idle;
                 return MapDeviceResult.Failed;
             }
@@ -443,29 +475,38 @@ namespace AutoExile.Systems
                 }
             }
 
-            // Find a matching map from the stash and insert it
-            var mapStash = atlas.GetChildFromIndices(MapStashPath);
-            if (mapStash == null)
-            {
-                Status = "[Select] Map stash panel not found";
-                _phase = MapDevicePhase.Idle;
-                return MapDeviceResult.Failed;
-            }
-
             Element? targetMap = null;
             int checkedCount = 0;
-            for (int i = 0; i < mapStash.ChildCount; i++)
+            bool useInventoryAutoMatch = !namedMapFlow && !ForceCtrlClick &&
+                                         _inventoryFragmentPath != null;
+
+            // Auto-match callers withdraw their fragment into player inventory.
+            // Right-clicking that concrete item is the authoritative transition to
+            // the matching atlas device panel, so do not substitute stale atlas
+            // stash/slot elements for it.
+            if (!useInventoryAutoMatch)
             {
-                var item = mapStash.GetChildAtIndex(i);
-                if (item == null || item.Type != ElementType.InventoryItem)
-                    continue;
-                checkedCount++;
+                var mapStash = atlas.GetChildFromIndices(MapStashPath);
+                if (mapStash == null)
+                {
+                    Status = "[Select] Map stash panel not found";
+                    _phase = MapDevicePhase.Idle;
+                    return MapDeviceResult.Failed;
+                }
 
-                if (_mapFilter != null && !_mapFilter(item))
-                    continue;
+                for (int i = 0; i < mapStash.ChildCount; i++)
+                {
+                    var item = mapStash.GetChildAtIndex(i);
+                    if (item == null || item.Type != ElementType.InventoryItem)
+                        continue;
+                    checkedCount++;
 
-                targetMap = item;
-                break;
+                    if (_mapFilter != null && !_mapFilter(item))
+                        continue;
+
+                    targetMap = item;
+                    break;
+                }
             }
 
             // Fallback: check player inventory for the map / fragment.
@@ -519,23 +560,18 @@ namespace AutoExile.Systems
                         var absPos2 = new Vector2(windowRect2.X + slotRect.Center.X,
                             windowRect2.Y + slotRect.Center.Y);
 
-                        bool useInventoryCtrlClick = namedMapFlow || ForceCtrlClick || _autoMatchRightClickAttempted;
+                        bool useInventoryCtrlClick = namedMapFlow || ForceCtrlClick;
                         bool inserted = useInventoryCtrlClick
                             ? BotInput.CtrlClick(absPos2)
                             : BotInput.RightClick(absPos2);
                         if (inserted)
                         {
                             if (!namedMapFlow && !ForceCtrlClick)
-                            {
-                                if (useInventoryCtrlClick) _autoMatchCtrlFallbackAttempted = true;
-                                else _autoMatchRightClickAttempted = true;
-                            }
+                                _autoMatchRightClickAttempted = true;
                             _lastActionTime = DateTime.Now;
                             Status = namedMapFlow
                                 ? $"[Select] Ctrl+clicking inventory map into {TargetMapName} slot"
-                                : useInventoryCtrlClick
-                                    ? "[Select] Right-click unconfirmed — Ctrl+clicking fragment from inventory"
-                                    : "[Select] Right-clicking fragment from inventory";
+                                : "[Select] Right-clicking fragment from inventory";
                         }
                         return MapDeviceResult.InProgress;
                     }
@@ -543,6 +579,7 @@ namespace AutoExile.Systems
 
                 if (!foundAny)
                 {
+                    RequestedItemUnavailable = true;
                     Status = $"[Select] No '{_inventoryFragmentPath}' in stash or inventory";
                     _phase = MapDevicePhase.Idle;
                     return MapDeviceResult.Failed;
@@ -565,7 +602,7 @@ namespace AutoExile.Systems
 
             // Named map or ForceCtrlClick (farming): Ctrl+click to insert into device slot.
             // Auto-match (boss fragments only): Right-click to auto-select node + insert.
-            bool useCtrlClick = namedMapFlow || ForceCtrlClick || _autoMatchRightClickAttempted;
+            bool useCtrlClick = namedMapFlow || ForceCtrlClick;
             bool clicked = useCtrlClick
                 ? BotInput.CtrlClick(absPos)
                 : BotInput.RightClick(absPos);
@@ -573,16 +610,11 @@ namespace AutoExile.Systems
                 return MapDeviceResult.InProgress; // gate blocked, retry next tick
 
             if (!namedMapFlow && !ForceCtrlClick)
-            {
-                if (useCtrlClick) _autoMatchCtrlFallbackAttempted = true;
-                else _autoMatchRightClickAttempted = true;
-            }
+                _autoMatchRightClickAttempted = true;
             _lastActionTime = DateTime.Now;
             Status = namedMapFlow || ForceCtrlClick
                 ? "[Select] Ctrl+clicking map into device"
-                : useCtrlClick
-                    ? "[Select] Right-click unconfirmed — Ctrl+clicking fragment into device"
-                    : "[Select] Right-clicking fragment into device";
+                : "[Select] Right-clicking fragment into device";
 
             // Re-enter this phase — IsMapInDevice check will advance us
             return MapDeviceResult.InProgress;
@@ -726,21 +758,112 @@ namespace AutoExile.Systems
         private MapDeviceResult TickActivate(GameController gc)
         {
             var atlas = gc.IngameState.IngameUi.Atlas;
+            var activateSettleMs = ActivateUiSettleMs + (int)Math.Ceiling(ExtraLatencySec * 1000f);
+            if ((DateTime.Now - _phaseStartTime).TotalMilliseconds < activateSettleMs)
+            {
+                Status = $"[Activate] Waiting {activateSettleMs}ms for device controls to settle";
+                return MapDeviceResult.InProgress;
+            }
+
             if (atlas?.IsVisible != true)
             {
-                // Atlas closing alone does not prove that the fragment was consumed.
-                // Wait for portals before publishing a confirmed activation.
-                _phase = MapDevicePhase.WaitForPortals;
+                if (_activateClickAttempted)
+                {
+                    // Atlas closing after our activate click is the expected transition.
+                    _phase = MapDevicePhase.WaitForPortals;
+                    _phaseStartTime = DateTime.Now;
+                    Status = "Atlas closed after activate — waiting for portals";
+                    return MapDeviceResult.InProgress;
+                }
+
+                // The atlas/device panel disappeared before we clicked activate.
+                // Re-open the physical device once instead of treating the close as success.
+                _phase = MapDevicePhase.OpenDevice;
                 _phaseStartTime = DateTime.Now;
-                Status = "Atlas closed — waiting for portals";
+                Status = "Atlas closed before activate — reopening map device";
+                return MapDeviceResult.InProgress;
+            }
+
+            if (_activateClickAttempted)
+            {
+                var postClickWaitMs = ActivatePostClickWaitMs + (int)Math.Ceiling(ExtraLatencySec * 1000f);
+                if ((DateTime.Now - _phaseStartTime).TotalMilliseconds < postClickWaitMs)
+                {
+                    Status = $"[Activate] Click sent — waiting up to {postClickWaitMs}ms for atlas to close";
+                    return MapDeviceResult.InProgress;
+                }
+
+                if (_activatePanelRecoveryAttempted)
+                {
+                    Status = "Activate click produced no transition after clean device reopen";
+                    _phase = MapDevicePhase.Idle;
+                    return MapDeviceResult.Failed;
+                }
+
+                if (!CanAct())
+                {
+                    Status = "[Activate] Waiting for input gate before click-timeout recovery";
+                    return MapDeviceResult.InProgress;
+                }
+                if (BotInput.PressKey(Keys.Escape))
+                {
+                    _activateClickAttempted = false;
+                    _activatePanelRecoveryAttempted = true;
+                    _lastActionTime = DateTime.Now;
+                    _phaseStartTime = DateTime.Now;
+                    Status = "[Activate] Click produced no transition — closing atlas for one clean reopen";
+                }
+                else
+                {
+                    Status = "[Activate] Escape input was not accepted after click timeout; retrying";
+                }
                 return MapDeviceResult.InProgress;
             }
 
             var activateBtn = atlas.GetChildFromIndices(ActivateButtonPath);
             if (activateBtn == null || !activateBtn.IsVisible)
             {
-                Status = "Activate button not found";
-                return MapDeviceResult.InProgress;
+                var inventoryVisible = gc.IngameState.IngameUi.InventoryPanel?.IsVisible == true;
+                if (inventoryVisible)
+                {
+                    if (!CanAct())
+                    {
+                        Status = "[Activate] Waiting for input gate before closing inventory";
+                        return MapDeviceResult.InProgress;
+                    }
+                    if (BotInput.PressKey(Keys.Escape))
+                    {
+                        _lastActionTime = DateTime.Now;
+                        _phaseStartTime = DateTime.Now;
+                        Status = "[Activate] Closing inventory before reading device controls";
+                    }
+                    return MapDeviceResult.InProgress;
+                }
+
+                if (!_activatePanelRecoveryAttempted)
+                {
+                    if (!CanAct())
+                    {
+                        Status = "[Activate] Waiting for input gate before stale-atlas recovery";
+                        return MapDeviceResult.InProgress;
+                    }
+                    if (BotInput.PressKey(Keys.Escape))
+                    {
+                        _activatePanelRecoveryAttempted = true;
+                        _lastActionTime = DateTime.Now;
+                        _phaseStartTime = DateTime.Now;
+                        Status = "[Activate] Device panel missing — closing stale atlas for one clean reopen";
+                    }
+                    else
+                    {
+                        Status = "[Activate] Escape input was not accepted; retrying";
+                    }
+                    return MapDeviceResult.InProgress;
+                }
+
+                Status = "Activate button not found after clean device reopen";
+                _phase = MapDevicePhase.Idle;
+                return MapDeviceResult.Failed;
             }
 
             // Don't click a greyed-out button — it'll register a fake "click" with
@@ -763,6 +886,8 @@ namespace AutoExile.Systems
                 return MapDeviceResult.InProgress;
             }
             _lastActionTime = DateTime.Now;
+            _phaseStartTime = DateTime.Now;
+            _activateClickAttempted = true;
 
             // Stay in Activate phase — next tick will detect atlas closing (lines above)
             // and transition to WaitForPortals only after verification

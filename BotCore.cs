@@ -49,6 +49,13 @@ namespace AutoExile
         private ThreatSystem _threat = new();
         private EldritchAltarHandler _altarHandler = new();
         private NinjaPriceService _ninjaPrice = new();
+        private double _lastVoicesStatsRepairValue;
+        private static readonly string[] KnownUnidentifiedVoicesOutlierLootIds =
+        {
+            "22f8e2b509df483da661a8df1b66215f",
+            "8aa5f118020941bd85ccc4c257439a35",
+            "a44e8516bb804e07a1a34e5deb86d6c2",
+        };
         private RuntimeTracker _runtime = new();
         private EntityCache _entityCache = new();
         private ThreatMap _threatMap = new();
@@ -137,6 +144,9 @@ namespace AutoExile
             _ninjaPrice.Initialize(DirectoryFullName, msg => LogMessage($"[AutoExile] NinjaPrice: {msg}"));
             _stats = new StatsService(msg => LogMessage($"[Stats] {msg}"));
             _stats.Initialize(DirectoryFullName);
+            BotInput.Stats = _stats;
+            _navigation.Stats = _stats;
+            _stash.Stats = _stats;
             _mapDatabase = new MapDatabase(msg => LogMessage($"[AutoExile] {msg}"));
             _mapDatabase.Initialize(_stats);
 
@@ -273,6 +283,38 @@ namespace AutoExile
                 var valueStr = chaosValue > 0 ? $" ({chaosValue:F0}c)" : "";
                 _stats.RecordEvent("loot_skip", $"{itemName}{valueStr}: {reason} @ {area}");
                 _perf.RecordFailure("lootSkip", reason ?? "(unknown)");
+            };
+            _loot.OnScanFault = (stage, itemName, errorType) =>
+            {
+                var area = GameController?.Area?.CurrentArea?.Name ?? "";
+                _stats.RecordRuntimeEvent("loot", "scan_fault", "isolated", errorType,
+                    new { stage, itemName, area });
+                _perf.RecordFailure("lootScan", $"{stage}:{errorType}");
+            };
+            _loot.OnScanMismatch = evidence =>
+            {
+                var area = GameController?.Area?.CurrentArea?.Name ?? "";
+                _stats.RecordRuntimeEvent("loot", "scan_mismatch", "observed",
+                    "visible_labels_without_candidates", new
+                    {
+                        area,
+                        evidence.LabelEntries,
+                        evidence.VisibleLabels,
+                        evidence.NullLabels,
+                        evidence.InvisibleLabels,
+                        evidence.NullEntities,
+                        evidence.FailedCooldownLabels,
+                        evidence.AutoPickupLabels,
+                        evidence.CacheHits,
+                        evidence.EvaluatedLabels,
+                        evidence.PricePendingLabels,
+                        evidence.FilteredLabels,
+                        evidence.Candidates,
+                        evidence.ScanFaults,
+                        evidence.Unresolved,
+                        evidence.FirstFault,
+                        evidence.SampleLabels,
+                    });
             };
 
             // Populate map name list from atlas nodes (when in-game)
@@ -479,6 +521,7 @@ namespace AutoExile
             // Runs before all early returns so the dashboard stays live even when
             // POE is unfocused or an async action is in flight.
             TickWebServer();
+            EmitForensicsSnapshot();
 
             // Update active-runtime accounting on every tick (even when POE is
             // unfocused) so the timer reflects real elapsed wall time accurately.
@@ -489,6 +532,7 @@ namespace AutoExile
             // timer (or bump MaxRuntimeMinutes) to resume.
             if (Settings.Running.Value && _runtime.IsExpired(Settings.Run.MaxRuntimeMinutes.Value))
             {
+                _stats.RecordRuntimeEvent("session", "running_origin", "stop", "max_runtime", critical: true);
                 Settings.Running.Value = false;
                 LogMessage($"[AutoExile] Max runtime ({Settings.Run.MaxRuntimeMinutes.Value} min) reached — bot stopped");
             }
@@ -521,8 +565,6 @@ namespace AutoExile
             // An async action is in flight (cursor settle, key hold).
             // Still tick combat for self-cast skills (RF, guards, etc.) and mode for state updates,
             // but skip navigation which would queue conflicting cursor movements.
-            var canAct = Systems.BotInput.CanAct;
-
             // Retry exploration init if it was missed (terrain data not ready when AreaChange fired)
             if (!_exploration.IsInitialized && GameController.Player != null)
             {
@@ -687,6 +729,14 @@ namespace AutoExile
 
             // Tick ninja price service (league detection, refresh timer)
             _ninjaPrice.Tick(GameController);
+            var unidentifiedVoicesValue = _ninjaPrice.UnidentifiedVoicesChaosValue;
+            if (unidentifiedVoicesValue > 0d &&
+                Math.Abs(unidentifiedVoicesValue - _lastVoicesStatsRepairValue) >= 0.01d)
+            {
+                _lastVoicesStatsRepairValue = unidentifiedVoicesValue;
+                _stats.CorrectUnidentifiedVoicesOutliers(
+                    unidentifiedVoicesValue, KnownUnidentifiedVoicesOutlierLootIds);
+            }
 
             // Build gem colour map from game data (once)
             _gemValuation.BuildColourMap(GameController);
@@ -769,7 +819,9 @@ namespace AutoExile
             // This prevents stale walk commands: the walk command always targets the current path,
             // not a path that's about to be replaced.
             // Only tick nav when no async action is in flight (cursor settle / key hold).
-            if (canAct)
+            // Mode tick can start an async input transaction, so an earlier gate
+            // snapshot is stale here (notably during the paired Z label refresh).
+            if (Systems.BotInput.CanAct)
                 _navigation.Tick(GameController);
 
             // Auto level gems (global, runs across all modes)
@@ -786,6 +838,7 @@ namespace AutoExile
             // Toggle running hotkey — checked in Render so it's never blocked by early returns in Tick
             if (Settings.ToggleRunning.PressedOnce())
             {
+                _stats.RecordRuntimeEvent("session", "running_origin", Settings.Running.Value ? "stop" : "start", "toggle_hotkey", critical: true);
                 Settings.Running.Value = !Settings.Running.Value;
                 if (Settings.Running.Value)
                 {
@@ -977,6 +1030,44 @@ namespace AutoExile
         private long _lastTerrainHash;
         private DateTime _lastTerrainRefresh = DateTime.MinValue;
         private const double TerrainRefreshIntervalSec = 3.0;
+        private DateTime _lastForensicsSnapshot = DateTime.MinValue;
+        private string _lastForensicsSignature = "";
+        private const double ForensicsSnapshotHeartbeatSeconds = 15.0;
+
+        private void EmitForensicsSnapshot()
+        {
+            var now = DateTime.UtcNow;
+            var player = GameController.Player?.GridPosNum ?? Vector2.Zero;
+            var area = GameController.Area?.CurrentArea?.Name ?? "";
+            var hash = GameController.IngameState?.Data?.CurrentAreaHash ?? 0;
+            var phase = ""; var decision = ""; var status = "";
+            if (_mode is SimulacrumMode sim) { phase = sim.Phase.ToString(); decision = sim.Decision; status = sim.StatusText; }
+            else if (_mode is Modes.WaveFarm.WaveFarmMode farm) { decision = farm.Decision; status = farm.Status; }
+            else if (_mode is BlightMode blight) { phase = blight.Phase.ToString(); status = blight.StatusText; }
+            else if (_mode is HeistMode heist) { phase = heist.Phase.ToString(); decision = heist.Decision; }
+            else if (_mode is FollowerMode follower) { phase = follower.State.ToString(); decision = follower.Decision; status = follower.StatusText; }
+            else if (_mode is LabyrinthMode lab) { phase = lab.Phase.ToString(); status = lab.StatusText; }
+            var target = _combat.BestTarget;
+            var signature = $"{Settings.Running.Value}|{_mode.Name}|{area}|{hash}|{phase}|{decision}|{status}|{_navigation.IsNavigating}|{_navigation.CurrentWaypointIndex}|{_navigation.LastRecoveryAction}|{_simulacrumMode?.State.CurrentWave}|{_combat.NearbyMonsterCount}";
+            var elapsed = (now - _lastForensicsSnapshot).TotalSeconds;
+            var stateChanged = !string.Equals(signature, _lastForensicsSignature, StringComparison.Ordinal);
+            // Keep state transitions at one-second resolution, but collapse an unchanged
+            // state to a 15-second heartbeat so idle/retry periods cannot bury critical
+            // stop/start evidence under identical snapshots.
+            if ((!stateChanged && elapsed < ForensicsSnapshotHeartbeatSeconds) || elapsed < 1) return;
+            _lastForensicsSnapshot = now; _lastForensicsSignature = signature;
+            _stats.RecordRuntimeEvent("state", "snapshot", "observed", context: new {
+                running = Settings.Running.Value, mode = _mode.Name, area, areaHash = hash, phase, decision, status,
+                playerX = player.X, playerY = player.Y, wave = _simulacrumMode?.State.CurrentWave ?? 0,
+                waveActive = _simulacrumMode?.State.IsWaveActive ?? false, nearbyMonsters = _combat.NearbyMonsterCount,
+                totalMonsters = _combat.CachedMonsterCount, targetId = target?.Id, targetName = target?.RenderName,
+                navigating = _navigation.IsNavigating, waypoint = _navigation.CurrentWaypointIndex,
+                waypointTotal = _navigation.CurrentNavPath?.Count ?? 0, destination = _navigation.Destination,
+                recovery = _navigation.LastRecoveryAction, stuckRecoveries = _navigation.StuckRecoveries,
+                interactionBusy = _interaction.IsBusy, movementActive = BotInput.IsMovementActive,
+                movementSuspended = BotInput.IsMovementSuspended, inputRate = BotInput.RawInputEventsPerSecond
+            });
+        }
 
         private void TickWebServer()
         {
@@ -1006,10 +1097,12 @@ namespace AutoExile
                 switch (cmd.Action)
                 {
                     case "start":
+                        _stats.RecordRuntimeEvent("session", "running_origin", "start", "web_control", critical: true);
                         Settings.Running.Value = true;
                         if (!_lootTracker.IsActive) _lootTracker.StartSession();
                         break;
                     case "stop":
+                        _stats.RecordRuntimeEvent("session", "running_origin", "stop", "web_control", critical: true);
                         Settings.Running.Value = false;
                         if (_lootTracker.IsActive) _lootTracker.StopSession();
                         break;
@@ -1140,6 +1233,10 @@ namespace AutoExile
                     ExplorationRegions = _exploration.IsInitialized && _exploration.ActiveBlob != null
                         ? _exploration.ActiveBlob.Regions.Count : 0,
                     LootCandidates = _loot.Candidates.Count,
+                    LootLabelEntries = _loot.LastLabelEntryCount,
+                    LootVisibleLabels = _loot.LastVisibleLabelCount,
+                    LootScanFaults = _loot.LastScanFaultCount,
+                    LootScanError = _loot.LastScanFault,
                     SessionChaos = Sanitize((float)statsSession.ChaosValue),
                     ChaosPerHour = Sanitize((float)statsSession.ChaosPerHour),
                     ChaosPerDivine = Sanitize((float)(_ninjaPrice.ChaosPerDivine)),

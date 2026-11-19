@@ -24,9 +24,10 @@ namespace AutoExile.Statistics
             public bool Completed { get; set; }
         }
 
-        private const int CurrentSchemaVersion = 3;
+        private const int CurrentSchemaVersion = 4;
+        private const int StatsWriteQueueCapacity = 8192;
         private readonly Action<string> _log;
-        private readonly BlockingCollection<Action<SqliteConnection>> _writes = new(8192);
+        private readonly BlockingCollection<Action<SqliteConnection>> _writes = new(StatsWriteQueueCapacity);
         private readonly ManualResetEventSlim _initialized = new(false);
         private Thread? _worker;
         private volatile StatsSnapshot _snapshot = new();
@@ -81,6 +82,8 @@ namespace AutoExile.Statistics
             var value = running ? 1 : 0;
             if (Interlocked.Exchange(ref _lastRunning, value) == value) return;
             Enqueue(db => SetSessionRunning(db, running, NowMs()));
+            RecordRuntimeEvent("session", "running_state", running ? "running" : "stopped", "state_transition",
+                new { origin = "BotCore.SetRunning" }, critical: true);
         }
 
         /// <summary>Requests a snapshot refresh at most once per second without touching SQLite on the game thread.</summary>
@@ -246,6 +249,35 @@ VALUES($id,$source,$session,$run,$now,$hash,$area,$item,1,$slots,$value,'ninja')
             });
         }
 
+        /// <summary>
+        /// Repairs the historical signature produced when an unidentified Voices was
+        /// persisted at the most expensive identified variant price.
+        /// </summary>
+        public void CorrectUnidentifiedVoicesOutliers(double chaosValue, params string[] lootIds)
+        {
+            if (!double.IsFinite(chaosValue) || chaosValue <= 0d || lootIds.Length == 0) return;
+            var valueMilli = (long)Math.Round(chaosValue * 1000d, MidpointRounding.AwayFromZero);
+            Enqueue(db =>
+            {
+                var corrected = 0;
+                foreach (var lootId in lootIds.Where(id => !string.IsNullOrWhiteSpace(id)).Distinct(StringComparer.Ordinal))
+                {
+                    using var cmd = db.CreateCommand();
+                    cmd.CommandText = @"
+UPDATE loot_events
+SET chaos_value_milli=$value, valuation_source='trade:unidentified-voices-repair'
+WHERE loot_id=$loot
+  AND item_name='Large Cluster Jewel'
+  AND valuation_source='ninja'";
+                    cmd.Parameters.AddWithValue("$loot", lootId);
+                    cmd.Parameters.AddWithValue("$value", valueMilli);
+                    corrected += cmd.ExecuteNonQuery();
+                }
+                if (corrected > 0)
+                    _log($"Corrected {corrected} historical unidentified Voices valuation(s) to {chaosValue:F1}c.");
+            });
+        }
+
         public void RecordEvent(string eventType, string details)
         {
             Enqueue(db =>
@@ -359,9 +391,11 @@ VALUES($id,$source,$session,$run,$now,$hash,$area,$item,1,$slots,$value,'ninja')
                 db.Open();
                 Configure(db);
                 CreateSchema(db);
+                LoadForensicCounters(db);
                 RecoverSessionClock(db);
                 ImportLegacyFiles(db, _pluginDataDirectory);
                 ImportOperationalFiles(db, _pluginDirectory);
+                RetainRuntimeEvents(db);
                 PublishSnapshot(db, null);
                 _log($"Stats database initialized at {_databasePath}");
                 _initialized.Set();
@@ -373,7 +407,11 @@ VALUES($id,$source,$session,$run,$now,$hash,$area,$item,1,$slots,$value,'ninja')
                         command(db);
                         // Coalesce bursts so HUD/API aggregation never runs once per loot item.
                         for (var i = 0; i < 255 && _writes.TryTake(out var next); i++)
+                        {
                             next(db);
+                        }
+                        FlushForensicOverflow(db);
+                        RetainRuntimeEvents(db);
                         PublishSnapshot(db, null);
                     }
                     catch (Exception ex)
@@ -386,6 +424,7 @@ VALUES($id,$source,$session,$run,$now,$hash,$area,$item,1,$slots,$value,'ninja')
             catch (Exception ex)
             {
                 Volatile.Write(ref _acceptingWrites, 0);
+                try { _writes.CompleteAdding(); } catch (InvalidOperationException) { }
                 _snapshot = Unavailable("unavailable", ex.Message);
                 _log($"Stats database unavailable: {ex.Message}");
                 _initialized.Set();
@@ -409,7 +448,8 @@ PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 PRAGMA synchronous=FULL;
 PRAGMA busy_timeout=2000;
-PRAGMA wal_autocheckpoint=1000;";
+PRAGMA wal_autocheckpoint=1000;
+PRAGMA journal_size_limit=16777216;";
             cmd.ExecuteNonQuery();
         }
 
@@ -459,10 +499,30 @@ CREATE TABLE IF NOT EXISTS lab_exit_memory(
 CREATE TABLE IF NOT EXISTS operational_imports(
  source_path TEXT PRIMARY KEY,source_sha256 TEXT NOT NULL,imported_at_ms INTEGER NOT NULL,
  rows_imported INTEGER NOT NULL,status TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS runtime_events(
+ sequence INTEGER PRIMARY KEY AUTOINCREMENT, occurred_at_ms INTEGER NOT NULL, occurred_at_utc TEXT NOT NULL,
+ committed_at_ms INTEGER NOT NULL, producer_thread_id INTEGER NOT NULL,
+ session_id TEXT, run_id TEXT, category TEXT NOT NULL, event_name TEXT NOT NULL, outcome TEXT NOT NULL,
+ reason TEXT, context_json TEXT);
+CREATE INDEX IF NOT EXISTS ix_runtime_events_time ON runtime_events(occurred_at_ms);
+CREATE INDEX IF NOT EXISTS ix_runtime_events_category_outcome_time
+ ON runtime_events(category,outcome,occurred_at_ms DESC);
+CREATE INDEX IF NOT EXISTS ix_runtime_events_category_event_time
+ ON runtime_events(category,event_name,occurred_at_ms DESC);
 INSERT OR IGNORE INTO schema_migrations(version,applied_at_ms) VALUES(1,$now);
 INSERT OR IGNORE INTO schema_migrations(version,applied_at_ms) VALUES(2,$now);", ("$now", NowMs()));
             if (!ColumnExists(db, tx, "runs", "consumed"))
                 Execute(db, tx, "ALTER TABLE runs ADD COLUMN consumed INTEGER NOT NULL DEFAULT 0");
+            if (!ColumnExists(db, tx, "runtime_events", "occurred_at_utc"))
+                Execute(db, tx, "ALTER TABLE runtime_events ADD COLUMN occurred_at_utc TEXT NOT NULL DEFAULT ''");
+            if (!ColumnExists(db, tx, "runtime_events", "session_id"))
+                Execute(db, tx, "ALTER TABLE runtime_events ADD COLUMN session_id TEXT");
+            if (!ColumnExists(db, tx, "runtime_events", "run_id"))
+                Execute(db, tx, "ALTER TABLE runtime_events ADD COLUMN run_id TEXT");
+            if (!ColumnExists(db, tx, "runtime_events", "committed_at_ms"))
+                Execute(db, tx, "ALTER TABLE runtime_events ADD COLUMN committed_at_ms INTEGER NOT NULL DEFAULT 0");
+            if (!ColumnExists(db, tx, "runtime_events", "producer_thread_id"))
+                Execute(db, tx, "ALTER TABLE runtime_events ADD COLUMN producer_thread_id INTEGER NOT NULL DEFAULT 0");
             Execute(db, tx, @"UPDATE runs SET consumed=COALESCE(
 (SELECT s.consumed FROM simulacrum_runs s WHERE s.run_id=runs.run_id),consumed)");
             Execute(db, tx, "INSERT OR IGNORE INTO schema_migrations(version,applied_at_ms) VALUES($version,$now)",

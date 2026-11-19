@@ -275,6 +275,9 @@ namespace AutoExile.WebServer
                     case "/api/history/events" when method == "GET":
                         await HandleHistoryEvents(req, resp);
                         break;
+                    case "/api/history/forensics" when method == "GET":
+                        await HandleHistoryForensics(req, resp);
+                        break;
                     case "/api/maps" when method == "GET":
                         await HandleGetMaps(resp);
                         break;
@@ -653,6 +656,32 @@ namespace AutoExile.WebServer
             var limit = GetQueryInt(req, "limit", 100);
             var data = (Stats?.Snapshot.RecentEvents ?? Array.Empty<StatsEventSnapshot>()).Take(limit);
             await ServeJson(resp, data, pretty: true);
+        }
+
+        private async Task HandleHistoryForensics(SimpleHttpRequest req, SimpleHttpResponse resp)
+        {
+            if (Stats == null)
+            {
+                resp.StatusCode = 503;
+                await ServeJson(resp, new RuntimeEventReport { Error = "Stats service is not ready." }, pretty: true);
+                return;
+            }
+
+            var limit = GetQueryInt(req, "limit", 100);
+            var hours = GetQueryInt(req, "hours", 6);
+            var query = new RuntimeEventQuery
+            {
+                Limit = limit,
+                WindowHours = hours,
+                Category = req.QueryString["category"],
+                EventName = req.QueryString["eventName"],
+                Outcome = req.QueryString["outcome"],
+                BeforeSequence = GetQueryLong(req, "beforeSeq"),
+                SinceSequence = GetQueryLong(req, "sinceSeq"),
+                FromUtc = GetQueryUtc(req, "fromUtc"),
+                ToUtc = GetQueryUtc(req, "toUtc"),
+            };
+            await ServeJson(resp, Stats.ReadRuntimeEventReport(query), pretty: true);
         }
 
         private async Task HandleGetUltimatumMods(SimpleHttpResponse resp)
@@ -1049,6 +1078,22 @@ namespace AutoExile.WebServer
             return int.TryParse(val, out var result) ? result : defaultValue;
         }
 
+        private static long? GetQueryLong(SimpleHttpRequest req, string key)
+        {
+            var val = req.QueryString[key];
+            return long.TryParse(val, out var result) && result > 0 ? result : null;
+        }
+
+        private static DateTimeOffset? GetQueryUtc(SimpleHttpRequest req, string key)
+        {
+            var val = req.QueryString[key];
+            return DateTimeOffset.TryParse(val, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AssumeUniversal |
+                System.Globalization.DateTimeStyles.AdjustToUniversal, out var result)
+                ? result
+                : null;
+        }
+
         private static async Task ServeJson(SimpleHttpResponse resp, object data, bool pretty = false)
         {
             resp.ContentType = "application/json; charset=utf-8";
@@ -1109,6 +1154,10 @@ namespace AutoExile.WebServer
         public int ExplorationRegions { get; init; }
 
         public int LootCandidates { get; init; }
+        public int LootLabelEntries { get; init; }
+        public int LootVisibleLabels { get; init; }
+        public int LootScanFaults { get; init; }
+        public string LootScanError { get; init; } = "";
         public float SessionChaos { get; init; }
         public float ChaosPerHour { get; init; }
         public float ChaosPerDivine { get; init; }

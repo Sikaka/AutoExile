@@ -2,6 +2,7 @@ using ExileCore;
 using ExileCore.PoEMemory.MemoryObjects;
 using ExileCore.Shared.Enums;
 using System.Numerics;
+using AutoExile.Statistics;
 using System.Windows.Forms;
 
 namespace AutoExile.Systems
@@ -14,6 +15,7 @@ namespace AutoExile.Systems
     /// </summary>
     public class NavigationSystem
     {
+        public StatsService? Stats { get; set; }
         // Movement keys — read from CombatSystem each tick via BotCore sync
         public Keys MoveKey { get; set; } = Keys.T;
 
@@ -80,7 +82,19 @@ namespace AutoExile.Systems
         private const int MaxRecoveriesBeforeRepath = 3;
         private const float InteractSearchRadius = 28f; // grid units to search for interactables
         public int StuckRecoveries => _totalStuckRecoveries;
-        public string LastRecoveryAction { get; private set; } = "";
+        private string _lastRecoveryAction = "";
+        public string LastRecoveryAction
+        {
+            get => _lastRecoveryAction;
+            private set
+            {
+                if (string.Equals(_lastRecoveryAction, value, StringComparison.Ordinal)) return;
+                _lastRecoveryAction = value;
+                if (!string.IsNullOrWhiteSpace(value))
+                    Stats?.RecordRuntimeEvent("navigation", "recovery", "attempted", value,
+                        new { destination = Destination, waypoint = CurrentWaypointIndex });
+            }
+        }
         private static readonly Random _rng = new();
 
         // Obstacle injection — modes can mark grid positions as blocked (e.g. locked puzzle doors)
@@ -701,6 +715,8 @@ namespace AutoExile.Systems
         /// </summary>
         public bool NavigateTo(GameController gc, Vector2 gridTarget, int maxNodes = 0)
         {
+            Stats?.RecordRuntimeEvent("navigation", "navigate_to", "attempted", null,
+                new { x = gridTarget.X, y = gridTarget.Y, maxNodes });
             var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
             var pfGrid = gc.IngameState.Data.RawFramePathfindingData;
 

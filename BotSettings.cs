@@ -357,7 +357,7 @@ namespace AutoExile
             public RangeNode<int> BestFindsMinChaosValue { get; set; } = new RangeNode<int>(100, 0, 10000);
 
             [Menu("Ignore Quest Items", "Skip quest items (heist contracts, etc.) during loot pickup.")]
-            public ToggleNode IgnoreQuestItems { get; set; } = new ToggleNode(true);
+            public ToggleNode IgnoreQuestItems { get; set; } = new ToggleNode(false);
 
             // --- Cluster Jewel Filtering ---
 

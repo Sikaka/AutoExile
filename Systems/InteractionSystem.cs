@@ -249,6 +249,32 @@ namespace AutoExile.Systems
         {
             var target = _currentTarget!;
 
+            // The hover/click transaction is asynchronous. Do not count a scheduled
+            // transaction as a click, and do not schedule another one until its real
+            // terminal result is available.
+            if (BotInput.IsLabelClickInProgress(target.EntityId))
+            {
+                Status = "Verifying loot label...";
+                return InteractionResult.InProgress;
+            }
+
+            if (BotInput.TryConsumeLabelClickResult(target.EntityId, out var clickResult))
+            {
+                _lastClickTime = DateTime.Now;
+                _clickAttempts++;
+                if (clickResult == BotInput.LabelClickResult.ClickSent)
+                {
+                    Status = $"Clicked item (attempt {_clickAttempts}) — awaiting confirmation";
+                }
+                else
+                {
+                    Status = $"Loot label verification failed (attempt {_clickAttempts})";
+                    if (_clickAttempts >= MaxClickAttempts)
+                        LastFailReason = "label click verification failed";
+                }
+                return InteractionResult.InProgress;
+            }
+
             // Stop navigation before clicking — if the player is walking, clicks miss because
             // the camera/label positions are shifting every frame. This is critical for items
             // picked up "in radius" (requireProximity=false) where no navigate phase runs.
@@ -358,10 +384,12 @@ namespace AutoExile.Systems
             Func<SharpDX.RectangleF?> rectProvider = () =>
             {
                 var (f, desc) = FindGroundItemLabel(gc, entityId);
-                return f && desc?.Label != null &&
-                    (desc.Label.IsVisible || desc.Label.IsVisibleLocal)
-                    ? desc.ClientRect
-                    : null;
+                if (!f || desc?.Label == null ||
+                    (!desc.Label.IsVisible && !desc.Label.IsVisibleLocal))
+                    return null;
+
+                var freshRect = desc.ClientRect;
+                return BotInput.IsRectOnScreen(freshRect) ? freshRect : null;
             };
             var sent = BotInput.ClickLabelVerified(gc, labelRect, worldEntity, rectProvider);
             if (!sent)
@@ -370,9 +398,7 @@ namespace AutoExile.Systems
                 return InteractionResult.InProgress;
             }
 
-            _lastClickTime = DateTime.Now;
-            _clickAttempts++;
-            Status = $"Clicking item (attempt {_clickAttempts})";
+            Status = "Verifying loot label before click";
 
             return InteractionResult.InProgress;
         }

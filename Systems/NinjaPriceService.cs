@@ -3,6 +3,7 @@ using ExileCore.PoEMemory.Components;
 using ExileCore.PoEMemory.MemoryObjects;
 using ExileCore.Shared.Enums;
 using System.Net.Http;
+using System.Text;
 using System.Text.Json;
 
 namespace AutoExile.Systems
@@ -21,6 +22,7 @@ namespace AutoExile.Systems
         public string Status { get; private set; } = "not initialized";
         public DateTime LastRefreshTime { get; private set; } = DateTime.MinValue;
         public int RefreshIntervalMinutes { get; set; } = 20;
+        public double UnidentifiedVoicesChaosValue => Volatile.Read(ref _unidentifiedVoicesChaosValue);
 
         // ── Internal state ──
 
@@ -40,6 +42,7 @@ namespace AutoExile.Systems
 
         // Currency prices need special handling (different API shape)
         private volatile Dictionary<string, double> _currencyPrices = new();
+        private double _unidentifiedVoicesChaosValue;
 
         // Unique art path → list of possible unique names
         private volatile Dictionary<string, List<string>> _uniqueArtMapping = new();
@@ -377,6 +380,26 @@ namespace AutoExile.Systems
             var mapping = _uniqueArtMapping;
             if (!mapping.TryGetValue(artPath, out var candidateNames) || candidateNames.Count == 0)
                 return PriceResult.Zero;
+
+            if (candidateNames.Any(name => name.Equals("Voices", StringComparison.OrdinalIgnoreCase)))
+            {
+                var unidentifiedValue = Volatile.Read(ref _unidentifiedVoicesChaosValue);
+                if (unidentifiedValue > 0)
+                {
+                    return new PriceResult
+                    {
+                        MinChaosValue = unidentifiedValue,
+                        MaxChaosValue = unidentifiedValue,
+                        MatchCount = 1,
+                        DetailsId = "trade:unidentified-voices",
+                    };
+                }
+
+                // Preserve the safe pickup range if the trade endpoint is temporarily
+                // unavailable. Persisted statistics use PriceResult.EstimatedChaosValue,
+                // so this ambiguity cannot become the one-passive maximum in history.
+                return PriceVoices(entity);
+            }
 
             // Get the item's actual link count to filter price entries
             // poe.ninja has separate entries for 0-link, 5-link, 6-link variants
@@ -927,6 +950,9 @@ namespace AutoExile.Systems
                         await Task.Delay(200); // Rate limit
                     }
 
+                    var unidentifiedVoicesValue = await FetchUnidentifiedVoicesPrice(
+                        league, newCurrencyPrices, cacheDir);
+
                     // Write metadata
                     try
                     {
@@ -939,6 +965,7 @@ namespace AutoExile.Systems
                     // Atomic swap
                     _prices = newPrices;
                     _currencyPrices = newCurrencyPrices;
+                    Volatile.Write(ref _unidentifiedVoicesChaosValue, unidentifiedVoicesValue);
                     _priceCount = totalEntries;
                     LastRefreshTime = DateTime.Now;
                     Status = $"loaded {totalEntries} prices ({successCount}/{totalEndpoints} endpoints)";
@@ -954,6 +981,114 @@ namespace AutoExile.Systems
                     _refreshing = false;
                 }
             });
+        }
+
+        private async Task<double> FetchUnidentifiedVoicesPrice(string league,
+            IReadOnlyDictionary<string, double> currencyPrices, string cacheDir)
+        {
+            var cacheFile = Path.Combine(cacheDir, "UnidentifiedVoices.json");
+            try
+            {
+                var payload = new
+                {
+                    query = new
+                    {
+                        status = new { option = "online" },
+                        name = "Voices",
+                        type = "Large Cluster Jewel",
+                        stats = new[] { new { type = "and", filters = Array.Empty<object>() } },
+                        filters = new
+                        {
+                            type_filters = new { filters = new { rarity = new { option = "unique" } } },
+                            misc_filters = new { filters = new { identified = new { option = "false" } } },
+                        },
+                    },
+                    sort = new { price = "asc" },
+                };
+
+                var searchUrl = $"https://www.pathofexile.com/api/trade/search/{Uri.EscapeDataString(league)}";
+                using var request = new HttpRequestMessage(HttpMethod.Post, searchUrl)
+                {
+                    Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"),
+                };
+                using var searchResponse = await _http.SendAsync(request);
+                searchResponse.EnsureSuccessStatusCode();
+                using var searchJson = JsonDocument.Parse(await searchResponse.Content.ReadAsStringAsync());
+                var root = searchJson.RootElement;
+                var queryId = root.GetProperty("id").GetString();
+                var ids = root.GetProperty("result").EnumerateArray()
+                    .Select(value => value.GetString())
+                    .Where(value => !string.IsNullOrWhiteSpace(value))
+                    .Take(10)
+                    .ToArray();
+                if (string.IsNullOrWhiteSpace(queryId) || ids.Length == 0)
+                    throw new InvalidOperationException("no unidentified Voices listings");
+
+                var fetchUrl = $"https://www.pathofexile.com/api/trade/fetch/{string.Join(',', ids)}" +
+                    $"?query={Uri.EscapeDataString(queryId)}";
+                using var fetchResponse = await _http.GetAsync(fetchUrl);
+                fetchResponse.EnsureSuccessStatusCode();
+                using var fetchJson = JsonDocument.Parse(await fetchResponse.Content.ReadAsStringAsync());
+
+                var values = new List<double>();
+                foreach (var result in fetchJson.RootElement.GetProperty("result").EnumerateArray())
+                {
+                    if (!result.TryGetProperty("listing", out var listing) ||
+                        !listing.TryGetProperty("price", out var price) ||
+                        !price.TryGetProperty("amount", out var amountElement) ||
+                        !price.TryGetProperty("currency", out var currencyElement))
+                        continue;
+
+                    var amount = amountElement.GetDouble();
+                    var currency = currencyElement.GetString() ?? "";
+                    double chaosValue;
+                    if (currency.Equals("chaos", StringComparison.OrdinalIgnoreCase))
+                        chaosValue = amount;
+                    else if (currency.Equals("divine", StringComparison.OrdinalIgnoreCase) &&
+                             currencyPrices.TryGetValue("Divine Orb", out var divineChaos))
+                        chaosValue = amount * divineChaos;
+                    else
+                        continue;
+
+                    if (chaosValue > 0) values.Add(chaosValue);
+                }
+
+                if (values.Count == 0)
+                    throw new InvalidOperationException("no convertible unidentified Voices listings");
+
+                values.Sort();
+                var middle = values.Count / 2;
+                var median = values.Count % 2 == 0
+                    ? (values[middle - 1] + values[middle]) / 2d
+                    : values[middle];
+                try
+                {
+                    File.WriteAllText(cacheFile, JsonSerializer.Serialize(new
+                    {
+                        chaosValue = median,
+                        fetchedAtUtc = DateTime.UtcNow,
+                    }));
+                }
+                catch { }
+
+                _log($"Unidentified Voices market value: {median:F1}c ({values.Count} listings)");
+                return median;
+            }
+            catch (Exception ex)
+            {
+                _log($"Unidentified Voices price failed: {ex.Message}");
+                try
+                {
+                    if (File.Exists(cacheFile))
+                    {
+                        using var cached = JsonDocument.Parse(File.ReadAllText(cacheFile));
+                        if (cached.RootElement.TryGetProperty("chaosValue", out var value))
+                            return value.GetDouble();
+                    }
+                }
+                catch { }
+                return 0;
+            }
         }
 
         private async Task<string?> FetchWithCache(string url, string cacheFile, string endpointType)

@@ -2,7 +2,7 @@ namespace AutoExile.Statistics
 {
     public sealed class StatsSnapshot
     {
-        public int SchemaVersion { get; init; } = 3;
+        public int SchemaVersion { get; init; } = 4;
         public long Revision { get; init; }
         public DateTime UpdatedAtUtc { get; init; } = DateTime.UtcNow;
         public StatsHealth Health { get; init; } = new();
@@ -111,5 +111,67 @@ namespace AutoExile.Statistics
         public string EventType { get; init; } = "";
         public int? Wave { get; init; }
         public string? Details { get; init; }
+    }
+
+    public sealed class RuntimeEventReport
+    {
+        public DateTime GeneratedAtUtc { get; init; } = DateTime.UtcNow;
+        public int WindowHours { get; init; }
+        public long TotalEvents { get; init; }
+        public DateTime? OldestEventUtc { get; init; }
+        public DateTime? NewestEventUtc { get; init; }
+        public RuntimeStorageSnapshot Storage { get; init; } = new();
+        public IReadOnlyList<RuntimeEventBreakdown> Categories { get; init; } = Array.Empty<RuntimeEventBreakdown>();
+        public IReadOnlyList<RuntimeEventBreakdown> Outcomes { get; init; } = Array.Empty<RuntimeEventBreakdown>();
+        public IReadOnlyList<RuntimeEventSnapshot> Events { get; init; } = Array.Empty<RuntimeEventSnapshot>();
+        public bool HasMore { get; init; }
+        public long? NextBeforeSequence { get; init; }
+        public string? Error { get; init; }
+    }
+
+    public sealed class RuntimeEventQuery
+    {
+        public int Limit { get; init; } = 100;
+        public int WindowHours { get; init; } = 6;
+        public string? Category { get; init; }
+        public string? EventName { get; init; }
+        public string? Outcome { get; init; }
+        public long? BeforeSequence { get; init; }
+        public long? SinceSequence { get; init; }
+        public DateTimeOffset? FromUtc { get; init; }
+        public DateTimeOffset? ToUtc { get; init; }
+    }
+
+    public sealed class RuntimeStorageSnapshot
+    {
+        public long DatabaseBytes { get; init; }
+        public long WalBytes { get; init; }
+        public long ShmBytes { get; init; }
+        public int RetentionDays { get; init; }
+        public int CriticalRetentionDays { get; init; }
+        public int RetentionRows { get; init; }
+        public int PendingWrites { get; init; }
+        public long DroppedEvents { get; init; }
+    }
+
+    public sealed class RuntimeEventBreakdown
+    {
+        public string Name { get; init; } = "";
+        public long Count { get; init; }
+    }
+
+    public sealed class RuntimeEventSnapshot
+    {
+        public long Sequence { get; init; }
+        public DateTime OccurredAtUtc { get; init; }
+        public long CommitLatencyMs { get; init; }
+        public int ProducerThreadId { get; init; }
+        public string? SessionId { get; init; }
+        public string? RunId { get; init; }
+        public string Category { get; init; } = "";
+        public string EventName { get; init; } = "";
+        public string Outcome { get; init; } = "";
+        public string? Reason { get; init; }
+        public string? ContextJson { get; init; }
     }
 }
