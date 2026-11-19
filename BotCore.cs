@@ -26,6 +26,12 @@ namespace AutoExile
 
         private BotContext _ctx = null!;
         private IBotMode _mode = new IdleMode();
+
+        /// <summary>
+        /// Full exception text if Initialise() threw. When set, _ctx and the web server
+        /// may be null, so Tick/Render/AreaChange skip their work and DrawSettings shows it.
+        /// </summary>
+        private string? _initError;
         private readonly Dictionary<string, IBotMode> _modes = new();
 
         // Systems
@@ -128,6 +134,23 @@ namespace AutoExile
         public override bool Initialise()
         {
             Name = "AutoExile";
+            try
+            {
+                InitialiseCore();
+                _initError = null;
+            }
+            catch (Exception ex)
+            {
+                // Without this, a failure here leaves _ctx null and every Tick/Render
+                // throws a NullReferenceException that hides the real cause.
+                _initError = ex.ToString();
+                LogError($"[AutoExile] Initialise failed: {_initError}");
+            }
+            return base.Initialise();
+        }
+
+        private void InitialiseCore()
+        {
             Instance = this;
             _recorder.SetOutputDir(Path.Combine(DirectoryFullName, "Recordings"));
             _mavenRecorder.Initialize(DirectoryFullName);
@@ -292,8 +315,6 @@ namespace AutoExile
                 _webServer.GetPlayerBuffs = GetPlayerBuffsForWebUI;
                 _webServer.Start();
             }
-
-            return base.Initialise();
         }
 
         /// <summary>
@@ -357,6 +378,7 @@ namespace AutoExile
         /// </summary>
         public override void AreaChange(AreaInstance area)
         {
+            if (_initError != null) return;
             var currentArea = area?.Name ?? "";
             var currentHash = GameController.IngameState?.Data?.CurrentAreaHash ?? 0;
             if (currentHash == 0) return; // Not loaded yet
@@ -466,7 +488,7 @@ namespace AutoExile
 
         public override Job Tick()
         {
-            if (!Settings.Enable || !GameController.InGame)
+            if (_initError != null || !Settings.Enable || !GameController.InGame)
                 return base.Tick();
 
             // Web server: push status snapshot + process commands
@@ -773,7 +795,7 @@ namespace AutoExile
 
         public override void Render()
         {
-            if (!Settings.Enable || !GameController.InGame)
+            if (_initError != null || !Settings.Enable || !GameController.InGame)
                 return;
 
             // Toggle running hotkey — checked in Render so it's never blocked by early returns in Tick
@@ -944,10 +966,21 @@ namespace AutoExile
                 var errorDetail = _webServer?.LastError;
                 if (!string.IsNullOrEmpty(errorDetail))
                     ImGui.TextColored(new Vector4(1f, 0.5f, 0.5f, 1f), $"Web server failed: {errorDetail}");
+                else if (_webServer == null && _initError != null)
+                    ImGui.TextColored(new Vector4(1f, 0.5f, 0.5f, 1f), "Web server not created — plugin initialisation failed (see error below)");
                 else if (_webServer == null)
                     ImGui.TextColored(new Vector4(1f, 0.5f, 0.5f, 1f), "Web server not created — check WebUiEnabled setting, restart plugin");
                 else
                     ImGui.TextColored(new Vector4(1f, 0.5f, 0.5f, 1f), "Web server not running — restart plugin");
+            }
+
+            if (_initError != null)
+            {
+                ImGui.Separator();
+                ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), "AutoExile failed to initialise — bot is disabled. Fix the error and reload the plugin:");
+                ImGui.TextWrapped(_initError);
+                if (ImGui.SmallButton("Copy error"))
+                    ImGui.SetClipboardText(_initError);
             }
 
             ImGui.Separator();
