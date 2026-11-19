@@ -203,15 +203,15 @@ namespace AutoExile.Systems
 
         private void CheckTriggers(GameController gc, float hpPercent, bool isAlive, NavigationSystem nav)
         {
-            if ((DateTime.Now - _lastDumpTime).TotalMilliseconds < DumpCooldownMs)
-                return;
-
-            // Navigation stuck recovery (one dump per Repath episode)
+            // Navigation stuck recovery (one dump per Repath episode); reset the episode
+            // memo before the cooldown so a new episode is not lost inside it.
             if (nav.StuckRecoveries <= 0 || nav.LastRecoveryAction != "Repath")
             {
                 _lastDumpedRecoveryCount = -1;
                 return;
             }
+            if ((DateTime.Now - _lastDumpTime).TotalMilliseconds < DumpCooldownMs)
+                return;
             if (nav.StuckRecoveries == _lastDumpedRecoveryCount) return;
             if (string.IsNullOrEmpty(_outputDir) || _count == 0) return;
 
@@ -220,19 +220,19 @@ namespace AutoExile.Systems
                 _autoDumpTicks.Dequeue();
 
             RefreshFolderCount(now);
-            string? skipReason = null;
-            if (_autoDumpTicks.Count >= MaxAutoDumpsPerHour)
-                skipReason = $"{MaxAutoDumpsPerHour} automatic dumps already written in the last hour";
-            else if (_folderRecordingCount >= MaxFolderRecordings)
-                skipReason = $"{_folderRecordingCount} recording_*.json files in {_outputDir}";
-            else if (_folderRecordingCount < 0)
+            var hourlyCap = _autoDumpTicks.Count >= MaxAutoDumpsPerHour;
+            var folderCap = !hourlyCap && _folderRecordingCount >= MaxFolderRecordings;
+            if (!hourlyCap && !folderCap && _folderRecordingCount < 0)
                 return;
 
-            if (skipReason != null)
+            if (hourlyCap || folderCap)
             {
                 if (now - _lastSkipLogAt >= SkipLogIntervalMs)
                 {
                     _lastSkipLogAt = now;
+                    var skipReason = hourlyCap
+                        ? $"{MaxAutoDumpsPerHour} automatic dumps already written in the last hour"
+                        : $"{_folderRecordingCount} recording_*.json files in {_outputDir}";
                     DebugWindow.LogMsg($"[BotRecorder] Automatic dump skipped: {skipReason}. Deleting old recordings resumes it.");
                 }
                 return;
@@ -261,7 +261,7 @@ namespace AutoExile.Systems
                         : 0;
                     Volatile.Write(ref _folderRecordingCount, n);
                 }
-                catch { }
+                catch { Volatile.Write(ref _folderRecordingCount, 0); } // fail open; hourly cap still applies
                 finally { Volatile.Write(ref _folderCountRefreshing, 0); }
             });
         }
@@ -313,7 +313,21 @@ namespace AutoExile.Systems
                             WriteIndented = false,
                             DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingDefault
                         });
-                        File.WriteAllText(path, json);
+                        // Exclusive create: never overwrite; bump the suffix if the name is taken.
+                        var stem = Path.Combine(Path.GetDirectoryName(path)!, Path.GetFileNameWithoutExtension(path));
+                        for (int attempt = 0; attempt < 20; attempt++)
+                        {
+                            var target = attempt == 0 ? path : $"{stem}_{attempt + 1}.json";
+                            FileStream fs;
+                            try { fs = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None); }
+                            catch (IOException) when (File.Exists(target)) { continue; }
+                            using (fs)
+                            {
+                                var bytes = new System.Text.UTF8Encoding(false).GetBytes(json);
+                                fs.Write(bytes, 0, bytes.Length);
+                            }
+                            break;
+                        }
                     }
                     catch { }
                 });
