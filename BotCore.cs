@@ -1032,6 +1032,11 @@ namespace AutoExile
         private const double TerrainRefreshIntervalSec = 3.0;
         private DateTime _lastForensicsSnapshot = DateTime.MinValue;
         private string _lastForensicsSignature = "";
+        private string _lastForensicsVolatile = "";
+        private const double ForensicsVolatileFloorSeconds = 5.0;
+        private long _webSnapshotErrorLogTick;
+        private string _webSnapshotErrorLast = "";
+        private int _webSnapshotErrorSuppressed;
         private const double ForensicsSnapshotHeartbeatSeconds = 15.0;
 
         private void EmitForensicsSnapshot()
@@ -1048,14 +1053,20 @@ namespace AutoExile
             else if (_mode is FollowerMode follower) { phase = follower.State.ToString(); decision = follower.Decision; status = follower.StatusText; }
             else if (_mode is LabyrinthMode lab) { phase = lab.Phase.ToString(); status = lab.StatusText; }
             var target = _combat.BestTarget;
-            var signature = $"{Settings.Running.Value}|{_mode.Name}|{area}|{hash}|{phase}|{decision}|{status}|{_navigation.IsNavigating}|{_navigation.CurrentWaypointIndex}|{_navigation.LastRecoveryAction}|{_simulacrumMode?.State.CurrentWave}|{_combat.NearbyMonsterCount}";
+            var recoveryKind = _navigation.LastRecoveryAction ?? "";
+            var recoveryParen = recoveryKind.IndexOf('(');
+            if (recoveryParen > 0) recoveryKind = recoveryKind.Substring(0, recoveryParen).TrimEnd();
+            var signature = $"{Settings.Running.Value}|{_mode.Name}|{area}|{hash}|{phase}|{_navigation.IsNavigating}|{recoveryKind}|{_simulacrumMode?.State.CurrentWave}|{_simulacrumMode?.State.IsWaveActive}";
+            var volatileSig = $"{decision}|{status}";
             var elapsed = (now - _lastForensicsSnapshot).TotalSeconds;
             var stateChanged = !string.Equals(signature, _lastForensicsSignature, StringComparison.Ordinal);
+            var volatileChanged = elapsed >= ForensicsVolatileFloorSeconds
+                && !string.Equals(volatileSig, _lastForensicsVolatile, StringComparison.Ordinal);
             // Keep state transitions at one-second resolution, but collapse an unchanged
             // state to a 15-second heartbeat so idle/retry periods cannot bury critical
             // stop/start evidence under identical snapshots.
-            if ((!stateChanged && elapsed < ForensicsSnapshotHeartbeatSeconds) || elapsed < 1) return;
-            _lastForensicsSnapshot = now; _lastForensicsSignature = signature;
+            if ((!stateChanged && !volatileChanged && elapsed < ForensicsSnapshotHeartbeatSeconds) || elapsed < 1) return;
+            _lastForensicsSnapshot = now; _lastForensicsSignature = signature; _lastForensicsVolatile = volatileSig;
             _stats.RecordRuntimeEvent("state", "snapshot", "observed", context: new {
                 running = Settings.Running.Value, mode = _mode.Name, area, areaHash = hash, phase, decision, status,
                 playerX = player.X, playerY = player.Y, wave = _simulacrumMode?.State.CurrentWave ?? 0,
@@ -1298,7 +1309,16 @@ namespace AutoExile
             catch (Exception ex)
             {
                 // Log the crash so we can diagnose — don't let it kill future updates
-                LogMessage($"[AutoExile] Web snapshot error: {ex.Message}");
+                var nowTick = Environment.TickCount64;
+                if (ex.Message != _webSnapshotErrorLast || nowTick - _webSnapshotErrorLogTick >= 60000)
+                {
+                    var suppressed = _webSnapshotErrorSuppressed;
+                    LogMessage($"[AutoExile] Web snapshot error: {ex.Message}" + (suppressed > 0 ? $" (+{suppressed} similar suppressed)" : ""));
+                    _webSnapshotErrorLast = ex.Message;
+                    _webSnapshotErrorLogTick = nowTick;
+                    _webSnapshotErrorSuppressed = 0;
+                }
+                else _webSnapshotErrorSuppressed++;
             }
         }
 
