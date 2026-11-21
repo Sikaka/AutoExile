@@ -61,8 +61,8 @@ namespace AutoExile.UI
             var baseSy = Math.Max(1f, _lineH / 16f);
             var details = sim != null && expanded;
 
-            // Fit above maxBottom (the chat): first drop the extra row spacing, then cut the decision to
-            // one line, then drop the monsters/ignored row.
+            // Fit above maxBottom (the chat): first cut the decision to one line, then drop the
+            // monsters/ignored row, and only then drop the extra row spacing (tight rows read as cramped).
             var showLive = true;
             var decision = details ? Wrap(sim!.Decision, ContentW, 2) : Array.Empty<string>();
             IReadOnlyList<string> warnings = Array.Empty<string>();
@@ -70,9 +70,9 @@ namespace AutoExile.UI
             var rows = 0;
             for (var step = 0; step < 4; step++)
             {
-                _sy = baseSy * (step == 0 ? RowSpacing : 1f);
-                if (step == 2 && decision.Length > 1) decision = Wrap(sim!.Decision, ContentW, 1);
-                if (step == 3) showLive = false;
+                _sy = baseSy * (step < 3 ? RowSpacing : 1f);
+                if (step == 1 && decision.Length > 1) decision = Wrap(sim!.Decision, ContentW, 1);
+                if (step == 2 && details) showLive = false;
 
                 // Without the details row, the ignored-item count shows as a warning instead.
                 warnings = sim == null ? Array.Empty<string>()
