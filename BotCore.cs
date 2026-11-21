@@ -927,13 +927,17 @@ namespace AutoExile
             // The mode HUD starts below the two global status lines (and recorder line).
             var windowRect = GameController.Window.GetWindowRectangle();
             var hudTop = Math.Clamp(windowRect.Height * 0.12f, 120f, 180f);
-            _ctx.ModeHudTop = hudTop + (_humanRecorder.IsRecording ? 60f : 44f);
+            var compactHud = Settings.CompactHud.Value;
+            _ctx.ModeHudTop = hudTop + (compactHud
+                ? (_humanRecorder.IsRecording ? 38f : 22f)
+                : (_humanRecorder.IsRecording ? 60f : 44f));
 
             // Status overlay
             var running = Settings.Running.Value;
             var color = running ? SharpDX.Color.LimeGreen : SharpDX.Color.Yellow;
             var status = running ? $"BOT: {_mode.Name}" : $"BOT: PAUSED ({_mode.Name})";
-            Graphics.DrawText(status, new Vector2(100, hudTop), color);
+            if (!compactHud)
+                Graphics.DrawText(status, new Vector2(100, hudTop), color);
 
             // Runtime line — shows elapsed (always) + remaining (when limit set).
             // Pause time is excluded automatically by RuntimeTracker.
@@ -958,13 +962,22 @@ namespace AutoExile
                             :  pctLeft < 0.10              ? SharpDX.Color.Orange
                             :                                SharpDX.Color.LightGray;
             }
-            Graphics.DrawText(runtimeText, new Vector2(100, hudTop + 16f), runtimeColor);
+            if (compactHud)
+            {
+                var compactText = maxMin <= 0
+                    ? $"{status} • {elapsedStr}"
+                    : $"{status} • {elapsedStr} / {maxMin / 60}:{(maxMin % 60):D2} (-{(int)_runtime.Remaining(maxMin).TotalHours}:{_runtime.Remaining(maxMin).Minutes:D2})";
+                var compactColor = runtimeColor != SharpDX.Color.LightGray ? runtimeColor : color;
+                Graphics.DrawText(compactText, new Vector2(100, hudTop), compactColor);
+            }
+            else
+                Graphics.DrawText(runtimeText, new Vector2(100, hudTop + 16f), runtimeColor);
 
             // Human recorder indicator
             if (_humanRecorder.IsRecording)
             {
                 var recText = $"REC  {_humanRecorder.TicksRecorded} ticks";
-                Graphics.DrawText(recText, new Vector2(100, hudTop + 36f), SharpDX.Color.Red);
+                Graphics.DrawText(recText, new Vector2(100, hudTop + (compactHud ? 16f : 36f)), SharpDX.Color.Red);
             }
 
             // Loot tracker overlay (top-right area)
@@ -1056,6 +1069,10 @@ namespace AutoExile
             var enable = Settings.Enable.Value;
             if (ImGui.Checkbox("Enable", ref enable))
                 Settings.Enable.Value = enable;
+
+            var compact = Settings.CompactHud.Value;
+            if (ImGui.Checkbox("Compact HUD", ref compact))
+                Settings.CompactHud.Value = compact;
 
             ImGui.Separator();
             ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f), "All settings are managed via the web dashboard.");

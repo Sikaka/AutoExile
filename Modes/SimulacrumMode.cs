@@ -1806,6 +1806,56 @@ namespace AutoExile.Modes
             or SimPhase.LootSweep
             or SimPhase.ExitMap;
 
+        private float RenderCompactHud(BotContext ctx, ExileCore.Graphics g, float hudX, float hudY, float lineH)
+        {
+            var stats = ctx.Stats.Snapshot;
+            var currentRun = stats.CurrentRun;
+
+            var runText = currentRun != null
+                ? FormatHudDuration(DateTime.UtcNow - currentRun.ActivatedAtUtc)
+                : "--";
+            g.DrawText($"SIM {_phase} • W{_state.CurrentWave}/15 {(_state.IsWaveActive ? "ACTIVE" : "idle")} • D{_state.DeathCount}/{ctx.Settings.Run.MaxDeaths.Value} • run {runText}",
+                new Vector2(hudX, hudY),
+                _state.IsWaveActive ? SharpDX.Color.Red : SharpDX.Color.Cyan);
+            hudY += lineH;
+
+            // Decision is never cleared, so it goes stale; StatusText tracks the live step.
+            var live = StatusText;
+            if (!string.IsNullOrEmpty(live))
+            {
+                if (live.Length > 70)
+                    live = live.Substring(0, 69) + "…";
+                g.DrawText(live, new Vector2(hudX, hudY), SharpDX.Color.LightGreen);
+                hudY += lineH;
+            }
+
+            var chaosPerDivine = ctx.NinjaPrice.ChaosPerDivine;
+            var runLoot = "--";
+            if (currentRun != null)
+            {
+                var runValue = chaosPerDivine > 0
+                    ? $"{currentRun.ChaosValue / chaosPerDivine:F2} div"
+                    : $"{currentRun.ChaosValue:F1}c";
+                runLoot = $"{currentRun.ItemsLooted} • {runValue}";
+            }
+            g.DrawText($"Run loot {runLoot}", new Vector2(hudX, hudY), SharpDX.Color.Gold);
+            hudY += lineH;
+
+            if (stats.Health.Status != "healthy")
+            {
+                g.DrawText($"Stats {stats.Health.Status}", new Vector2(hudX, hudY), SharpDX.Color.OrangeRed);
+                hudY += lineH;
+            }
+
+            if (ctx.Interaction.IsBusy)
+            {
+                g.DrawText($"Interact: {ctx.Interaction.Status}", new Vector2(hudX, hudY), SharpDX.Color.Yellow);
+                hudY += lineH;
+            }
+
+            return hudY;
+        }
+
         public void Render(BotContext ctx)
         {
             if (ctx.Graphics == null) return;
@@ -1818,6 +1868,11 @@ namespace AutoExile.Modes
             var hudX = 20f;
             var lineH = 16f;
 
+            var compactHud = ctx.Settings.CompactHud.Value;
+            if (compactHud)
+                hudY = RenderCompactHud(ctx, g, hudX, hudY, lineH);
+            else
+            {
             g.DrawText($"SIMULACRUM • {_phase}", new Vector2(hudX, hudY), SharpDX.Color.Gold);
             hudY += lineH;
             g.DrawText(StatusText, new Vector2(hudX, hudY), SharpDX.Color.LightGreen);
@@ -1878,6 +1933,7 @@ namespace AutoExile.Modes
                     new Vector2(hudX, hudY), SharpDX.Color.Yellow);
                 hudY += lineH;
             }
+            }
 
             // --- World drawing (only in map) ---
             if (gc.Area.CurrentArea.IsHideout || gc.Area.CurrentArea.IsTown)
@@ -1920,9 +1976,12 @@ namespace AutoExile.Modes
             }
 
             // Monster count
-            g.DrawText($"Monsters: {ctx.Combat.NearbyMonsterCount}",
-                new Vector2(hudX, hudY), SharpDX.Color.Gray);
-            hudY += lineH;
+            if (!compactHud)
+            {
+                g.DrawText($"Monsters: {ctx.Combat.NearbyMonsterCount}",
+                    new Vector2(hudX, hudY), SharpDX.Color.Gray);
+                hudY += lineH;
+            }
 
             // Failed loot count
             if (ctx.Loot.FailedCount > 0)

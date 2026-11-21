@@ -60,6 +60,9 @@ namespace AutoExile
         [Menu("Debug Incubator Overlay", "Show equipment slot indices and stash item rects when inventory/stash is open.")]
         public ToggleNode DebugIncubatorOverlay { get; set; } = new ToggleNode(false);
 
+        [Menu("Compact HUD", "Show a short in-game overlay instead of the full stats block.")]
+        public ToggleNode CompactHud { get; set; } = new ToggleNode(true);
+
         [Menu("Debug Perf Overlay", "Show per-section tick timings (avg/max ms) and loot/interaction/explore failure tallies during wave farming.")]
         public ToggleNode DebugPerfOverlay { get; set; } = new ToggleNode(false);
 
