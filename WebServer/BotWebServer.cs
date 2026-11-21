@@ -35,7 +35,7 @@ namespace AutoExile.WebServer
         private readonly List<WebSocket> _wsClients = new();
         private readonly object _wsLock = new();
         private const int MaxWebSocketClients = 8;
-        private static readonly TimeSpan WebSocketSendTimeout = TimeSpan.FromSeconds(3);
+        private const long WebSocketSendTimeoutMs = 3000;
 
         // Self-healing: BotCore calls CheckHealth periodically
         private long _nextHealthCheckAtMs;
@@ -578,6 +578,7 @@ namespace AutoExile.WebServer
 
         private async Task BroadcastLoop(CancellationToken ct)
         {
+            var sendsInFlight = new Dictionary<WebSocket, (Task Send, long StartedAtMs)>();
             while (!ct.IsCancellationRequested)
             {
                 try
@@ -590,10 +591,44 @@ namespace AutoExile.WebServer
                     if (clients.Count == 0) continue;
 
                     var json = JsonSerializer.SerializeToUtf8Bytes(_currentStatus, JsonOpts);
+                    var segment = new ArraySegment<byte>(json);
+                    var now = Environment.TickCount64;
 
-                    // Send to every client in parallel with a deadline: one stalled peer
-                    // must not freeze the live view for the others.
-                    await Task.WhenAll(clients.Select(ws => SendWithDeadline(ws, json, ct)));
+                    foreach (var gone in sendsInFlight.Keys.Where(ws => !clients.Contains(ws)).ToList())
+                        sendsInFlight.Remove(gone);
+
+                    // Each client gets its own send task and the loop never awaits one: a peer
+                    // that stops reading only misses frames, and is dropped once its send has
+                    // been stuck past the deadline. This does not rely on SendAsync honouring
+                    // cancellation, which a stalled socket may not do.
+                    foreach (var ws in clients)
+                    {
+                        if (sendsInFlight.TryGetValue(ws, out var inFlight))
+                        {
+                            if (!inFlight.Send.IsCompleted)
+                            {
+                                if (now - inFlight.StartedAtMs > WebSocketSendTimeoutMs)
+                                    DropWebSocket(ws, sendsInFlight);
+                                continue;
+                            }
+                            sendsInFlight.Remove(ws);
+                            if (!inFlight.Send.IsCompletedSuccessfully)
+                            {
+                                DropWebSocket(ws, sendsInFlight);
+                                continue;
+                            }
+                        }
+
+                        if (ws.State != WebSocketState.Open)
+                        {
+                            DropWebSocket(ws, sendsInFlight);
+                            continue;
+                        }
+
+                        var send = Task.Run(() => ws.SendAsync(segment, WebSocketMessageType.Text, true, ct));
+                        _ = send.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+                        sendsInFlight[ws] = (send, now);
+                    }
                 }
                 catch (OperationCanceledException) { break; }
                 catch (Exception ex)
@@ -603,30 +638,16 @@ namespace AutoExile.WebServer
             }
         }
 
-        private async Task SendWithDeadline(WebSocket ws, byte[] json, CancellationToken ct)
+        private void DropWebSocket(WebSocket ws, Dictionary<WebSocket, (Task Send, long StartedAtMs)> sendsInFlight)
         {
-            try
-            {
-                if (ws.State == WebSocketState.Open)
-                {
-                    using var sendCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                    sendCts.CancelAfter(WebSocketSendTimeout);
-                    await ws.SendAsync(new ArraySegment<byte>(json), WebSocketMessageType.Text, true, sendCts.Token);
-                    return;
-                }
-            }
-            catch when (ct.IsCancellationRequested)
-            {
-                return;
-            }
-            catch
-            {
-                // fall through: drop the client
-            }
-
+            sendsInFlight.Remove(ws);
             lock (_wsLock) { _wsClients.Remove(ws); }
-            // Abort also ends the client's receive loop, which releases its connection slot.
-            try { ws.Abort(); } catch { }
+            // Abort ends the client's receive loop, which releases its connection slot.
+            // Off-thread so a socket wedged in a send cannot hold up the broadcast loop.
+            _ = Task.Run(() =>
+            {
+                try { ws.Abort(); } catch { }
+            });
         }
 
         // ====================================================================
