@@ -550,6 +550,7 @@ CREATE TABLE IF NOT EXISTS stats_events(
  event_id TEXT PRIMARY KEY,source_key TEXT NOT NULL UNIQUE,session_id TEXT NOT NULL REFERENCES sessions(session_id),
  run_id TEXT REFERENCES runs(run_id),event_type TEXT NOT NULL,occurred_at_ms INTEGER NOT NULL,wave INTEGER,details TEXT);
 CREATE INDEX IF NOT EXISTS ix_events_time ON stats_events(occurred_at_ms DESC);
+CREATE INDEX IF NOT EXISTS ix_events_run ON stats_events(run_id,occurred_at_ms);
 CREATE TABLE IF NOT EXISTS loot_events(
  loot_id TEXT PRIMARY KEY,source_key TEXT NOT NULL UNIQUE,session_id TEXT NOT NULL REFERENCES sessions(session_id),
  run_id TEXT REFERENCES runs(run_id),picked_at_ms INTEGER NOT NULL,instance_hash INTEGER,area_name TEXT NOT NULL DEFAULT '',
@@ -1067,7 +1068,7 @@ CASE WHEN resumed_at_ms IS NULL THEN 0 ELSE MAX(0,$now-resumed_at_ms) END),0) FR
             };
         }
 
-        private static List<StatsRunSnapshot> ReadRuns(SqliteConnection db, string where, int limit)
+        private static List<StatsRunSnapshot> ReadRuns(SqliteConnection db, string where, int limit, string? runId = null)
         {
             using var cmd = db.CreateCommand();
             cmd.CommandText = $@"SELECT r.run_id,r.session_id,r.mode,r.consumed,r.state,r.result,r.terminal_reason,r.area_name,r.instance_hash,
@@ -1080,6 +1081,7 @@ r.data_quality FROM runs r LEFT JOIN simulacrum_runs s ON s.run_id=r.run_id
 {where} ORDER BY r.activated_at_ms DESC LIMIT $limit";
             cmd.Parameters.AddWithValue("$now", NowMs());
             cmd.Parameters.AddWithValue("$limit", limit);
+            if (runId != null) cmd.Parameters.AddWithValue("$runId", runId);
             var result = new List<StatsRunSnapshot>();
             using var reader = cmd.ExecuteReader();
             while (reader.Read()) result.Add(new StatsRunSnapshot

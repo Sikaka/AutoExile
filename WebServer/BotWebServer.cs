@@ -335,6 +335,9 @@ namespace AutoExile.WebServer
                         await ServeJson(resp, (Stats?.Snapshot.BestFinds ?? Array.Empty<StatsLootSnapshot>())
                             .Take(GetQueryInt(req, "limit", 20)), pretty: true);
                         break;
+                    case "/api/history/runs/detail" when method == "GET":
+                        await HandleHistoryRunDetail(req, resp);
+                        break;
                     case "/api/history/runs" when method == "GET":
                         await HandleHistoryRuns(req, resp);
                         break;
@@ -765,6 +768,40 @@ namespace AutoExile.WebServer
             var limit = GetQueryInt(req, "limit", 50);
             var data = (Stats?.Snapshot.RecentRuns ?? Array.Empty<StatsRunSnapshot>()).Take(limit);
             await ServeJson(resp, data, pretty: true);
+        }
+
+        private async Task HandleHistoryRunDetail(SimpleHttpRequest req, SimpleHttpResponse resp)
+        {
+            var runId = req.QueryString["runId"];
+            if (string.IsNullOrWhiteSpace(runId))
+            {
+                resp.StatusCode = 400;
+                await ServeJson(resp, new { error = "runId is required." }, pretty: true);
+                return;
+            }
+            if (Stats == null)
+            {
+                resp.StatusCode = 503;
+                await ServeJson(resp, new { error = "Stats service is not ready." }, pretty: true);
+                return;
+            }
+
+            StatsRunDetail? detail;
+            try { detail = Stats.ReadRunDetail(runId); }
+            catch (Exception ex)
+            {
+                resp.StatusCode = 503;
+                _log($"Run detail read failed for {runId}: {ex.GetType().Name}: {ex.Message}");
+                await ServeJson(resp, new { error = "Run detail unavailable." }, pretty: true);
+                return;
+            }
+            if (detail == null)
+            {
+                resp.StatusCode = 404;
+                await ServeJson(resp, new { error = "Run not found." }, pretty: true);
+                return;
+            }
+            await ServeJson(resp, detail, pretty: true);
         }
 
         private async Task HandleHistoryEvents(SimpleHttpRequest req, SimpleHttpResponse resp)

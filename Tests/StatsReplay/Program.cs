@@ -391,6 +391,107 @@ INSERT INTO simulacrum_runs(run_id,consumed) VALUES('old-run',1);";
             "a reused activation key did not create exactly one new run");
     }
 
+    var detailDb = Path.Combine(root, "run-detail", "stats.db");
+    using (var detailSetup = new StatsService(logs.Add, detailDb))
+    {
+        Require(detailSetup.Initialize(pluginDirectory), "run detail setup failed");
+        Flush(detailSetup);
+    }
+    const long t0 = 1_700_000_000_000L;
+    using (var seed = new SqliteConnection($"Data Source={detailDb};Pooling=False"))
+    {
+        seed.Open();
+        using var command = seed.CreateCommand();
+        command.CommandText = $@"
+INSERT INTO sessions(session_id,started_at_ms) VALUES('detail-session',{t0});
+INSERT INTO runs(run_id,session_id,mode,activation_key,area_name,state,result,terminal_reason,consumed,activated_at_ms,first_entry_at_ms,ended_at_ms,last_observed_at_ms,entry_count,death_count,wall_duration_ms)
+ VALUES('detail-sim','detail-session','Simulacrum','detail-a','Simulacrum','closed','partial','left',1,{t0},{t0 + 1000},{t0 + 200_000},{t0 + 200_000},1,1,200000);
+INSERT INTO simulacrum_runs(run_id,consumed,highest_wave_started,waves_completed) VALUES('detail-sim',1,4,3);
+INSERT INTO runs(run_id,session_id,mode,activation_key,area_name,state,result,consumed,activated_at_ms,last_observed_at_ms,wall_duration_ms)
+ VALUES('detail-boss','detail-session','Boss','detail-b','Arena','closed','completed',1,{t0 + 300_000},{t0 + 310_000},10000);
+INSERT INTO runs(run_id,session_id,mode,activation_key,area_name,state,result,consumed,activated_at_ms,last_observed_at_ms,wall_duration_ms)
+ VALUES('detail-big','detail-session','Boss','detail-c','Arena','closed','completed',1,{t0 + 400_000},{t0 + 500_000},100000);
+INSERT INTO runs(run_id,session_id,mode,activation_key,area_name,state,result,consumed,activated_at_ms,last_observed_at_ms,wall_duration_ms,data_quality)
+ VALUES('detail-legacy','detail-session','Simulacrum','detail-d','Simulacrum','closed','completed',1,{t0 + 600_000},{t0 + 700_000},100000,'legacy_partial');
+INSERT INTO simulacrum_runs(run_id,consumed,highest_wave_started,waves_completed) VALUES('detail-legacy',1,15,15);
+WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x<2001)
+INSERT INTO loot_events(loot_id,source_key,session_id,run_id,picked_at_ms,item_name,quantity,chaos_value_milli)
+ SELECT 'b'||x,'bs'||x,'detail-session','detail-big',{t0 + 400_000}+x,'Bulk',1,1000 FROM c;
+INSERT INTO stats_events(event_id,source_key,session_id,run_id,event_type,occurred_at_ms,wave) VALUES
+ ('e9','k9','detail-session','detail-sim','run_ended',{t0 + 200_000},3),
+ ('e1','k1','detail-session','detail-sim','run_started',{t0},NULL),
+ ('e2','k2','detail-session','detail-sim','wave_started',{t0 + 10_000},1),
+ ('e3','k3','detail-session','detail-sim','wave_completed',{t0 + 40_000},1),
+ ('e4','k4','detail-session','detail-sim','wave_started',{t0 + 62_000},2),
+ ('e5','k5','detail-session','detail-sim','wave_completed',{t0 + 102_000},2),
+ ('e6','k6','detail-session','detail-sim','wave_started',{t0 + 105_000},3),
+ ('e7','k7','detail-session','detail-sim','wave_completed',{t0 + 165_000},3),
+ ('e8','k8','detail-session','detail-sim','wave_started',{t0 + 170_000},4),
+ ('ed','kd','detail-session','detail-sim','death',{t0 + 80_000},NULL);
+INSERT INTO loot_events(loot_id,source_key,session_id,run_id,picked_at_ms,item_name,quantity,chaos_value_milli) VALUES
+ ('l5','s5','detail-session','detail-sim',{t0 + 180_000},'Alpha',1,1000),
+ ('l1','s1','detail-session','detail-sim',{t0 + 5_000},'Early',1,1000),
+ ('l2','s2','detail-session','detail-sim',{t0 + 20_000},'Alpha',1,2000),
+ ('l3','s3','detail-session','detail-sim',{t0 + 70_000},'Alpha',1,3000),
+ ('l4','s4','detail-session','detail-sim',{t0 + 110_000},'Beta',2,10000),
+ ('l6','s6','detail-session','detail-sim',{t0 + 105_000},'Gamma',1,500);";
+        command.ExecuteNonQuery();
+    }
+    using (var detailStats = new StatsService(logs.Add, detailDb))
+    {
+        Require(detailStats.Initialize(pluginDirectory), "run detail restart failed");
+        Flush(detailStats);
+        var detail = detailStats.ReadRunDetail("detail-sim") ?? throw new InvalidOperationException("run detail missing");
+        var listRow = detailStats.Snapshot.RecentRuns.Single(run => run.RunId == "detail-sim");
+        Require(detail.Run.ItemsLooted == listRow.ItemsLooted && detail.Run.ChaosValueMilli == listRow.ChaosValueMilli &&
+                detail.Run.WallDurationMs == listRow.WallDurationMs && detail.Run.WavesCompleted == 3 &&
+                detail.Run.HighestWaveStarted == 4 && detail.Run.DeathCount == 1,
+            "run detail row differs from list row");
+        Require(detail.LootSummary.Items == listRow.ItemsLooted && Math.Abs(detail.LootSummary.ChaosValue - listRow.ChaosValue) < 1e-9 &&
+                detail.LootSummary.Items == 7 && Math.Abs(detail.LootSummary.ChaosValue - 17.5d) < 1e-9,
+            "loot summary does not match list row");
+        Require(detail.Waves.Count == 4 && detail.Waves.Select(w => w.Wave).SequenceEqual(new[] { 1, 2, 3, 4 }),
+            "wave rows mismatch");
+        Require(detail.Waves.Select(w => w.DurationMs).SequenceEqual(new long?[] { 30_000, 40_000, 60_000, null }),
+            "wave durations mismatch");
+        Require(detail.Waves.Select(w => w.GapBeforeMs).SequenceEqual(new long?[] { null, 22_000, 3_000, 5_000 }),
+            "wave gaps mismatch");
+        Require(detail.Waves[3].CompletedAtUtc == null && detail.Waves[3].StartedAtUtc != null, "unfinished wave mismatch");
+        var ws = detail.WaveSummary;
+        Require(ws.Completed == 3 && Math.Abs(ws.AverageMs.GetValueOrDefault() - 130_000d / 3) < 1e-6 && ws.MedianMs == 40_000 &&
+                ws.FastestWave == 1 && ws.FastestMs == 30_000 &&
+                ws.SlowestWave == 3 && ws.SlowestMs == 60_000 && ws.TotalWaveMs == 130_000 && ws.TotalGapMs == 30_000,
+            "wave summary mismatch");
+        Require(detail.Loot.Select(l => l.LootId).SequenceEqual(new[] { "l1", "l2", "l3", "l6", "l4", "l5" }),
+            "loot not chronological");
+        Require(detail.Loot.Select(l => l.Wave).SequenceEqual(new int?[] { null, 1, 2, 3, 3, 4 }), "loot wave assignment mismatch (a pickup at a wave's start belongs to that wave)");
+        Require(detail.Waves.Select(w => w.LootCount).SequenceEqual(new[] { 1, 1, 3, 1 }) &&
+                Math.Abs(detail.Waves[2].ChaosValue - 10.5d) < 1e-9, "per-wave loot aggregation mismatch");
+        Require(!detail.LootTruncated, "loot unexpectedly truncated");
+        Require(detail.LootSummary.TopItems.Select(i => i.ItemName).SequenceEqual(new[] { "Beta", "Alpha", "Early", "Gamma" }) &&
+                detail.LootSummary.TopItems[1].Count == 3 && Math.Abs(detail.LootSummary.TopItems[1].ChaosValue - 6d) < 1e-9,
+            "top items grouping mismatch");
+        Require(detail.Events.Count == 10 && detail.Events[0].EventType == "run_started" &&
+                detail.Events[^1].EventType == "run_ended" && detail.Events[^1].Wave == null &&
+                detail.Events.Zip(detail.Events.Skip(1), (a, b) => a.OccurredAtUtc <= b.OccurredAtUtc).All(x => x) &&
+                detail.Events.Count(e => e.EventType == "death") == 1,
+            "events mismatch");
+
+        var bossDetail = detailStats.ReadRunDetail("detail-boss") ?? throw new InvalidOperationException("boss detail missing");
+        Require(bossDetail.Waves.Count == 0 && bossDetail.WaveSummary.Completed == 0 && bossDetail.WaveSummary.AverageMs == null &&
+                bossDetail.Loot.Count == 0 && bossDetail.LootSummary.Items == 0 && bossDetail.LootSummary.TopItems.Count == 0 &&
+                bossDetail.Events.Count == 0, "no-loot non-Simulacrum detail mismatch");
+        Require(detailStats.ReadRunDetail("missing-run") == null, "missing run returned a detail");
+
+        var bigDetail = detailStats.ReadRunDetail("detail-big") ?? throw new InvalidOperationException("big detail missing");
+        Require(bigDetail.Loot.Count == 2000 && bigDetail.LootTruncated && bigDetail.LootSummary.Items == 2001 &&
+                Math.Abs(bigDetail.LootSummary.ChaosValue - 2001d) < 1e-9, "loot cap or full-run totals mismatch");
+
+        var legacyDetail = detailStats.ReadRunDetail("detail-legacy") ?? throw new InvalidOperationException("legacy detail missing");
+        Require(legacyDetail.WaveSummary.Completed == 15 && legacyDetail.Run.DataQuality == "legacy_partial" &&
+                legacyDetail.WaveSummary.AverageMs == null, "imported run without wave events lost its completed wave count");
+    }
+
     Console.WriteLine("Stats replay passed: modes, best finds, operational import, dedup, restart, legacy import, unavailable DB, v2 upgrade, stale-run recovery, reused activation, shutdown drain.");
 }
 finally

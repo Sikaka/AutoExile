@@ -216,6 +216,27 @@ tr:hover td { background:var(--surface2); }
 .forensics-breakdown { display:flex; flex-wrap:wrap; gap:6px; margin:0 0 12px; }
 .forensics-chip { padding:4px 8px; border:1px solid var(--border); border-radius:999px; background:var(--surface); color:var(--text-dim); font-size:10px; }
 .forensics-chip b { color:var(--text); }
+.run-row { cursor:pointer; }
+.run-row:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
+.run-report { padding:16px; }
+.run-report-head { display:flex; flex-wrap:wrap; align-items:center; gap:10px 14px; margin-bottom:12px; }
+.run-report-back { padding:6px 14px; }
+.run-report-title { min-width:0; flex:1; }
+.run-report-title strong { display:block; font-size:15px; overflow-wrap:anywhere; }
+.run-report-title span { color:var(--text-dim); font-size:11px; overflow-wrap:anywhere; }
+.run-report-metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(110px,1fr)); gap:8px; margin-bottom:14px; }
+.run-report-section { margin-top:16px; }
+.run-report-section h3 { margin-bottom:8px; color:var(--text-dim); font-size:10px; font-weight:600; letter-spacing:1px; text-transform:uppercase; }
+.run-report-note { margin:6px 0 0; color:var(--text-dim); font-size:11px; overflow-wrap:anywhere; }
+.run-report-waves { display:grid; gap:4px; }
+.run-report-wave { display:grid; grid-template-columns:36px minmax(0,1fr) 64px 44px 64px; align-items:center; gap:8px; font-size:11px; }
+.run-report-wave > span:first-child { color:var(--text-dim); }
+.run-report-wave-head { color:var(--text-dim); font-size:9px; font-weight:600; letter-spacing:.6px; text-transform:uppercase; }
+.run-report-wave > span:nth-child(n+3) { text-align:right; white-space:nowrap; }
+.run-report-track { height:10px; border-radius:3px; background:var(--surface2); overflow:hidden; }
+.run-report-bar { height:100%; min-width:2px; border-radius:3px; background:var(--accent); }
+.run-report-wave.unfinished .run-report-track { border:1px dashed var(--orange); background:transparent; }
+.run-report-wave.unfinished .run-report-bar { display:none; }
 .forensics-context { max-width:430px; }
 .forensics-context summary { color:var(--accent); cursor:pointer; font-size:10px; }
 .forensics-context code { display:block; max-height:180px; margin-top:6px; padding:8px; overflow:auto; border:1px solid var(--border); border-radius:5px; background:var(--bg); color:var(--text-dim); font-size:9px; line-height:1.45; white-space:pre-wrap; word-break:break-word; }
@@ -460,6 +481,9 @@ tr:hover td { background:var(--surface2); }
   .history-table-wrap td:last-child { border-bottom:0; }
   .history-table-wrap td::before { content:attr(data-label); color:var(--text-dim); font-size:9px; font-weight:600; letter-spacing:.65px; text-transform:uppercase; }
   .empty-state { padding:34px 16px; }
+  .run-report { padding:4px 0; }
+  .run-report-wave { grid-template-columns:30px minmax(0,1fr) 60px 30px 54px; gap:6px; font-size:10px; }
+  .run-report-wave-head { font-size:8px; }
 }
 @media (prefers-reduced-motion:reduce) {
   *, *::before, *::after { scroll-behavior:auto !important; animation-duration:.01ms !important; animation-iteration-count:1 !important; transition-duration:.01ms !important; }
@@ -2623,6 +2647,7 @@ async function handlePresetFile(event) {
 async function switchHistory(type, el) {
   document.querySelectorAll('.history-tab').forEach(t=>t.classList.remove('active'));
   if(el) el.classList.add('active');
+  if (runReport) closeRunReport(false);
   currentHistoryType = type;
   historyLimit = 20;
   await loadHistory(type);
@@ -2881,6 +2906,7 @@ async function loadHistory(type) {
   currentHistoryType = type;
   const container = document.getElementById('historyContent');
   const more = document.getElementById('historyLoadMore');
+  if (type === 'runs' && runReport) { renderRunReport(); return; }
   try {
     const suffix = type === 'forensics' ? `&hours=${forensicsWindowHours}` : '';
     const fetchLimit = type === 'best-finds' ? 20 : type === 'forensics' ? 500 : 100;
@@ -2889,6 +2915,7 @@ async function loadHistory(type) {
     const payload = await r.json();
     const data = type === 'forensics' ? (payload.events || []) : payload;
     if (type === 'forensics') historyReports[type] = payload;
+    if (type === 'runs' && runReport) { historyData[type] = data || []; return; }
     if (!data || data.length === 0) {
       historyData[type] = [];
       renderHistoryControls(type, []);
@@ -2901,6 +2928,7 @@ async function loadHistory(type) {
     renderHistoryControls(type, data);
     applyHistoryView();
   } catch(e) {
+    if (type === 'runs' && runReport) return;
     document.getElementById('historyFilters').innerHTML = '';
     container.innerHTML = `<div class="empty-state">Error: ${esc(e.message)}</div>`;
     more.classList.remove('visible');
@@ -3011,6 +3039,7 @@ function syncHistorySortControls() {
 
 function applyHistoryView() {
   const type = currentHistoryType;
+  if (type === 'runs' && runReport) return;
   const source = historyData[type] || [];
   const state = historyViewState[type];
   const query = state.query.trim().toLowerCase();
@@ -3143,10 +3172,217 @@ function renderRunsTable(data) {
     const completed = r.result === 'completed' || r.completed === true;
     const resultText = runResultText(r);
     const result = completed ? '<span class="green">Completed</span>' : `<span class="${r.state === 'open' || !endedAt ? 'yellow' : 'red'}">${esc(resultText)}</span>`;
-    html += `<tr><td data-label="Start">${esc(start)}</td><td data-label="Mode">${esc(r.mode)}</td><td data-label="Area">${esc(r.areaName||r.area||'')}</td><td data-label="Duration">${dur}</td><td data-label="Wave">${r.wavesCompleted||r.highestWaveStarted||r.highestWave||'-'}</td><td data-label="Deaths">${r.deathCount??r.deaths??0}</td><td data-label="Chaos" class="yellow">${Number(r.chaosValue??r.totalChaos??0).toFixed(1)}c</td><td data-label="Items">${r.itemsLooted||0}</td><td data-label="Result">${result}</td></tr>`;
+    const rowAttrs = r.runId ? ` class="run-row" role="button" tabindex="0" data-run-id="${escAttr(r.runId)}" title="Open run report" onclick="openRunReport(this.dataset.runId)" onkeydown="runRowKey(event,this)"` : '';
+    html += `<tr${rowAttrs}><td data-label="Start">${esc(start)}</td><td data-label="Mode">${esc(r.mode)}</td><td data-label="Area">${esc(r.areaName||r.area||'')}</td><td data-label="Duration">${dur}</td><td data-label="Wave">${r.wavesCompleted||r.highestWaveStarted||r.highestWave||'-'}</td><td data-label="Deaths">${r.deathCount??r.deaths??0}</td><td data-label="Chaos" class="yellow">${Number(r.chaosValue??r.totalChaos??0).toFixed(1)}c</td><td data-label="Items">${r.itemsLooted||0}</td><td data-label="Result">${result}</td></tr>`;
   }
   html += '</tbody></table></div>';
   document.getElementById('historyContent').innerHTML = html;
+}
+
+// ==================== RUN REPORT ====================
+let runReport = null;
+let runReportSeq = 0;
+const RUN_REPORT_LOOT_PREVIEW = 200;
+const RUN_REPORT_EVENT_PREVIEW = 200;
+const RUN_REPORT_HIDDEN_EVENTS = new Set(['wave_started','wave_completed']);
+
+function runRowKey(event, row) {
+  if (event.key !== 'Enter' && event.key !== ' ') return;
+  event.preventDefault();
+  openRunReport(row.dataset.runId);
+}
+
+async function openRunReport(runId) {
+  if (!runId) return;
+  const seq = ++runReportSeq;
+  runReport = { runId, seq, data:null, error:'', loading:true, showAllLoot:false, showAllEvents:false, scrollY:window.scrollY };
+  renderRunReport();
+  const content = document.getElementById('historyContent');
+  if (content.getBoundingClientRect().top < 0) content.scrollIntoView({block:'start'});
+  document.getElementById('runReportBack')?.focus({preventScroll:true});
+  try {
+    const r = await fetch(`/api/history/runs/detail?runId=${encodeURIComponent(runId)}`);
+    let body = null;
+    try { body = await r.json(); } catch {}
+    if (!runReport || runReport.seq !== seq) return;
+    if (!r.ok) throw new Error(body?.error || (r.status === 404 ? 'Run not found.' : r.status === 503 ? 'Stats service is not ready.' : `HTTP ${r.status}`));
+    if (!body || !body.run) throw new Error('Empty response.');
+    runReport.data = body;
+  } catch (e) {
+    if (!runReport || runReport.seq !== seq) return;
+    runReport.error = e?.message || 'Request failed.';
+  }
+  runReport.loading = false;
+  const hadFocus = document.activeElement?.id === 'runReportBack';
+  renderRunReport();
+  if (hadFocus || document.activeElement === document.body) document.getElementById('runReportBack')?.focus({preventScroll:true});
+}
+
+function closeRunReport(restore = true) {
+  if (!runReport) return;
+  const { runId, scrollY } = runReport;
+  runReport = null;
+  runReportSeq++;
+  document.getElementById('historyFilters').style.display = '';
+  if (!restore) return;
+  applyHistoryView();
+  window.scrollTo(0, scrollY);
+  const row = [...document.querySelectorAll('#historyContent .run-row')].find(el => el.dataset.runId === runId);
+  row?.focus({preventScroll:true});
+}
+
+function toggleRunReportList(key, buttonId) {
+  if (!runReport) return;
+  const button = document.getElementById(buttonId);
+  const top = button ? button.getBoundingClientRect().top : null;
+  runReport[key] = !runReport[key];
+  renderRunReport();
+  const next = document.getElementById(buttonId);
+  if (!next) return;
+  if (top != null) window.scrollBy(0, next.getBoundingClientRect().top - top);
+  next.focus({preventScroll:true});
+}
+
+function renderRunReport() {
+  if (!runReport) return;
+  document.getElementById('historyFilters').style.display = 'none';
+  document.getElementById('historyLoadMore').classList.remove('visible');
+  document.getElementById('historyContent').innerHTML = runReportHtml(runReport, Date.now());
+}
+
+function runReportClock(ms) {
+  if (ms == null || ms === '' || !Number.isFinite(Number(ms))) return '-';
+  const total = Math.max(0, Math.round(Number(ms) / 1000));
+  const h = Math.floor(total / 3600), m = Math.floor((total % 3600) / 60), s = total % 60;
+  return h > 0 ? `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}` : `${m}:${String(s).padStart(2,'0')}`;
+}
+
+function runReportBarPct(ms, maxMs) {
+  const v = Number(ms), max = Number(maxMs);
+  if (!(v > 0) || !(max > 0)) return 0;
+  return Math.max(2, Math.min(100, v / max * 100));
+}
+
+function runReportChaos(value) {
+  const n = Number(value);
+  return `${(Number.isFinite(n) ? n : 0).toFixed(1)}c`;
+}
+
+function runReportTime(value) {
+  if (!value) return '-';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '-' : date.toLocaleTimeString();
+}
+
+function runReportWave(value) {
+  return value == null || !Number.isFinite(Number(value)) ? '-' : `W${Number(value)}`;
+}
+
+function runReportDurationMs(run, nowMs) {
+  const wall = Number(run.wallDurationMs);
+  if (wall > 0) return wall;
+  const start = Date.parse(run.activatedAtUtc || run.firstEntryAtUtc || '');
+  if (!Number.isFinite(start)) return null;
+  const end = run.endedAtUtc ? Date.parse(run.endedAtUtc) : run.state === 'open' ? nowMs : NaN;
+  return Number.isFinite(end) && end >= start ? end - start : null;
+}
+
+function runReportHtml(state, nowMs) {
+  const back = '<button id="runReportBack" class="btn run-report-back" type="button" onclick="closeRunReport()">← Back</button>';
+  if (state.loading) return `<div class="run-report"><div class="run-report-head">${back}</div><div class="empty-state">Loading run…</div></div>`;
+  if (state.error || !state.data?.run) return `<div class="run-report"><div class="run-report-head">${back}</div><div class="empty-state red">Could not load run: ${esc(state.error || 'No data.')}</div></div>`;
+
+  const d = state.data;
+  const run = d.run;
+  const isOpen = run.state === 'open' || !run.endedAtUtc;
+  const isLive = run.state === 'open';
+  const completed = run.result === 'completed';
+  const resultCls = completed ? 'green' : isOpen ? 'yellow' : 'red';
+  const durMs = runReportDurationMs(run, nowMs);
+  const chaos = Number(run.chaosValue ?? 0) || 0;
+  const perHour = durMs > 0 ? chaos / (durMs / 3600000) : null;
+  const waves = Array.isArray(d.waves) ? d.waves : [];
+  const summary = d.waveSummary || {};
+  const legacy = run.dataQuality && run.dataQuality !== 'native'
+    ? `<span class="forensics-chip" title="Data quality">Legacy data · ${esc(run.dataQuality)}</span>` : '';
+  const reason = run.terminalReason ? ` · ${esc(run.terminalReason)}` : '';
+  const title = [run.mode, run.areaName].filter(Boolean).map(esc).join(' · ') || 'Run';
+
+  let html = `<div class="run-report"><div class="run-report-head">${back}<div class="run-report-title"><strong>${title}</strong>`
+    + `<span>${esc(formatTimestamp(run.activatedAtUtc || run.firstEntryAtUtc))} · ${esc(runReportClock(durMs))}${isLive && durMs != null ? ' so far' : ''} · <span class="${resultCls}">${esc(runResultText(run))}</span>${reason}</span></div>${legacy}</div>`;
+
+  const metric = (label, value, cls = '') => `<div class="forensics-metric"><span>${esc(label)}</span><strong${cls ? ` class="${cls}"` : ''}>${value}</strong></div>`;
+  html += '<div class="run-report-metrics">';
+  if (waves.length) html += metric('Waves', `${Number(summary.completed ?? run.wavesCompleted ?? 0)}/15`);
+  html += metric('Deaths', Number(run.deathCount ?? 0), Number(run.deathCount) > 0 ? 'red' : '');
+  html += metric('Items', Number(run.itemsLooted ?? 0).toLocaleString());
+  html += metric('Chaos', esc(runReportChaos(chaos)), 'yellow');
+  html += metric('Chaos / hour', perHour == null ? '-' : esc(runReportChaos(perHour)), 'yellow');
+  html += '</div>';
+
+  if (waves.length) {
+    const maxMs = Math.max(0, ...waves.map(w => Number(w.durationMs) || 0));
+    const lastStarted = Math.max(0, ...waves.filter(w => w.startedAtUtc).map(w => Number(w.wave) || 0));
+    html += '<div class="run-report-section"><h3>Waves</h3><div class="run-report-waves">'
+      + '<div class="run-report-wave run-report-wave-head"><span>Wave</span><span></span><span>Time</span><span>Items</span><span>Chaos</span></div>';
+    for (const w of waves) {
+      const done = w.durationMs != null && Number.isFinite(Number(w.durationMs));
+      const status = done ? runReportClock(w.durationMs)
+        : !w.startedAtUtc ? 'No start'
+        : isLive && Number(w.wave) === lastStarted ? 'Running' : 'Unfinished';
+      const tip = w.gapBeforeMs != null ? `Gap before: ${runReportClock(w.gapBeforeMs)}` : '';
+      html += `<div class="run-report-wave${done ? '' : ' unfinished'}"${tip ? ` title="${escAttr(tip)}"` : ''}><span>${esc(runReportWave(w.wave))}</span>`
+        + `<div class="run-report-track"><div class="run-report-bar" style="width:${runReportBarPct(w.durationMs, maxMs).toFixed(1)}%"></div></div>`
+        + `<span${done ? '' : ' class="orange"'}>${esc(status)}</span><span>${Number(w.lootCount) || 0}</span><span class="yellow">${Number(w.chaosValue) > 0 ? esc(runReportChaos(w.chaosValue)) : '-'}</span></div>`;
+    }
+    const fast = summary.fastestWave != null ? `${esc(runReportWave(summary.fastestWave))} ${esc(runReportClock(summary.fastestMs))}` : '-';
+    const slow = summary.slowestWave != null ? `${esc(runReportWave(summary.slowestWave))} ${esc(runReportClock(summary.slowestMs))}` : '-';
+    html += `</div><p class="run-report-note">Avg ${esc(runReportClock(summary.averageMs))} · Median ${esc(runReportClock(summary.medianMs))} · Fastest ${fast} · Slowest ${slow} · Wave time ${esc(runReportClock(summary.totalWaveMs))} · Gaps ${esc(runReportClock(summary.totalGapMs))}</p></div>`;
+  }
+
+  const top = Array.isArray(d.lootSummary?.topItems) ? d.lootSummary.topItems : [];
+  if (top.length) {
+    html += '<div class="run-report-section"><h3>Top drops</h3><div class="history-table-wrap"><table><thead><tr><th>Item</th><th>Count</th><th>Chaos</th></tr></thead><tbody>';
+    for (const t of top) html += `<tr><td data-label="Item">${esc(t.itemName)}</td><td data-label="Count">${Number(t.count) || 0}</td><td data-label="Chaos" class="yellow">${esc(runReportChaos(t.chaosValue))}</td></tr>`;
+    html += '</tbody></table></div></div>';
+  }
+
+  const loot = Array.isArray(d.loot) ? d.loot : [];
+  html += `<div class="run-report-section"><h3>All drops (${loot.length.toLocaleString()})</h3>`;
+  if (!loot.length) html += '<p class="run-report-note">No loot recorded.</p>';
+  else {
+    const shown = state.showAllLoot ? loot : loot.slice(0, RUN_REPORT_LOOT_PREVIEW);
+    html += '<div class="history-table-wrap"><table><thead><tr><th>Time</th><th>Wave</th><th>Item</th><th>Qty</th><th>Chaos</th></tr></thead><tbody>';
+    for (const l of shown) html += `<tr><td data-label="Time">${esc(runReportTime(l.pickedAtUtc))}</td><td data-label="Wave">${esc(runReportWave(l.wave))}</td><td data-label="Item">${esc(l.itemName)}</td><td data-label="Qty">${Number(l.quantity) || 0}</td><td data-label="Chaos" class="yellow">${Number(l.chaosValue) > 0 ? esc(runReportChaos(l.chaosValue)) : '-'}</td></tr>`;
+    html += '</tbody></table></div>';
+    if (loot.length > RUN_REPORT_LOOT_PREVIEW) html += `<div class="history-actions"><button id="runReportLootToggle" class="btn" type="button" onclick="toggleRunReportList('showAllLoot','runReportLootToggle')">${state.showAllLoot ? `Show first ${RUN_REPORT_LOOT_PREVIEW}` : `Show all ${loot.length.toLocaleString()}`}</button></div>`;
+    if (d.lootTruncated) html += `<p class="run-report-note">List limited to ${loot.length.toLocaleString()} rows. Totals include all loot.</p>`;
+  }
+  html += '</div>';
+
+  const events = (Array.isArray(d.events) ? d.events : []).filter(e => !RUN_REPORT_HIDDEN_EVENTS.has(e.eventType));
+  html += '<div class="run-report-section"><h3>Events</h3>';
+  if (!events.length) html += '<p class="run-report-note">No events recorded.</p>';
+  else {
+    const starts = waves.filter(w => w.startedAtUtc).map(w => ({wave:Number(w.wave), at:Date.parse(w.startedAtUtc)})).filter(w => Number.isFinite(w.at));
+    const waveAt = value => {
+      const at = Date.parse(value || '');
+      if (!Number.isFinite(at)) return null;
+      let best = null;
+      for (const w of starts) if (w.at <= at && (best == null || w.wave > best)) best = w.wave;
+      return best;
+    };
+    const shownEvents = state.showAllEvents ? events : events.slice(0, RUN_REPORT_EVENT_PREVIEW);
+    html += '<div class="history-table-wrap"><table><thead><tr><th>Time</th><th>Wave</th><th>Event</th><th>Details</th></tr></thead><tbody>';
+    for (const e of shownEvents) {
+      const cls = e.eventType === 'death' ? ' class="red"' : '';
+      html += `<tr><td data-label="Time">${esc(runReportTime(e.occurredAtUtc))}</td><td data-label="Wave">${esc(runReportWave(e.wave ?? waveAt(e.occurredAtUtc)))}</td><td data-label="Event"${cls}>${esc(titleCase(e.eventType))}</td><td data-label="Details">${esc(e.details || '-')}</td></tr>`;
+    }
+    html += '</tbody></table></div>';
+    if (events.length > RUN_REPORT_EVENT_PREVIEW) html += `<div class="history-actions"><button id="runReportEventsToggle" class="btn" type="button" onclick="toggleRunReportList('showAllEvents','runReportEventsToggle')">${state.showAllEvents ? `Show first ${RUN_REPORT_EVENT_PREVIEW}` : `Show all ${events.length.toLocaleString()}`}</button></div>`;
+  }
+  html += '</div></div>';
+  return html;
 }
 
 function renderEventsTable(data) {

@@ -89,6 +89,73 @@ namespace AutoExile.Statistics
         public double ChaosValue => ChaosValueMilli / 1000d;
     }
 
+    public sealed class StatsRunDetail
+    {
+        public StatsRunSnapshot Run { get; init; } = new();
+        public IReadOnlyList<StatsRunWave> Waves { get; init; } = Array.Empty<StatsRunWave>();
+        public StatsRunWaveSummary WaveSummary { get; init; } = new();
+        public IReadOnlyList<StatsRunLoot> Loot { get; init; } = Array.Empty<StatsRunLoot>();
+        public bool LootTruncated { get; init; }
+        public StatsRunLootSummary LootSummary { get; init; } = new();
+        public IReadOnlyList<StatsRunEvent> Events { get; init; } = Array.Empty<StatsRunEvent>();
+    }
+
+    public sealed class StatsRunWave
+    {
+        public int Wave { get; init; }
+        public DateTime? StartedAtUtc { get; init; }
+        public DateTime? CompletedAtUtc { get; init; }
+        public long? DurationMs { get; init; }
+        public long? GapBeforeMs { get; init; }
+        public int LootCount { get; init; }
+        public double ChaosValue { get; init; }
+    }
+
+    public sealed class StatsRunWaveSummary
+    {
+        public int Completed { get; init; }
+        public double? AverageMs { get; init; }
+        public double? MedianMs { get; init; }
+        public int? FastestWave { get; init; }
+        public long? FastestMs { get; init; }
+        public int? SlowestWave { get; init; }
+        public long? SlowestMs { get; init; }
+        public long TotalWaveMs { get; init; }
+        public long TotalGapMs { get; init; }
+    }
+
+    public sealed class StatsRunLoot
+    {
+        public string LootId { get; init; } = "";
+        public DateTime PickedAtUtc { get; init; }
+        public string ItemName { get; init; } = "";
+        public int Quantity { get; init; }
+        public double ChaosValue { get; init; }
+        public int? Wave { get; init; }
+    }
+
+    public sealed class StatsRunLootSummary
+    {
+        public long Items { get; init; }
+        public double ChaosValue { get; init; }
+        public IReadOnlyList<StatsRunTopItem> TopItems { get; init; } = Array.Empty<StatsRunTopItem>();
+    }
+
+    public sealed class StatsRunTopItem
+    {
+        public string ItemName { get; init; } = "";
+        public long Count { get; init; }
+        public double ChaosValue { get; init; }
+    }
+
+    public sealed class StatsRunEvent
+    {
+        public DateTime OccurredAtUtc { get; init; }
+        public string EventType { get; init; } = "";
+        public int? Wave { get; init; }
+        public string? Details { get; init; }
+    }
+
     public sealed class StatsLootSnapshot
     {
         public string LootId { get; init; } = "";
