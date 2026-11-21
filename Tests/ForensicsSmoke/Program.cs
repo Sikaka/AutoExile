@@ -352,7 +352,12 @@ FROM runtime_events WHERE category IN ('input','movement','navigation','simulacr
         }
         Require(stacking.RecordRuntimeEvent("input", "StartMovement", "sent", context: new { key = "R", x = 400.0, y = 200.0 }),
             "stack: distinct event was rejected");
+        foreach (var flask in new[] { "D1", "D2", "D3", "D4", "D5" })
+            Require(stacking.RecordRuntimeEvent("input", "PressKeyOverlay", "sent", context: new { key = flask, x = (double?)null, y = (double?)null }),
+                $"stack: flask {flask} was rejected");
     }
+    Require(ScalarLong(stackDb, "SELECT COUNT(DISTINCT json_extract(context_json,'$.key')) FROM runtime_events WHERE event_name='PressKeyOverlay'") == 5,
+        "stack: different keys were stacked together");
     Require(ScalarLong(stackDb, "SELECT COUNT(*) FROM runtime_events WHERE category='input' AND event_name='StartMovement'") == 3,
         "stack: repeated input was not stored as first row + summary + distinct row");
     Require(ScalarLong(stackDb, "SELECT COUNT(*) FROM runtime_events WHERE category='movement' AND event_name='stop'") == 2,

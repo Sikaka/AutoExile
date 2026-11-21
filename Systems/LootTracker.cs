@@ -30,6 +30,8 @@ namespace AutoExile.Systems
         public Action<string, double, int, long>? OnItemRecordedDetailed { get; set; }
         /// <summary>Raised for valuable or cluster-priced pickups so forensics can show which price line was used.</summary>
         public Action<string, PriceResult>? OnItemPriced { get; set; }
+        /// <summary>Scan-time price of a ground item by entity id (LootSystem cache).</summary>
+        public Func<long, PriceResult?>? PriceLookup { get; set; }
         private const double PricedEventMinChaos = 50;
 
         // Recent loot log (capped to prevent unbounded growth)
@@ -175,6 +177,15 @@ namespace AutoExile.Systems
             // ground item to go through the pickup→succeed→record cycle multiple times
             if (entityId != 0 && !_recordedEntityIds.Add(entityId))
                 return;
+
+            // Callers pass the pickup value (MaxChaosValue). Statistics take the conservative
+            // estimate of the same scan, so an ambiguous price never books its highest line.
+            if (entityId != 0 && PriceLookup?.Invoke(entityId) is { MatchCount: > 0 } price)
+            {
+                chaosValue = price.EstimatedChaosValue;
+                if (chaosValue >= PricedEventMinChaos || price.PricingNote != null)
+                    OnItemPriced?.Invoke(itemName, price);
+            }
 
             _totalChaosValue += chaosValue;
             _totalItemsLooted++;

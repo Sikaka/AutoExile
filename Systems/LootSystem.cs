@@ -187,6 +187,7 @@ namespace AutoExile.Systems
             public double ChaosPerSlot;
             public string ItemName;
             public bool PricePending;
+            public PriceResult? Price;
             public int PriceAttempts;
             public DateTime EvaluatedAtUtc;
         }
@@ -507,8 +508,16 @@ namespace AutoExile.Systems
                 InventorySlots = invSlots,
                 ChaosPerSlot = chaosPerSlot,
                 PricePending = PriceService?.IsLoaded == true && chaosValue <= 0,
+                Price = priceResult,
             };
         }
+
+        /// <summary>
+        /// Price evaluated for a ground item during this area's scans. Pickup decisions use its
+        /// MaxChaosValue; statistics use EstimatedChaosValue (the cheapest line when ambiguous).
+        /// </summary>
+        public PriceResult? GetCachedPrice(long entityId)
+            => _scanCache.TryGetValue(entityId, out var cached) ? cached.Price : null;
 
         /// <summary>
         /// Get the best candidate to pick up (nearest visible item).

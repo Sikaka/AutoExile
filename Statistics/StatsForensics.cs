@@ -113,8 +113,9 @@ public sealed partial class StatsService
     private static readonly System.Text.RegularExpressions.Regex VolatileField = new(
         "\"(\\w*Ms|suppressed|totalRecoveries|sameSpot)\":[^,}]*,?",
         System.Text.RegularExpressions.RegexOptions.Compiled);
+    // Numeric JSON values only (after ':' '[' or ','); digits inside strings such as "D1" stay exact.
     private static readonly System.Text.RegularExpressions.Regex Number = new(
-        "-?\\d+(\\.\\d+)?([eE][+-]?\\d+)?",
+        "(?<=[:\\[,])-?\\d+(\\.\\d+)?([eE][+-]?\\d+)?(?=[,}\\]])",
         System.Text.RegularExpressions.RegexOptions.Compiled);
 
     /// <summary>Same event, same rounded context: timings and counters dropped, coordinates in 10-unit cells.</summary>

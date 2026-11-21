@@ -145,6 +145,7 @@ namespace AutoExile
             _stats = new StatsService(msg => LogMessage($"[Stats] {msg}"));
             _stats.Initialize(DirectoryFullName);
             BotInput.Stats = _stats;
+            _tickWatchdog?.Dispose();
             _tickWatchdog = new System.Threading.Timer(_ => TickWatchdog(), null,
                 TickWatchdogPeriodMs, TickWatchdogPeriodMs);
             _navigation.Stats = _stats;
@@ -256,6 +257,7 @@ namespace AutoExile
 
             // SQLite is the canonical stats store. The legacy JSONL files are imported
             // once by StatsService but are never dual-written after migration.
+            _lootTracker.PriceLookup = id => _loot.GetCachedPrice(id);
             _lootTracker.OnItemPriced = (name, price) =>
                 _stats.RecordRuntimeEvent("loot", "priced", "observed", null, new
                 {
@@ -531,6 +533,7 @@ namespace AutoExile
         private long _lastInGameAtMs;
         private volatile string _lastTickArea = "";
         private volatile bool _lastTickRunning;
+        private int _tickGapReports;
 
         private void TickWatchdog()
         {
@@ -540,8 +543,18 @@ namespace AutoExile
                 var lastTick = Interlocked.Read(ref _lastTickAtMs);
                 var lastInGame = Interlocked.Read(ref _lastInGameAtMs);
                 if (lastTick == 0) return;
+                // Stacked repeat summaries are otherwise flushed only from Tick.
+                _stats?.FlushCoalescedRuntimeEvents(false);
                 var sinceTick = now - lastTick;
                 var sinceInGame = lastInGame == 0 ? -1 : now - lastInGame;
+                var gap = sinceTick >= TickWatchdogPeriodMs || sinceInGame >= TickWatchdogPeriodMs || sinceInGame < 0;
+                if (!gap || !_lastTickRunning)
+                {
+                    _tickGapReports = 0;
+                    return;
+                }
+                // Every 15 s for the first minute of a gap, then once a minute.
+                if (++_tickGapReports > 4 && _tickGapReports % 4 != 0) return;
                 if (sinceTick >= TickWatchdogPeriodMs)
                     _stats?.RecordRuntimeEvent("state", "tick_gap", "observed", "no_tick", new
                     {

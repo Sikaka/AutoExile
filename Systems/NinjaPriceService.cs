@@ -581,12 +581,24 @@ namespace AutoExile.Systems
             }
             if (fitting.Count == 0) return PriceResult.Zero;
 
-            // Thin lines only when nothing liquid fits; their price then never exceeds the cheapest one.
             var liquid = fitting.FindAll(e => !e.ListingCount.HasValue || e.ListingCount.Value >= ClusterMinListings);
-            var pool = liquid.Count > 0 ? liquid : fitting;
-
             ItemLine chosen;
-            if (variantStr != null && liquid.Count > 0)
+            if (liquid.Count == 0)
+            {
+                // Only thin lines: no reliable price. Statistics book 0; pickup still sees the cheapest line.
+                chosen = fitting.MinBy(e => e.ChaosValue ?? 0)!;
+                return new PriceResult
+                {
+                    MinChaosValue = 0,
+                    MaxChaosValue = chosen.ChaosValue ?? 0,
+                    MatchCount = Math.Max(2, fitting.Count),
+                    DetailsId = chosen.DetailsId,
+                    PricingNote = ClusterNote(enchantName, passiveCount, itemLevel, chosen) + " thin_only",
+                };
+            }
+            var pool = liquid;
+
+            if (variantStr != null)
             {
                 // Known variant: the highest levelRequired tier that fits; cheapest line inside that tier.
                 var tier = pool.Max(e => e.LevelRequired ?? 0);
@@ -599,7 +611,7 @@ namespace AutoExile.Systems
                 };
             }
 
-            // Unknown passives or only thin lines: statistics take the cheapest line, pickup keeps the ceiling.
+            // Unknown passives: statistics take the cheapest line, pickup keeps the ceiling.
             chosen = pool.MinBy(e => e.ChaosValue ?? 0)!;
             var min = chosen.ChaosValue ?? 0;
             var max = pool.Max(e => e.ChaosValue ?? 0);

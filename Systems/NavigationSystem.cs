@@ -82,6 +82,12 @@ namespace AutoExile.Systems
         private const long ArrivalHoldMs = 1500;
         private Vector2 _lastArrivalTarget, _lastArrivalPos;
         private long _lastArrivalAtMs;
+
+        // Recovery hold: an escape/backtrack target is steered for a short window. Without it the
+        // next tick steers back to the blocked waypoint before the re-pressed key reaches the game.
+        private const int RecoveryHoldMs = 700;
+        private Vector2 _recoveryTarget;
+        private DateTime _recoveryUntil = DateTime.MinValue;
         private const float BlinkApproachGrid = 4f;      // tight approach before blink
 
         // Stuck recovery state
@@ -309,7 +315,7 @@ namespace AutoExile.Systems
 
             // Inside the normal arrival radius but blocked from the closer one: arrived, not stuck.
             var closeEnoughStalled = isLastWaypoint && reachDist < FinalWaypointGrid && distToWaypoint < FinalWaypointGrid
-                && (_stuckTimer > StuckTimeLimit * 0.5f || _noProgressTimer > NoProgressTimeLimit * 0.5f);
+                && _stuckTimer > StuckTimeLimit * 0.5f;
 
             if (distToWaypoint < reachDist || closeEnoughStalled)
             {
@@ -484,6 +490,12 @@ namespace AutoExile.Systems
                         return;
                     }
                 }
+            }
+
+            if (DateTime.Now < _recoveryUntil)
+            {
+                ExecuteWalk(GridToScreen(gc, _recoveryTarget), gc.Window.GetWindowRectangle());
+                return;
             }
 
             // Get current waypoint and determine action
@@ -1062,6 +1074,7 @@ namespace AutoExile.Systems
             var screenPos = GridToScreen(gc, bestBacktrack.Value);
             var windowRect = gc.Window.GetWindowRectangle();
             ExecuteWalk(screenPos, windowRect, repress: true);
+            HoldRecoveryTarget(bestBacktrack.Value);
             LastRecoveryAction = $"Backtrack ({Vector2.Distance(playerGrid, bestBacktrack.Value):F0}g, {currentDistToDest - bestDistToDest:F0}g closer)";
             return true;
         }
@@ -1091,6 +1104,7 @@ namespace AutoExile.Systems
             var windowRect = gc.Window.GetWindowRectangle();
 
             ExecuteWalk(screenPos, windowRect, repress: true);
+            HoldRecoveryTarget(nudgeTarget);
 
             // An escape probe is itself a recovery attempt. Restart every stuck/repath
             // clock here so the periodic branch cannot fire again on the next game tick.
@@ -1110,6 +1124,14 @@ namespace AutoExile.Systems
         /// ±90° of the waypoint; after repeated stucks at one spot the full circle is tried,
         /// backwards included, so a dead-end pocket is left the way it was entered.
         /// </summary>
+        private void HoldRecoveryTarget(Vector2 gridTarget)
+        {
+            _recoveryTarget = gridTarget;
+            _recoveryUntil = DateTime.Now.AddMilliseconds(RecoveryHoldMs);
+        }
+
+        private static readonly float[] EscapeDistanceScales = { 1f, 0.7f, 0.4f };
+
         private Vector2 PickEscapeTarget(GameController gc, Vector2 playerGrid, Vector2 dirToWaypoint, float probeDistance)
         {
             if (dirToWaypoint.LengthSquared() < 0.0001f) dirToWaypoint = new Vector2(1, 0);
@@ -1127,7 +1149,7 @@ namespace AutoExile.Systems
 
             const int Samples = 12;
             var offset = _rng.NextDouble() * span / Samples;
-            for (var distScale = 1f; distScale >= 0.4f; distScale -= 0.3f)
+            foreach (var distScale in EscapeDistanceScales)
             {
                 for (var i = 0; i < Samples; i++)
                 {
@@ -1291,6 +1313,7 @@ namespace AutoExile.Systems
             _stuckAtSameSpotCount = 0;
             _bestDistToWaypoint = float.MaxValue;
             _noProgressTimer = 0;
+            _recoveryUntil = DateTime.MinValue;
             BotInput.StopMovement();
         }
 

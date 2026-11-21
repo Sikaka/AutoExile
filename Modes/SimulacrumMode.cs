@@ -786,6 +786,7 @@ namespace AutoExile.Modes
                         if (_wasSearching)
                         {
                             _wasSearching = false;
+                            ResetChase();
                             // Stop stale navigation from patrolling — combat handles movement now
                             ctx.Navigation.Stop(gc);
                             // Restore normal seen radius now that we're fighting
@@ -830,6 +831,7 @@ namespace AutoExile.Modes
                         _wasSearching = true;
                         ctx.Exploration.SeenRadiusOverride = 40;
                         ctx.Exploration.ResetSeen();
+                        ResetChase();
                     }
                     _combatEngageTime = DateTime.MinValue;
                     _combatEngageCount = 0;
@@ -1046,18 +1048,15 @@ namespace AutoExile.Modes
                 {
                     _wasSearching = true;
                     var monsterDist = Vector2.Distance(playerPos, nearestPos.Value);
-                    if (nearestId != _chaseTargetId)
-                    {
-                        _chaseTargetId = nearestId;
-                        _chaseBestDist = monsterDist;
-                        _chaseProgressAt = DateTime.Now;
-                    }
-                    else if (monsterDist < _chaseBestDist - ChaseProgressGrid)
+                    // Progress is distance to whichever monster is nearest, so two unreachable
+                    // monsters swapping as "nearest" cannot keep restarting the clock.
+                    if (_chaseProgressAt == DateTime.MinValue || monsterDist < _chaseBestDist - ChaseProgressGrid)
                     {
                         _chaseBestDist = monsterDist;
                         _chaseProgressAt = DateTime.Now;
                     }
-                    else if ((DateTime.Now - _chaseProgressAt).TotalSeconds > ChaseNoProgressSeconds)
+                    _chaseTargetId = nearestId;
+                    if ((DateTime.Now - _chaseProgressAt).TotalSeconds > ChaseNoProgressSeconds)
                     {
                         BlacklistChaseTarget();
                         ResetChase();
@@ -1146,7 +1145,9 @@ namespace AutoExile.Modes
             {
                 if (entity.Type != EntityType.Monster || !entity.IsHostile || !entity.IsAlive)
                     continue;
-                if (Vector2.Distance(entity.GridPosNum, playerGrid) <= radius)
+                if (Vector2.Distance(entity.GridPosNum, playerGrid) > radius) continue;
+                // Keep a longer (chase) blacklist that is already in place.
+                if (!_blacklistedMonsters.TryGetValue(entity.Id, out var stamped) || stamped < now)
                     _blacklistedMonsters[entity.Id] = now;
             }
         }
