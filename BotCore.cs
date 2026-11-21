@@ -145,6 +145,8 @@ namespace AutoExile
             _stats = new StatsService(msg => LogMessage($"[Stats] {msg}"));
             _stats.Initialize(DirectoryFullName);
             BotInput.Stats = _stats;
+            _tickWatchdog = new System.Threading.Timer(_ => TickWatchdog(), null,
+                TickWatchdogPeriodMs, TickWatchdogPeriodMs);
             _navigation.Stats = _stats;
             _stash.Stats = _stats;
             _mapDatabase = new MapDatabase(msg => LogMessage($"[AutoExile] {msg}"));
@@ -254,6 +256,17 @@ namespace AutoExile
 
             // SQLite is the canonical stats store. The legacy JSONL files are imported
             // once by StatsService but are never dual-written after migration.
+            _lootTracker.OnItemPriced = (name, price) =>
+                _stats.RecordRuntimeEvent("loot", "priced", "observed", null, new
+                {
+                    item = name,
+                    estimated = price.EstimatedChaosValue,
+                    min = price.MinChaosValue,
+                    max = price.MaxChaosValue,
+                    matches = price.MatchCount,
+                    line = price.DetailsId,
+                    note = price.PricingNote,
+                });
             _lootTracker.OnItemRecordedDetailed = (name, value, slots, entityId) =>
             {
                 var area = GameController?.Area?.CurrentArea?.Name ?? "";
@@ -509,8 +522,52 @@ namespace AutoExile
             }
         }
 
+        // ── Tick watchdog ──
+        // Snapshots are written from Tick, so a stall where Tick stops (loading screen, game or
+        // ExileApi hang) or runs while not in game used to leave only a silent gap in forensics.
+        private const int TickWatchdogPeriodMs = 15_000;
+        private System.Threading.Timer? _tickWatchdog;
+        private long _lastTickAtMs;
+        private long _lastInGameAtMs;
+        private volatile string _lastTickArea = "";
+        private volatile bool _lastTickRunning;
+
+        private void TickWatchdog()
+        {
+            try
+            {
+                var now = Environment.TickCount64;
+                var lastTick = Interlocked.Read(ref _lastTickAtMs);
+                var lastInGame = Interlocked.Read(ref _lastInGameAtMs);
+                if (lastTick == 0) return;
+                var sinceTick = now - lastTick;
+                var sinceInGame = lastInGame == 0 ? -1 : now - lastInGame;
+                if (sinceTick >= TickWatchdogPeriodMs)
+                    _stats?.RecordRuntimeEvent("state", "tick_gap", "observed", "no_tick", new
+                    {
+                        sinceTickMs = sinceTick, sinceInGameMs = sinceInGame,
+                        area = _lastTickArea, running = _lastTickRunning,
+                    });
+                else if (sinceInGame >= TickWatchdogPeriodMs || sinceInGame < 0)
+                    _stats?.RecordRuntimeEvent("state", "tick_gap", "observed", "not_in_game", new
+                    {
+                        sinceTickMs = sinceTick, sinceInGameMs = sinceInGame,
+                        area = _lastTickArea, running = _lastTickRunning,
+                    });
+            }
+            catch { }
+        }
+
         public override Job Tick()
         {
+            var tickNow = Environment.TickCount64;
+            Interlocked.Exchange(ref _lastTickAtMs, tickNow);
+            _lastTickRunning = Settings.Enable && Settings.Running.Value;
+            if (GameController.InGame)
+            {
+                Interlocked.Exchange(ref _lastInGameAtMs, tickNow);
+                _lastTickArea = GameController.Area?.CurrentArea?.Name ?? "";
+            }
             _stats.SetRunning(Settings.Enable && GameController.InGame && Settings.Running.Value);
             _stats.SetBestFindsMinimumChaos(Settings.Loot.BestFindsMinChaosValue.Value);
             _stats.Pulse();
@@ -1333,6 +1390,8 @@ namespace AutoExile
         /// <summary>Called by ExileCore when plugin is being unloaded.</summary>
         public override void OnClose()
         {
+            _tickWatchdog?.Dispose();
+            _tickWatchdog = null;
             _webServer?.Stop();
             _webServer = null;
             _stats?.Dispose();

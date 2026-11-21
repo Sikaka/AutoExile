@@ -16,6 +16,8 @@ namespace AutoExile.Systems
         public double MaxChaosValue { get; set; }
         public int MatchCount { get; set; }
         public string DetailsId { get; set; } = "";
+        /// <summary>Inputs that chose the line, for loot forensics (cluster jewels).</summary>
+        public string? PricingNote { get; set; }
 
         /// <summary>
         /// Conservative value suitable for persisted statistics. MaxChaosValue remains

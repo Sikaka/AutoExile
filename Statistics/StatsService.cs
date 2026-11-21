@@ -127,6 +127,7 @@ namespace AutoExile.Statistics
             var previous = Volatile.Read(ref _lastPulseMs);
             if (now - previous < 1000 || Interlocked.CompareExchange(ref _lastPulseMs, now, previous) != previous)
                 return;
+            try { FlushCoalescedRuntimeEvents(false); } catch { }
             // A flag, not a queued item: the writer picks it up on its next cycle or idle wake-up.
             Volatile.Write(ref _snapshotRequested, 1);
         }
@@ -1220,6 +1221,7 @@ VALUES($id,$source,$session,$run,$type,$at,$wave,$details)",
 
         public void Dispose()
         {
+            try { FlushCoalescedRuntimeEvents(true); } catch { }
             if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
             _writes.CompleteAdding();
             if (_worker != null && !_worker.Join(TimeSpan.FromSeconds(3)))

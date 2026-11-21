@@ -80,6 +80,21 @@ namespace AutoExile.Modes
         private readonly Dictionary<long, DateTime> _blacklistedMonsters = new();
         private const float MonsterBlacklistSeconds = 10f;
 
+        // Chase progress: an unreachable monster (behind a wall, on a ledge) was chased for hours.
+        private const float ChaseNoProgressSeconds = 15f;
+        private const float ChaseProgressGrid = 5f;
+        private const float ChaseBlacklistSeconds = 60f;
+        private long _chaseTargetId;
+        private float _chaseBestDist = float.MaxValue;
+        private DateTime _chaseProgressAt = DateTime.MinValue;
+
+        // Between-wave stash progress: "Stashed 3 items" was reported 136 times in 7 minutes while
+        // the same 3 items stayed in the inventory. Two trips that leave the stashable count
+        // unchanged block stash trips until that count changes.
+        private int _stashTripStartCount = -1;
+        private int _stashNoProgressTrips;
+        private int _stashBlockedCount = -1;
+
 
         // Action cooldown
         private const float MajorActionCooldownMs = 500f;
@@ -118,6 +133,10 @@ namespace AutoExile.Modes
             _combatEngageTime = DateTime.MinValue;
             _combatEngageCount = 0;
             _blacklistedMonsters.Clear();
+            ResetChase();
+            _stashTripStartCount = -1;
+            _stashNoProgressTrips = 0;
+            _stashBlockedCount = -1;
 
             // Enable combat
             ModeHelpers.EnableDefaultCombat(ctx);
@@ -652,6 +671,7 @@ namespace AutoExile.Modes
                 ctx.Exploration.ResetSeen();
                 ctx.Loot.ClearFailed(); // items that failed in earlier waves may be pickable now
                 _blacklistedMonsters.Clear(); // new wave = fresh monster spawns
+                ResetChase();
                 _wasSearching = false;
                 _waveStartAttempts = 0;
                 _betweenWaveStartTime = DateTime.MinValue;
@@ -713,8 +733,17 @@ namespace AutoExile.Modes
                 (DateTime.Now - _state.WaveStartedAt).TotalMinutes > _settings.WaveTimeoutMinutes.Value)
             {
                 ctx.Stats?.RecordRuntimeEvent("simulacrum", "wave_timeout", "continued", "active_wave_timeout",
-                    new { wave = _state.CurrentWave, target = Decision, progress = ctx.Combat.NearbyMonsterCount });
+                    new { wave = _state.CurrentWave, target = Decision, progress = ctx.Combat.NearbyMonsterCount,
+                          chased = _chaseTargetId, blacklisted = _blacklistedMonsters.Count });
                 _state.ResetWaveTimer();
+                // Recovery, never an exit: drop whatever the bot was chasing and re-sweep the arena.
+                if (_chaseTargetId != 0) BlacklistChaseTarget();
+                BlacklistNearbyMonsters(gc, gc.Player.GridPosNum, ctx.Settings.Build.CombatRange.Value);
+                ResetChase();
+                ctx.Navigation.Stop(gc);
+                _wasSearching = true;
+                ctx.Exploration.SeenRadiusOverride = 40;
+                ctx.Exploration.ResetSeen();
                 Decision = $"Wave {_state.CurrentWave} timeout → continue incomplete run";
                 StatusText = $"Wave {_state.CurrentWave}/15 still active — continuing recovery/search";
                 return;
@@ -834,21 +863,24 @@ namespace AutoExile.Modes
                 // are kept in inventory for future runs and must NOT trigger a stash trip.
                 // Without this, holding spare fragments causes an infinite loop:
                 // open stash → filter rejects everything → close → re-trigger.
-                int stashableCount = 0;
-                var slots = StashSystem.GetInventorySlotItems(gc);
-                if (slots != null)
-                    foreach (var it in slots)
-                        if (KeepSimulacrumsFilter(it)) stashableCount++;
+                int stashableCount = CountStashable(gc);
+                if (_stashBlockedCount >= 0 && stashableCount != _stashBlockedCount)
+                {
+                    _stashBlockedCount = -1;
+                    _stashNoProgressTrips = 0;
+                }
+                bool stashBlocked = _stashBlockedCount >= 0;
 
-                bool shouldStartStashing =
+                bool shouldStartStashing = !stashBlocked &&
                     stashableCount >= ctx.Settings.Run.StashItemThreshold.Value &&
                     (!hasUnresolvedFloorLoot || mustStashForCapacity);
-                bool shouldContinueStashing = _isStashing && stashableCount > 0 &&
+                bool shouldContinueStashing = !stashBlocked && _isStashing && stashableCount > 0 &&
                     (!hasUnresolvedFloorLoot || mustStashForCapacity);
 
                 if (shouldStartStashing || shouldContinueStashing)
                 {
                     _isStashing = true;
+                    _stashTripStartCount = stashableCount;
                     Decision = $"Between waves → Stash ({stashableCount} items)";
                     _phase = SimPhase.BetweenWaveStash;
                     _phaseStartTime = DateTime.Now;
@@ -1009,11 +1041,31 @@ namespace AutoExile.Modes
             // Tier 1: Known monsters exist — navigate toward the nearest non-blacklisted one
             if (ctx.Combat.CachedMonsterCount > 0)
             {
-                var nearestPos = FindNearestNonBlacklisted(gc, playerPos, ctx.Combat.BlacklistedEnemies);
+                var nearestPos = FindNearestNonBlacklisted(gc, playerPos, ctx.Combat.BlacklistedEnemies, out var nearestId);
                 if (nearestPos.HasValue)
                 {
                     _wasSearching = true;
                     var monsterDist = Vector2.Distance(playerPos, nearestPos.Value);
+                    if (nearestId != _chaseTargetId)
+                    {
+                        _chaseTargetId = nearestId;
+                        _chaseBestDist = monsterDist;
+                        _chaseProgressAt = DateTime.Now;
+                    }
+                    else if (monsterDist < _chaseBestDist - ChaseProgressGrid)
+                    {
+                        _chaseBestDist = monsterDist;
+                        _chaseProgressAt = DateTime.Now;
+                    }
+                    else if ((DateTime.Now - _chaseProgressAt).TotalSeconds > ChaseNoProgressSeconds)
+                    {
+                        BlacklistChaseTarget();
+                        ResetChase();
+                        ctx.Navigation.Stop(gc);
+                        Decision = $"Wave {_state.CurrentWave} — chase target unreachable, blacklisted ({_blacklistedMonsters.Count})";
+                        StatusText = $"Wave {_state.CurrentWave}/15 — skipping unreachable monster";
+                        return;
+                    }
                     if (monsterDist > 20f)
                     {
                         if (ctx.Navigation.IsNavigating)
@@ -1026,6 +1078,7 @@ namespace AutoExile.Modes
                 }
                 // All cached monsters are blacklisted — fall through to explore
             }
+            ResetChase();
 
             // Tier 2: No cached monsters — explore to find stragglers
             // (ResetSeen already called at the fighting→searching transition above)
@@ -1102,10 +1155,12 @@ namespace AutoExile.Modes
         /// Find the nearest alive hostile monster that isn't blacklisted.
         /// Returns null if all cached monsters are blacklisted (or none exist).
         /// </summary>
-        private Vector2? FindNearestNonBlacklisted(GameController gc, Vector2 playerGrid, HashSet<string> enemyBlacklist)
+        private Vector2? FindNearestNonBlacklisted(GameController gc, Vector2 playerGrid, HashSet<string> enemyBlacklist,
+            out long nearestId)
         {
             float nearestDist = float.MaxValue;
             Vector2? nearestPos = null;
+            nearestId = 0;
 
             foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
             {
@@ -1121,10 +1176,25 @@ namespace AutoExile.Modes
                 {
                     nearestDist = dist;
                     nearestPos = entity.GridPosNum;
+                    nearestId = entity.Id;
                 }
             }
 
             return nearestPos;
+        }
+
+        /// <summary>Blacklists the chased monster for ChaseBlacklistSeconds (entries expire MonsterBlacklistSeconds after their stamp).</summary>
+        private void BlacklistChaseTarget()
+        {
+            if (_chaseTargetId == 0) return;
+            _blacklistedMonsters[_chaseTargetId] = DateTime.Now.AddSeconds(ChaseBlacklistSeconds - MonsterBlacklistSeconds);
+        }
+
+        private void ResetChase()
+        {
+            _chaseTargetId = 0;
+            _chaseBestDist = float.MaxValue;
+            _chaseProgressAt = DateTime.MinValue;
         }
 
         /// <summary>Remove expired blacklist entries.</summary>
@@ -1260,6 +1330,35 @@ namespace AutoExile.Modes
         // Between-wave stash
         // =================================================================
 
+        private int CountStashable(GameController gc)
+        {
+            int count = 0;
+            var slots = StashSystem.GetInventorySlotItems(gc);
+            if (slots != null)
+                foreach (var it in slots)
+                    if (KeepSimulacrumsFilter(it)) count++;
+            return count;
+        }
+
+        /// <summary>Counts trips that left the stashable count unchanged; two in a row block further trips.</summary>
+        private void NoteStashTripEnd(BotContext ctx, string outcome)
+        {
+            if (_stashTripStartCount < 0) return;
+            var remaining = CountStashable(ctx.Game);
+            if (remaining < _stashTripStartCount)
+            {
+                _stashNoProgressTrips = 0;
+            }
+            else if (++_stashNoProgressTrips >= 2)
+            {
+                _stashBlockedCount = remaining;
+                _isStashing = false;
+                ctx.Stats?.RecordRuntimeEvent("simulacrum", "stash_no_progress", "blocked", outcome,
+                    new { wave = _state.CurrentWave, remaining, stored = ctx.Stash.ItemsStored, trips = _stashNoProgressTrips });
+            }
+            _stashTripStartCount = -1;
+        }
+
         private void TickBetweenWaveStash(BotContext ctx, InteractionResult interactionResult)
         {
             // If wave started while stashing, cancel and return to wave cycle
@@ -1280,6 +1379,7 @@ namespace AutoExile.Modes
                 if (ctx.Stash.IsBusy)
                     ctx.Stash.Cancel(ctx.Game, ctx.Navigation);
                 _isStashing = false;
+                NoteStashTripEnd(ctx, "timeout");
                 _phase = SimPhase.WaveCycle;
                 _phaseStartTime = DateTime.Now;
                 StatusText = "Stash timeout — resuming wave cycle";
@@ -1333,6 +1433,7 @@ namespace AutoExile.Modes
                     // keeps working. The between-waves loot logic (Priority 4) runs first,
                     // and shouldContinueStashing ensures we come back to stash any new pickups
                     // before starting the next wave. _isStashing resets when the wave starts.
+                    NoteStashTripEnd(ctx, "succeeded");
                     _phase = SimPhase.WaveCycle;
                     _phaseStartTime = DateTime.Now;
                     StatusText = $"Stashed {ctx.Stash.ItemsStored} items — resuming wave cycle";

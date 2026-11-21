@@ -28,6 +28,9 @@ namespace AutoExile.Systems
 
         /// <summary>Detailed pickup callback including the stable in-area entity id.</summary>
         public Action<string, double, int, long>? OnItemRecordedDetailed { get; set; }
+        /// <summary>Raised for valuable or cluster-priced pickups so forensics can show which price line was used.</summary>
+        public Action<string, PriceResult>? OnItemPriced { get; set; }
+        private const double PricedEventMinChaos = 50;
 
         // Recent loot log (capped to prevent unbounded growth)
         private readonly List<LootRecord> _recentLoot = new();
@@ -134,7 +137,13 @@ namespace AutoExile.Systems
             var chaosValue = 0.0;
             if (PriceService != null && PriceService.IsLoaded && itemEntity != null)
             {
-                try { chaosValue = PriceService.GetPrice(gc, itemEntity).EstimatedChaosValue; }
+                try
+                {
+                    var price = PriceService.GetPrice(gc, itemEntity);
+                    chaosValue = price.EstimatedChaosValue;
+                    if (chaosValue >= PricedEventMinChaos || price.PricingNote != null)
+                        OnItemPriced?.Invoke(itemName, price);
+                }
                 catch { }
             }
 

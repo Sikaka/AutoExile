@@ -321,7 +321,7 @@ namespace AutoExile.Systems
             // ── Cluster jewel (non-unique): lookup by enchant + passive count + ilvl ──
             if (category.Value == NinjaPriceCategory.ClusterJewel)
             {
-                return PriceClusterJewel(entity, mods);
+                return PriceClusterJewel(entity, mods, baseName);
             }
 
             // ── Everything else: lookup by base name ──
@@ -512,11 +512,19 @@ namespace AutoExile.Systems
             return new PriceResult { MinChaosValue = minVal, MaxChaosValue = minVal, MatchCount = entries.Count, DetailsId = detailsId };
         }
 
+        private static readonly System.Text.RegularExpressions.Regex ClusterPassiveCountPattern = new(
+            @"Adds (\d+) Passive Skill", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        /// <summary>poe.ninja lines with fewer listings are single-seller outliers (one line priced a white cluster at 31k chaos).</summary>
+        private const int ClusterMinListings = 5;
+
         /// <summary>
-        /// Price a non-unique cluster jewel by its enchant text, passive count, and item level.
+        /// Price a non-unique cluster jewel by its enchant text, passive count, base and item level.
         /// Ninja indexes these by enchant name with variant = "{N} passives" and levelRequired tiers.
+        /// When the passive count cannot be read the cheapest matching line is used for statistics,
+        /// never the most expensive one.
         /// </summary>
-        private PriceResult PriceClusterJewel(Entity entity, Mods? mods)
+        private PriceResult PriceClusterJewel(Entity entity, Mods? mods, string baseName)
         {
             if (mods?.EnchantedStats == null || mods.EnchantedStats.Count == 0)
                 return PriceResult.Zero;
@@ -527,82 +535,87 @@ namespace AutoExile.Systems
 
             foreach (var stat in mods.EnchantedStats)
             {
-                if (stat.StartsWith(ClusterEnchantPrefix, StringComparison.Ordinal))
+                if (string.IsNullOrEmpty(stat)) continue;
+                var countMatch = ClusterPassiveCountPattern.Match(stat);
+                if (passiveCount == 0 && countMatch.Success && int.TryParse(countMatch.Groups[1].Value, out var count))
+                    passiveCount = count;
+
+                var prefixAt = stat.IndexOf(ClusterEnchantPrefix, StringComparison.Ordinal);
+                if (prefixAt >= 0 && enchantName == null)
                 {
-                    enchantName = stat[ClusterEnchantPrefix.Length..]
+                    enchantName = stat[(prefixAt + ClusterEnchantPrefix.Length)..]
                         .Replace("\r\n", ", ")
                         .Replace("\n", ", ")
                         .Replace("\r", "")
                         .Trim();
                 }
-                else if (stat.StartsWith("Adds ", StringComparison.Ordinal) && stat.Contains("Passive Skill"))
-                {
-                    // "Adds 3 Passive Skills" → extract the number
-                    var parts = stat.Split(' ');
-                    if (parts.Length >= 2 && int.TryParse(parts[1], out var count))
-                        passiveCount = count;
-                }
             }
 
             if (string.IsNullOrEmpty(enchantName))
-            {
-                // Try LocalStats for passive count if enchant parsing didn't get it
-                if (entity.TryGetComponent<LocalStats>(out var localStats) && localStats.StatDictionary != null)
-                {
-                    var statKey = Enum.Parse<GameStat>(nameof(GameStat.LocalJewelExpansionPassiveNodeCount));
-                    localStats.StatDictionary.TryGetValue(statKey, out passiveCount);
-                }
                 return PriceResult.Zero;
-            }
 
-            // Also try LocalStats for passive count as backup
             if (passiveCount == 0 && entity.TryGetComponent<LocalStats>(out var ls) && ls.StatDictionary != null)
-            {
-                var statKey = Enum.Parse<GameStat>(nameof(GameStat.LocalJewelExpansionPassiveNodeCount));
-                ls.StatDictionary.TryGetValue(statKey, out passiveCount);
-            }
+                ls.StatDictionary.TryGetValue(GameStat.LocalJewelExpansionPassiveNodeCount, out passiveCount);
 
             var itemLevel = mods.ItemLevel;
             var variantStr = passiveCount > 0 ? $"{passiveCount} passives" : null;
 
-            // Look up by enchant name in cluster jewel data
             var prices = _prices;
             if (!prices.TryGetValue(NinjaPriceCategory.ClusterJewel, out var byName))
                 return PriceResult.Zero;
             if (!byName.TryGetValue(enchantName, out var entries) || entries.Count == 0)
                 return PriceResult.Zero;
 
-            // Filter by variant (passive count) and find best level match (highest levelRequired <= itemLevel)
-            ItemLine? bestMatch = null;
+            var fitting = new List<ItemLine>();
             foreach (var entry in entries)
             {
-                // Filter by passive count if we know it
+                if ((entry.ChaosValue ?? 0) <= 0) continue;
+                if (!string.IsNullOrEmpty(baseName) && !string.IsNullOrEmpty(entry.BaseType) &&
+                    !string.Equals(entry.BaseType, baseName, StringComparison.Ordinal))
+                    continue;
                 if (variantStr != null && entry.Variant != null && entry.Variant != variantStr)
                     continue;
-
-                // Filter by level requirement
                 if (entry.LevelRequired.HasValue && entry.LevelRequired.Value > itemLevel)
                     continue;
+                fitting.Add(entry);
+            }
+            if (fitting.Count == 0) return PriceResult.Zero;
 
-                // Pick the entry with the highest levelRequired that fits (most specific price)
-                if (bestMatch == null ||
-                    (entry.LevelRequired ?? 0) > (bestMatch.LevelRequired ?? 0))
+            // Thin lines only when nothing liquid fits; their price then never exceeds the cheapest one.
+            var liquid = fitting.FindAll(e => !e.ListingCount.HasValue || e.ListingCount.Value >= ClusterMinListings);
+            var pool = liquid.Count > 0 ? liquid : fitting;
+
+            ItemLine chosen;
+            if (variantStr != null && liquid.Count > 0)
+            {
+                // Known variant: the highest levelRequired tier that fits; cheapest line inside that tier.
+                var tier = pool.Max(e => e.LevelRequired ?? 0);
+                chosen = pool.Where(e => (e.LevelRequired ?? 0) == tier).MinBy(e => e.ChaosValue ?? 0)!;
+                var val = chosen.ChaosValue ?? 0;
+                return new PriceResult
                 {
-                    bestMatch = entry;
-                }
+                    MinChaosValue = val, MaxChaosValue = val, MatchCount = 1, DetailsId = chosen.DetailsId,
+                    PricingNote = ClusterNote(enchantName, passiveCount, itemLevel, chosen),
+                };
             }
 
-            if (bestMatch == null) return PriceResult.Zero;
-
-            var val = bestMatch.ChaosValue ?? 0;
+            // Unknown passives or only thin lines: statistics take the cheapest line, pickup keeps the ceiling.
+            chosen = pool.MinBy(e => e.ChaosValue ?? 0)!;
+            var min = chosen.ChaosValue ?? 0;
+            var max = pool.Max(e => e.ChaosValue ?? 0);
             return new PriceResult
             {
-                MinChaosValue = val,
-                MaxChaosValue = val,
-                MatchCount = 1,
-                DetailsId = bestMatch.DetailsId,
+                MinChaosValue = min,
+                MaxChaosValue = max,
+                MatchCount = Math.Max(2, pool.Count),
+                DetailsId = chosen.DetailsId,
+                PricingNote = ClusterNote(enchantName, passiveCount, itemLevel, chosen) + $" pool={pool.Count} max={max:F0}",
             };
         }
+
+        private static string ClusterNote(string enchant, int passives, int itemLevel, ItemLine line)
+            => $"cluster enchant='{enchant}' passives={passives} ilvl={itemLevel} line={line.DetailsId} " +
+               $"variant={line.Variant} lvl={line.LevelRequired} listings={line.ListingCount}";
 
         private PriceResult LookupItem(string name, NinjaPriceCategory category)
         {

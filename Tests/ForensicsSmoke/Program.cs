@@ -338,6 +338,29 @@ FROM runtime_events WHERE category IN ('input','movement','navigation','simulacr
         "Dispose did not drain all accepted noncritical events");
     RequireQuickCheck(drainDb, "shutdown drain");
 
+    // Integration: identical high-volume events stack into the first row plus one repeat summary.
+    var stackDb = Path.Combine(root, "stack", "stats.db");
+    using (var stacking = new StatsService(logs.Add, stackDb))
+    {
+        Require(stacking.Initialize(pluginDirectory), "stack: initialization failed");
+        for (var i = 0; i < 40; i++)
+        {
+            Require(stacking.RecordRuntimeEvent("input", "StartMovement", "sent", context: new { key = "R", x = 960.0 + (i % 3), y = 540.0, elapsedMs = i }),
+                $"stack: event {i} was rejected");
+            Require(stacking.RecordRuntimeEvent("movement", "stop", "inactive", context: new { key = "R", suspendedMs = i * 7 }),
+                $"stack: stop {i} was rejected");
+        }
+        Require(stacking.RecordRuntimeEvent("input", "StartMovement", "sent", context: new { key = "R", x = 400.0, y = 200.0 }),
+            "stack: distinct event was rejected");
+    }
+    Require(ScalarLong(stackDb, "SELECT COUNT(*) FROM runtime_events WHERE category='input' AND event_name='StartMovement'") == 3,
+        "stack: repeated input was not stored as first row + summary + distinct row");
+    Require(ScalarLong(stackDb, "SELECT COUNT(*) FROM runtime_events WHERE category='movement' AND event_name='stop'") == 2,
+        "stack: interleaved repeated movement event was not stacked");
+    Require(ScalarLong(stackDb, "SELECT COALESCE(SUM(json_extract(context_json,'$.repeated')),0) FROM runtime_events WHERE category='input' AND json_extract(context_json,'$.coalesced')=1") == 39,
+        "stack: repeat summary count is wrong");
+    RequireQuickCheck(stackDb, "repeat stacking");
+
     // Integration/stress: a locked writer must not block producers; overflow is explicit and durable.
     var overflowDb = Path.Combine(root, "overflow", "stats.db");
     var overflowRejected = 0;

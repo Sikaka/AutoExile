@@ -48,6 +48,11 @@ public sealed partial class StatsService
         try
         {
             var occurredAt = DateTimeOffset.UtcNow;
+            if (!critical && IsCoalescedCategory(category))
+            {
+                var contextJson = SerializeRuntimeContext(context);
+                return RecordCoalesced(category, eventName, outcome ?? "", reason, contextJson, occurredAt);
+            }
             var record = new RuntimeEventRecord
             {
                 OccurredAtMs = occurredAt.ToUnixTimeMilliseconds(),
@@ -81,6 +86,136 @@ public sealed partial class StatsService
         {
             return false;
         }
+    }
+
+    // ── Repeat stacking ──
+    // A burst of the same high-volume event (a stuck movement loop presses R 15 times a
+    // second) is stored as its first row plus one summary row carrying the repeat count.
+    internal const long CoalesceWindowMs = 2000;
+    internal const long CoalesceMaxSpanMs = 10_000;
+    private const int CoalesceMaxKeys = 128;
+    private readonly object _coalesceLock = new();
+    private readonly Dictionary<string, CoalesceEntry> _coalesce = new();
+    private long _lastCoalesceSweepMs;
+
+    private sealed class CoalesceEntry
+    {
+        public string Category = "", EventName = "", Outcome = "";
+        public string? Reason;
+        public long FirstRepeatAtMs, LastAtMs;
+        public int Repeats;
+        public string? LastContextJson;
+    }
+
+    private static bool IsCoalescedCategory(string category)
+        => category is "input" or "movement" or "navigation";
+
+    private static readonly System.Text.RegularExpressions.Regex VolatileField = new(
+        "\"(\\w*Ms|suppressed|totalRecoveries|sameSpot)\":[^,}]*,?",
+        System.Text.RegularExpressions.RegexOptions.Compiled);
+    private static readonly System.Text.RegularExpressions.Regex Number = new(
+        "-?\\d+(\\.\\d+)?([eE][+-]?\\d+)?",
+        System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    /// <summary>Same event, same rounded context: timings and counters dropped, coordinates in 10-unit cells.</summary>
+    internal static string CoalesceKey(string category, string eventName, string outcome, string? reason, string? contextJson)
+    {
+        var ctx = contextJson ?? "";
+        if (ctx.Length > 0)
+        {
+            ctx = VolatileField.Replace(ctx, "");
+            ctx = Number.Replace(ctx, m => double.TryParse(m.Value, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var v)
+                ? Math.Round(v / 10d).ToString(System.Globalization.CultureInfo.InvariantCulture) : m.Value);
+        }
+        return $"{category}|{eventName}|{outcome}|{reason}|{ctx}";
+    }
+
+    private bool RecordCoalesced(string category, string eventName, string outcome, string? reason,
+        string? contextJson, DateTimeOffset occurredAt)
+    {
+        var now = occurredAt.ToUnixTimeMilliseconds();
+        var key = CoalesceKey(category, eventName, outcome, reason, contextJson);
+        lock (_coalesceLock)
+        {
+            if (_coalesce.TryGetValue(key, out var entry) && now - entry.LastAtMs <= CoalesceWindowMs)
+            {
+                if (entry.Repeats == 0) entry.FirstRepeatAtMs = now;
+                entry.Repeats++;
+                entry.LastAtMs = now;
+                entry.LastContextJson = contextJson;
+                if (now - entry.FirstRepeatAtMs >= CoalesceMaxSpanMs) EmitCoalesceSummary(entry);
+                SweepCoalesced(now, false);
+                return true;
+            }
+            if (entry != null)
+            {
+                EmitCoalesceSummary(entry);
+                _coalesce.Remove(key);
+            }
+            if (_coalesce.Count >= CoalesceMaxKeys) SweepCoalesced(now, true);
+            _coalesce[key] = new CoalesceEntry
+            {
+                Category = category, EventName = eventName, Outcome = outcome, Reason = reason, LastAtMs = now,
+            };
+            SweepCoalesced(now, false);
+        }
+        return EnqueueRuntimeEvent(new RuntimeEventRecord
+        {
+            OccurredAtMs = now,
+            OccurredAtUtc = occurredAt.ToString("O"),
+            ProducerThreadId = Environment.CurrentManagedThreadId,
+            Category = category,
+            EventName = eventName,
+            Outcome = outcome,
+            Reason = reason,
+            ContextJson = contextJson,
+        }, false);
+    }
+
+    /// <summary>Writes pending repeat summaries whose window has closed; all of them when forced.</summary>
+    internal void FlushCoalescedRuntimeEvents(bool force)
+    {
+        lock (_coalesceLock) SweepCoalesced(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), force);
+    }
+
+    // Caller holds _coalesceLock.
+    private void SweepCoalesced(long now, bool force)
+    {
+        if (!force && now - _lastCoalesceSweepMs < 500) return;
+        _lastCoalesceSweepMs = now;
+        List<string>? expired = null;
+        foreach (var (key, entry) in _coalesce)
+        {
+            if (!force && now - entry.LastAtMs <= CoalesceWindowMs) continue;
+            EmitCoalesceSummary(entry);
+            (expired ??= new()).Add(key);
+        }
+        if (expired != null) foreach (var key in expired) _coalesce.Remove(key);
+    }
+
+    // Caller holds _coalesceLock.
+    private void EmitCoalesceSummary(CoalesceEntry entry)
+    {
+        if (entry.Repeats <= 0) return;
+        var at = DateTimeOffset.FromUnixTimeMilliseconds(entry.LastAtMs);
+        var context = "{\"coalesced\":true,\"repeated\":" + entry.Repeats
+            + ",\"spanMs\":" + (entry.LastAtMs - entry.FirstRepeatAtMs)
+            + ",\"firstRepeatAtUtc\":" + JsonSerializer.Serialize(DateTimeOffset.FromUnixTimeMilliseconds(entry.FirstRepeatAtMs).ToString("O"))
+            + ",\"last\":" + (entry.LastContextJson ?? "null") + "}";
+        EnqueueRuntimeEvent(new RuntimeEventRecord
+        {
+            OccurredAtMs = entry.LastAtMs,
+            OccurredAtUtc = at.ToString("O"),
+            ProducerThreadId = Environment.CurrentManagedThreadId,
+            Category = entry.Category,
+            EventName = entry.EventName,
+            Outcome = entry.Outcome,
+            Reason = entry.Reason,
+            ContextJson = context,
+        }, false);
+        entry.Repeats = 0;
+        entry.FirstRepeatAtMs = 0;
     }
 
     private static string? SerializeRuntimeContext(object? context)
