@@ -575,6 +575,7 @@ namespace AutoExile
         private long _lastLeagueCheckMs = long.MinValue / 2;
 
         private readonly HudPanel _hudPanel = new();
+        private float _lastPanelBottom;
 
         private bool LeftGamePanelOpen()
         {
@@ -979,12 +980,15 @@ namespace AutoExile
             var simHud = _simulacrumMode != null && _mode == _simulacrumMode ? _simulacrumMode.BuildHud(_ctx) : null;
             // The stash and other left-side panels open where the HUD sits; while one is open the
             // HUD shrinks to a one-line pill at the top centre.
-            var hudBottom = LeftGamePanelOpen()
+            var leftPanelOpen = LeftGamePanelOpen();
+            var hudBottom = leftPanelOpen
                 ? _hudPanel.DrawPill(windowRect.Width / 2f, hudTop, header, simHud)
                 : _hudPanel.Draw(new Vector2(12f, hudTop), windowRect.Height * 0.64f, header, simHud,
                     !Settings.CompactHud.Value, simHud != null ? _toggleHud : null);
-            // Modes that still draw their own text lines start below the panel.
-            _ctx.ModeHudTop = hudBottom + 6f;
+            if (!leftPanelOpen) _lastPanelBottom = hudBottom;
+            // Modes that still draw their own text lines start below the panel; while the pill shows
+            // they keep their place instead of jumping up.
+            _ctx.ModeHudTop = (leftPanelOpen ? Math.Max(hudBottom, _lastPanelBottom) : hudBottom) + 6f;
 
             // Loot tracker overlay (top-right area)
             var winWidth = windowRect.Width;

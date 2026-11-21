@@ -132,7 +132,7 @@ namespace AutoExile.UI
                 parts.Add(("  W", Dim));
                 parts.Add((sim.Wave.ToString(), sim.WaveActive ? Red : Cyan));
                 parts.Add(("/" + sim.WaveMax, Dim));
-                parts.Add(("  RUN ", Dim));
+                parts.Add(("  ", Dim));
                 parts.Add((sim.RunTime, Bright));
                 if (sim.Deaths > 0)
                 {
@@ -140,8 +140,11 @@ namespace AutoExile.UI
                     parts.Add((sim.Deaths.ToString(), Red));
                 }
             }
-            parts.Add(("  ", Dim));
-            parts.Add((header.Elapsed, Mid));
+            else
+            {
+                parts.Add(("  ", Dim));
+                parts.Add((header.Elapsed, Mid));
+            }
 
             const float padX = 9f, padY = 3f;
             var textW = parts.Sum(p => W(p.Text));
