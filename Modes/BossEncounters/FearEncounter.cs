@@ -27,8 +27,8 @@ namespace AutoExile.Modes.BossEncounters
         public string Name => "Incarnation of Fear";
         public string Status { get; private set; } = "";
 
-        private const string FragmentPath = "CurrencyUberBossKeyAnger";
-        private const string BossPath = "AngerBossUBER@";
+        private const string FragmentPath = "CurrencyFearKey";
+        private const string BossPath = "AngerBoss@";
 
         // Default pre-lay position SOUTH of boss — traps land directly on boss at (206,306).
         private static readonly Vector2 DefaultDpsPosition = new(206, 320);
@@ -62,7 +62,7 @@ namespace AutoExile.Modes.BossEncounters
         };
 
         public string? InventoryFragmentPath => FragmentPath;
-        public int FragmentCost => 4;
+        public int FragmentCost => 1;
 
         // Suppress combat during first-entry approach (don't chase untargetable boss)
         // and during re-entry approach (need to click area transition, not fight)
