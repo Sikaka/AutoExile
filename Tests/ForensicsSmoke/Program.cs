@@ -253,6 +253,47 @@ FROM runtime_events WHERE category IN ('input','movement','navigation','simulacr
             Require(payload.RootElement.GetProperty("error").GetString() == "Stats service is not ready.",
                 "forensics unavailable response lost its diagnostic error");
         }
+
+        // Integration: a peer that stops reading must not freeze the live feed for
+        // others, and a stopped listener comes back through CheckHealth.
+        var wsPort = ReserveLoopbackPort();
+        using (var server = new BotWebServer(wsPort, networkAccess: false, logs.Add))
+        {
+            server.Start();
+            Require(server.IsRunning, $"websocket test server failed: {server.LastError}");
+            server.UpdateStatus(new BotStatusSnapshot { Status = new string('x', 512 * 1024) });
+
+            using var stalled = new TcpClient { ReceiveBufferSize = 1024 };
+            await stalled.ConnectAsync(IPAddress.Loopback, wsPort);
+            var stalledStream = stalled.GetStream();
+            var handshake = "GET /api/ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+                            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+            await stalledStream.WriteAsync(System.Text.Encoding.ASCII.GetBytes(handshake));
+            // From here the stalled peer never reads again.
+
+            using var healthy = new System.Net.WebSockets.ClientWebSocket();
+            await healthy.ConnectAsync(new Uri($"ws://127.0.0.1:{wsPort}/api/ws"), CancellationToken.None);
+            var buffer = new byte[1024 * 1024];
+            var received = 0;
+            var feedDeadline = DateTime.UtcNow.AddSeconds(12);
+            while (DateTime.UtcNow < feedDeadline && received < 12)
+            {
+                using var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                System.Net.WebSockets.WebSocketReceiveResult result;
+                try { result = await healthy.ReceiveAsync(buffer, readCts.Token); }
+                catch (OperationCanceledException) { break; }
+                if (result.EndOfMessage) received++;
+            }
+            Require(received >= 12, $"live feed stalled behind a non-reading client (messages={received})");
+
+            server.Stop();
+            Require(!server.IsRunning, "server still running after Stop");
+            server.CheckHealth();
+            Require(server.IsRunning, "CheckHealth did not restart a stopped server");
+            using var restartClient = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+            using var statusResponse = await restartClient.GetAsync($"http://127.0.0.1:{wsPort}/api/status");
+            Require(statusResponse.IsSuccessStatusCode, "restarted server did not answer /api/status");
+        }
     }
 
     // Integration: committed events and ordering survive a clean restart.

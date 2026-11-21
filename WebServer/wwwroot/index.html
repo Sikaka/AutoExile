@@ -807,19 +807,37 @@ function connectWs() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/api/ws`);
   ws.onopen = () => {
+    wsLastMessageAt = Date.now();
     document.getElementById('wsStatus').textContent = 'Live';
     document.getElementById('wsStatus').className = 'connection-badge ok';
   };
   ws.onmessage = (e) => {
+    wsLastMessageAt = Date.now();
     try { updateDashboard(JSON.parse(e.data)); } catch {}
   };
   ws.onclose = () => {
     document.getElementById('wsStatus').textContent = 'Reconnecting...';
     document.getElementById('wsStatus').className = 'connection-badge err';
+    clearTimeout(wsRetryTimer);
     wsRetryTimer = setTimeout(connectWs, 2000);
   };
   ws.onerror = () => ws.close();
 }
+
+// The server pushes a status every 500 ms. An open socket that stays silent is a
+// dead connection the browser has not noticed yet: drop it and reconnect.
+let wsLastMessageAt = 0;
+setInterval(() => {
+  if (!ws || ws.readyState !== WebSocket.OPEN || Date.now() - wsLastMessageAt < 8000) return;
+  const stale = ws;
+  stale.onclose = null;
+  stale.onerror = null;
+  try { stale.close(); } catch {}
+  document.getElementById('wsStatus').textContent = 'Reconnecting...';
+  document.getElementById('wsStatus').className = 'connection-badge err';
+  clearTimeout(wsRetryTimer);
+  connectWs();
+}, 2000);
 
 // Fallback to polling if WebSocket fails
 let pollFallback = false;

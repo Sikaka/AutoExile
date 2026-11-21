@@ -34,6 +34,13 @@ namespace AutoExile.WebServer
         // WebSocket clients
         private readonly List<WebSocket> _wsClients = new();
         private readonly object _wsLock = new();
+        private const int MaxWebSocketClients = 8;
+        private static readonly TimeSpan WebSocketSendTimeout = TimeSpan.FromSeconds(3);
+
+        // Self-healing: BotCore calls CheckHealth periodically
+        private long _nextHealthCheckAtMs;
+        private long _nextAddressCheckAtMs;
+        private int _restartFailures;
 
         // Settings + data store — set by BotCore after construction
         public BotSettings? Settings { get; set; }
@@ -172,6 +179,49 @@ namespace AutoExile.WebServer
         }
 
         public void Dispose() => Stop();
+
+        /// <summary>
+        /// Restarts the server when its listener died or failed to start, or when the
+        /// Tailscale address set changed. Cheap when healthy; call from the bot tick.
+        /// </summary>
+        public void CheckHealth()
+        {
+            var now = Environment.TickCount64;
+            if (now < _nextHealthCheckAtMs) return;
+            _nextHealthCheckAtMs = now + 10_000;
+
+            string? reason = null;
+            if (!IsRunning)
+            {
+                reason = _listener == null ? "not listening" : "listener faulted";
+            }
+            else if (_networkAccess && now >= _nextAddressCheckAtMs)
+            {
+                _nextAddressCheckAtMs = now + 30_000;
+                IPAddress[] current;
+                try { current = GetTailscaleIPv4Addresses(); }
+                catch { current = _tailscaleAddresses; }
+                if (!current.SequenceEqual(_tailscaleAddresses))
+                    reason = $"Tailscale addresses changed ({FormatAddresses(_tailscaleAddresses)} -> {FormatAddresses(current)})";
+            }
+            if (reason == null) return;
+
+            _log($"Web server restarting: {reason}");
+            Stop();
+            Start();
+            if (IsRunning)
+            {
+                _restartFailures = 0;
+                return;
+            }
+
+            // Back off up to 5 minutes while the ports stay unavailable.
+            _restartFailures++;
+            _nextHealthCheckAtMs = now + Math.Min(300_000, 10_000L << Math.Min(_restartFailures, 5));
+        }
+
+        private static string FormatAddresses(IPAddress[] addresses)
+            => addresses.Length == 0 ? "none" : string.Join(",", addresses.Select(a => a.ToString()));
 
         public void UpdateStatus(BotStatusSnapshot status) => _currentStatus = status;
 
@@ -487,7 +537,22 @@ namespace AutoExile.WebServer
             {
                 ws = await ctx.AcceptWebSocketAsync();
 
-                lock (_wsLock) { _wsClients.Add(ws); }
+                WebSocket? evicted = null;
+                lock (_wsLock)
+                {
+                    // Reconnecting tabs can leave half-open sockets behind; keep the newest
+                    // ones so they cannot use up the server's connection slots.
+                    if (_wsClients.Count >= MaxWebSocketClients)
+                    {
+                        evicted = _wsClients[0];
+                        _wsClients.RemoveAt(0);
+                    }
+                    _wsClients.Add(ws);
+                }
+                if (evicted != null)
+                {
+                    try { evicted.Abort(); } catch { }
+                }
 
                 // Keep connection alive — read loop (we don't expect client messages)
                 var buffer = new byte[256];
@@ -525,22 +590,10 @@ namespace AutoExile.WebServer
                     if (clients.Count == 0) continue;
 
                     var json = JsonSerializer.SerializeToUtf8Bytes(_currentStatus, JsonOpts);
-                    var segment = new ArraySegment<byte>(json);
 
-                    foreach (var ws in clients)
-                    {
-                        try
-                        {
-                            if (ws.State == WebSocketState.Open)
-                                await ws.SendAsync(segment, WebSocketMessageType.Text, true, ct);
-                            else
-                                lock (_wsLock) { _wsClients.Remove(ws); }
-                        }
-                        catch
-                        {
-                            lock (_wsLock) { _wsClients.Remove(ws); }
-                        }
-                    }
+                    // Send to every client in parallel with a deadline: one stalled peer
+                    // must not freeze the live view for the others.
+                    await Task.WhenAll(clients.Select(ws => SendWithDeadline(ws, json, ct)));
                 }
                 catch (OperationCanceledException) { break; }
                 catch (Exception ex)
@@ -548,6 +601,32 @@ namespace AutoExile.WebServer
                     _log($"WebSocket broadcast error: {ex.Message}");
                 }
             }
+        }
+
+        private async Task SendWithDeadline(WebSocket ws, byte[] json, CancellationToken ct)
+        {
+            try
+            {
+                if (ws.State == WebSocketState.Open)
+                {
+                    using var sendCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    sendCts.CancelAfter(WebSocketSendTimeout);
+                    await ws.SendAsync(new ArraySegment<byte>(json), WebSocketMessageType.Text, true, sendCts.Token);
+                    return;
+                }
+            }
+            catch when (ct.IsCancellationRequested)
+            {
+                return;
+            }
+            catch
+            {
+                // fall through: drop the client
+            }
+
+            lock (_wsLock) { _wsClients.Remove(ws); }
+            // Abort also ends the client's receive loop, which releases its connection slot.
+            try { ws.Abort(); } catch { }
         }
 
         // ====================================================================

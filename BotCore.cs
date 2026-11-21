@@ -584,6 +584,7 @@ namespace AutoExile
             _stats.SetRunning(Settings.Enable && GameController.InGame && Settings.Running.Value);
             _stats.SetBestFindsMinimumChaos(Settings.Loot.BestFindsMinChaosValue.Value);
             _stats.Pulse();
+            _webServer?.CheckHealth();
             if (!Settings.Enable || !GameController.InGame)
                 return base.Tick();
 

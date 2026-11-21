@@ -42,7 +42,11 @@ namespace AutoExile.WebServer
             _log = log;
         }
 
-        public bool IsListening => _listeners.Count > 0 && _listeners.All(listener => listener.Server.IsBound);
+        private const int MaxConsecutiveAcceptErrors = 20;
+        private volatile bool _faulted;
+
+        /// <summary>False once any accept loop has died outside a requested stop; the owner restarts the server.</summary>
+        public bool IsListening => !_faulted && _listeners.Count > 0 && _listeners.All(listener => listener.Server.IsBound);
 
         public void Start(CancellationToken cancellationToken)
         {
@@ -77,11 +81,13 @@ namespace AutoExile.WebServer
 
         private async Task AcceptLoop(TcpListener listener, CancellationToken cancellationToken)
         {
+            var consecutiveErrors = 0;
             while (!cancellationToken.IsCancellationRequested)
             {
                 try
                 {
                     var client = await listener.AcceptTcpClientAsync(cancellationToken);
+                    consecutiveErrors = 0;
                     var localAddress = ((IPEndPoint)client.Client.LocalEndPoint!).Address;
                     var remoteAddress = ((IPEndPoint)client.Client.RemoteEndPoint!).Address;
                     if (!_allowConnection(remoteAddress, localAddress))
@@ -108,12 +114,31 @@ namespace AutoExile.WebServer
                         }
                     }, CancellationToken.None);
                 }
-                catch (OperationCanceledException) { break; }
-                catch (ObjectDisposedException) { break; }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { break; }
+                catch (ObjectDisposedException)
+                {
+                    if (!cancellationToken.IsCancellationRequested)
+                    {
+                        _faulted = true;
+                        _log($"Web server listener on {listener.LocalEndpoint} was closed unexpectedly");
+                    }
+                    break;
+                }
                 catch (SocketException) when (cancellationToken.IsCancellationRequested) { break; }
                 catch (Exception ex)
                 {
-                    _log($"Web server accept error: {ex.GetType().Name}: {ex.Message}");
+                    consecutiveErrors++;
+                    _log($"Web server accept error ({consecutiveErrors}): {ex.GetType().Name}: {ex.Message}");
+                    if (!listener.Server.IsBound || consecutiveErrors >= MaxConsecutiveAcceptErrors)
+                    {
+                        _faulted = true;
+                        _log($"Web server listener on {listener.LocalEndpoint} gave up after {consecutiveErrors} errors");
+                        break;
+                    }
+
+                    // Back off so a persistently failing socket cannot spin a core.
+                    try { await Task.Delay(Math.Min(consecutiveErrors, 8) * 250, cancellationToken); }
+                    catch (OperationCanceledException) { break; }
                 }
             }
         }
@@ -306,7 +331,14 @@ namespace AutoExile.WebServer
                            $"Sec-WebSocket-Accept: {Convert.ToBase64String(acceptBytes)}\r\n\r\n";
             await _stream.WriteAsync(Encoding.ASCII.GetBytes(response));
             WebSocketAccepted = true;
-            return WebSocket.CreateFromStream(_stream, isServer: true, subProtocol: null, keepAliveInterval: TimeSpan.FromSeconds(30));
+            // Ping every 15 s and abort when the peer stops answering, so a client that
+            // vanished without closing (sleeping phone, dropped Tailscale path) frees its slot.
+            return WebSocket.CreateFromStream(_stream, new WebSocketCreationOptions
+            {
+                IsServer = true,
+                KeepAliveInterval = TimeSpan.FromSeconds(15),
+                KeepAliveTimeout = TimeSpan.FromSeconds(20),
+            });
         }
     }
 
