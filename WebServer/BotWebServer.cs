@@ -22,6 +22,7 @@ namespace AutoExile.WebServer
         private CancellationTokenSource? _cts;
         private Task? _broadcastTask;
         private int _port;
+        private readonly int _configuredPort;
         private readonly bool _networkAccess;
         private readonly Action<string> _log;
         private string _advertisedHost = "localhost";
@@ -88,6 +89,7 @@ namespace AutoExile.WebServer
         public BotWebServer(int port, bool networkAccess, Action<string> log)
         {
             _port = port;
+            _configuredPort = port;
             _networkAccess = networkAccess;
             _log = log;
         }
@@ -99,8 +101,9 @@ namespace AutoExile.WebServer
         {
             if (IsRunning) return;
 
-            // Try primary port, then fallback ports if in use
-            var portsToTry = new[] { _port, _port + 1, _port + 2 };
+            // Try the configured port, then fallback ports if in use. Always start from the
+            // configured one so a restart cannot drift the dashboard to a fallback port.
+            var portsToTry = new[] { _configuredPort, _configuredPort + 1, _configuredPort + 2 };
 
             foreach (var port in portsToTry)
             {
@@ -157,7 +160,13 @@ namespace AutoExile.WebServer
         /// <summary>Last startup error message, if any. Displayed in ImGui when server isn't running.</summary>
         public string? LastError { get; private set; }
 
-        public void Stop()
+        public void Stop() => Stop(graceful: true);
+
+        /// <param name="graceful">
+        /// False aborts WebSocket clients instead of waiting up to 1 s each for a close
+        /// handshake; used by the in-tick restart, when the peers may be unreachable.
+        /// </param>
+        private void Stop(bool graceful)
         {
             _cts?.Cancel();
 
@@ -166,8 +175,15 @@ namespace AutoExile.WebServer
             {
                 foreach (var ws in _wsClients)
                 {
-                    try { ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Server stopping", CancellationToken.None).Wait(1000); }
-                    catch { }
+                    if (graceful)
+                    {
+                        try { ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Server stopping", CancellationToken.None).Wait(1000); }
+                        catch { }
+                    }
+                    else
+                    {
+                        try { ws.Abort(); } catch { }
+                    }
                     try { ws.Dispose(); } catch { }
                 }
                 _wsClients.Clear();
@@ -207,7 +223,7 @@ namespace AutoExile.WebServer
             if (reason == null) return;
 
             _log($"Web server restarting: {reason}");
-            Stop();
+            Stop(graceful: false);
             Start();
             if (IsRunning)
             {
