@@ -338,6 +338,9 @@ namespace AutoExile.WebServer
                     case "/api/history/runs/detail" when method == "GET":
                         await HandleHistoryRunDetail(req, resp);
                         break;
+                    case "/api/history/seasons" when method == "GET":
+                        await HandleHistorySeasons(req, resp);
+                        break;
                     case "/api/history/runs" when method == "GET":
                         await HandleHistoryRuns(req, resp);
                         break;
@@ -768,6 +771,43 @@ namespace AutoExile.WebServer
             var limit = GetQueryInt(req, "limit", 50);
             var data = (Stats?.Snapshot.RecentRuns ?? Array.Empty<StatsRunSnapshot>()).Take(limit);
             await ServeJson(resp, data, pretty: true);
+        }
+
+        /// <summary>
+        /// Without a league parameter: the season list. With ?league=NAME: that season.
+        /// ?league= (empty) selects records made before league tracking.
+        /// </summary>
+        private async Task HandleHistorySeasons(SimpleHttpRequest req, SimpleHttpResponse resp)
+        {
+            if (Stats == null)
+            {
+                resp.StatusCode = 503;
+                await ServeJson(resp, new { error = "Stats service is not ready." }, pretty: true);
+                return;
+            }
+            var league = req.QueryString["league"];
+            try
+            {
+                if (league == null)
+                {
+                    await ServeJson(resp, Stats.ReadSeasons(), pretty: true);
+                    return;
+                }
+                var detail = Stats.ReadSeason(league);
+                if (detail == null)
+                {
+                    resp.StatusCode = 404;
+                    await ServeJson(resp, new { error = "Season not found." }, pretty: true);
+                    return;
+                }
+                await ServeJson(resp, detail, pretty: true);
+            }
+            catch (Exception ex)
+            {
+                resp.StatusCode = 503;
+                _log($"Season read failed: {ex.GetType().Name}: {ex.Message}");
+                await ServeJson(resp, new { error = "Season data unavailable." }, pretty: true);
+            }
         }
 
         private async Task HandleHistoryRunDetail(SimpleHttpRequest req, SimpleHttpResponse resp)

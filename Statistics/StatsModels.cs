@@ -18,12 +18,43 @@ namespace AutoExile.Statistics
         public IReadOnlyList<StatsLootSnapshot> BestFinds { get; init; } = Array.Empty<StatsLootSnapshot>();
         public int BestFindsMinimumChaos { get; init; } = 100;
         public IReadOnlyList<StatsEventSnapshot> RecentEvents { get; init; } = Array.Empty<StatsEventSnapshot>();
+        /// <summary>League of the current season; null until the game reports one.</summary>
+        public string? CurrentLeague { get; init; }
+        public StatsAggregate? Season { get; init; }
+        public IReadOnlyDictionary<string, StatsAggregate> SeasonByMode { get; init; }
+            = new Dictionary<string, StatsAggregate>(StringComparer.OrdinalIgnoreCase);
 
         public StatsAggregate SessionFor(string mode) =>
             SessionByMode.TryGetValue(mode, out var value) ? value : new StatsAggregate { SessionId = Session.SessionId };
 
+        public StatsAggregate? SeasonFor(string mode) =>
+            Season == null ? null : SeasonByMode.TryGetValue(mode, out var value) ? value : new StatsAggregate();
+
         public StatsAggregate LifetimeFor(string mode) =>
             LifetimeByMode.TryGetValue(mode, out var value) ? value : new StatsAggregate();
+    }
+
+    public sealed class StatsSeasonSummary
+    {
+        /// <summary>Null for records made before league tracking.</summary>
+        public string? League { get; init; }
+        public bool Current { get; init; }
+        public DateTime? StartedAtUtc { get; init; }
+        public DateTime? LastActivityAtUtc { get; init; }
+        public int Runs { get; init; }
+        public int FullClears { get; init; }
+        public long ItemsLooted { get; init; }
+        public double ChaosValue { get; init; }
+    }
+
+    public sealed class StatsSeasonDetail
+    {
+        public StatsSeasonSummary Season { get; init; } = new();
+        public StatsAggregate Summary { get; init; } = new();
+        public IReadOnlyDictionary<string, StatsAggregate> ByMode { get; init; }
+            = new Dictionary<string, StatsAggregate>(StringComparer.OrdinalIgnoreCase);
+        public IReadOnlyList<StatsRunSnapshot> Runs { get; init; } = Array.Empty<StatsRunSnapshot>();
+        public IReadOnlyList<StatsLootSnapshot> BestFinds { get; init; } = Array.Empty<StatsLootSnapshot>();
     }
 
     public sealed class StatsHealth

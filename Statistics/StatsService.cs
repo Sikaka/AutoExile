@@ -72,6 +72,7 @@ namespace AutoExile.Statistics
         private long _lastWriteErrorLogTickMs;
         private int _writeErrorsSinceLastLog;
         private int _bestFindsMinimumChaos = 100;
+        private string? _league;            // caller (tick) thread only
 
         public StatsService(Action<string> log, string? databasePathOverride = null)
         {
@@ -346,6 +347,49 @@ WHERE loot_id=$loot
             });
         }
 
+        /// <summary>
+        /// Starts a new stats session (season) when the game league changes. Sessions recorded before
+        /// league tracking existed keep a NULL league.
+        /// </summary>
+        public void SetLeague(string? league)
+        {
+            league = league?.Trim();
+            if (string.IsNullOrEmpty(league) || league == _league) return;
+            _league = league;
+            Enqueue(db =>
+            {
+                using var tx = db.BeginTransaction();
+                var now = NowMs();
+                Execute(db, tx, "INSERT OR REPLACE INTO stats_meta(key,value) VALUES('current_league',$league)",
+                    ("$league", league));
+                var sessionId = EnsureSession(db, tx, now);
+                var sessionLeague = ScalarString(db, tx, "SELECT league FROM sessions WHERE session_id=$id", ("$id", sessionId));
+                if (sessionLeague == league)
+                {
+                    // A rotation queued for an earlier league change is no longer needed.
+                    Execute(db, tx, @"DELETE FROM stats_meta WHERE key='pending_session_rotation'
+AND value IN ('league_changed','league_tracking_started')");
+                }
+                else if (sessionLeague == null && ScalarInt32(db, tx,
+                    @"SELECT (SELECT COUNT(*) FROM runs WHERE session_id=$id)+(SELECT COUNT(*) FROM loot_events WHERE session_id=$id)",
+                    ("$id", sessionId)) == 0)
+                {
+                    Execute(db, tx, "UPDATE sessions SET league=$league WHERE session_id=$id",
+                        ("$league", league), ("$id", sessionId));
+                }
+                else
+                {
+                    var reason = sessionLeague == null ? "league_tracking_started" : "league_changed";
+                    if (GetOpenRunId(db, tx) != null)
+                        Execute(db, tx, "INSERT OR REPLACE INTO stats_meta(key,value) VALUES('pending_session_rotation',$reason)",
+                            ("$reason", reason));
+                    else
+                        RotateSessionNow(db, tx, now, reason);
+                }
+                tx.Commit();
+            });
+        }
+
         public void RotateSession(string reason = "manual")
         {
             Enqueue(db =>
@@ -586,6 +630,8 @@ CREATE INDEX IF NOT EXISTS ix_runtime_events_category_event_time
  ON runtime_events(category,event_name,occurred_at_ms DESC);
 INSERT OR IGNORE INTO schema_migrations(version,applied_at_ms) VALUES(1,$now);
 INSERT OR IGNORE INTO schema_migrations(version,applied_at_ms) VALUES(2,$now);", ("$now", NowMs()));
+            if (!ColumnExists(db, tx, "sessions", "league"))
+                Execute(db, tx, "ALTER TABLE sessions ADD COLUMN league TEXT");
             if (!ColumnExists(db, tx, "runs", "consumed"))
                 Execute(db, tx, "ALTER TABLE runs ADD COLUMN consumed INTEGER NOT NULL DEFAULT 0");
             if (!ColumnExists(db, tx, "runtime_events", "occurred_at_utc"))
@@ -644,7 +690,8 @@ INSERT OR IGNORE INTO schema_migrations(version,applied_at_ms) VALUES(2,$now);",
                 "SELECT session_id FROM sessions WHERE ended_at_ms IS NULL ORDER BY started_at_ms DESC LIMIT 1");
             if (sessionId != null) return sessionId;
             sessionId = Guid.NewGuid().ToString("N");
-            Execute(db, tx, "INSERT INTO sessions(session_id,started_at_ms) VALUES($id,$now)",
+            Execute(db, tx, @"INSERT INTO sessions(session_id,started_at_ms,league)
+VALUES($id,$now,(SELECT value FROM stats_meta WHERE key='current_league'))",
                 ("$id", sessionId), ("$now", now));
             return sessionId;
         }
@@ -932,6 +979,8 @@ VALUES($path,$hash,$now,$seen,$imported,'complete')",
                 var currentSession = ScalarString(db, null,
                     "SELECT session_id FROM sessions WHERE ended_at_ms IS NULL ORDER BY started_at_ms DESC LIMIT 1");
                 var currentRun = ReadRuns(db, "WHERE r.state='open'", 1).FirstOrDefault();
+                var currentLeague = ScalarString(db, null, "SELECT value FROM stats_meta WHERE key='current_league'");
+                var season = currentLeague == null ? null : new LeagueScope(currentLeague);
                 _snapshot = new StatsSnapshot
                 {
                     Revision = Interlocked.Increment(ref _revision),
@@ -950,6 +999,11 @@ VALUES($path,$hash,$now,$seen,$imported,'complete')",
                     Lifetime = ReadAggregate(db, null, null),
                     SessionByMode = ReadModeAggregates(db, currentSession),
                     LifetimeByMode = ReadModeAggregates(db, null),
+                    CurrentLeague = currentLeague,
+                    Season = season == null ? null : ReadAggregate(db, null, null, season),
+                    SeasonByMode = season == null
+                        ? new Dictionary<string, StatsAggregate>(StringComparer.OrdinalIgnoreCase)
+                        : ReadModeAggregates(db, null, season),
                     RecentRuns = ReadRuns(db, "WHERE r.state='closed'", 50),
                     RecentLoot = ReadRecentLoot(db, 100),
                     BestFinds = ReadBestFinds(db, Volatile.Read(ref _bestFindsMinimumChaos) * 1000L, 20),
@@ -970,29 +1024,44 @@ VALUES($path,$hash,$now,$seen,$imported,'complete')",
             Health = new StatsHealth { Status = status, Error = error, DatabasePath = _databasePath, PendingWrites = _writes.Count },
         };
 
+        /// <summary>Filters by sessions.league; a null League selects sessions recorded before league tracking.</summary>
+        private sealed record LeagueScope(string? League);
+
+        private const string LeagueSessionsSql = "SELECT session_id FROM sessions WHERE league IS $league";
+
+        private static void BindLeague(SqliteCommand cmd, LeagueScope? scope)
+        {
+            if (scope != null) cmd.Parameters.AddWithValue("$league", (object?)scope.League ?? DBNull.Value);
+        }
+
         private static IReadOnlyDictionary<string, StatsAggregate> ReadModeAggregates(
-            SqliteConnection db, string? sessionId)
+            SqliteConnection db, string? sessionId, LeagueScope? scope = null)
         {
             using var cmd = db.CreateCommand();
-            cmd.CommandText = sessionId == null
-                ? "SELECT DISTINCT mode FROM runs ORDER BY mode"
-                : "SELECT DISTINCT mode FROM runs WHERE session_id=$session ORDER BY mode";
+            var where = new List<string>();
+            if (sessionId != null) where.Add("session_id=$session");
+            if (scope != null) where.Add($"session_id IN ({LeagueSessionsSql})");
+            cmd.CommandText = "SELECT DISTINCT mode FROM runs" +
+                (where.Count == 0 ? "" : " WHERE " + string.Join(" AND ", where)) + " ORDER BY mode";
             if (sessionId != null) cmd.Parameters.AddWithValue("$session", sessionId);
+            BindLeague(cmd, scope);
             var modes = new List<string>();
             using (var reader = cmd.ExecuteReader())
                 while (reader.Read()) modes.Add(reader.GetString(0));
 
             var result = new Dictionary<string, StatsAggregate>(StringComparer.OrdinalIgnoreCase);
             foreach (var mode in modes)
-                result[mode] = ReadAggregate(db, sessionId, mode);
+                result[mode] = ReadAggregate(db, sessionId, mode, scope);
             return result;
         }
 
-        private static StatsAggregate ReadAggregate(SqliteConnection db, string? sessionId, string? mode)
+        private static StatsAggregate ReadAggregate(SqliteConnection db, string? sessionId, string? mode,
+            LeagueScope? scope = null)
         {
             var predicates = new List<string>();
             if (sessionId != null) predicates.Add("r.session_id=$session");
             if (mode != null) predicates.Add("r.mode=$mode");
+            if (scope != null) predicates.Add($"r.session_id IN ({LeagueSessionsSql})");
             var runFilter = predicates.Count == 0 ? "" : " WHERE " + string.Join(" AND ", predicates);
             using var runCmd = db.CreateCommand();
             runCmd.CommandText = $@"SELECT COUNT(*),COALESCE(SUM(r.consumed),0),COALESCE(SUM(CASE WHEN r.first_entry_at_ms IS NOT NULL THEN 1 ELSE 0 END),0),
@@ -1007,18 +1076,21 @@ COALESCE(AVG(CASE WHEN r.state='closed' THEN r.wall_duration_ms END),0)
 FROM runs r LEFT JOIN simulacrum_runs s ON s.run_id=r.run_id{runFilter}";
             if (sessionId != null) runCmd.Parameters.AddWithValue("$session", sessionId);
             if (mode != null) runCmd.Parameters.AddWithValue("$mode", mode);
+            BindLeague(runCmd, scope);
             using var rr = runCmd.ExecuteReader();
             rr.Read();
 
             using var lootCmd = db.CreateCommand();
-            lootCmd.CommandText = mode == null
-                ? "SELECT COALESCE(SUM(l.quantity),0),COALESCE(SUM(l.chaos_value_milli),0) FROM loot_events l" +
-                  (sessionId == null ? "" : " WHERE l.session_id=$session")
-                : @"SELECT COALESCE(SUM(l.quantity),0),COALESCE(SUM(l.chaos_value_milli),0)
-FROM loot_events l JOIN runs r ON r.run_id=l.run_id WHERE r.mode=$mode" +
-                  (sessionId == null ? "" : " AND l.session_id=$session");
+            var lootPredicates = new List<string>();
+            if (mode != null) lootPredicates.Add("r.mode=$mode");
+            if (sessionId != null) lootPredicates.Add("l.session_id=$session");
+            if (scope != null) lootPredicates.Add($"l.session_id IN ({LeagueSessionsSql})");
+            lootCmd.CommandText = "SELECT COALESCE(SUM(l.quantity),0),COALESCE(SUM(l.chaos_value_milli),0) FROM loot_events l" +
+                (mode == null ? "" : " JOIN runs r ON r.run_id=l.run_id") +
+                (lootPredicates.Count == 0 ? "" : " WHERE " + string.Join(" AND ", lootPredicates));
             if (sessionId != null) lootCmd.Parameters.AddWithValue("$session", sessionId);
             if (mode != null) lootCmd.Parameters.AddWithValue("$mode", mode);
+            BindLeague(lootCmd, scope);
             using var lr = lootCmd.ExecuteReader();
             lr.Read();
 
@@ -1033,6 +1105,7 @@ FROM runs r{runFilter}";
                 modeDurationCmd.Parameters.AddWithValue("$now", NowMs());
                 if (sessionId != null) modeDurationCmd.Parameters.AddWithValue("$session", sessionId);
                 modeDurationCmd.Parameters.AddWithValue("$mode", mode);
+                BindLeague(modeDurationCmd, scope);
                 using var mr = modeDurationCmd.ExecuteReader();
                 if (mr.Read())
                 {
@@ -1049,6 +1122,20 @@ CASE WHEN resumed_at_ms IS NULL THEN 0 ELSE MAX(0,$now-resumed_at_ms) END FROM s
                 sessionCmd.Parameters.AddWithValue("$id", sessionId);
                 using var sr = sessionCmd.ExecuteReader();
                 if (sr.Read()) { started = FromMs(sr.GetInt64(0)); activeMs = sr.GetInt64(1); }
+            }
+            else if (scope != null)
+            {
+                using var seasonCmd = db.CreateCommand();
+                seasonCmd.CommandText = @"SELECT MIN(started_at_ms),COALESCE(SUM(active_duration_ms+
+CASE WHEN resumed_at_ms IS NULL THEN 0 ELSE MAX(0,$now-resumed_at_ms) END),0) FROM sessions WHERE league IS $league";
+                seasonCmd.Parameters.AddWithValue("$now", NowMs());
+                BindLeague(seasonCmd, scope);
+                using var sr = seasonCmd.ExecuteReader();
+                if (sr.Read())
+                {
+                    if (!sr.IsDBNull(0)) started = FromMs(sr.GetInt64(0));
+                    activeMs = sr.GetInt64(1);
+                }
             }
             else
             {
@@ -1068,7 +1155,8 @@ CASE WHEN resumed_at_ms IS NULL THEN 0 ELSE MAX(0,$now-resumed_at_ms) END),0) FR
             };
         }
 
-        private static List<StatsRunSnapshot> ReadRuns(SqliteConnection db, string where, int limit, string? runId = null)
+        private static List<StatsRunSnapshot> ReadRuns(SqliteConnection db, string where, int limit, string? runId = null,
+            LeagueScope? scope = null)
         {
             using var cmd = db.CreateCommand();
             cmd.CommandText = $@"SELECT r.run_id,r.session_id,r.mode,r.consumed,r.state,r.result,r.terminal_reason,r.area_name,r.instance_hash,
@@ -1082,6 +1170,7 @@ r.data_quality FROM runs r LEFT JOIN simulacrum_runs s ON s.run_id=r.run_id
             cmd.Parameters.AddWithValue("$now", NowMs());
             cmd.Parameters.AddWithValue("$limit", limit);
             if (runId != null) cmd.Parameters.AddWithValue("$runId", runId);
+            BindLeague(cmd, scope);
             var result = new List<StatsRunSnapshot>();
             using var reader = cmd.ExecuteReader();
             while (reader.Read()) result.Add(new StatsRunSnapshot
@@ -1117,13 +1206,16 @@ FROM loot_events l ORDER BY l.picked_at_ms DESC LIMIT $limit";
             return result;
         }
 
-        private static List<StatsLootSnapshot> ReadBestFinds(SqliteConnection db, long minimumValueMilli, int limit)
+        private static List<StatsLootSnapshot> ReadBestFinds(SqliteConnection db, long minimumValueMilli, int limit,
+            LeagueScope? scope = null)
         {
             using var cmd = db.CreateCommand();
-            cmd.CommandText = @"SELECT l.loot_id,l.run_id,l.picked_at_ms,l.item_name,l.quantity,l.slots,l.chaos_value_milli,l.area_name,
+            var seasonFilter = scope == null ? "" : $" AND l.session_id IN ({LeagueSessionsSql})";
+            cmd.CommandText = $@"SELECT l.loot_id,l.run_id,l.picked_at_ms,l.item_name,l.quantity,l.slots,l.chaos_value_milli,l.area_name,
 COALESCE((SELECT r.mode FROM runs r WHERE r.run_id=l.run_id),'Session')
-FROM loot_events l WHERE l.chaos_value_milli >= $minimum
+FROM loot_events l WHERE l.chaos_value_milli >= $minimum{seasonFilter}
 ORDER BY l.chaos_value_milli DESC,l.picked_at_ms DESC LIMIT $limit";
+            BindLeague(cmd, scope);
             cmd.Parameters.AddWithValue("$minimum", minimumValueMilli);
             cmd.Parameters.AddWithValue("$limit", limit);
             var result = new List<StatsLootSnapshot>();

@@ -571,6 +571,8 @@ namespace AutoExile
             catch { }
         }
 
+        private long _lastLeagueCheckMs = long.MinValue / 2;
+
         public override Job Tick()
         {
             var tickNow = Environment.TickCount64;
@@ -580,6 +582,13 @@ namespace AutoExile
             {
                 Interlocked.Exchange(ref _lastInGameAtMs, tickNow);
                 _lastTickArea = GameController.Area?.CurrentArea?.Name ?? "";
+                if (tickNow - _lastLeagueCheckMs >= 5000)
+                {
+                    _lastLeagueCheckMs = tickNow;
+                    // Each league is its own stats season; SetLeague ignores an unchanged value.
+                    try { _stats.SetLeague(GameController.IngameState?.ServerData?.League); }
+                    catch { }
+                }
             }
             _stats.SetRunning(Settings.Enable && GameController.InGame && Settings.Running.Value);
             _stats.SetBestFindsMinimumChaos(Settings.Loot.BestFindsMinChaosValue.Value);

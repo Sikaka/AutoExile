@@ -589,7 +589,7 @@ tr:hover td { background:var(--surface2); }
       <div class="ledger-outcomes"><span><strong id="simConsumed">0</strong> Consumed</span><span><strong id="simEntered">0</strong> Entered</span><span><strong id="simPartial">0</strong> Partial</span><span><strong id="simNoProgress">0</strong> No progress</span><span><strong id="simInterrupted">0</strong> Interrupted</span></div>
     </div>
     <div class="ledger-section lifetime">
-      <div class="ledger-title">Lifetime</div>
+      <div id="simTotalsTitle" class="ledger-title">Lifetime</div>
       <div class="ledger-metric"><span>Waves</span><strong id="simLifetimeWaves">0</strong></div>
       <div class="ledger-metric"><span>Deaths</span><strong id="simLifetimeDeaths">0</strong></div>
       <div class="ledger-metric"><span>Value</span><strong id="simLifetimeValue" class="yellow">0c</strong></div>
@@ -787,6 +787,7 @@ tr:hover td { background:var(--surface2); }
     <div class="history-tab active" onclick="switchHistory('loot',this)">Loot Log</div>
     <div class="history-tab" onclick="switchHistory('best-finds',this)">Best Finds</div>
     <div class="history-tab" onclick="switchHistory('runs',this)">Run Sessions</div>
+    <div class="history-tab" onclick="switchHistory('seasons',this)">Seasons</div>
     <div class="history-tab" onclick="switchHistory('events',this)">Events</div>
     <div class="history-tab" onclick="switchHistory('forensics',this)">Forensics</div>
   </div>
@@ -933,7 +934,11 @@ function updateDashboard(s) {
     const health = stats && stats.health ? stats.health : null;
     const current = stats && stats.currentRun ? stats.currentRun : null;
     const session = stats && stats.sessionByMode ? stats.sessionByMode.Simulacrum || null : null;
-    const lifetime = stats && stats.lifetimeByMode ? stats.lifetimeByMode.Simulacrum || null : null;
+    // A league season, once the game has reported one, replaces the all-time totals.
+    const season = stats && stats.season ? ((stats.seasonByMode || {}).Simulacrum || {}) : null;
+    const lifetime = season || (stats && stats.lifetimeByMode ? stats.lifetimeByMode.Simulacrum || null : null);
+    const totalLabel = season ? 'Season' : 'Total';
+    setText('simTotalsTitle', season ? `Season · ${stats.currentLeague}` : 'Lifetime');
     const currentWave = current ? Math.max(current.highestWaveStarted || 0, current.wavesCompleted || 0) : (s.simWave || 0);
     const waveText = currentWave > 0 ? `${currentWave}/15` : '-';
     document.getElementById('simWave').textContent = waveText;
@@ -964,14 +969,14 @@ function updateDashboard(s) {
     const sessionValue = session ? session.chaosValue || 0 : s.sessionChaos || 0;
     const lifetimeValue = lifetime ? lifetime.chaosValue || 0 : 0;
     setText('simCurrentRuns', current ? 1 : 0);
-    setText('simDeathsContext', `Session ${sessionDeaths} · Total ${lifetimeDeaths}`);
-    setText('simItemsContext', `Session ${sessionItems} · Total ${lifetimeItems}`);
-    setText('simValueContext', `Session ${formatNumber(sessionValue, 1)}c · Total ${formatNumber(lifetimeValue, 1)}c`);
-    setText('simRunsContext', `Session ${sessionAttempts} · Total ${lifetimeAttempts}`);
-    setText('simClearsSummary', `Session ${session ? session.fullClears || 0 : s.simRuns || 0} · Total ${lifetime ? lifetime.fullClears || 0 : 0}`);
+    setText('simDeathsContext', `Session ${sessionDeaths} · ${totalLabel} ${lifetimeDeaths}`);
+    setText('simItemsContext', `Session ${sessionItems} · ${totalLabel} ${lifetimeItems}`);
+    setText('simValueContext', `Session ${formatNumber(sessionValue, 1)}c · ${totalLabel} ${formatNumber(lifetimeValue, 1)}c`);
+    setText('simRunsContext', `Session ${sessionAttempts} · ${totalLabel} ${lifetimeAttempts}`);
+    setText('simClearsSummary', `Session ${session ? session.fullClears || 0 : s.simRuns || 0} · ${totalLabel} ${lifetime ? lifetime.fullClears || 0 : 0}`);
     const sessionAvgWaves = session && session.averageWavesPerEnteredRun > 0 ? session.averageWavesPerEnteredRun.toFixed(1) : (s.simAvgWaves > 0 ? s.simAvgWaves.toFixed(1) : '-');
     const lifetimeAvgWaves = lifetime && lifetime.averageWavesPerEnteredRun > 0 ? lifetime.averageWavesPerEnteredRun.toFixed(1) : '-';
-    setText('simAvgWavesSummary', `Session ${sessionAvgWaves} · Total ${lifetimeAvgWaves}`);
+    setText('simAvgWavesSummary', `Session ${sessionAvgWaves} · ${totalLabel} ${lifetimeAvgWaves}`);
     setText('simChaosHour', `${formatNumber(session ? session.chaosPerHour : s.chaosPerHour, 1)}c / hour`);
     setText('simConsumed', session ? session.consumed : 0);
     setText('simEntered', session ? session.entered : 0);
@@ -2907,6 +2912,7 @@ async function loadHistory(type) {
   const container = document.getElementById('historyContent');
   const more = document.getElementById('historyLoadMore');
   if (type === 'runs' && runReport) { renderRunReport(); return; }
+  if (type === 'seasons') { if (runReport) renderRunReport(); else await loadSeasons(); return; }
   try {
     const suffix = type === 'forensics' ? `&hours=${forensicsWindowHours}` : '';
     const fetchLimit = type === 'best-finds' ? 20 : type === 'forensics' ? 500 : 100;
@@ -3040,6 +3046,7 @@ function syncHistorySortControls() {
 function applyHistoryView() {
   const type = currentHistoryType;
   if (type === 'runs' && runReport) return;
+  if (type === 'seasons') { if (!runReport) renderSeasons(); return; }
   const source = historyData[type] || [];
   const state = historyViewState[type];
   const query = state.query.trim().toLowerCase();
@@ -3177,6 +3184,147 @@ function renderRunsTable(data) {
   }
   html += '</tbody></table></div>';
   document.getElementById('historyContent').innerHTML = html;
+}
+
+// ==================== SEASONS ====================
+// list: season summaries; league: undefined = list view, '' = records before league tracking.
+const seasonView = { list:null, league:undefined, detail:null, error:'', loading:false, seq:0, showAllRuns:false };
+const SEASON_RUN_PREVIEW = 100;
+
+function seasonName(league) {
+  return league == null || league === '' ? 'Before seasons' : league;
+}
+
+async function loadSeasons() {
+  const seq = ++seasonView.seq;
+  const league = seasonView.league;
+  seasonView.loading = true;
+  seasonView.error = '';
+  renderSeasons();
+  try {
+    const url = league === undefined ? '/api/history/seasons' : `/api/history/seasons?league=${encodeURIComponent(league)}`;
+    const r = await fetch(url);
+    let body = null;
+    try { body = await r.json(); } catch {}
+    if (seq !== seasonView.seq) return;
+    if (!r.ok) throw new Error(body?.error || `HTTP ${r.status}`);
+    if (league === undefined) seasonView.list = Array.isArray(body) ? body : [];
+    else seasonView.detail = body;
+  } catch (e) {
+    if (seq !== seasonView.seq) return;
+    seasonView.error = e?.message || 'Request failed.';
+  }
+  seasonView.loading = false;
+  if (currentHistoryType === 'seasons' && !runReport) renderSeasons();
+}
+
+function openSeason(league) {
+  seasonView.league = league;
+  seasonView.detail = null;
+  seasonView.showAllRuns = false;
+  loadSeasons().then(() => document.getElementById('seasonBack')?.focus({preventScroll:true}));
+}
+
+function closeSeason() {
+  const league = seasonView.league;
+  seasonView.league = undefined;
+  seasonView.detail = null;
+  loadSeasons().then(() => {
+    const row = [...document.querySelectorAll('#historyContent .season-row')].find(el => el.dataset.league === league);
+    row?.focus({preventScroll:true});
+  });
+}
+
+function seasonRowKey(event, row) {
+  if (event.key !== 'Enter' && event.key !== ' ') return;
+  event.preventDefault();
+  openSeason(row.dataset.league);
+}
+
+function toggleSeasonRuns() {
+  seasonView.showAllRuns = !seasonView.showAllRuns;
+  renderSeasons();
+  document.getElementById('seasonRunsToggle')?.focus({preventScroll:true});
+}
+
+function renderSeasons() {
+  document.getElementById('historyFilters').style.display = 'none';
+  document.getElementById('historyLoadMore').classList.remove('visible');
+  document.getElementById('historyContent').innerHTML = seasonView.league === undefined ? seasonListHtml() : seasonDetailHtml();
+}
+
+function seasonListHtml() {
+  if (seasonView.error) return `<div class="empty-state red">Could not load seasons: ${esc(seasonView.error)}</div>`;
+  if (!seasonView.list) return '<div class="empty-state">Loading seasons…</div>';
+  if (!seasonView.list.length) return '<div class="empty-state">No seasons recorded yet</div>';
+  let html = '<div class="history-table-wrap"><table><thead><tr><th>Season</th><th>Started</th><th>Last activity</th><th>Runs</th><th>Full clears</th><th>Items</th><th>Chaos</th></tr></thead><tbody>';
+  for (const s of seasonView.list) {
+    const key = s.league ?? '';
+    const name = `${esc(seasonName(s.league))}${s.current ? ' <span class="green">· current</span>' : ''}`;
+    html += `<tr class="run-row season-row" role="button" tabindex="0" data-league="${escAttr(key)}" title="Open season" onclick="openSeason(this.dataset.league)" onkeydown="seasonRowKey(event,this)">`
+      + `<td data-label="Season">${name}</td><td data-label="Started">${esc(formatTimestamp(s.startedAtUtc))}</td><td data-label="Last activity">${esc(formatTimestamp(s.lastActivityAtUtc))}</td>`
+      + `<td data-label="Runs">${Number(s.runs) || 0}</td><td data-label="Full clears">${Number(s.fullClears) || 0}</td><td data-label="Items">${(Number(s.itemsLooted) || 0).toLocaleString()}</td>`
+      + `<td data-label="Chaos" class="yellow">${esc(runReportChaos(s.chaosValue))}</td></tr>`;
+  }
+  return html + '</tbody></table></div>';
+}
+
+function seasonDetailHtml() {
+  const back = '<button id="seasonBack" class="btn run-report-back" type="button" onclick="closeSeason()">← Seasons</button>';
+  const d = seasonView.detail;
+  if (seasonView.error) return `<div class="run-report"><div class="run-report-head">${back}</div><div class="empty-state red">Could not load season: ${esc(seasonView.error)}</div></div>`;
+  if (!d) return `<div class="run-report"><div class="run-report-head">${back}</div><div class="empty-state">Loading season…</div></div>`;
+  const sum = d.summary || {};
+  const info = d.season || {};
+  const metric = (label, value, cls = '') => `<div class="forensics-metric"><span>${esc(label)}</span><strong${cls ? ` class="${cls}"` : ''}>${value}</strong></div>`;
+  let html = `<div class="run-report"><div class="run-report-head">${back}<div class="run-report-title"><strong>${esc(seasonName(info.league))}${info.current ? ' <span class="green">· current</span>' : ''}</strong>`
+    + `<span>${esc(formatTimestamp(info.startedAtUtc))} – ${esc(formatTimestamp(info.lastActivityAtUtc))}</span></div></div>`;
+  html += '<div class="run-report-metrics">'
+    + metric('Runs', (Number(sum.attempts) || 0).toLocaleString())
+    + metric('Full clears', (Number(sum.fullClears) || 0).toLocaleString(), 'green')
+    + metric('Deaths', (Number(sum.deaths) || 0).toLocaleString(), Number(sum.deaths) > 0 ? 'red' : '')
+    + metric('Items', (Number(sum.itemsLooted) || 0).toLocaleString())
+    + metric('Chaos', esc(runReportChaos(sum.chaosValue)), 'yellow')
+    + metric('Chaos / hour', esc(runReportChaos(sum.chaosPerHour)), 'yellow')
+    + metric('Bot time', esc(formatDuration(sum.activeDurationMs)))
+    + '</div>';
+
+  const modes = Object.entries(d.byMode || {});
+  if (modes.length) {
+    html += '<div class="run-report-section"><h3>By mode</h3><div class="history-table-wrap"><table><thead><tr><th>Mode</th><th>Runs</th><th>Full clears</th><th>Avg waves</th><th>Avg run</th><th>Deaths</th><th>Items</th><th>Chaos</th></tr></thead><tbody>';
+    for (const [mode, m] of modes) {
+      const avgWaves = Number(m.averageWavesPerEnteredRun) > 0 ? Number(m.averageWavesPerEnteredRun).toFixed(1) : '-';
+      html += `<tr><td data-label="Mode">${esc(mode)}</td><td data-label="Runs">${Number(m.attempts) || 0}</td><td data-label="Full clears">${Number(m.fullClears) || 0}</td>`
+        + `<td data-label="Avg waves">${avgWaves}</td><td data-label="Avg run">${Number(m.averageRunDurationMs) > 0 ? esc(runReportClock(m.averageRunDurationMs)) : '-'}</td>`
+        + `<td data-label="Deaths">${Number(m.deaths) || 0}</td><td data-label="Items">${(Number(m.itemsLooted) || 0).toLocaleString()}</td><td data-label="Chaos" class="yellow">${esc(runReportChaos(m.chaosValue))}</td></tr>`;
+    }
+    html += '</tbody></table></div></div>';
+  }
+
+  const finds = Array.isArray(d.bestFinds) ? d.bestFinds : [];
+  if (finds.length) {
+    html += '<div class="run-report-section"><h3>Best finds</h3><div class="history-table-wrap"><table><thead><tr><th>Time</th><th>Item</th><th>Value</th><th>Mode</th></tr></thead><tbody>';
+    for (const f of finds) html += `<tr><td data-label="Time">${esc(formatTimestamp(f.pickedAtUtc))}</td><td data-label="Item">${esc(f.itemName)}</td><td data-label="Value" class="yellow">${esc(runReportChaos(f.chaosValue))}</td><td data-label="Mode">${esc(f.mode || 'Session')}</td></tr>`;
+    html += '</tbody></table></div></div>';
+  }
+
+  const runs = Array.isArray(d.runs) ? d.runs : [];
+  html += `<div class="run-report-section"><h3>Runs (${runs.length.toLocaleString()}${runs.length < (Number(sum.attempts) || 0) ? ` of ${(Number(sum.attempts) || 0).toLocaleString()}` : ''})</h3>`;
+  if (!runs.length) html += '<p class="run-report-note">No closed runs.</p>';
+  else {
+    const shown = seasonView.showAllRuns ? runs : runs.slice(0, SEASON_RUN_PREVIEW);
+    html += '<div class="history-table-wrap"><table><thead><tr><th>Start</th><th>Mode</th><th>Duration</th><th>Wave</th><th>Deaths</th><th>Chaos</th><th>Items</th><th>Result</th></tr></thead><tbody>';
+    for (const r of shown) {
+      const cls = r.result === 'completed' ? 'green' : 'red';
+      html += `<tr class="run-row" role="button" tabindex="0" data-run-id="${escAttr(r.runId)}" title="Open run report" onclick="openRunReport(this.dataset.runId)" onkeydown="runRowKey(event,this)">`
+        + `<td data-label="Start">${esc(formatTimestamp(r.activatedAtUtc))}</td><td data-label="Mode">${esc(r.mode)}</td><td data-label="Duration">${esc(runReportClock(r.wallDurationMs))}</td>`
+        + `<td data-label="Wave">${r.wavesCompleted || r.highestWaveStarted || '-'}</td><td data-label="Deaths">${Number(r.deathCount) || 0}</td>`
+        + `<td data-label="Chaos" class="yellow">${esc(runReportChaos(r.chaosValue))}</td><td data-label="Items">${Number(r.itemsLooted) || 0}</td><td data-label="Result"><span class="${cls}">${esc(runResultText(r))}</span></td></tr>`;
+    }
+    html += '</tbody></table></div>';
+    if (runs.length > SEASON_RUN_PREVIEW) html += `<div class="history-actions"><button id="seasonRunsToggle" class="btn" type="button" onclick="toggleSeasonRuns()">${seasonView.showAllRuns ? `Show first ${SEASON_RUN_PREVIEW}` : `Show all ${runs.length.toLocaleString()}`}</button></div>`;
+  }
+  return html + '</div></div>';
 }
 
 // ==================== RUN REPORT ====================

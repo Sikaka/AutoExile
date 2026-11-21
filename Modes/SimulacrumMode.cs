@@ -1884,7 +1884,10 @@ namespace AutoExile.Modes
             hudY += lineH;
 
             var stats = ctx.Stats.Snapshot;
-            var session = stats.SessionFor(Name);
+            // Totals follow the current league season once the game has reported it.
+            var season = stats.SeasonFor(Name);
+            var session = season ?? stats.SessionFor(Name);
+            var totalsLabel = season != null ? "Season" : "Session";
             var currentRun = stats.CurrentRun;
             var attemptText = currentRun != null
                 ? FormatHudDuration(DateTime.UtcNow - currentRun.ActivatedAtUtc)
@@ -1900,7 +1903,7 @@ namespace AutoExile.Modes
                 hudY += lineH;
             }
 
-            g.DrawText($"Session {FormatHudDuration(TimeSpan.FromMilliseconds(session.ActiveDurationMs))}  •  Runs {session.Attempts}  •  Items {session.ItemsLooted}",
+            g.DrawText($"{totalsLabel} {FormatHudDuration(TimeSpan.FromMilliseconds(session.ActiveDurationMs))}  •  Runs {session.Attempts}  •  Items {session.ItemsLooted}",
                 new Vector2(hudX, hudY), SharpDX.Color.White);
             hudY += lineH;
 

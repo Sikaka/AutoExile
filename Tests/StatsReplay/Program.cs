@@ -492,7 +492,80 @@ INSERT INTO loot_events(loot_id,source_key,session_id,run_id,picked_at_ms,item_n
                 legacyDetail.WaveSummary.AverageMs == null, "imported run without wave events lost its completed wave count");
     }
 
-    Console.WriteLine("Stats replay passed: modes, best finds, operational import, dedup, restart, legacy import, unavailable DB, v2 upgrade, stale-run recovery, reused activation, shutdown drain.");
+    // League seasons: each league starts its own session; older records keep a NULL league.
+    var seasonDb = Path.Combine(root, "season", "stats.db");
+    var seasonPlugin = Path.Combine(root, "season-plugin");
+    Directory.CreateDirectory(Path.Combine(seasonPlugin, "Data"));
+    string mercenariesSession;
+    using (var seasons = new StatsService(logs.Add, seasonDb))
+    {
+        Require(seasons.Initialize(seasonPlugin), "season setup failed");
+        seasons.SetRunning(true);
+        seasons.RecordLoot("Pre-season Item", 2, 1, 9001, 1, "Hideout");
+        Flush(seasons);
+        var preSession = seasons.Snapshot.Session.SessionId;
+        Require(seasons.Snapshot.CurrentLeague == null && seasons.Snapshot.Season == null, "season reported before a league was known");
+
+        seasons.SetLeague("Covens");
+        Flush(seasons);
+        Require(seasons.Snapshot.CurrentLeague == "Covens" && seasons.Snapshot.Session.SessionId != preSession,
+            "tracking start did not open a new session for the league");
+        Require(seasons.Snapshot.Season is { ItemsLooted: 0, Attempts: 0 } && seasons.Snapshot.Lifetime.ItemsLooted == 1,
+            "pre-season loot leaked into the new season");
+
+        seasons.BeginSimulacrumActivation("season-1", "Hideout");
+        seasons.ObserveSimulacrumEntry(4242, "Simulacrum");
+        seasons.RecordLoot("Covens Item", 5, 1, 9002, 4242, "Simulacrum");
+        Flush(seasons);
+        var covensSession = seasons.Snapshot.Session.SessionId;
+        Require(seasons.Snapshot.SeasonFor("Simulacrum") is { Attempts: 1, ItemsLooted: 1 }, "season mode totals missed the run");
+
+        seasons.SetLeague("Mercenaries");
+        Flush(seasons);
+        Require(seasons.Snapshot.Session.SessionId == covensSession, "league change split an open run");
+        seasons.EndSimulacrumRun(false, "season_test");
+        Flush(seasons);
+        mercenariesSession = seasons.Snapshot.Session.SessionId!;
+        Require(mercenariesSession != covensSession && seasons.Snapshot.Season is { Attempts: 0, ItemsLooted: 0 },
+            "deferred league rotation was not applied after the run ended");
+
+        seasons.SetLeague("Mercenaries");
+        Flush(seasons);
+        Require(seasons.Snapshot.Session.SessionId == mercenariesSession, "an unchanged league rotated the session");
+
+        var list = seasons.ReadSeasons();
+        Require(list.Select(s => s.League).SequenceEqual(new[] { "Mercenaries", "Covens", null }) &&
+                list[0].Current && !list[1].Current && list[1].Runs == 1 && Math.Abs(list[1].ChaosValue - 5) < 1e-9 &&
+                list[2].ItemsLooted == 1 && list[2].Runs == 0, "season list mismatch");
+        var covens = seasons.ReadSeason("Covens") ?? throw new InvalidOperationException("Covens season missing");
+        Require(covens.Summary.Attempts == 1 && covens.Summary.ItemsLooted == 1 && covens.Runs.Count == 1 &&
+                covens.ByMode.ContainsKey("Simulacrum") && covens.BestFinds.Count == 0, "season detail mismatch");
+        var preSeason = seasons.ReadSeason("") ?? throw new InvalidOperationException("pre-season bucket missing");
+        Require(preSeason.Season.League == null && preSeason.Summary.ItemsLooted == 1 && preSeason.Summary.Attempts == 0,
+            "pre-season bucket mismatch");
+        Require(seasons.ReadSeason("Unknown League") == null, "unknown league returned a season");
+    }
+    using (var seasonRestart = new StatsService(logs.Add, seasonDb))
+    {
+        Require(seasonRestart.Initialize(seasonPlugin), "season restart failed");
+        seasonRestart.SetLeague("Mercenaries");
+        Flush(seasonRestart);
+        Require(seasonRestart.Snapshot.Session.SessionId == mercenariesSession && seasonRestart.Snapshot.CurrentLeague == "Mercenaries",
+            "restart in the same league rotated the session");
+    }
+    var freshSeasonDb = Path.Combine(root, "season-fresh", "stats.db");
+    using (var fresh = new StatsService(logs.Add, freshSeasonDb))
+    {
+        Require(fresh.Initialize(seasonPlugin), "fresh season setup failed");
+        Flush(fresh);
+        var firstSession = fresh.Snapshot.Session.SessionId;
+        fresh.SetLeague("Covens");
+        Flush(fresh);
+        Require(fresh.Snapshot.Session.SessionId == firstSession && fresh.ReadSeasons().Single().League == "Covens",
+            "an empty session was rotated instead of being labelled with the league");
+    }
+
+    Console.WriteLine("Stats replay passed: modes, best finds, operational import, dedup, restart, legacy import, unavailable DB, v2 upgrade, stale-run recovery, reused activation, shutdown drain, run detail, league seasons.");
 }
 finally
 {
