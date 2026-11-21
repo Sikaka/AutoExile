@@ -10,6 +10,7 @@ using AutoExile.Modes;
 using AutoExile.Modes.BossEncounters;
 using AutoExile.Systems;
 using AutoExile.WebServer;
+using AutoExile.UI;
 using AutoExile.Statistics;
 using System.IO;
 using System.Linq;
@@ -572,6 +573,10 @@ namespace AutoExile
         }
 
         private long _lastLeagueCheckMs = long.MinValue / 2;
+
+        private readonly HudPanel _hudPanel = new();
+        private Action? _toggleHudAction;
+        private Action _toggleHud => _toggleHudAction ??= () => Settings.CompactHud.Value = !Settings.CompactHud.Value;
         private string? _lastLeagueRead;
 
         public override Job Tick()
@@ -940,62 +945,26 @@ namespace AutoExile
 
             UpdateDebugRangeCircle();
 
-            // Keep the overlay below PoE's top skill/buff strip at every resolution.
-            // The mode HUD starts below the two global status lines (and recorder line).
+            // The status panel sits below PoE's top skill/buff strip at every resolution.
             var windowRect = GameController.Window.GetWindowRectangle();
             var hudTop = Math.Clamp(windowRect.Height * 0.12f, 120f, 180f);
-            var compactHud = Settings.CompactHud.Value;
-            _ctx.ModeHudTop = hudTop + (compactHud
-                ? (_humanRecorder.IsRecording ? 38f : 22f)
-                : (_humanRecorder.IsRecording ? 60f : 44f));
-
-            // Status overlay
-            var running = Settings.Running.Value;
-            var color = running ? SharpDX.Color.LimeGreen : SharpDX.Color.Yellow;
-            var status = running ? $"BOT: {_mode.Name}" : $"BOT: PAUSED ({_mode.Name})";
-            if (!compactHud)
-                Graphics.DrawText(status, new Vector2(100, hudTop), color);
-
-            // Runtime line — shows elapsed (always) + remaining (when limit set).
-            // Pause time is excluded automatically by RuntimeTracker.
-            var maxMin   = Settings.Run.MaxRuntimeMinutes.Value;
-            var elapsed  = _runtime.ActiveDuration;
-            var elapsedStr = $"{(int)elapsed.TotalHours}:{elapsed.Minutes:D2}";
-            string runtimeText;
-            SharpDX.Color runtimeColor;
-            if (maxMin <= 0)
+            var maxMin = Settings.Run.MaxRuntimeMinutes.Value;
+            var elapsed = _runtime.ActiveDuration;
+            var header = new HudHeader
             {
-                runtimeText  = $"Runtime: {elapsedStr} (no limit)";
-                runtimeColor = SharpDX.Color.LightGray;
-            }
-            else
-            {
-                var remaining = _runtime.Remaining(maxMin);
-                var remStr = $"{(int)remaining.TotalHours}:{remaining.Minutes:D2}";
-                runtimeText  = $"Runtime: {elapsedStr} / {maxMin / 60}:{(maxMin % 60):D2}  (stopping in {remStr})";
-                // Amber at last 10%, red at last 5 minutes
-                var pctLeft = (double)remaining.TotalMinutes / maxMin;
-                runtimeColor = remaining.TotalMinutes < 5 ? SharpDX.Color.Red
-                            :  pctLeft < 0.10              ? SharpDX.Color.Orange
-                            :                                SharpDX.Color.LightGray;
-            }
-            if (compactHud)
-            {
-                var compactText = maxMin <= 0
-                    ? $"{status} • {elapsedStr}"
-                    : $"{status} • {elapsedStr} / {maxMin / 60}:{(maxMin % 60):D2} (-{(int)_runtime.Remaining(maxMin).TotalHours}:{_runtime.Remaining(maxMin).Minutes:D2})";
-                var compactColor = runtimeColor != SharpDX.Color.LightGray ? runtimeColor : color;
-                Graphics.DrawText(compactText, new Vector2(100, hudTop), compactColor);
-            }
-            else
-                Graphics.DrawText(runtimeText, new Vector2(100, hudTop + 16f), runtimeColor);
-
-            // Human recorder indicator
-            if (_humanRecorder.IsRecording)
-            {
-                var recText = $"REC  {_humanRecorder.TicksRecorded} ticks";
-                Graphics.DrawText(recText, new Vector2(100, hudTop + (compactHud ? 16f : 36f)), SharpDX.Color.Red);
-            }
+                // Pause time is excluded automatically by RuntimeTracker.
+                Running = Settings.Running.Value,
+                Mode = _mode.Name,
+                Elapsed = $"{(int)elapsed.TotalHours}:{elapsed.Minutes:D2}",
+                Limit = maxMin > 0 ? $"{maxMin / 60}:{maxMin % 60:D2}" : null,
+                LimitLow = maxMin > 0 && _runtime.Remaining(maxMin).TotalMinutes < maxMin * 0.10,
+                RecordingTicks = _humanRecorder.IsRecording ? _humanRecorder.TicksRecorded : null,
+            };
+            var simHud = _simulacrumMode != null && _mode == _simulacrumMode ? _simulacrumMode.BuildHud(_ctx) : null;
+            var hudBottom = _hudPanel.Draw(new Vector2(12f, hudTop), windowRect.Height * 0.59f, header, simHud,
+                !Settings.CompactHud.Value, simHud != null ? _toggleHud : null);
+            // Modes that still draw their own text lines start below the panel.
+            _ctx.ModeHudTop = hudBottom + 6f;
 
             // Loot tracker overlay (top-right area)
             var winWidth = windowRect.Width;

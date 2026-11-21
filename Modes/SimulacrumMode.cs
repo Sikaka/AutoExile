@@ -14,7 +14,7 @@ namespace AutoExile.Modes
     /// In map: find monolith → wave cycle (fight/loot/stash between waves) → exit after wave 15 or abort
     /// Death: revive (handled by BotCore) → re-enter map if portals remain
     /// </summary>
-    public class SimulacrumMode : IBotMode
+    public partial class SimulacrumMode : IBotMode
     {
         public string Name => "Simulacrum";
 
@@ -1792,14 +1792,6 @@ namespace AutoExile.Modes
         // Render
         // =================================================================
 
-        private static string FormatHudDuration(TimeSpan value)
-        {
-            if (value < TimeSpan.Zero) value = TimeSpan.Zero;
-            return value.TotalHours >= 1
-                ? $"{(int)value.TotalHours}h {value.Minutes:D2}m {value.Seconds:D2}s"
-                : $"{(int)value.TotalMinutes}m {value.Seconds:D2}s";
-        }
-
         private bool HasCurrentAttempt => _phase is SimPhase.FindMonolith
             or SimPhase.NavigateToMonolith
             or SimPhase.WaveCycle
@@ -1807,137 +1799,12 @@ namespace AutoExile.Modes
             or SimPhase.LootSweep
             or SimPhase.ExitMap;
 
-        private float RenderCompactHud(BotContext ctx, ExileCore.Graphics g, float hudX, float hudY, float lineH)
-        {
-            var stats = ctx.Stats.Snapshot;
-            var currentRun = stats.CurrentRun;
-
-            var runText = currentRun != null
-                ? FormatHudDuration(DateTime.UtcNow - currentRun.ActivatedAtUtc)
-                : "--";
-            g.DrawText($"SIM {_phase} • W{_state.CurrentWave}/15 {(_state.IsWaveActive ? "ACTIVE" : "idle")} • D{_state.DeathCount}/{ctx.Settings.Run.MaxDeaths.Value} • run {runText}",
-                new Vector2(hudX, hudY),
-                _state.IsWaveActive ? SharpDX.Color.Red : SharpDX.Color.Cyan);
-            hudY += lineH;
-
-            // Decision is never cleared, so it goes stale; StatusText tracks the live step.
-            var live = StatusText;
-            if (!string.IsNullOrEmpty(live))
-            {
-                if (live.Length > 70)
-                    live = live.Substring(0, 69) + "…";
-                g.DrawText(live, new Vector2(hudX, hudY), SharpDX.Color.LightGreen);
-                hudY += lineH;
-            }
-
-            var chaosPerDivine = ctx.NinjaPrice.ChaosPerDivine;
-            var runLoot = "--";
-            if (currentRun != null)
-            {
-                var runValue = chaosPerDivine > 0
-                    ? $"{currentRun.ChaosValue / chaosPerDivine:F2} div"
-                    : $"{currentRun.ChaosValue:F1}c";
-                runLoot = $"{currentRun.ItemsLooted} • {runValue}";
-            }
-            g.DrawText($"Run loot {runLoot}", new Vector2(hudX, hudY), SharpDX.Color.Gold);
-            hudY += lineH;
-
-            if (stats.Health.Status != "healthy")
-            {
-                g.DrawText($"Stats {stats.Health.Status}", new Vector2(hudX, hudY), SharpDX.Color.OrangeRed);
-                hudY += lineH;
-            }
-
-            if (ctx.Interaction.IsBusy)
-            {
-                g.DrawText($"Interact: {ctx.Interaction.Status}", new Vector2(hudX, hudY), SharpDX.Color.Yellow);
-                hudY += lineH;
-            }
-
-            return hudY;
-        }
-
         public void Render(BotContext ctx)
         {
             if (ctx.Graphics == null) return;
             var gc = ctx.Game;
             var cam = gc.IngameState.Camera;
             var g = ctx.Graphics;
-
-            // --- HUD ---
-            var hudY = ctx.ModeHudTop;
-            var hudX = 20f;
-            var lineH = 16f;
-
-            var compactHud = ctx.Settings.CompactHud.Value;
-            if (compactHud)
-                hudY = RenderCompactHud(ctx, g, hudX, hudY, lineH);
-            else
-            {
-            g.DrawText($"SIMULACRUM • {_phase}", new Vector2(hudX, hudY), SharpDX.Color.Gold);
-            hudY += lineH;
-            g.DrawText(StatusText, new Vector2(hudX, hudY), SharpDX.Color.LightGreen);
-            hudY += lineH;
-
-            g.DrawText($"Wave {_state.CurrentWave}/15 {(_state.IsWaveActive ? "ACTIVE" : "idle")}  •  Deaths {_state.DeathCount}/{ctx.Settings.Run.MaxDeaths.Value}",
-                new Vector2(hudX, hudY),
-                _state.IsWaveActive ? SharpDX.Color.Red : SharpDX.Color.Cyan);
-            hudY += lineH;
-
-            var stats = ctx.Stats.Snapshot;
-            // Totals follow the current league season once the game has reported it.
-            var season = stats.SeasonFor(Name);
-            var session = season ?? stats.SessionFor(Name);
-            var totalsLabel = season != null ? "Season" : "Session";
-            var currentRun = stats.CurrentRun;
-            var attemptText = currentRun != null
-                ? FormatHudDuration(DateTime.UtcNow - currentRun.ActivatedAtUtc)
-                : "--";
-            g.DrawText($"Current {attemptText}  •  Full clears {session.FullClears}",
-                new Vector2(hudX, hudY), SharpDX.Color.Gold);
-            hudY += lineH;
-
-            if (session.Entered > 0)
-            {
-                g.DrawText($"Average {FormatHudDuration(TimeSpan.FromMilliseconds(session.AverageRunDurationMs))}  •  {session.AverageWavesPerEnteredRun:F1} waves/run",
-                    new Vector2(hudX, hudY), SharpDX.Color.Gold);
-                hudY += lineH;
-            }
-
-            g.DrawText($"{totalsLabel} {FormatHudDuration(TimeSpan.FromMilliseconds(session.ActiveDurationMs))}  •  Runs {session.Attempts}  •  Items {session.ItemsLooted}",
-                new Vector2(hudX, hudY), SharpDX.Color.White);
-            hudY += lineH;
-
-            var chaosPerDivine = ctx.NinjaPrice.ChaosPerDivine;
-            var totalValue = chaosPerDivine > 0
-                ? $"{session.ChaosValue / chaosPerDivine:F2} div"
-                : $"{session.ChaosValue:F1}c";
-            var hourlyValue = chaosPerDivine > 0
-                ? $"{session.ChaosPerHour / chaosPerDivine:F2} div/h"
-                : $"{session.ChaosPerHour:F1}c/h";
-            g.DrawText($"Value {totalValue}  •  Rate {hourlyValue}  •  Current loot {_lootTracker.PickupCount}",
-                new Vector2(hudX, hudY), SharpDX.Color.Gold);
-            hudY += lineH;
-
-            if (stats.Health.Status != "healthy")
-            {
-                g.DrawText($"Stats {stats.Health.Status}", new Vector2(hudX, hudY), SharpDX.Color.OrangeRed);
-                hudY += lineH;
-            }
-
-            if (!string.IsNullOrEmpty(Decision))
-            {
-                g.DrawText($"Decision: {Decision}", new Vector2(hudX, hudY), SharpDX.Color.Yellow);
-                hudY += lineH;
-            }
-
-            if (ctx.Interaction.IsBusy)
-            {
-                g.DrawText($"Interact: {ctx.Interaction.Status}",
-                    new Vector2(hudX, hudY), SharpDX.Color.Yellow);
-                hudY += lineH;
-            }
-            }
 
             // --- World drawing (only in map) ---
             if (gc.Area.CurrentArea.IsHideout || gc.Area.CurrentArea.IsTown)
@@ -1977,22 +1844,6 @@ namespace AutoExile.Modes
                     var to = Systems.Pathfinding.GridToScreen(gc, path[i + 1].Position);
                     g.DrawLine(from, to, 1.5f, SharpDX.Color.CornflowerBlue);
                 }
-            }
-
-            // Monster count
-            if (!compactHud)
-            {
-                g.DrawText($"Monsters: {ctx.Combat.NearbyMonsterCount}",
-                    new Vector2(hudX, hudY), SharpDX.Color.Gray);
-                hudY += lineH;
-            }
-
-            // Failed loot count
-            if (ctx.Loot.FailedCount > 0)
-            {
-                g.DrawText($"Ignored items: {ctx.Loot.FailedCount}",
-                    new Vector2(hudX, hudY), SharpDX.Color.OrangeRed);
-                hudY += lineH;
             }
 
             // Draw failed/ignored items in world with reason labels
