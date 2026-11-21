@@ -35,6 +35,7 @@ namespace AutoExile.Modes
 
         // ── Run state ──
         private bool _mapCompleted;
+        private bool _runSucceeded;
         private string _lastAreaName = "";
         private string _lastBossType = "";
         private int _deathCount;
@@ -116,6 +117,7 @@ namespace AutoExile.Modes
             _targetItemsLooted = 0;
             _totalRunTimeMs = 0;
             _mapCompleted = false;
+            _runSucceeded = false;
             _portalKeyPressed = false;
             _sessionStartTime = DateTime.Now;
             _runStartTime = DateTime.Now;
@@ -127,6 +129,7 @@ namespace AutoExile.Modes
             else
             {
                 // Already in a map — assume boss zone
+                TrackRunEntry(ctx, gc.Area.CurrentArea.Name ?? "");
                 _activeEncounter.OnEnterZone(ctx);
                 _phase = BossPhase.InBossZone;
                 ModeHelpers.EnableDefaultCombat(ctx);
@@ -258,6 +261,7 @@ namespace AutoExile.Modes
             _phase = BossPhase.InHideout;
             _phaseStartTime = DateTime.Now;
             _mapCompleted = false;
+            _runSucceeded = false;
             _portalKeyPressed = false;
 
             // Re-read boss type selection (user may have changed it between runs)
@@ -344,6 +348,7 @@ namespace AutoExile.Modes
             {
                 case BossEncounterResult.Complete:
                     _mapCompleted = true;
+                    _runSucceeded = true;
                     _phase = BossPhase.LootSweep;
                     _phaseStartTime = DateTime.Now;
                     _lootTracker.ResetCount();
@@ -352,6 +357,7 @@ namespace AutoExile.Modes
 
                 case BossEncounterResult.Failed:
                     _mapCompleted = true;
+                    _runSucceeded = false;
                     _phase = BossPhase.ExitMap;
                     _phaseStartTime = DateTime.Now;
                     _exitPortalAttempts = 0;
@@ -632,6 +638,8 @@ namespace AutoExile.Modes
             {
                 if (_mapCompleted)
                 {
+                    ctx.Stats.EndRun(Name, _runSucceeded ? "completed" : "failed",
+                        _runSucceeded ? "boss_completed" : "boss_failed");
                     _totalRunTimeMs += (DateTime.Now - _runStartTime).TotalMilliseconds;
                     _runsCompleted++;
                     _mapCompleted = false;
@@ -648,6 +656,7 @@ namespace AutoExile.Modes
                 }
                 else if (_deathCount >= ctx.Settings.Run.MaxDeaths.Value)
                 {
+                    ctx.Stats.EndRun(Name, "failed", "max_deaths_reached");
                     _totalRunTimeMs += (DateTime.Now - _runStartTime).TotalMilliseconds;
                     _runsCompleted++;
                     _runStartTime = DateTime.Now;
@@ -661,6 +670,7 @@ namespace AutoExile.Modes
             }
             else
             {
+                TrackRunEntry(ctx, newArea);
                 // Entered boss zone — cache entry portal position before moving away
                 _entryPortalPos = null;
                 foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
@@ -709,6 +719,14 @@ namespace AutoExile.Modes
                 Status = $"Entered {newArea}";
                 ctx.Log($"[Boss] Entered zone: {newArea}");
             }
+        }
+
+        private static void TrackRunEntry(BotContext ctx, string areaName)
+        {
+            var instanceHash = ctx.Game.IngameState?.Data?.CurrentAreaHash ?? 0;
+            if (instanceHash == 0) return;
+            ctx.Stats.BeginRun("Boss", $"boss:{instanceHash}", areaName, consumed: true);
+            ctx.Stats.ObserveRunEntry("Boss", instanceHash, areaName);
         }
 
         // ── Render ──

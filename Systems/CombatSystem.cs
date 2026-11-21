@@ -273,6 +273,11 @@ namespace AutoExile.Systems
             // Scan threats (use entity cache when available for pre-filtered monster list)
             ScanThreats(gc, settings, ctx.Entities);
 
+            // Publish aggressive pathing intent before skill execution. Otherwise a
+            // build that casts every tick returns before positioning and never moves
+            // toward the densest visible pack.
+            UpdateAggressiveMovementIntent(gc.Player.GridPosNum);
+
             // Check if active channel should be released (target died, conditions changed, etc.)
             ReleaseChannelIfNeeded(gc, settings);
 
@@ -319,6 +324,21 @@ namespace AutoExile.Systems
                 TickPositioning(ctx);
 
             return false;
+        }
+
+        private void UpdateAggressiveMovementIntent(Vector2 playerGrid)
+        {
+            if (SuppressPositioning || Profile.Positioning != CombatPositioning.Aggressive ||
+                BestTarget == null || NearbyMonsterCount == 0 || _walkableMonsterWeighted.Count == 0)
+                return;
+
+            var distance = Vector2.Distance(playerGrid, DenseClusterCenter);
+            if (distance <= 15f) return;
+
+            WantsToMove = true;
+            MoveTargetGrid = DenseClusterCenter;
+            MoveTarget = ToWorld(DenseClusterCenter);
+            LastAction = $"aggressive: pathfind to density @ ({DenseClusterCenter.X:F0},{DenseClusterCenter.Y:F0}) dist={distance:F0}";
         }
 
         /// <summary>Reset state (call on mode exit).</summary>
@@ -431,11 +451,12 @@ namespace AutoExile.Systems
             _walkableMonsterWeighted.Clear();
             _allMonsterWeighted.Clear();
 
-            // Use EntityCache.Monsters when available (pre-filtered, no type check needed).
-            // Falls back to OnlyValidEntities if cache not wired up.
-            IEnumerable<Entity> monsters = entityCache != null
-                ? entityCache.Monsters
-                : gc.EntityListWrapper.OnlyValidEntities.Where(e => e.Type == EntityType.Monster);
+            // Read the live entity list for combat decisions. Simulacrum monsters can
+            // be added while dormant, pruned from the push cache, and later become
+            // alive/targetable without another EntityAdded callback. Using that cache
+            // made combat report zero monsters while the recorder saw a full pack.
+            IEnumerable<Entity> monsters = gc.EntityListWrapper.OnlyValidEntities
+                .Where(e => e.Type == EntityType.Monster);
 
             foreach (var entity in monsters)
             {
@@ -762,6 +783,12 @@ namespace AutoExile.Systems
             _primaryMovementEntry = null;
             _movementSkillEntries.Clear();
 
+            // A configured PrimaryMovement key is only safe when that key actually
+            // contains PoE's built-in "Move" action. Profiles can outlive skill-bar
+            // changes, so prefer the live bar over a stale configured key.
+            var detectedMoveOnlyKey = DetectMoveOnlyKey(gc);
+            PrimaryMoveKey = detectedMoveOnlyKey;
+
             // Iterate user-configured slots (key-based, not slot-index-based)
             foreach (var slotConfig in settings.AllSkillSlots)
             {
@@ -775,14 +802,15 @@ namespace AutoExile.Systems
                 // PrimaryMovement doesn't need an ActorSkill match — it's just a key
                 if (role == SkillRole.PrimaryMovement)
                 {
+                    var effectiveKey = detectedMoveOnlyKey ?? key;
                     _primaryMovementEntry = new SkillBarEntry
                     {
                         Skill = null,
-                        Key = key,
+                        Key = effectiveKey,
                         Role = role,
                         Priority = 0,
                     };
-                    PrimaryMoveKey = key;
+                    PrimaryMoveKey = effectiveKey;
                     continue;
                 }
 
@@ -920,6 +948,41 @@ namespace AutoExile.Systems
                 int crossCompare = b.CanCrossTerrain.CompareTo(a.CanCrossTerrain);
                 return crossCompare != 0 ? crossCompare : b.Priority.CompareTo(a.Priority);
             });
+        }
+
+        /// <summary>
+        /// Find a keyboard slot containing PoE's built-in Move action.
+        /// This mirrors the proven AutoPOE behavior of selecting a live "Move"
+        /// binding instead of trusting a stale profile key.
+        /// </summary>
+        private Keys? DetectMoveOnlyKey(GameController gc)
+        {
+            var barIds = gc.IngameState?.ServerData?.SkillBarIds;
+            var actorSkills = gc.Player?.GetComponent<Actor>()?.ActorSkills;
+            if (barIds == null || actorSkills == null)
+                return null;
+
+            var limit = Math.Min(barIds.Count, 8);
+            for (var barPosition = 0; barPosition < limit; barPosition++)
+            {
+                var key = KeyForSlot(barPosition);
+                if (key == Keys.None || key == Keys.RButton || key == Keys.MButton)
+                    continue;
+
+                var skillId = barIds[barPosition];
+                if (skillId == 0)
+                    continue;
+
+                var skill = actorSkills.FirstOrDefault(candidate => candidate.Id == skillId);
+                if (skill == null)
+                    continue;
+
+                if (string.Equals(skill.Name, "Move", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(skill.InternalName, "move", StringComparison.OrdinalIgnoreCase))
+                    return key;
+            }
+
+            return null;
         }
 
         /// <summary>
@@ -1221,7 +1284,7 @@ namespace AutoExile.Systems
                             screenPos.Y >= 0 && screenPos.Y <= windowRect.Height)
                         {
                             var absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
-                            Input.SetCursorPos(absPos);
+                            BotInput.UpdateWorldSkillCursor(absPos);
                         }
                     }
                     return;
@@ -1229,27 +1292,11 @@ namespace AutoExile.Systems
 
                 // Start new channel — lightweight key-down, no gate reservation.
                 // Combat cursor positioning handles where the cursor points each tick.
-                BotInput.SuspendMovement();
-                if (!BotInput.IsHeld(entry.Key))
-                {
-                    Input.KeyDown(entry.Key);
-                    BotInput.TrackHeldKey(entry.Key);
-                }
+                acted = gridTarget.HasValue
+                    ? StartTargetedChannel(gc, gridTarget.Value, entry.Key)
+                    : BotInput.HoldKey(entry.Key);
+                if (!acted) return;
                 _activeChannel = entry;
-                acted = true;
-
-                // Move cursor to target for the initial key-down frame
-                if (gridTarget.HasValue)
-                {
-                    var screenPos = Pathfinding.GridToScreen(gc, gridTarget.Value);
-                    var windowRect = gc.Window.GetWindowRectangle();
-                    if (screenPos.X >= 0 && screenPos.X <= windowRect.Width &&
-                        screenPos.Y >= 0 && screenPos.Y <= windowRect.Height)
-                    {
-                        var absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
-                        Input.SetCursorPos(absPos);
-                    }
-                }
             }
             else
             {
@@ -1285,6 +1332,18 @@ namespace AutoExile.Systems
             LastAction = $"skill: {skillName}{channelTag}";
         }
 
+        private static bool StartTargetedChannel(GameController gc, Vector2 gridTarget, Keys key)
+        {
+            var screenPos = Pathfinding.GridToScreen(gc, gridTarget);
+            var windowRect = gc.Window.GetWindowRectangle();
+            if (screenPos.X < 0 || screenPos.X > windowRect.Width ||
+                screenPos.Y < 0 || screenPos.Y > windowRect.Height)
+                return false;
+
+            var absPos = new Vector2(windowRect.X + screenPos.X, windowRect.Y + screenPos.Y);
+            return BotInput.HoldKeyAt(absPos, key);
+        }
+
         /// <summary>
         /// Release the active channeling skill if conditions are no longer met.
         /// Called at the start of each combat tick.
@@ -1296,7 +1355,10 @@ namespace AutoExile.Systems
             // Channel key was released externally (by BotInput.ReleaseAllKeys, another action, etc.)
             if (!BotInput.IsHeld(_activeChannel.Key))
             {
-                _activeChannel = null;
+                // HoldKeyAt moves the cursor asynchronously before pressing the key.
+                // Keep the channel pending while that gated action is still in flight.
+                if (BotInput.CanAct)
+                    _activeChannel = null;
                 return;
             }
 

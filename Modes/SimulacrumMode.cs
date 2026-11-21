@@ -28,12 +28,20 @@ namespace AutoExile.Modes
 
         // Hideout/loop tracking
         private bool _mapCompleted;
+        private bool _mapAborted;
+        private bool _lootSweepCompletesRun;
+        private DateTime _nextStockRecheckAt = DateTime.MinValue;
+        private const float StockRecheckSeconds = 60f;
         private string _lastAreaName = "";
+        private int _exitPortalAttempts;
+        private bool _portalKeyPressed;
 
         // Loot tracking — only record on confirmed pickup
         private DateTime _lastLootScan = DateTime.MinValue;
         private const float LootScanIntervalMs = 500;
         private readonly LootPickupTracker _lootTracker = new();
+        private int _sweepLabelRefreshAttempts;
+        private const int MaxSweepLabelRefreshAttempts = 2;
 
         // Hideout flow
         private readonly HideoutFlow _hideoutFlow = new();
@@ -46,6 +54,16 @@ namespace AutoExile.Modes
         // Track whether we were searching (no monsters) last tick — reset exploration when
         // transitioning from searching → combat, so the next search re-sweeps the whole map
         private bool _wasSearching;
+        private long _lastActivationSequence;
+        private int _lastStatsWaveStarted;
+        private int _lastStatsWaveCompleted;
+        private bool _lastStatsWaveActive;
+        private long _nextMonolithPathAtMs;
+        private bool _monolithPathFailing;
+        private DateTime _lastMapEntryAt = DateTime.MinValue;
+        private int _rapidReentryDeaths;
+        private const float RapidReentryDeathSeconds = 15f;
+        private const int MaxRapidReentryDeaths = 2;
 
         // Wave start retry tracking — bail if we can't start the next wave
         private int _waveStartAttempts;
@@ -62,6 +80,21 @@ namespace AutoExile.Modes
         private readonly Dictionary<long, DateTime> _blacklistedMonsters = new();
         private const float MonsterBlacklistSeconds = 10f;
 
+        // Chase progress: an unreachable monster (behind a wall, on a ledge) was chased for hours.
+        private const float ChaseNoProgressSeconds = 15f;
+        private const float ChaseProgressGrid = 5f;
+        private const float ChaseBlacklistSeconds = 60f;
+        private long _chaseTargetId;
+        private float _chaseBestDist = float.MaxValue;
+        private DateTime _chaseProgressAt = DateTime.MinValue;
+
+        // Between-wave stash progress: "Stashed 3 items" was reported 136 times in 7 minutes while
+        // the same 3 items stayed in the inventory. Two trips that leave the stashable count
+        // unchanged block stash trips until that count changes.
+        private int _stashTripStartCount = -1;
+        private int _stashNoProgressTrips;
+        private int _stashBlockedCount = -1;
+
 
         // Action cooldown
         private const float MajorActionCooldownMs = 500f;
@@ -76,17 +109,34 @@ namespace AutoExile.Modes
         {
             _settings = ctx.Settings.Simulacrum;
             _mapCompleted = false;
+            _mapAborted = false;
+            _lootSweepCompletesRun = false;
+            _nextStockRecheckAt = DateTime.MinValue;
             _lastAreaName = "";
             _isStashing = false;
             _lootTracker.Reset();
+            _sweepLabelRefreshAttempts = 0;
             _lastKnownWave = 0;
+            _lastActivationSequence = ctx.MapDevice.ActivationSequence;
+            _lastStatsWaveStarted = 0;
+            _lastStatsWaveCompleted = 0;
+            _lastStatsWaveActive = false;
+            _monolithPathFailing = false;
+            _lastMapEntryAt = DateTime.MinValue;
+            _rapidReentryDeaths = 0;
             _wasSearching = false;
             _waveStartAttempts = 0;
             _betweenWaveStartTime = DateTime.MinValue;
+            _exitPortalAttempts = 0;
+            _portalKeyPressed = false;
 
             _combatEngageTime = DateTime.MinValue;
             _combatEngageCount = 0;
             _blacklistedMonsters.Clear();
+            ResetChase();
+            _stashTripStartCount = -1;
+            _stashNoProgressTrips = 0;
+            _stashBlockedCount = -1;
 
             // Enable combat
             ModeHelpers.EnableDefaultCombat(ctx);
@@ -102,6 +152,17 @@ namespace AutoExile.Modes
             else
             {
                 // Already in a map — try to find monolith
+                var areaHash = gc.IngameState?.Data?.CurrentAreaHash ?? 0;
+                ctx.Stats.BeginSimulacrumActivation($"recovered:{areaHash}",
+                    gc.Area.CurrentArea.Name ?? "");
+                if (areaHash != 0)
+                {
+                    ctx.Stats.ObserveSimulacrumEntry(areaHash, gc.Area.CurrentArea.Name ?? "");
+                    // The recovered instance was accounted for above. Seed the area
+                    // tracker only after a real hash was observed; otherwise the first
+                    // Tick remains the retry path once the game exposes the instance.
+                    _lastAreaName = gc.Area.CurrentArea.Name ?? "";
+                }
                 _state.Reset();
                 _phase = SimPhase.FindMonolith;
                 _phaseStartTime = DateTime.Now;
@@ -133,6 +194,18 @@ namespace AutoExile.Modes
         {
             var gc = ctx.Game;
 
+            if (ctx.MapDevice.ActivationSequence != _lastActivationSequence)
+            {
+                _lastActivationSequence = ctx.MapDevice.ActivationSequence;
+                var confirmed = ctx.MapDevice.LastActivationConfirmedAtUtc ?? DateTime.UtcNow;
+                ctx.Stats.BeginSimulacrumActivation(
+                    $"sim:{confirmed.Ticks}:{_lastActivationSequence}",
+                    gc.Area?.CurrentArea?.Name ?? "");
+                _lastStatsWaveStarted = 0;
+                _lastStatsWaveCompleted = 0;
+                _lastStatsWaveActive = false;
+            }
+
             // Detect area changes
             var currentArea = gc.Area?.CurrentArea?.Name ?? "";
             if (!string.IsNullOrEmpty(currentArea) && currentArea != _lastAreaName)
@@ -148,6 +221,19 @@ namespace AutoExile.Modes
             if (inMap)
             {
                 _state.Tick(gc, _settings.MinWaveDelaySeconds.Value);
+
+                if (_state.IsWaveActive && _state.CurrentWave > _lastStatsWaveStarted)
+                {
+                    _lastStatsWaveStarted = _state.CurrentWave;
+                    ctx.Stats.RecordWaveStarted(_state.CurrentWave);
+                }
+                if (_lastStatsWaveActive && !_state.IsWaveActive &&
+                    _state.CurrentWave > _lastStatsWaveCompleted)
+                {
+                    _lastStatsWaveCompleted = _state.CurrentWave;
+                    ctx.Stats.RecordWaveCompleted(_state.CurrentWave);
+                }
+                _lastStatsWaveActive = _state.IsWaveActive;
 
                 // Disable combat during LootSweep/ExitMap — we need to navigate freely
                 // to pick up remaining items and reach the portal without being dragged into fights
@@ -171,6 +257,19 @@ namespace AutoExile.Modes
                 case SimPhase.StashItems:
                 case SimPhase.OpenMap:
                 case SimPhase.EnterPortal:
+                    // A profile/web setting can be corrected after the hideout flow has
+                    // already stopped. Re-read only configuration failures here; a real
+                    // empty-stash failure must remain stopped instead of retrying forever.
+                    if (!_hideoutFlow.IsActive
+                        && _hideoutFlow.FragmentConfigurationMissing
+                        && !string.IsNullOrWhiteSpace(ctx.Settings.Stash.FragmentTabName.Value)
+                        && ctx.Settings.Simulacrum.SimulacrumStock.Value > 0)
+                    {
+                        StartHideoutFlow(ctx);
+                        StatusText = "Fragment settings updated — retrying stash";
+                        break;
+                    }
+
                     var signal = _hideoutFlow.Tick(ctx);
                     StatusText = _hideoutFlow.Status;
                     if (signal == HideoutSignal.PortalTimeout)
@@ -180,6 +279,14 @@ namespace AutoExile.Modes
                         _phaseStartTime = DateTime.Now;
                         StartHideoutFlow(ctx);
                         StatusText = "No portal found — starting new run";
+                    }
+                    else if (signal == HideoutSignal.NoFragments &&
+                             !_hideoutFlow.FragmentConfigurationMissing)
+                    {
+                        _phase = SimPhase.Done;
+                        StatusText = $"Out of Simulacrums — {_state.RunsCompleted} runs completed";
+                        Decision = "No Simulacrum confirmed — waiting for stock recheck";
+                        _nextStockRecheckAt = DateTime.Now.AddSeconds(StockRecheckSeconds);
                     }
                     break;
 
@@ -203,7 +310,23 @@ namespace AutoExile.Modes
                     TickExitMap(ctx);
                     break;
                 case SimPhase.Done:
-                    StatusText = "Simulacrum complete";
+                    // Preserve the terminal reason. Replacing an out-of-stock or
+                    // failed status with "complete" makes the HUD contradict itself.
+                    var doneArea = gc.Area?.CurrentArea;
+                    if (doneArea != null && (doneArea.IsHideout || doneArea.IsTown))
+                    {
+                        var fragmentInInventory = StashSystem.CountInventoryItems(gc, FullSimulacrumPath) > 0;
+                        if (fragmentInInventory || DateTime.Now >= _nextStockRecheckAt)
+                        {
+                            _phase = SimPhase.InHideout;
+                            _phaseStartTime = DateTime.Now;
+                            StartHideoutFlow(ctx);
+                            StatusText = fragmentInInventory
+                                ? "Simulacrum detected in inventory — resuming"
+                                : "Rechecking Simulacrum stock";
+                            Decision = "Stock recheck started";
+                        }
+                    }
                     break;
                 case SimPhase.Idle:
                     StatusText = "Idle";
@@ -229,17 +352,47 @@ namespace AutoExile.Modes
                 if (_mapCompleted)
                 {
                     // Map completed — start new cycle
+                    ctx.Stats.EndSimulacrumRun(true, "wave_15_complete_and_hideout_confirmed");
                     _state.RecordRunComplete();
+                    ctx.LootTracker.RecordMapComplete();
                     _state.Reset();
                     _phase = SimPhase.InHideout;
                     _phaseStartTime = DateTime.Now;
                     _mapCompleted = false;
+                    _mapAborted = false;
                     _lootTracker.ResetCount();
                     StartHideoutFlow(ctx);
                     StatusText = "Back in hideout — starting new run";
                 }
+                else if (_mapAborted)
+                {
+                    // An abort/timeout is an attempt, not a completed Simulacrum.
+                    ctx.Stats.EndSimulacrumRun(false, "aborted_and_hideout_confirmed");
+                    _state.Reset();
+                    _phase = SimPhase.InHideout;
+                    _phaseStartTime = DateTime.Now;
+                    _mapAborted = false;
+                    _lootTracker.ResetCount();
+                    StartHideoutFlow(ctx);
+                    StatusText = "Back in hideout after aborted run — starting new attempt";
+                }
                 else if (_state.DeathCount > 0 && _state.DeathCount < ctx.Settings.Run.MaxDeaths.Value)
                 {
+                    var diedSoonAfterEntry = _lastMapEntryAt != DateTime.MinValue
+                        && (DateTime.Now - _lastMapEntryAt).TotalSeconds <= RapidReentryDeathSeconds;
+                    _rapidReentryDeaths = diedSoonAfterEntry ? _rapidReentryDeaths + 1 : 0;
+                    if (_rapidReentryDeaths >= MaxRapidReentryDeaths)
+                    {
+                        ctx.Stats.EndSimulacrumRun(false, "rapid_reentry_death_loop");
+                        _state.Reset();
+                        _phase = SimPhase.InHideout;
+                        _phaseStartTime = DateTime.Now;
+                        _lootTracker.ResetCount();
+                        StartHideoutFlow(ctx);
+                        StatusText = "Repeated immediate deaths — abandoning unsafe portals";
+                        return;
+                    }
+
                     // Died — try to re-enter
                     _phase = SimPhase.EnterPortal;
                     _phaseStartTime = DateTime.Now;
@@ -248,8 +401,9 @@ namespace AutoExile.Modes
                 }
                 else if (_state.DeathCount >= ctx.Settings.Run.MaxDeaths.Value)
                 {
-                    // Too many deaths — start fresh
-                    _state.RecordRunComplete();
+                    // Too many deaths — start fresh, but do not count a failed
+                    // attempt as a completed Simulacrum.
+                    ctx.Stats.EndSimulacrumRun(false, "max_deaths_reached");
                     _state.Reset();
                     _phase = SimPhase.InHideout;
                     _phaseStartTime = DateTime.Now;
@@ -259,6 +413,10 @@ namespace AutoExile.Modes
                 }
                 else
                 {
+                    // A manual/unexpected return to hideout is not a clear either.
+                    ctx.Stats.EndSimulacrumRun(false, "unexpected_hideout_return");
+                    _state.Reset();
+                    _lootTracker.ResetCount();
                     _phase = SimPhase.InHideout;
                     _phaseStartTime = DateTime.Now;
                     StartHideoutFlow(ctx);
@@ -271,8 +429,12 @@ namespace AutoExile.Modes
                 // share the area name + hash, so cached exploration state from a previous run
                 // would make the bot think the map is already fully explored.
                 var deathCount = _state.DeathCount;
+                var isPortalReentry = deathCount > 0;
                 _state.OnAreaChanged();
                 _state.DeathCount = deathCount;
+                var areaHash = gc.IngameState?.Data?.CurrentAreaHash ?? 0;
+                ctx.Stats.ObserveSimulacrumEntry(areaHash, gc.Area.CurrentArea.Name ?? "");
+                _lastMapEntryAt = DateTime.Now;
                 _phase = SimPhase.FindMonolith;
                 _phaseStartTime = DateTime.Now;
 
@@ -286,7 +448,9 @@ namespace AutoExile.Modes
                         ctx.Settings.Build.BlinkRange.Value);
                 }
 
-                _lootTracker.ResetCount();
+                // Keep current-attempt loot across death/portal re-entry.
+                if (!isPortalReentry)
+                    _lootTracker.ResetCount();
                 StatusText = "Entered map — finding monolith";
             }
         }
@@ -320,6 +484,9 @@ namespace AutoExile.Modes
         {
             var stash = ctx.Settings.Stash;
             var sim   = ctx.Settings.Simulacrum;
+            _lootSweepCompletesRun = false;
+            _lastMapEntryAt = DateTime.MinValue;
+            _rapidReentryDeaths = 0;
 
             // No targetMapName — Simulacrum has no atlas node. Forcing named-map flow
             // would loop trying to click a node that doesn't exist. Auto-match flow
@@ -347,6 +514,7 @@ namespace AutoExile.Modes
             {
                 _phase = SimPhase.NavigateToMonolith;
                 _phaseStartTime = DateTime.Now;
+                _monolithPathFailing = false;
                 StatusText = "Monolith found — navigating";
                 return;
             }
@@ -361,6 +529,26 @@ namespace AutoExile.Modes
                 return;
             }
 
+            ExploreForMonolith(ctx);
+
+            StatusText = "Exploring to find monolith...";
+
+            // Use the wave timeout setting for the overall FindMonolith phase too.
+            // The 60s hardcoded timeout was too short for some maps and too generous
+            // for a true stuck condition — use the user-configured wave timeout instead.
+            if (elapsed > _settings.WaveTimeoutMinutes.Value * 60)
+            {
+                ctx.Navigation.Stop(gc);
+                ctx.Exploration.ResetSeen();
+                _phaseStartTime = DateTime.Now;
+                Decision = "Monolith search timeout → reset exploration";
+                StatusText = "No monolith found — restarting search inside the instance";
+            }
+        }
+
+        private void ExploreForMonolith(BotContext ctx)
+        {
+            var gc = ctx.Game;
             // Explore the map until the monolith entity enters the network bubble.
             if (ctx.Exploration.IsInitialized)
             {
@@ -385,17 +573,6 @@ namespace AutoExile.Modes
                     }
                 }
             }
-
-            StatusText = "Exploring to find monolith...";
-
-            // Use the wave timeout setting for the overall FindMonolith phase too.
-            // The 60s hardcoded timeout was too short for some maps and too generous
-            // for a true stuck condition — use the user-configured wave timeout instead.
-            if (elapsed > _settings.WaveTimeoutMinutes.Value * 60)
-            {
-                StatusText = "No monolith found — timeout";
-                _phase = SimPhase.Done;
-            }
         }
 
         private void TickNavigateToMonolith(BotContext ctx)
@@ -410,6 +587,7 @@ namespace AutoExile.Modes
             if (_state.IsWaveActive)
             {
                 ctx.Navigation.Stop(ctx.Game);
+                _monolithPathFailing = false;
                 _phase = SimPhase.WaveCycle;
                 _phaseStartTime = DateTime.Now;
                 StatusText = "Wave already active — joining combat";
@@ -422,22 +600,44 @@ namespace AutoExile.Modes
             if (dist < 18f)
             {
                 ctx.Navigation.Stop(ctx.Game);
+                _monolithPathFailing = false;
                 _phase = SimPhase.WaveCycle;
                 _phaseStartTime = DateTime.Now;
                 StatusText = "Near monolith — entering wave cycle";
                 return;
             }
 
+            // While the path is failing, keep exploration bookkeeping running every frame
+            // even during an exploration leg (ExploreForMonolith starts no navigation while one is active).
+            if (_monolithPathFailing && ctx.Navigation.IsNavigating)
+                ExploreForMonolith(ctx);
+
             if (!ctx.Navigation.IsNavigating)
             {
+                var now = Environment.TickCount64;
+                if (_monolithPathFailing && now < _nextMonolithPathAtMs)
+                {
+                    ExploreForMonolith(ctx);
+                    StatusText = "No path to monolith — exploring, retrying";
+                    return;
+                }
+
                 var success = ctx.Navigation.NavigateTo(ctx.Game,
                     _state.MonolithPosition.Value);
                 if (!success)
                 {
-                    StatusText = "No path to monolith";
-                    _phase = SimPhase.Done;
+                    _nextMonolithPathAtMs = now + 1000;
+                    if (!_monolithPathFailing)
+                    {
+                        _monolithPathFailing = true;
+                        ctx.Navigation.Stop(ctx.Game);
+                        ctx.Exploration.ResetSeen();
+                    }
+                    Decision = "Monolith path failed → exploring, retrying";
+                    StatusText = "No path to monolith — exploring, retrying";
                     return;
                 }
+                _monolithPathFailing = false;
             }
 
             StatusText = $"Navigating to monolith (dist: {dist:F0})";
@@ -455,6 +655,14 @@ namespace AutoExile.Modes
             // Handle pending loot pickup results
             _lootTracker.HandleResult(interactionResult, ctx);
 
+            if (ctx.Loot.TogglePhase != LootSystem.LabelTogglePhase.Idle)
+            {
+                ctx.Loot.TickLabelToggle(gc);
+                Decision = "Refreshing hidden loot labels";
+                StatusText = $"Label refresh: {ctx.Loot.ToggleStatus}";
+                return;
+            }
+
             // --- Wave transition: reset exploration so we re-sweep for new spawns ---
             if (_state.CurrentWave != _lastKnownWave)
             {
@@ -463,6 +671,7 @@ namespace AutoExile.Modes
                 ctx.Exploration.ResetSeen();
                 ctx.Loot.ClearFailed(); // items that failed in earlier waves may be pickable now
                 _blacklistedMonsters.Clear(); // new wave = fresh monster spawns
+                ResetChase();
                 _wasSearching = false;
                 _waveStartAttempts = 0;
                 _betweenWaveStartTime = DateTime.MinValue;
@@ -500,19 +709,43 @@ namespace AutoExile.Modes
                         return;
                     }
                 }
+
+                // A price-hydration wait or bounded pickup retry must not be
+                // overwritten by exploration as soon as the candidate temporarily
+                // disappears. Keep combat responsive, but hold position during the
+                // quiet part of the wave until loot becomes actionable again.
+                if (ctx.Loot.HasUnresolvedLootNearby &&
+                    ctx.Combat.NearbyMonsterCount == 0 &&
+                    !ctx.Interaction.IsBusy)
+                {
+                    ctx.Navigation.Stop(gc);
+                    Decision = $"Wave {_state.CurrentWave} — waiting to retry loot";
+                    StatusText = "Holding position for pending floor loot";
+                    return;
+                }
             }
 
             // --- Priority 2: Wave timeout check ---
-            // Sweep loot before exiting — wave timeout shouldn't abandon items on the ground
+            // A long boss/search wave is not proof that the Simulacrum is finished.
+            // Keep the instance alive and restart the observation window; only an
+            // inactive wave 15 is allowed to enter the completion/exit path.
             if (_state.IsWaveActive &&
                 (DateTime.Now - _state.WaveStartedAt).TotalMinutes > _settings.WaveTimeoutMinutes.Value)
             {
-                Decision = "Wave timeout → LootSweep";
-                _phase = SimPhase.LootSweep;
-                _phaseStartTime = DateTime.Now;
-                _sweepNearMonolith = false;
-                _lastEmptyScanAt = DateTime.MinValue;
-                StatusText = $"Wave {_state.CurrentWave} timed out — sweeping loot before exit";
+                ctx.Stats?.RecordRuntimeEvent("simulacrum", "wave_timeout", "continued", "active_wave_timeout",
+                    new { wave = _state.CurrentWave, target = Decision, progress = ctx.Combat.NearbyMonsterCount,
+                          chased = _chaseTargetId, blacklisted = _blacklistedMonsters.Count });
+                _state.ResetWaveTimer();
+                // Recovery, never an exit: drop whatever the bot was chasing and re-sweep the arena.
+                if (_chaseTargetId != 0) BlacklistChaseTarget();
+                BlacklistNearbyMonsters(gc, gc.Player.GridPosNum, ctx.Settings.Build.CombatRange.Value);
+                ResetChase();
+                ctx.Navigation.Stop(gc);
+                _wasSearching = true;
+                ctx.Exploration.SeenRadiusOverride = 40;
+                ctx.Exploration.ResetSeen();
+                Decision = $"Wave {_state.CurrentWave} timeout → continue incomplete run";
+                StatusText = $"Wave {_state.CurrentWave}/15 still active — continuing recovery/search";
                 return;
             }
 
@@ -553,6 +786,7 @@ namespace AutoExile.Modes
                         if (_wasSearching)
                         {
                             _wasSearching = false;
+                            ResetChase();
                             // Stop stale navigation from patrolling — combat handles movement now
                             ctx.Navigation.Stop(gc);
                             // Restore normal seen radius now that we're fighting
@@ -597,6 +831,7 @@ namespace AutoExile.Modes
                         _wasSearching = true;
                         ctx.Exploration.SeenRadiusOverride = 40;
                         ctx.Exploration.ResetSeen();
+                        ResetChase();
                     }
                     _combatEngageTime = DateTime.MinValue;
                     _combatEngageCount = 0;
@@ -609,9 +844,19 @@ namespace AutoExile.Modes
 
             // --- Between waves ---
 
-            // Priority 4: Stash items if inventory above threshold (or continuing a stash cycle).
-            // Must run BEFORE loot pickup — otherwise the bot picks up one item, sees it's above
-            // threshold, stashes one, picks up another, loops forever.
+            // Refresh floor state before deciding whether a proactive stash trip may run.
+            // Loot owns the mode while any pickable/retryable item is still on the floor.
+            ctx.Loot.Scan(gc);
+            _lastLootScan = DateTime.Now;
+            var floorLoot = ctx.Loot.GetBestCandidate();
+            bool hasUnresolvedFloorLoot = ctx.Loot.HasUnresolvedLootNearby;
+            bool mustStashForCapacity = floorLoot != null &&
+                TryGetFreeInventoryCells(gc, out var freeCells) &&
+                freeCells < floorLoot.InventorySlots;
+
+            // Priority 4: Stash only after the floor is clear, unless the next item
+            // provably cannot fit. This avoids stash/loot round-trips while preserving
+            // recovery when inventory capacity is genuinely exhausted.
             // Don't start StashSystem here — TickBetweenWaveStash navigates to the
             // cached stash position first so the entity loads into the entity list.
             if (!_state.IsWaveActive && _state.StashPosition.HasValue && !ctx.Interaction.IsBusy)
@@ -620,18 +865,24 @@ namespace AutoExile.Modes
                 // are kept in inventory for future runs and must NOT trigger a stash trip.
                 // Without this, holding spare fragments causes an infinite loop:
                 // open stash → filter rejects everything → close → re-trigger.
-                int stashableCount = 0;
-                var slots = StashSystem.GetInventorySlotItems(gc);
-                if (slots != null)
-                    foreach (var it in slots)
-                        if (KeepSimulacrumsFilter(it)) stashableCount++;
+                int stashableCount = CountStashable(gc);
+                if (_stashBlockedCount >= 0 && stashableCount != _stashBlockedCount)
+                {
+                    _stashBlockedCount = -1;
+                    _stashNoProgressTrips = 0;
+                }
+                bool stashBlocked = _stashBlockedCount >= 0;
 
-                bool shouldStartStashing    = stashableCount >= ctx.Settings.Run.StashItemThreshold.Value;
-                bool shouldContinueStashing = _isStashing && stashableCount > 0;
+                bool shouldStartStashing = !stashBlocked &&
+                    stashableCount >= ctx.Settings.Run.StashItemThreshold.Value &&
+                    (!hasUnresolvedFloorLoot || mustStashForCapacity);
+                bool shouldContinueStashing = !stashBlocked && _isStashing && stashableCount > 0 &&
+                    (!hasUnresolvedFloorLoot || mustStashForCapacity);
 
                 if (shouldStartStashing || shouldContinueStashing)
                 {
                     _isStashing = true;
+                    _stashTripStartCount = stashableCount;
                     Decision = $"Between waves → Stash ({stashableCount} items)";
                     _phase = SimPhase.BetweenWaveStash;
                     _phaseStartTime = DateTime.Now;
@@ -642,25 +893,31 @@ namespace AutoExile.Modes
             }
 
             // Priority 5: Loot must be fully cleared before starting next wave.
-            // Any visible loot (not blacklisted) resets the wave delay timer — we keep
-            // looting until everything is picked up or blacklisted, then wait the full
-            // delay for more drops before starting the next wave.
+            // Any visible loot that is pickable or awaiting a bounded retry resets the
+            // wave delay timer. A transient pickup failure must not be mistaken for an
+            // empty floor and open the next wave while the item is still present.
             // Also blocks if interaction is busy (mid-pickup) — stay at spawn zone, don't
             // wander to monolith.
             if (!_state.IsWaveActive)
             {
-                // Force a fresh scan every tick between waves (loot can drop at any time)
-                ctx.Loot.Scan(gc);
-                _lastLootScan = DateTime.Now;
-
                 bool hasLoot = ctx.Loot.HasLootNearby;
+                bool hasUnresolvedLoot = ctx.Loot.HasUnresolvedLootNearby;
                 bool pickingUp = ctx.Interaction.IsBusy && _lootTracker.HasPending;
 
-                if (hasLoot || pickingUp)
+                if (!hasLoot && !ctx.Interaction.IsBusy && ctx.Loot.ShouldToggleLabels(gc) &&
+                    ctx.Loot.StartLabelToggle(gc))
                 {
-                    if (hasLoot)
+                    Decision = "Between waves — refreshing hidden loot labels";
+                    StatusText = "Refreshing stacked loot labels before starting next wave";
+                    return;
+                }
+
+                if (hasUnresolvedLoot || pickingUp)
+                {
+                    if (hasUnresolvedLoot)
                     {
-                        // Loot exists — reset wave delay (items may still be dropping)
+                        // Loot exists or is waiting for a bounded retry — reset the delay
+                        // so the encounter cannot advance inside the retry window.
                         _state.ResetWaveDelay(_settings.MinWaveDelaySeconds.Value);
                     }
 
@@ -674,13 +931,26 @@ namespace AutoExile.Modes
                             StatusText = $"Picking up {candidate.ItemName} (between waves)";
                             return;
                         }
+
+                        Decision = "Between waves — waiting for loot pickup ownership";
+                        StatusText = "Holding position for loot pickup";
+                        return;
                     }
 
-                    // Either picking up or waiting — stay near spawn zones, don't wander to monolith
-                    if (!ctx.Interaction.IsBusy)
-                        IdleNearMonolith(ctx);
-                    Decision = pickingUp ? "Between waves — picking up loot" : "Between waves — clearing loot";
-                    StatusText = pickingUp ? $"Picking up loot (between waves)" : "Loot nearby — clearing before next wave";
+                    // A retry cooldown is still active. Hold position instead of starting
+                    // the monolith route and forcing a second trip back to the item.
+                    if (!ctx.Interaction.IsBusy && !hasLoot)
+                        ctx.Navigation.Stop(gc);
+                    Decision = pickingUp
+                        ? "Between waves — picking up loot"
+                        : hasLoot
+                            ? "Between waves — clearing loot"
+                            : "Between waves — waiting to retry loot";
+                    StatusText = pickingUp
+                        ? $"Picking up loot (between waves)"
+                        : hasLoot
+                            ? "Loot nearby — clearing before next wave"
+                            : "Loot pickup retry pending — holding next wave";
                     return;
                 }
             }
@@ -689,10 +959,12 @@ namespace AutoExile.Modes
             if (_state.CurrentWave >= 15 && !_state.IsWaveActive)
             {
                 Decision = "Wave 15 complete → LootSweep";
+                _lootSweepCompletesRun = true;
                 _phase = SimPhase.LootSweep;
                 _phaseStartTime = DateTime.Now;
                 _sweepNearMonolith = false;
                 _lastEmptyScanAt = DateTime.MinValue;
+                _sweepLabelRefreshAttempts = 0;
                 StatusText = "Wave 15 complete — sweeping loot";
                 return;
             }
@@ -705,29 +977,40 @@ namespace AutoExile.Modes
                 _state.ResetWaveDelay(_settings.MinWaveDelaySeconds.Value);
             }
 
-            // Track how long we've been between waves — bail if stuck too long
+            // Track how long we've been between waves. A timeout means our local
+            // monolith/navigation state needs rebuilding, not that the run is done.
             if (_betweenWaveStartTime == DateTime.MinValue)
                 _betweenWaveStartTime = DateTime.Now;
             var betweenWaveElapsed = (DateTime.Now - _betweenWaveStartTime).TotalSeconds;
             if (betweenWaveElapsed > BetweenWaveTimeoutSeconds)
             {
-                Decision = "Between-wave timeout → LootSweep";
-                _phase = SimPhase.LootSweep;
+                ctx.Stats?.RecordRuntimeEvent("simulacrum", "between_wave_timeout", "recovering", "monolith_navigation",
+                    new { wave = _state.CurrentWave, phase = _phase.ToString() });
+                ctx.Navigation.Stop(gc);
+                ctx.Exploration.ResetSeen();
+                _betweenWaveStartTime = DateTime.Now;
+                _waveStartAttempts = 0;
+                _phase = _state.MonolithPosition.HasValue
+                    ? SimPhase.NavigateToMonolith
+                    : SimPhase.FindMonolith;
                 _phaseStartTime = DateTime.Now;
-                _sweepNearMonolith = false;
-                _lastEmptyScanAt = DateTime.MinValue;
-                StatusText = $"Stuck between waves for {BetweenWaveTimeoutSeconds}s — exiting";
+                Decision = "Between-wave timeout → rebuild monolith navigation";
+                StatusText = $"Wave {_state.CurrentWave}/15 incomplete — recovering inside the instance";
                 return;
             }
 
             if (_waveStartAttempts >= MaxWaveStartAttempts)
             {
-                Decision = $"Failed to start wave after {MaxWaveStartAttempts} attempts → LootSweep";
-                _phase = SimPhase.LootSweep;
+                ctx.Navigation.Stop(gc);
+                ctx.Exploration.ResetSeen();
+                _waveStartAttempts = 0;
+                _betweenWaveStartTime = DateTime.Now;
+                _phase = _state.MonolithPosition.HasValue
+                    ? SimPhase.NavigateToMonolith
+                    : SimPhase.FindMonolith;
                 _phaseStartTime = DateTime.Now;
-                _sweepNearMonolith = false;
-                _lastEmptyScanAt = DateTime.MinValue;
-                StatusText = $"Can't start wave {_state.CurrentWave + 1} — exiting after {MaxWaveStartAttempts} failed attempts";
+                Decision = $"Wave start failed {MaxWaveStartAttempts} times → rebuild monolith navigation";
+                StatusText = $"Can't start wave {_state.CurrentWave + 1} — recovering inside the instance";
                 return;
             }
 
@@ -760,11 +1043,31 @@ namespace AutoExile.Modes
             // Tier 1: Known monsters exist — navigate toward the nearest non-blacklisted one
             if (ctx.Combat.CachedMonsterCount > 0)
             {
-                var nearestPos = FindNearestNonBlacklisted(gc, playerPos, ctx.Combat.BlacklistedEnemies);
+                var nearestPos = FindNearestNonBlacklisted(gc, playerPos, ctx.Combat.BlacklistedEnemies, out var nearestId);
                 if (nearestPos.HasValue)
                 {
                     _wasSearching = true;
                     var monsterDist = Vector2.Distance(playerPos, nearestPos.Value);
+                    // The chased monster died or despawned: the next one starts a fresh clock.
+                    if (_chaseTargetId != 0 && nearestId != _chaseTargetId && !IsAliveMonster(gc, _chaseTargetId))
+                        ResetChase();
+                    // Progress is distance to whichever monster is nearest, so two unreachable
+                    // monsters swapping as "nearest" cannot keep restarting the clock.
+                    if (_chaseProgressAt == DateTime.MinValue || monsterDist < _chaseBestDist - ChaseProgressGrid)
+                    {
+                        _chaseBestDist = monsterDist;
+                        _chaseProgressAt = DateTime.Now;
+                    }
+                    _chaseTargetId = nearestId;
+                    if ((DateTime.Now - _chaseProgressAt).TotalSeconds > ChaseNoProgressSeconds)
+                    {
+                        BlacklistChaseTarget();
+                        ResetChase();
+                        ctx.Navigation.Stop(gc);
+                        Decision = $"Wave {_state.CurrentWave} — chase target unreachable, blacklisted ({_blacklistedMonsters.Count})";
+                        StatusText = $"Wave {_state.CurrentWave}/15 — skipping unreachable monster";
+                        return;
+                    }
                     if (monsterDist > 20f)
                     {
                         if (ctx.Navigation.IsNavigating)
@@ -777,6 +1080,7 @@ namespace AutoExile.Modes
                 }
                 // All cached monsters are blacklisted — fall through to explore
             }
+            ResetChase();
 
             // Tier 2: No cached monsters — explore to find stragglers
             // (ResetSeen already called at the fighting→searching transition above)
@@ -844,7 +1148,9 @@ namespace AutoExile.Modes
             {
                 if (entity.Type != EntityType.Monster || !entity.IsHostile || !entity.IsAlive)
                     continue;
-                if (Vector2.Distance(entity.GridPosNum, playerGrid) <= radius)
+                if (Vector2.Distance(entity.GridPosNum, playerGrid) > radius) continue;
+                // Keep a longer (chase) blacklist that is already in place.
+                if (!_blacklistedMonsters.TryGetValue(entity.Id, out var stamped) || stamped < now)
                     _blacklistedMonsters[entity.Id] = now;
             }
         }
@@ -853,10 +1159,12 @@ namespace AutoExile.Modes
         /// Find the nearest alive hostile monster that isn't blacklisted.
         /// Returns null if all cached monsters are blacklisted (or none exist).
         /// </summary>
-        private Vector2? FindNearestNonBlacklisted(GameController gc, Vector2 playerGrid, HashSet<string> enemyBlacklist)
+        private Vector2? FindNearestNonBlacklisted(GameController gc, Vector2 playerGrid, HashSet<string> enemyBlacklist,
+            out long nearestId)
         {
             float nearestDist = float.MaxValue;
             Vector2? nearestPos = null;
+            nearestId = 0;
 
             foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
             {
@@ -872,10 +1180,33 @@ namespace AutoExile.Modes
                 {
                     nearestDist = dist;
                     nearestPos = entity.GridPosNum;
+                    nearestId = entity.Id;
                 }
             }
 
             return nearestPos;
+        }
+
+        /// <summary>Blacklists the chased monster for ChaseBlacklistSeconds (entries expire MonsterBlacklistSeconds after their stamp).</summary>
+        private void BlacklistChaseTarget()
+        {
+            if (_chaseTargetId == 0) return;
+            _blacklistedMonsters[_chaseTargetId] = DateTime.Now.AddSeconds(ChaseBlacklistSeconds - MonsterBlacklistSeconds);
+        }
+
+        private static bool IsAliveMonster(GameController gc, long entityId)
+        {
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+                if (entity.Id == entityId)
+                    return entity.Type == EntityType.Monster && entity.IsAlive;
+            return false;
+        }
+
+        private void ResetChase()
+        {
+            _chaseTargetId = 0;
+            _chaseBestDist = float.MaxValue;
+            _chaseProgressAt = DateTime.MinValue;
         }
 
         /// <summary>Remove expired blacklist entries.</summary>
@@ -1011,6 +1342,35 @@ namespace AutoExile.Modes
         // Between-wave stash
         // =================================================================
 
+        private int CountStashable(GameController gc)
+        {
+            int count = 0;
+            var slots = StashSystem.GetInventorySlotItems(gc);
+            if (slots != null)
+                foreach (var it in slots)
+                    if (KeepSimulacrumsFilter(it)) count++;
+            return count;
+        }
+
+        /// <summary>Counts trips that left the stashable count unchanged; two in a row block further trips.</summary>
+        private void NoteStashTripEnd(BotContext ctx, string outcome)
+        {
+            if (_stashTripStartCount < 0) return;
+            var remaining = CountStashable(ctx.Game);
+            if (remaining < _stashTripStartCount)
+            {
+                _stashNoProgressTrips = 0;
+            }
+            else if (++_stashNoProgressTrips >= 2)
+            {
+                _stashBlockedCount = remaining;
+                _isStashing = false;
+                ctx.Stats?.RecordRuntimeEvent("simulacrum", "stash_no_progress", "blocked", outcome,
+                    new { wave = _state.CurrentWave, remaining, stored = ctx.Stash.ItemsStored, trips = _stashNoProgressTrips });
+            }
+            _stashTripStartCount = -1;
+        }
+
         private void TickBetweenWaveStash(BotContext ctx, InteractionResult interactionResult)
         {
             // If wave started while stashing, cancel and return to wave cycle
@@ -1031,6 +1391,7 @@ namespace AutoExile.Modes
                 if (ctx.Stash.IsBusy)
                     ctx.Stash.Cancel(ctx.Game, ctx.Navigation);
                 _isStashing = false;
+                NoteStashTripEnd(ctx, "timeout");
                 _phase = SimPhase.WaveCycle;
                 _phaseStartTime = DateTime.Now;
                 StatusText = "Stash timeout — resuming wave cycle";
@@ -1084,6 +1445,7 @@ namespace AutoExile.Modes
                     // keeps working. The between-waves loot logic (Priority 4) runs first,
                     // and shouldContinueStashing ensures we come back to stash any new pickups
                     // before starting the next wave. _isStashing resets when the wave starts.
+                    NoteStashTripEnd(ctx, "succeeded");
                     _phase = SimPhase.WaveCycle;
                     _phaseStartTime = DateTime.Now;
                     StatusText = $"Stashed {ctx.Stash.ItemsStored} items — resuming wave cycle";
@@ -1113,10 +1475,10 @@ namespace AutoExile.Modes
         {
             _lootTracker.HandleResult(interactionResult, ctx);
 
-            if ((DateTime.Now - _phaseStartTime).TotalSeconds > LootSweepTimeoutSeconds)
+            if (ctx.Loot.TogglePhase != LootSystem.LabelTogglePhase.Idle)
             {
-                EnterExitMapPhase(ctx);
-                StatusText = $"Loot sweep timeout — exiting ({_lootTracker.PickupCount} items)";
+                ctx.Loot.TickLabelToggle(ctx.Game);
+                StatusText = $"Sweep: refreshing hidden loot labels — {ctx.Loot.ToggleStatus}";
                 return;
             }
 
@@ -1149,7 +1511,15 @@ namespace AutoExile.Modes
                 _lastEmptyScanAt = DateTime.MinValue; // ensure grace starts fresh from arrival
             }
 
-            // Step 2: Stash items if inventory has stashable loot above threshold.
+            // Read floor state at the monolith before allowing stash to take ownership.
+            ctx.Loot.Scan(gc);
+            var best = ctx.Loot.GetBestCandidate();
+            bool hasUnresolvedFloorLoot = ctx.Loot.HasUnresolvedLootNearby;
+            bool mustStashForCapacity = best != null &&
+                TryGetFreeInventoryCells(gc, out var freeCells) &&
+                freeCells < best.InventorySlots;
+
+            // Step 2: Stash after the floor is clear, or when the next item cannot fit.
             // Excludes spare full Simulacrums (filter rejects them), so holding
             // fragments doesn't trigger an empty stash trip.
             if (_state.StashPosition.HasValue)
@@ -1159,7 +1529,8 @@ namespace AutoExile.Modes
                 if (slots != null)
                     foreach (var it in slots)
                         if (KeepSimulacrumsFilter(it)) stashableCount++;
-                if (stashableCount >= ctx.Settings.Run.StashItemThreshold.Value)
+                if (stashableCount >= ctx.Settings.Run.StashItemThreshold.Value &&
+                    (!hasUnresolvedFloorLoot || mustStashForCapacity))
                 {
                     // Navigate close to stash so the entity loads into the entity list
                     var playerPos = gc.Player.GridPosNum;
@@ -1192,6 +1563,12 @@ namespace AutoExile.Modes
                     {
                         // After stashing, need to return to monolith for remaining drops
                         _sweepNearMonolith = false;
+                        _lastEmptyScanAt = DateTime.MinValue;
+                        _sweepLabelRefreshAttempts = 0;
+                        StatusText = stashResult == StashResult.Succeeded
+                            ? "Stash complete — returning to monolith for final loot check"
+                            : $"Stash failed ({ctx.Stash.Status}) — rebuilding final loot sweep";
+                        return;
                     }
                     else
                     {
@@ -1201,17 +1578,55 @@ namespace AutoExile.Modes
                 }
             }
 
-            // Step 3: Scan and pick up loot
-            ctx.Loot.Scan(gc);
-            var best = ctx.Loot.GetBestCandidate();
+            // Step 3: Pick up the fresh candidate captured at the monolith.
             if (best != null)
             {
                 _lastEmptyScanAt = DateTime.MinValue;
-                var withinRadius = best.Distance <= ctx.Interaction.InteractRadius;
-                ctx.Interaction.PickupGroundItem(best.Entity, ctx.Navigation,
-                    requireProximity: !withinRadius);
-                _lootTracker.SetPending(best.Entity.Id, best.ItemName, best.ChaosValue);
-                StatusText = $"Sweep: picking up {best.ItemName} ({_lootTracker.PickupCount} picked)";
+                _sweepLabelRefreshAttempts = 0;
+                var (_, candidate) = ctx.Loot.PickupNext(ctx.Interaction, ctx.Navigation);
+                if (candidate != null && ctx.Interaction.IsBusy)
+                {
+                    _lootTracker.SetPending(candidate.Entity.Id, candidate.ItemName, candidate.ChaosValue);
+                    StatusText = $"Sweep: picking up {candidate.ItemName} ({_lootTracker.PickupCount} picked)";
+                }
+                else
+                {
+                    StatusText = "Sweep: waiting for loot pickup ownership";
+                }
+                return;
+            }
+
+            // Visible loot can temporarily have no candidate while components hydrate
+            // or a bounded pickup retry cools down. This is not an empty floor.
+            if (hasUnresolvedFloorLoot)
+            {
+                ctx.Navigation.Stop(gc);
+                _lastEmptyScanAt = DateTime.MinValue;
+                StatusText = "Sweep: waiting to resolve pending floor loot";
+                return;
+            }
+
+            if (_sweepLabelRefreshAttempts < MaxSweepLabelRefreshAttempts &&
+                ctx.Loot.ShouldToggleLabels(gc) &&
+                ctx.Loot.StartLabelToggle(gc))
+            {
+                _sweepLabelRefreshAttempts++;
+                _lastEmptyScanAt = DateTime.MinValue;
+                StatusText = $"Sweep: refreshing stacked loot labels ({_sweepLabelRefreshAttempts}/{MaxSweepLabelRefreshAttempts})";
+                return;
+            }
+
+            // A sweep timeout is a recovery boundary, never proof that the floor is
+            // empty. Rebuild the monolith sweep; only the verified empty grace below
+            // is allowed to transition to map exit.
+            if ((DateTime.Now - _phaseStartTime).TotalSeconds > LootSweepTimeoutSeconds)
+            {
+                ctx.Navigation.Stop(gc);
+                _phaseStartTime = DateTime.Now;
+                _sweepNearMonolith = false;
+                _lastEmptyScanAt = DateTime.MinValue;
+                _sweepLabelRefreshAttempts = 0;
+                StatusText = $"Loot sweep timeout — restarting final floor check ({_lootTracker.PickupCount} picked)";
                 return;
             }
 
@@ -1220,9 +1635,15 @@ namespace AutoExile.Modes
             if (_lastEmptyScanAt == DateTime.MinValue)
                 _lastEmptyScanAt = DateTime.Now;
 
-            if ((DateTime.Now - _lastEmptyScanAt).TotalSeconds >= EmptyGraceSeconds)
+            // Never declare the floor empty before a fresh label-toggle cooldown
+            // could have elapsed. The old fixed five seconds raced the configured
+            // 7.1s cooldown and allowed an early exit with hidden labels.
+            var verifiedEmptyGraceSeconds = Math.Max(
+                EmptyGraceSeconds,
+                ctx.Loot.LabelToggleCooldownSeconds + 1f);
+            if ((DateTime.Now - _lastEmptyScanAt).TotalSeconds >= verifiedEmptyGraceSeconds)
             {
-                EnterExitMapPhase(ctx);
+                EnterExitMapPhase(ctx, _lootSweepCompletesRun);
                 StatusText = $"Sweep complete — exiting ({_lootTracker.PickupCount} items)";
                 return;
             }
@@ -1234,12 +1655,14 @@ namespace AutoExile.Modes
         // Exit map
         // =================================================================
 
-        private void EnterExitMapPhase(BotContext ctx)
+        private void EnterExitMapPhase(BotContext ctx, bool recordCompletion = true)
         {
             _phase = SimPhase.ExitMap;
             _phaseStartTime = DateTime.Now;
-            _mapCompleted = true;
-            ctx.LootTracker.RecordMapComplete();
+            _mapCompleted = recordCompletion;
+            _mapAborted = !recordCompletion;
+            _exitPortalAttempts = 0;
+            _portalKeyPressed = false;
 
             // Cancel any in-flight systems
             if (ctx.Stash.IsBusy)
@@ -1258,8 +1681,12 @@ namespace AutoExile.Modes
 
             if ((DateTime.Now - _phaseStartTime).TotalSeconds > 30)
             {
-                _phase = SimPhase.Done;
-                StatusText = "Exit timeout — giving up";
+                ctx.Interaction.Cancel(gc);
+                ctx.Navigation.Stop(gc);
+                _phaseStartTime = DateTime.Now;
+                _exitPortalAttempts = 0;
+                _portalKeyPressed = false;
+                StatusText = "Exit timeout — resetting portal recovery";
                 return;
             }
 
@@ -1292,12 +1719,12 @@ namespace AutoExile.Modes
                     }
                     else
                     {
-                        StatusText = "Near cached portal — waiting for entity";
+                        TryOpenExitPortal(ctx);
                     }
                 }
                 else
                 {
-                    StatusText = "No portal found — waiting";
+                    TryOpenExitPortal(ctx);
                 }
                 return;
             }
@@ -1315,13 +1742,69 @@ namespace AutoExile.Modes
             }
 
             ctx.Navigation.Stop(gc);
-            ModeHelpers.ClickEntity(gc, portal, ref _lastActionTime);
-            StatusText = "Clicking portal to exit";
+            if (ctx.Interaction.IsBusy)
+            {
+                StatusText = $"Clicking portal to exit ({ctx.Interaction.Status})";
+                return;
+            }
+
+            if (!string.IsNullOrEmpty(ctx.Interaction.LastFailReason))
+                _exitPortalAttempts++;
+
+            ctx.Interaction.InteractWithEntity(portal, ctx.Navigation);
+            _lastActionTime = DateTime.Now;
+            StatusText = $"Clicking portal to exit (attempt {_exitPortalAttempts + 1})";
+        }
+
+        private static bool TryGetFreeInventoryCells(GameController gc, out int freeCells)
+        {
+            freeCells = 0;
+            var items = StashSystem.GetInventorySlotItems(gc);
+            if (items == null) return false;
+
+            const int inventoryCells = 12 * 5;
+            int occupied = 0;
+            foreach (var item in items)
+                occupied += Math.Max(1, item.SizeX) * Math.Max(1, item.SizeY);
+
+            freeCells = Math.Max(0, inventoryCells - occupied);
+            return true;
+        }
+
+        private void TryOpenExitPortal(BotContext ctx)
+        {
+            if (_portalKeyPressed)
+            {
+                StatusText = "Waiting for exit portal";
+                return;
+            }
+
+            if (BotInput.PressKey(ctx.Settings.Run.PortalKey.Value))
+            {
+                _portalKeyPressed = true;
+                _lastActionTime = DateTime.Now;
+                StatusText = "Opening exit portal";
+            }
         }
 
         // =================================================================
         // Render
         // =================================================================
+
+        private static string FormatHudDuration(TimeSpan value)
+        {
+            if (value < TimeSpan.Zero) value = TimeSpan.Zero;
+            return value.TotalHours >= 1
+                ? $"{(int)value.TotalHours}h {value.Minutes:D2}m {value.Seconds:D2}s"
+                : $"{(int)value.TotalMinutes}m {value.Seconds:D2}s";
+        }
+
+        private bool HasCurrentAttempt => _phase is SimPhase.FindMonolith
+            or SimPhase.NavigateToMonolith
+            or SimPhase.WaveCycle
+            or SimPhase.BetweenWaveStash
+            or SimPhase.LootSweep
+            or SimPhase.ExitMap;
 
         public void Render(BotContext ctx)
         {
@@ -1331,43 +1814,57 @@ namespace AutoExile.Modes
             var g = ctx.Graphics;
 
             // --- HUD ---
-            var hudY = 100f;
+            var hudY = ctx.ModeHudTop;
             var hudX = 20f;
             var lineH = 16f;
 
-            g.DrawText($"Phase: {_phase}", new Vector2(hudX, hudY), SharpDX.Color.White);
+            g.DrawText($"SIMULACRUM • {_phase}", new Vector2(hudX, hudY), SharpDX.Color.Gold);
             hudY += lineH;
             g.DrawText(StatusText, new Vector2(hudX, hudY), SharpDX.Color.LightGreen);
             hudY += lineH;
 
-            g.DrawText($"Wave: {_state.CurrentWave}/15 {(_state.IsWaveActive ? "ACTIVE" : "idle")}",
+            g.DrawText($"Wave {_state.CurrentWave}/15 {(_state.IsWaveActive ? "ACTIVE" : "idle")}  •  Deaths {_state.DeathCount}/{ctx.Settings.Run.MaxDeaths.Value}",
                 new Vector2(hudX, hudY),
                 _state.IsWaveActive ? SharpDX.Color.Red : SharpDX.Color.Cyan);
             hudY += lineH;
 
-            if (_state.DeathCount > 0)
-            {
-                g.DrawText($"Deaths: {_state.DeathCount}/{ctx.Settings.Run.MaxDeaths.Value}",
-                    new Vector2(hudX, hudY), SharpDX.Color.Red);
-                hudY += lineH;
-            }
-
-            var runElapsed = DateTime.Now - _state.RunStartedAt;
-            g.DrawText($"Runs: {_state.RunsCompleted} | This run: {runElapsed.Minutes}m{runElapsed.Seconds:D2}s",
+            var stats = ctx.Stats.Snapshot;
+            var session = stats.SessionFor(Name);
+            var currentRun = stats.CurrentRun;
+            var attemptText = currentRun != null
+                ? FormatHudDuration(DateTime.UtcNow - currentRun.ActivatedAtUtc)
+                : "--";
+            g.DrawText($"Current {attemptText}  •  Full clears {session.FullClears}",
                 new Vector2(hudX, hudY), SharpDX.Color.Gold);
             hudY += lineH;
 
-            if (_state.RunsCompleted > 0)
+            if (session.Entered > 0)
             {
-                var avgDur = _state.AverageRunDuration;
-                g.DrawText($"Avg: {avgDur.Minutes}m{avgDur.Seconds:D2}s | {_state.AverageWavesPerRun:F1} waves/run",
+                g.DrawText($"Average {FormatHudDuration(TimeSpan.FromMilliseconds(session.AverageRunDurationMs))}  •  {session.AverageWavesPerEnteredRun:F1} waves/run",
                     new Vector2(hudX, hudY), SharpDX.Color.Gold);
                 hudY += lineH;
             }
 
-            g.DrawText($"Loot: {_lootTracker.PickupCount} items",
+            g.DrawText($"Session {FormatHudDuration(TimeSpan.FromMilliseconds(session.ActiveDurationMs))}  •  Runs {session.Attempts}  •  Items {session.ItemsLooted}",
+                new Vector2(hudX, hudY), SharpDX.Color.White);
+            hudY += lineH;
+
+            var chaosPerDivine = ctx.NinjaPrice.ChaosPerDivine;
+            var totalValue = chaosPerDivine > 0
+                ? $"{session.ChaosValue / chaosPerDivine:F2} div"
+                : $"{session.ChaosValue:F1}c";
+            var hourlyValue = chaosPerDivine > 0
+                ? $"{session.ChaosPerHour / chaosPerDivine:F2} div/h"
+                : $"{session.ChaosPerHour:F1}c/h";
+            g.DrawText($"Value {totalValue}  •  Rate {hourlyValue}  •  Current loot {_lootTracker.PickupCount}",
                 new Vector2(hudX, hudY), SharpDX.Color.Gold);
             hudY += lineH;
+
+            if (stats.Health.Status != "healthy")
+            {
+                g.DrawText($"Stats {stats.Health.Status}", new Vector2(hudX, hudY), SharpDX.Color.OrangeRed);
+                hudY += lineH;
+            }
 
             if (!string.IsNullOrEmpty(Decision))
             {

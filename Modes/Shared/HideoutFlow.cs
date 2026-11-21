@@ -37,13 +37,18 @@ namespace AutoExile.Modes.Shared
         // Scarab path substrings to insert into the map device after the map is loaded.
         // Set by Wave Farming; null/empty for Boss/Sim (they don't use scarabs).
         private IReadOnlyList<string>? _scarabPaths;
+        private string _lastFragmentScanFingerprint = "";
+        private DateTime _lastFragmentScanLoggedAtUtc = DateTime.MinValue;
 
         private const float BasePortalTimeoutSeconds = 15f;
-        private const float MapDeviceRetrySeconds = 10f;
+        private const float MapDeviceQuickRetrySeconds = 10f;
+        private const float MapDeviceRepeatedRetrySeconds = 60f;
         private const float ActionCooldownMs = 500f;
+        private int _mapDeviceRecoveryAttempts;
 
         public string Status { get; private set; } = "";
         public bool IsActive => _phase != HideoutPhase.Idle;
+        public bool FragmentConfigurationMissing { get; private set; }
 
         /// <summary>
         /// Start a full hideout flow: settle → stash → open map → enter portal.
@@ -74,6 +79,10 @@ namespace AutoExile.Modes.Shared
             _minFragments = minFragments;
             _withdrawList = withdrawList != null && withdrawList.Count > 0 ? withdrawList : null;
             _scarabPaths = scarabPaths != null && scarabPaths.Count > 0 ? scarabPaths : null;
+            FragmentConfigurationMissing = false;
+            _lastFragmentScanFingerprint = "";
+            _lastFragmentScanLoggedAtUtc = DateTime.MinValue;
+            _mapDeviceRecoveryAttempts = 0;
             _phase = HideoutPhase.Settle;
             _phaseStartTime = DateTime.Now;
             Status = "Hideout — settling";
@@ -126,6 +135,7 @@ namespace AutoExile.Modes.Shared
             _minFragments = 1;
             _withdrawList = null;
             _scarabPaths = null;
+            FragmentConfigurationMissing = false;
             Status = "";
         }
 
@@ -155,7 +165,9 @@ namespace AutoExile.Modes.Shared
                     var need = target - have;
                     if (need > 0)
                     {
-                        activeWithdrawList.Add((path, need));
+                        // StashSystem expects the desired inventory total, not the
+                        // remaining delta; it subtracts the current inventory itself.
+                        activeWithdrawList.Add((path, target));
                         totalNeededFromList += need;
                     }
                 }
@@ -163,12 +175,15 @@ namespace AutoExile.Modes.Shared
             }
 
             // Count fragments and non-fragment loot in inventory (single-item path)
-            int fragmentsInInventory = StashSystem.CountInventoryItems(ctx.Game, _withdrawFragmentPath);
-            int lootItems = StashSystem.CountNonMatchingItems(ctx.Game, _withdrawFragmentPath);
+            var inventoryEvidence = StashSystem.InspectInventory(ctx.Game, _withdrawFragmentPath);
+            int fragmentsInInventory = inventoryEvidence.MatchCount;
+            int lootItems = inventoryEvidence.NonMatchCount;
 
             // Only withdraw when below minimum needed — don't top up each run
             bool usesFragments = !string.IsNullOrEmpty(_withdrawFragmentPath);
             int minNeeded = _minFragments > 0 ? _minFragments : 1;
+            if (usesFragments && fragmentsInInventory < minNeeded)
+                RecordFragmentScanEvidence(ctx, inventoryEvidence, minNeeded);
             bool canWithdraw = usesFragments
                 && !string.IsNullOrEmpty(_resourceTabName)
                 && _fragmentStock > 0;
@@ -180,7 +195,10 @@ namespace AutoExile.Modes.Shared
             // Not enough fragments and no way to get more — signal stop (only for modes that use fragments)
             if (usesFragments && fragmentsInInventory < minNeeded && !canWithdraw)
             {
-                Status = "No fragments in inventory";
+                FragmentConfigurationMissing = true;
+                Status = string.IsNullOrWhiteSpace(_resourceTabName)
+                    ? "Fragment tab is not configured"
+                    : "Fragment inventory stock is disabled";
                 _phase = HideoutPhase.Idle;
                 return HideoutSignal.NoFragments;
             }
@@ -217,6 +235,40 @@ namespace AutoExile.Modes.Shared
             return HideoutSignal.InProgress;
         }
 
+        private void RecordFragmentScanEvidence(BotContext ctx,
+            InventoryScanEvidence evidence, int minNeeded)
+        {
+            var fingerprint = $"{_withdrawFragmentPath}:{evidence.Readable}:{evidence.Stage}:" +
+                $"{evidence.ErrorType}:{evidence.HolderCount}:{evidence.SlotCount}:" +
+                $"{evidence.MatchCount}:{evidence.NullItems}:{evidence.EmptyPaths}:" +
+                evidence.SlotFaults;
+            var now = DateTime.UtcNow;
+            if (fingerprint == _lastFragmentScanFingerprint &&
+                now - _lastFragmentScanLoggedAtUtc < TimeSpan.FromSeconds(30))
+                return;
+
+            _lastFragmentScanFingerprint = fingerprint;
+            _lastFragmentScanLoggedAtUtc = now;
+            ctx.Stats.RecordRuntimeEvent("inventory", "fragment_scan_mismatch", "observed",
+                "configured_fragment_not_matched", new
+                {
+                    expectedPath = _withdrawFragmentPath,
+                    minNeeded,
+                    resourceTabConfigured = !string.IsNullOrWhiteSpace(_resourceTabName),
+                    evidence.Readable,
+                    evidence.Stage,
+                    evidence.ErrorType,
+                    evidence.HolderCount,
+                    evidence.SlotCount,
+                    evidence.MatchCount,
+                    evidence.NonMatchCount,
+                    evidence.NullItems,
+                    evidence.EmptyPaths,
+                    evidence.SlotFaults,
+                    samplePaths = evidence.SamplePaths.ToArray(),
+                });
+        }
+
         private HideoutSignal TickStash(BotContext ctx)
         {
             var result = ctx.Stash.Tick(ctx.Game, ctx.Navigation);
@@ -229,10 +281,13 @@ namespace AutoExile.Modes.Shared
                     // Verify we have enough fragments before proceeding to map device
                     if (!string.IsNullOrEmpty(_withdrawFragmentPath) && !string.IsNullOrEmpty(_resourceTabName))
                     {
-                        int frags = StashSystem.CountInventoryItems(ctx.Game, _withdrawFragmentPath);
+                        var postWithdrawEvidence = StashSystem.InspectInventory(ctx.Game, _withdrawFragmentPath);
+                        int frags = postWithdrawEvidence.MatchCount;
                         int needed = _minFragments > 0 ? _minFragments : 1;
                         if (frags < needed)
                         {
+                            RecordFragmentScanEvidence(ctx, postWithdrawEvidence, needed);
+                            FragmentConfigurationMissing = false;
                             Status = $"Not enough fragments ({frags}/{needed}) — stopping";
                             _phase = HideoutPhase.Idle;
                             return HideoutSignal.NoFragments;
@@ -273,13 +328,48 @@ namespace AutoExile.Modes.Shared
             switch (result)
             {
                 case MapDeviceResult.Succeeded:
+                    _mapDeviceRecoveryAttempts = 0;
                     Status = "Map opened — entering";
+                    // TickEnterPortal reports success as soon as loading starts. If the
+                    // area transition is rejected or cancelled, MapDevice is Idle on the
+                    // next tick; give the load a short grace period, then recreate the
+                    // flow instead of remaining in OpenMap forever.
+                    _phaseStartTime = DateTime.Now;
                     // Area change will fire when player enters the portal
                     break;
                 case MapDeviceResult.Failed:
-                    Status = $"Map device failed: {ctx.MapDevice.Status}";
-                    if ((DateTime.Now - _phaseStartTime).TotalSeconds > MapDeviceRetrySeconds)
+                    if (ctx.MapDevice.RequestedItemUnavailable)
                     {
+                        return HandleRequestedItemUnavailable();
+                    }
+                    Status = $"Map device failed: {ctx.MapDevice.Status}";
+                    var failedRetrySeconds = _mapDeviceRecoveryAttempts == 0
+                        ? MapDeviceQuickRetrySeconds
+                        : MapDeviceRepeatedRetrySeconds;
+                    if ((DateTime.Now - _phaseStartTime).TotalSeconds > failedRetrySeconds)
+                    {
+                        ctx.Stats.RecordEvent("map_device_recovery",
+                            $"failed:attempt={_mapDeviceRecoveryAttempts + 1}:{ctx.MapDevice.Phase}:{ctx.MapDevice.Status}");
+                        _mapDeviceRecoveryAttempts++;
+                        _phaseStartTime = DateTime.Now;
+                        StartMapDevice(ctx);
+                    }
+                    break;
+                case MapDeviceResult.None:
+                    if (ctx.MapDevice.RequestedItemUnavailable)
+                    {
+                        return HandleRequestedItemUnavailable();
+                    }
+                    Status = "Map device became idle before area transition";
+                    var idleRetrySeconds = _mapDeviceRecoveryAttempts == 0
+                        ? MapDeviceQuickRetrySeconds
+                        : MapDeviceRepeatedRetrySeconds;
+                    if (!ctx.Game.IsLoading
+                        && (DateTime.Now - _phaseStartTime).TotalSeconds > idleRetrySeconds)
+                    {
+                        ctx.Stats.RecordEvent("map_device_recovery",
+                            $"idle_before_area_transition:attempt={_mapDeviceRecoveryAttempts + 1}:{ctx.MapDevice.Status}");
+                        _mapDeviceRecoveryAttempts++;
                         _phaseStartTime = DateTime.Now;
                         StartMapDevice(ctx);
                     }
@@ -289,6 +379,31 @@ namespace AutoExile.Modes.Shared
                     break;
             }
             return HideoutSignal.InProgress;
+        }
+
+        private HideoutSignal HandleRequestedItemUnavailable()
+        {
+            FragmentConfigurationMissing = false;
+
+            // Inventory visibility at the atlas is not authoritative stock evidence:
+            // a just-withdrawn fragment can disappear from ExileCore's inventory view
+            // during the device transition. When a resource tab is configured, return
+            // to the stash flow and let its bounded tab scan confirm stock instead.
+            var canRecheckStock = !string.IsNullOrWhiteSpace(_withdrawFragmentPath)
+                && !string.IsNullOrWhiteSpace(_resourceTabName)
+                && _fragmentStock > 0;
+            if (canRecheckStock)
+            {
+                _mapDeviceRecoveryAttempts++;
+                _phase = HideoutPhase.Settle;
+                _phaseStartTime = DateTime.Now;
+                Status = "Fragment missing at map device — rechecking configured stock tab";
+                return HideoutSignal.InProgress;
+            }
+
+            Status = "Requested fragment is not available in stash or inventory";
+            _phase = HideoutPhase.Idle;
+            return HideoutSignal.NoFragments;
         }
 
         private HideoutSignal TickEnterPortal(BotContext ctx)

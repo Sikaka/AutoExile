@@ -63,6 +63,7 @@ namespace AutoExile.Systems
                 dict = new Dictionary<string, int>();
                 _failures[category] = dict;
             }
+            if (dict.Count >= 100 && !dict.ContainsKey(reason)) reason = "(other)";
             dict[reason] = dict.TryGetValue(reason, out var n) ? n + 1 : 1;
         }
 

@@ -1,6 +1,7 @@
 using ExileCore;
 using AutoExile.Mechanics;
 using AutoExile.Systems;
+using AutoExile.Statistics;
 
 namespace AutoExile
 {
@@ -32,6 +33,7 @@ namespace AutoExile
         public required MapDatabase MapDatabase { get; init; }
         public required BotSettings Settings { get; init; }
         public required PerformanceTracker Perf { get; init; }
+        public required StatsService Stats { get; init; }
 
         /// <summary>
         /// Minimap icons discovered from TileEntities. Updated periodically by BotCore.
@@ -50,6 +52,12 @@ namespace AutoExile
         /// Graphics API for rendering overlays. Set during Render() calls.
         /// </summary>
         public ExileCore.Graphics? Graphics { get; set; }
+
+        /// <summary>
+        /// Resolution-aware vertical origin for mode HUDs. Updated by BotCore
+        /// before rendering so mode text stays below the global status lines.
+        /// </summary>
+        public float ModeHudTop { get; set; } = 164f;
 
         /// <summary>
         /// Elapsed seconds since last tick.

@@ -30,6 +30,7 @@ namespace AutoExile.Modes.WaveFarm
         private string _lastAreaName = "";
         private int _runsCompleted;
         private bool _mapCompleted;
+        private long _statsMapInstanceHash;
 
         // Exit map
         private bool _portalKeyPressed;
@@ -113,6 +114,7 @@ namespace AutoExile.Modes.WaveFarm
             _lastZoneHash = ctx.Game?.IngameState?.Data?.CurrentAreaHash ?? 0;
             _runsCompleted = 0;
             _mapCompleted = false;
+            _statsMapInstanceHash = 0;
             ctx.Perf.Reset();
 
             // Resolve plan
@@ -539,6 +541,19 @@ namespace AutoExile.Modes.WaveFarm
             _mapCompleted = false;
             _portalKeyPressed = false;
 
+            var instanceHash = gc.IngameState?.Data?.CurrentAreaHash ?? 0;
+            if (_statsMapInstanceHash == 0 && instanceHash != 0)
+            {
+                _statsMapInstanceHash = instanceHash;
+                var areaName = gc.Area?.CurrentArea?.Name ?? "";
+                ctx.Stats.BeginRun(Name, $"wave-farm:{instanceHash}", areaName, consumed: true);
+                ctx.Stats.ObserveRunEntry(Name, instanceHash, areaName);
+            }
+            else if (instanceHash == _statsMapInstanceHash)
+            {
+                ctx.Stats.ObserveRunEntry(Name, instanceHash, gc.Area?.CurrentArea?.Name ?? "");
+            }
+
             _wave.Initialize(_activePlan!);
             _activePlan!.Reset();
 
@@ -931,7 +946,9 @@ namespace AutoExile.Modes.WaveFarm
 
                 if (_mapCompleted)
                 {
+                    ctx.Stats.EndRun(Name, "completed", "map_completed");
                     _mapCompleted = false;
+                    _statsMapInstanceHash = 0;
                     _runsCompleted++;
                     StartHideoutFlow(ctx);
                     ctx.Log($"[WaveFarm] Run #{_runsCompleted} complete");

@@ -26,6 +26,14 @@ namespace AutoExile.Systems
         /// <summary>Optional callback fired after each successful loot recording. (itemName, chaosValue, slots)</summary>
         public Action<string, double, int>? OnItemRecorded { get; set; }
 
+        /// <summary>Detailed pickup callback including the stable in-area entity id.</summary>
+        public Action<string, double, int, long>? OnItemRecordedDetailed { get; set; }
+        /// <summary>Raised for valuable or cluster-priced pickups so forensics can show which price line was used.</summary>
+        public Action<string, PriceResult>? OnItemPriced { get; set; }
+        /// <summary>Scan-time price of a ground item by entity id (LootSystem cache).</summary>
+        public Func<long, PriceResult?>? PriceLookup { get; set; }
+        private const double PricedEventMinChaos = 50;
+
         // Recent loot log (capped to prevent unbounded growth)
         private readonly List<LootRecord> _recentLoot = new();
         private const int MaxRecentLoot = 100;
@@ -131,7 +139,13 @@ namespace AutoExile.Systems
             var chaosValue = 0.0;
             if (PriceService != null && PriceService.IsLoaded && itemEntity != null)
             {
-                try { chaosValue = PriceService.GetPrice(gc, itemEntity).MaxChaosValue; }
+                try
+                {
+                    var price = PriceService.GetPrice(gc, itemEntity);
+                    chaosValue = price.EstimatedChaosValue;
+                    if (chaosValue >= PricedEventMinChaos || price.PricingNote != null)
+                        OnItemPriced?.Invoke(itemName, price);
+                }
                 catch { }
             }
 
@@ -150,6 +164,7 @@ namespace AutoExile.Systems
                 _recentLoot.RemoveAt(0);
 
             OnItemRecorded?.Invoke(itemName, chaosValue, 1);
+            OnItemRecordedDetailed?.Invoke(itemName, chaosValue, 1, itemEntity?.Id ?? 0);
         }
 
         /// <summary>
@@ -162,6 +177,15 @@ namespace AutoExile.Systems
             // ground item to go through the pickup→succeed→record cycle multiple times
             if (entityId != 0 && !_recordedEntityIds.Add(entityId))
                 return;
+
+            // Callers pass the pickup value (MaxChaosValue). Statistics take the conservative
+            // estimate of the same scan, so an ambiguous price never books its highest line.
+            if (entityId != 0 && PriceLookup?.Invoke(entityId) is { MatchCount: > 0 } price)
+            {
+                chaosValue = price.EstimatedChaosValue;
+                if (chaosValue >= PricedEventMinChaos || price.PricingNote != null)
+                    OnItemPriced?.Invoke(itemName, price);
+            }
 
             _totalChaosValue += chaosValue;
             _totalItemsLooted++;
@@ -177,6 +201,7 @@ namespace AutoExile.Systems
                 _recentLoot.RemoveAt(0);
 
             OnItemRecorded?.Invoke(itemName, chaosValue, 1);
+            OnItemRecordedDetailed?.Invoke(itemName, chaosValue, 1, entityId);
         }
 
         /// <summary>

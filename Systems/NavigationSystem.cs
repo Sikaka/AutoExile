@@ -2,6 +2,7 @@ using ExileCore;
 using ExileCore.PoEMemory.MemoryObjects;
 using ExileCore.Shared.Enums;
 using System.Numerics;
+using AutoExile.Statistics;
 using System.Windows.Forms;
 
 namespace AutoExile.Systems
@@ -14,6 +15,7 @@ namespace AutoExile.Systems
     /// </summary>
     public class NavigationSystem
     {
+        public StatsService? Stats { get; set; }
         // Movement keys — read from CombatSystem each tick via BotCore sync
         public Keys MoveKey { get; set; } = Keys.T;
 
@@ -72,6 +74,24 @@ namespace AutoExile.Systems
         // Waypoint reach thresholds in grid units
         private const float WaypointReachedGrid = 10f;   // intermediate waypoints
         private const float FinalWaypointGrid = 14f;     // final destination
+        private const float CloseFinalWaypointGrid = 4f; // final destination when the walk starts inside FinalWaypointGrid
+        private float _finalReachGrid = FinalWaypointGrid;
+
+        // Arrival hold: a mode that re-requests the target it was just stopped at would otherwise
+        // press and release the move key every frame (seen as 15 R presses a second at a spawn).
+        private const long ArrivalHoldMs = 1500;
+        private Vector2 _lastArrivalTarget, _lastArrivalPos;
+        private long _lastArrivalAtMs;
+
+        // Recovery hold: an escape/backtrack target is steered for a short window. Without it the
+        // next tick steers back to the blocked waypoint before the re-pressed key reaches the game.
+        // Held until the target is reached or the window ends; the path is then rebuilt from the
+        // new position so a dead-end pocket is left instead of re-entered.
+        private const int RecoveryHoldMs = 2000;
+        private const float RecoveryReachedGrid = 3f;
+        private Vector2 _recoveryTarget;
+        private DateTime _recoveryUntil = DateTime.MinValue;
+        private bool _recoveryActive;
         private const float BlinkApproachGrid = 4f;      // tight approach before blink
 
         // Stuck recovery state
@@ -80,7 +100,52 @@ namespace AutoExile.Systems
         private const int MaxRecoveriesBeforeRepath = 3;
         private const float InteractSearchRadius = 28f; // grid units to search for interactables
         public int StuckRecoveries => _totalStuckRecoveries;
-        public string LastRecoveryAction { get; private set; } = "";
+        private string _lastRecoveryAction = "";
+        public string LastRecoveryAction
+        {
+            get => _lastRecoveryAction;
+            private set
+            {
+                if (string.Equals(_lastRecoveryAction, value, StringComparison.Ordinal)) return;
+                _lastRecoveryAction = value;
+                if (string.IsNullOrWhiteSpace(value)) return;
+                var kind = RecoveryKind(value);
+                var now = Environment.TickCount64;
+                _recoveryEmits.TryGetValue(kind, out var last);
+                if (last.AtMs != 0 && now - last.AtMs < RecoveryEventIntervalMs)
+                {
+                    _recoveryEmits[kind] = (last.AtMs, last.Suppressed + 1);
+                    return;
+                }
+                _recoveryEmits[kind] = (now, 0);
+                Stats?.RecordRuntimeEvent("navigation", "recovery", "attempted", kind,
+                    new
+                    {
+                        text = value,
+                        destX = Destination?.X,
+                        destY = Destination?.Y,
+                        waypoint = CurrentWaypointIndex,
+                        totalRecoveries = _totalStuckRecoveries,
+                        sameSpot = _stuckAtSameSpotCount,
+                        suppressed = last.Suppressed
+                    });
+            }
+        }
+        private const long RecoveryEventIntervalMs = 5000;
+        private readonly Dictionary<string, (long AtMs, int Suppressed)> _recoveryEmits = new();
+
+        private static string RecoveryKind(string action)
+        {
+            if (action.Contains("escape probe", StringComparison.OrdinalIgnoreCase)) return "escape_probe";
+            if (action.StartsWith("Backtrack", StringComparison.Ordinal)) return "backtrack";
+            if (action.StartsWith("Blink crossed", StringComparison.Ordinal)) return "blink_crossed";
+            if (action.StartsWith("Blink timeout", StringComparison.Ordinal)) return "blink_timeout";
+            if (action.StartsWith("Interact", StringComparison.Ordinal)) return "interact";
+            if (action.StartsWith("Periodic repath", StringComparison.Ordinal)) return "periodic_repath";
+            if (action.StartsWith("No waypoint progress", StringComparison.Ordinal)) return "no_progress_repath";
+            if (action.StartsWith("Repath", StringComparison.Ordinal)) return "repath";
+            return "other";
+        }
         private static readonly Random _rng = new();
 
         // Obstacle injection — modes can mark grid positions as blocked (e.g. locked puzzle doors)
@@ -223,7 +288,7 @@ namespace AutoExile.Systems
                     _stuckTimer = 0;
                     LastRecoveryAction = "Blink crossed";
                     if (Destination.HasValue)
-                        NavigateTo(gc, Destination.Value);
+                        NavigateTo(gc, Destination.Value, 0, useFailureMemo: false);
                 }
                 else if (elapsed > BaseBlinkPendingTimeoutMs + ExtraLatencyMs)
                 {
@@ -234,7 +299,7 @@ namespace AutoExile.Systems
                         ? "Blink timeout (still on origin side), repath"
                         : "Blink timeout (on wall?), repath";
                     if (Destination.HasValue)
-                        NavigateTo(gc, Destination.Value);
+                        NavigateTo(gc, Destination.Value, 0, useFailureMemo: false);
                 }
             }
 
@@ -248,14 +313,24 @@ namespace AutoExile.Systems
 
             var isLastWaypoint = CurrentWaypointIndex >= CurrentNavPath.Count - 1;
             var nextIsBlink = !isLastWaypoint && CurrentNavPath[CurrentWaypointIndex + 1].Action == WaypointAction.Blink;
-            var reachDist = isLastWaypoint ? FinalWaypointGrid
+            var reachDist = isLastWaypoint ? _finalReachGrid
                 : nextIsBlink ? BlinkApproachGrid
                 : WaypointReachedGrid;
 
-            if (distToWaypoint < reachDist)
+            // Inside the normal arrival radius but blocked from the closer one: arrived, not stuck.
+            var closeEnoughStalled = isLastWaypoint && reachDist < FinalWaypointGrid && distToWaypoint < FinalWaypointGrid
+                && _stuckTimer > StuckTimeLimit * 0.5f;
+
+            if (distToWaypoint < reachDist || closeEnoughStalled)
             {
                 if (isLastWaypoint)
                 {
+                    if (Destination.HasValue)
+                    {
+                        _lastArrivalTarget = Destination.Value;
+                        _lastArrivalPos = playerGrid;
+                        _lastArrivalAtMs = Environment.TickCount64;
+                    }
                     Stop(gc);
                     return;
                 }
@@ -318,7 +393,7 @@ namespace AutoExile.Systems
                     else
                     {
                         LastRecoveryAction = $"Periodic repath (no waypoint advance in {PeriodicRepathIntervalSec:F0}s)";
-                        NavigateTo(gc, Destination.Value);
+                        NavigateTo(gc, Destination.Value, 0, useFailureMemo: false);
                     }
                     return;
                 }
@@ -351,7 +426,7 @@ namespace AutoExile.Systems
                         else
                         {
                             LastRecoveryAction = "Repath";
-                            NavigateTo(gc, Destination.Value);
+                            NavigateTo(gc, Destination.Value, 0, useFailureMemo: false);
                         }
                         return;
                     }
@@ -382,6 +457,23 @@ namespace AutoExile.Systems
                     _stuckRecoveryCount = 0;
             }
             _lastPosition = playerGrid;
+
+            // Recovery hold sits before no-progress detection: walking away from the waypoint
+            // is the point of a probe and must not trigger the next probe.
+            if (_recoveryActive)
+            {
+                if (DateTime.Now < _recoveryUntil && Vector2.Distance(playerGrid, _recoveryTarget) > RecoveryReachedGrid)
+                {
+                    ExecuteWalk(GridToScreen(gc, _recoveryTarget), gc.Window.GetWindowRectangle());
+                    return;
+                }
+                _recoveryActive = false;
+                if (Destination.HasValue)
+                {
+                    NavigateTo(gc, Destination.Value, 0, useFailureMemo: false);
+                    return;
+                }
+            }
 
             // No-progress detection: player is moving (not stuck) but not getting closer
             // to the current waypoint — e.g. shield charge bouncing off a wall, or trapped
@@ -414,7 +506,7 @@ namespace AutoExile.Systems
                         else
                         {
                             LastRecoveryAction = "No waypoint progress, repath";
-                            NavigateTo(gc, Destination.Value);
+                            NavigateTo(gc, Destination.Value, 0, useFailureMemo: false);
                         }
                         return;
                     }
@@ -510,7 +602,7 @@ namespace AutoExile.Systems
         /// <summary>Minimum screen distance (pixels) from center for effective move-clicks.</summary>
         internal const float MinScreenDist = 40f;
 
-        private void ExecuteWalk(Vector2 screenPos, SharpDX.RectangleF windowRect)
+        private void ExecuteWalk(Vector2 screenPos, SharpDX.RectangleF windowRect, bool repress = false)
         {
             var center = new Vector2(windowRect.Width / 2f, windowRect.Height / 2f);
 
@@ -540,6 +632,10 @@ namespace AutoExile.Systems
             // Continuous movement: hold the move key and update cursor position each tick.
             // First call starts movement (KeyDown), subsequent calls just reposition cursor.
             // This replaces the old pulse model: CursorPressKey → wait → CursorPressKey.
+            // A recovery re-presses the key: a held key the game stopped honouring (focus, death,
+            // panel) otherwise leaves the bot steering a cursor while the character stands still.
+            if (repress && BotInput.IsMovementActive && !BotInput.IsMovementSuspended)
+                BotInput.StopMovement();
             if (BotInput.IsMovementActive && !BotInput.IsMovementSuspended)
                 BotInput.UpdateMovementCursor(absPos);
             else
@@ -701,11 +797,67 @@ namespace AutoExile.Systems
         /// </summary>
         public bool NavigateTo(GameController gc, Vector2 gridTarget, int maxNodes = 0)
         {
+            if (!IsNavigating && _lastArrivalAtMs != 0
+                && Environment.TickCount64 - _lastArrivalAtMs < ArrivalHoldMs
+                && Vector2.Distance(gridTarget, _lastArrivalTarget) < 3f)
+            {
+                var player = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
+                if (Vector2.Distance(player, _lastArrivalPos) < 2f)
+                    return true; // already stopped here for this target; IsNavigating stays false
+            }
+            return NavigateTo(gc, gridTarget, maxNodes, useFailureMemo: true);
+        }
+
+        private const long FailureMemoTtlMs = 750;
+        private const long NavigateEventIntervalMs = 1000;
+        private (int Tx, int Ty, int Px, int Py, long Area, int BlockedCount, int BlockedHash, bool Relaxed, bool Blink, int MaxNodes) _failMemoKey;
+        private long _failMemoAtMs;
+        private int _navEvtX, _navEvtY, _navEvtSuppressed;
+        private long _navEvtArea, _navEvtAtMs;
+        private bool _navEvtResult;
+
+        private void RecordNavigateTo(Vector2 gridTarget, long area, int maxNodes, bool result)
+        {
+            int x = (int)gridTarget.X, y = (int)gridTarget.Y;
+            var now = Environment.TickCount64;
+            if (_navEvtAtMs != 0 && x == _navEvtX && y == _navEvtY && area == _navEvtArea
+                && result == _navEvtResult && now - _navEvtAtMs < NavigateEventIntervalMs)
+            {
+                _navEvtSuppressed++;
+                return;
+            }
+            var suppressed = _navEvtSuppressed;
+            _navEvtX = x;
+            _navEvtY = y;
+            _navEvtArea = area;
+            _navEvtResult = result;
+            _navEvtAtMs = now;
+            _navEvtSuppressed = 0;
+            Stats?.RecordRuntimeEvent("navigation", "navigate_to", "attempted", null,
+                new { x = gridTarget.X, y = gridTarget.Y, maxNodes, result, suppressed });
+        }
+
+        private bool NavigateTo(GameController gc, Vector2 gridTarget, int maxNodes, bool useFailureMemo)
+        {
             var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
+            long areaHash = gc.IngameState.Data.CurrentAreaHash;
+            var requestedMaxNodes = maxNodes;
+            int blockedHash = 0;
+            foreach (var bp in _blockedPositions)
+                blockedHash = HashCode.Combine(blockedHash, (int)bp.X, (int)bp.Y);
+            var memoKey = ((int)gridTarget.X, (int)gridTarget.Y, (int)playerGrid.X, (int)playerGrid.Y, areaHash,
+                _blockedPositions.Count, blockedHash, RelaxedPathing, BlinkEnabled, maxNodes);
+            if (useFailureMemo && _failMemoAtMs != 0 && memoKey == _failMemoKey
+                && Environment.TickCount64 - _failMemoAtMs < FailureMemoTtlMs)
+                return false;
+
             var pfGrid = gc.IngameState.Data.RawFramePathfindingData;
 
             if (pfGrid == null || pfGrid.Length == 0)
+            {
+                RecordNavigateTo(gridTarget, areaHash, requestedMaxNodes, false);
                 return false;
+            }
 
             // Patch grid with blocked positions (e.g. locked puzzle doors).
             // Create a shallow copy of the row array, then clone+zero only affected rows.
@@ -776,7 +928,15 @@ namespace AutoExile.Systems
             LastPathfindMs = sw.ElapsedMilliseconds;
 
             if (rawPath.Count == 0)
+            {
+                if (useFailureMemo)
+                {
+                    _failMemoKey = memoKey;
+                    _failMemoAtMs = Environment.TickCount64;
+                }
+                RecordNavigateTo(gridTarget, areaHash, requestedMaxNodes, false);
                 return false;
+            }
 
             CurrentNavPath = Pathfinding.SmoothNavPath(pfGrid, rawPath, minWalkable);
             if (PathMergeThreshold > 0)
@@ -800,7 +960,13 @@ namespace AutoExile.Systems
             }
 
             if (!Destination.HasValue || Vector2.Distance(Destination.Value, gridTarget) > 10f)
+            {
                 _totalStuckRecoveries = 0;
+                _recoveryActive = false; // a new destination drops a recovery for the old one
+            }
+            // A short walk would count as arrived before the first step; finish it properly instead.
+            _finalReachGrid = Vector2.Distance(playerGrid, CurrentNavPath[^1].Position) < FinalWaypointGrid + 4f
+                ? CloseFinalWaypointGrid : FinalWaypointGrid;
             Destination = gridTarget;
             IsNavigating = true;
             BlinkCount = CurrentNavPath.Count(w => w.Action == WaypointAction.Blink);
@@ -812,6 +978,7 @@ namespace AutoExile.Systems
             _lastRepathTime = DateTime.Now;
             _lastRepathWaypointIndex = CurrentWaypointIndex;
 
+            RecordNavigateTo(gridTarget, areaHash, requestedMaxNodes, true);
             return true;
         }
 
@@ -924,7 +1091,8 @@ namespace AutoExile.Systems
 
             var screenPos = GridToScreen(gc, bestBacktrack.Value);
             var windowRect = gc.Window.GetWindowRectangle();
-            ExecuteWalk(screenPos, windowRect);
+            ExecuteWalk(screenPos, windowRect, repress: true);
+            HoldRecoveryTarget(bestBacktrack.Value);
             LastRecoveryAction = $"Backtrack ({Vector2.Distance(playerGrid, bestBacktrack.Value):F0}g, {currentDistToDest - bestDistToDest:F0}g closer)";
             return true;
         }
@@ -949,19 +1117,69 @@ namespace AutoExile.Systems
                 _ => 70f,
             };
 
-            var angle = (float)(_rng.NextDouble() * Math.PI - Math.PI / 2);
-            var cos = (float)Math.Cos(angle);
-            var sin = (float)Math.Sin(angle);
-            var nudgeDir = new Vector2(
-                dirToWaypoint.X * cos - dirToWaypoint.Y * sin,
-                dirToWaypoint.X * sin + dirToWaypoint.Y * cos);
-
-            var nudgeTarget = playerGrid + nudgeDir * probeDistance;
+            var nudgeTarget = PickEscapeTarget(gc, playerGrid, dirToWaypoint, probeDistance);
             var screenPos = GridToScreen(gc, nudgeTarget);
             var windowRect = gc.Window.GetWindowRectangle();
 
-            ExecuteWalk(screenPos, windowRect);
+            ExecuteWalk(screenPos, windowRect, repress: true);
+            HoldRecoveryTarget(nudgeTarget);
+
+            // An escape probe is itself a recovery attempt. Restart every stuck/repath
+            // clock here so the periodic branch cannot fire again on the next game tick.
+            // Without this, a single stuck event sends a new random cursor target every
+            // frame and can accumulate hundreds of probes in a few seconds.
+            _lastPosition = playerGrid;
+            _stuckTimer = 0;
+            _bestDistToWaypoint = float.MaxValue;
+            _noProgressTimer = 0;
+            _lastRepathTime = DateTime.Now;
+            _lastRepathWaypointIndex = CurrentWaypointIndex;
             LastRecoveryAction = $"Escape probe ({probeDistance:F0}g, attempt #{_stuckAtSameSpotCount})";
+        }
+
+        /// <summary>
+        /// Picks an escape point the character can actually walk to. The first probes stay within
+        /// ±90° of the waypoint; after repeated stucks at one spot the full circle is tried,
+        /// backwards included, so a dead-end pocket is left the way it was entered.
+        /// </summary>
+        private void HoldRecoveryTarget(Vector2 gridTarget)
+        {
+            _recoveryTarget = gridTarget;
+            _recoveryUntil = DateTime.Now.AddMilliseconds(RecoveryHoldMs);
+            _recoveryActive = true;
+        }
+
+        private static readonly float[] EscapeDistanceScales = { 1f, 0.7f, 0.4f };
+
+        private Vector2 PickEscapeTarget(GameController gc, Vector2 playerGrid, Vector2 dirToWaypoint, float probeDistance)
+        {
+            if (dirToWaypoint.LengthSquared() < 0.0001f) dirToWaypoint = new Vector2(1, 0);
+            var fullCircle = _stuckAtSameSpotCount >= 2;
+            var span = fullCircle ? Math.PI * 2 : Math.PI;
+            var pfGrid = gc.IngameState.Data.RawFramePathfindingData;
+            Vector2 Rotate(double angle)
+            {
+                float c = (float)Math.Cos(angle), sn = (float)Math.Sin(angle);
+                return new Vector2(dirToWaypoint.X * c - dirToWaypoint.Y * sn, dirToWaypoint.X * sn + dirToWaypoint.Y * c);
+            }
+
+            var first = Rotate(_rng.NextDouble() * span - span / 2);
+            if (pfGrid == null || pfGrid.Length == 0) return playerGrid + first * probeDistance;
+
+            const int Samples = 12;
+            var offset = _rng.NextDouble() * span / Samples;
+            foreach (var distScale in EscapeDistanceScales)
+            {
+                for (var i = 0; i < Samples; i++)
+                {
+                    var dir = Rotate(offset + i * span / Samples - span / 2);
+                    var candidate = playerGrid + dir * probeDistance * distScale;
+                    if (!Pathfinding.IsWalkableCell(pfGrid, (int)candidate.X, (int)candidate.Y)) continue;
+                    if (!Pathfinding.HasLineOfSight(pfGrid, playerGrid, candidate)) continue;
+                    return candidate;
+                }
+            }
+            return playerGrid + first * probeDistance;
         }
 
         // ═══════════════════════════════════════════════════
@@ -1063,7 +1281,7 @@ namespace AutoExile.Systems
             if (tileGridPos == null)
                 return false;
 
-            return NavigateTo(gc, tileGridPos.Value, maxNodes: 500000);
+            return NavigateTo(gc, tileGridPos.Value, 500000, useFailureMemo: false);
         }
 
         /// <summary>
@@ -1114,6 +1332,8 @@ namespace AutoExile.Systems
             _stuckAtSameSpotCount = 0;
             _bestDistToWaypoint = float.MaxValue;
             _noProgressTimer = 0;
+            _recoveryUntil = DateTime.MinValue;
+            _recoveryActive = false;
             BotInput.StopMovement();
         }
 

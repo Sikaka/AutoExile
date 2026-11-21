@@ -5,6 +5,8 @@ using GameOffsets;
 using GameOffsets.Native;
 using System.Collections.Concurrent;
 using System.Numerics;
+using System.Reflection;
+using System.Runtime.InteropServices;
 
 namespace AutoExile.Systems
 {
@@ -15,6 +17,29 @@ namespace AutoExile.Systems
     /// </summary>
     public class TileMap
     {
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct TileStructureRaw
+        {
+            public long SubTileDetailsPtr;
+            public long TgtFilePtr;
+            public StdVector EntitiesList;
+            public short TileHeight;
+            public byte RotationSelector;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct TgtTileStructRaw
+        {
+            public NativeUtf16Text TgtPath;
+            public long TgtDetailPtr;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct TgtDetailStructRaw
+        {
+            public NativeUtf16Text Name;
+        }
+
         private ConcurrentDictionary<string, List<Vector2>> _tiles = new();
         private bool _loaded;
         private string _loadedArea = "";
@@ -36,7 +61,7 @@ namespace AutoExile.Systems
                     return false;
 
                 var tiles = new ConcurrentDictionary<string, List<Vector2>>();
-                TileStructure[] tileData = memory.ReadStdVector<TileStructure>(terrain.TgtArray);
+                var tileData = TryReadTileData(gc);
 
                 if (tileData == null || tileData.Length == 0)
                     return false;
@@ -51,8 +76,8 @@ namespace AutoExile.Systems
                         {
                             try
                             {
-                                var tgtTileStruct = memory.Read<TgtTileStruct>(tileData[i].TgtFilePtr);
-                                string detailName = memory.Read<TgtDetailStruct>(tgtTileStruct.TgtDetailPtr).name.ToString(memory);
+                                var tgtTileStruct = memory.Read<TgtTileStructRaw>(tileData[i].TgtFilePtr);
+                                string detailName = memory.Read<TgtDetailStructRaw>(tgtTileStruct.TgtDetailPtr).Name.ToString(memory);
                                 string tilePath = tgtTileStruct.TgtPath.ToString(memory);
 
                                 // Grid position: each tile is 23x23 grid cells
@@ -82,6 +107,30 @@ namespace AutoExile.Systems
             catch
             {
                 return false;
+            }
+        }
+
+        /// <summary>
+        /// Read optional terrain tile metadata without embedding a direct field reference.
+        /// GameOffsets has changed this field between ExileAPI builds; a direct access can
+        /// fail during JIT before Load's exception handler gets a chance to run.
+        /// </summary>
+        internal static TileStructureRaw[]? TryReadTileData(GameController gc)
+        {
+            try
+            {
+                object terrain = gc.IngameState.Data.Terrain;
+                var field = terrain.GetType().GetField(
+                    "TgtArray",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (field?.GetValue(terrain) is not StdVector tileVector)
+                    return null;
+
+                return gc.Memory.ReadStdVector<TileStructureRaw>(tileVector);
+            }
+            catch
+            {
+                return null;
             }
         }
 

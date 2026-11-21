@@ -3,6 +3,7 @@ using ExileCore.PoEMemory.Components;
 using ExileCore.PoEMemory.MemoryObjects;
 using ExileCore.Shared.Enums;
 using System.Net.Http;
+using System.Text;
 using System.Text.Json;
 
 namespace AutoExile.Systems
@@ -21,6 +22,7 @@ namespace AutoExile.Systems
         public string Status { get; private set; } = "not initialized";
         public DateTime LastRefreshTime { get; private set; } = DateTime.MinValue;
         public int RefreshIntervalMinutes { get; set; } = 20;
+        public double UnidentifiedVoicesChaosValue => Volatile.Read(ref _unidentifiedVoicesChaosValue);
 
         // ── Internal state ──
 
@@ -40,6 +42,7 @@ namespace AutoExile.Systems
 
         // Currency prices need special handling (different API shape)
         private volatile Dictionary<string, double> _currencyPrices = new();
+        private double _unidentifiedVoicesChaosValue;
 
         // Unique art path → list of possible unique names
         private volatile Dictionary<string, List<string>> _uniqueArtMapping = new();
@@ -292,6 +295,9 @@ namespace AutoExile.Systems
             // ── Identified unique: lookup by unique name ──
             if (rarity == ItemRarity.Unique && !string.IsNullOrEmpty(uniqueName))
             {
+                if (uniqueName.Equals("Voices", StringComparison.OrdinalIgnoreCase))
+                    return PriceVoices(entity);
+
                 return LookupItem(uniqueName, category.Value);
             }
 
@@ -315,11 +321,54 @@ namespace AutoExile.Systems
             // ── Cluster jewel (non-unique): lookup by enchant + passive count + ilvl ──
             if (category.Value == NinjaPriceCategory.ClusterJewel)
             {
-                return PriceClusterJewel(entity, mods);
+                return PriceClusterJewel(entity, mods, baseName);
             }
 
             // ── Everything else: lookup by base name ──
             return LookupItem(baseName, category.Value);
+        }
+
+        /// <summary>
+        /// Voices prices differ by the number of passive nodes. The one-passive
+        /// entry is represented by a null variant in poe.ninja, while the other
+        /// rolls use values such as "3 passives".
+        /// </summary>
+        private PriceResult PriceVoices(Entity entity)
+        {
+            var prices = _prices;
+            if (!prices.TryGetValue(NinjaPriceCategory.UniqueJewel, out var byName) ||
+                !byName.TryGetValue("Voices", out var entries) || entries.Count == 0)
+            {
+                return PriceResult.Zero;
+            }
+
+            int passiveCount = 0;
+            if (entity.TryGetComponent<LocalStats>(out var localStats) && localStats.StatDictionary != null)
+            {
+                var statKey = Enum.Parse<GameStat>(nameof(GameStat.LocalJewelExpansionPassiveNodeCount));
+                localStats.StatDictionary.TryGetValue(statKey, out passiveCount);
+            }
+
+            if (passiveCount <= 0)
+                return LookupItem("Voices", NinjaPriceCategory.UniqueJewel);
+
+            var expectedVariant = passiveCount == 1 ? null : $"{passiveCount} passives";
+            var match = entries.FirstOrDefault(entry =>
+                passiveCount == 1
+                    ? string.IsNullOrEmpty(entry.Variant)
+                    : string.Equals(entry.Variant, expectedVariant, StringComparison.OrdinalIgnoreCase));
+
+            if (match == null)
+                return LookupItem("Voices", NinjaPriceCategory.UniqueJewel);
+
+            var value = match.ChaosValue ?? 0;
+            return new PriceResult
+            {
+                MinChaosValue = value,
+                MaxChaosValue = value,
+                MatchCount = 1,
+                DetailsId = match.DetailsId,
+            };
         }
 
         private PriceResult PriceUnidentifiedUnique(Entity entity)
@@ -331,6 +380,26 @@ namespace AutoExile.Systems
             var mapping = _uniqueArtMapping;
             if (!mapping.TryGetValue(artPath, out var candidateNames) || candidateNames.Count == 0)
                 return PriceResult.Zero;
+
+            if (candidateNames.Any(name => name.Equals("Voices", StringComparison.OrdinalIgnoreCase)))
+            {
+                var unidentifiedValue = Volatile.Read(ref _unidentifiedVoicesChaosValue);
+                if (unidentifiedValue > 0)
+                {
+                    return new PriceResult
+                    {
+                        MinChaosValue = unidentifiedValue,
+                        MaxChaosValue = unidentifiedValue,
+                        MatchCount = 1,
+                        DetailsId = "trade:unidentified-voices",
+                    };
+                }
+
+                // Preserve the safe pickup range if the trade endpoint is temporarily
+                // unavailable. Persisted statistics use PriceResult.EstimatedChaosValue,
+                // so this ambiguity cannot become the one-passive maximum in history.
+                return PriceVoices(entity);
+            }
 
             // Get the item's actual link count to filter price entries
             // poe.ninja has separate entries for 0-link, 5-link, 6-link variants
@@ -443,11 +512,19 @@ namespace AutoExile.Systems
             return new PriceResult { MinChaosValue = minVal, MaxChaosValue = minVal, MatchCount = entries.Count, DetailsId = detailsId };
         }
 
+        private static readonly System.Text.RegularExpressions.Regex ClusterPassiveCountPattern = new(
+            @"Adds (\d+) Passive Skill", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        /// <summary>poe.ninja lines with fewer listings are single-seller outliers (one line priced a white cluster at 31k chaos).</summary>
+        private const int ClusterMinListings = 5;
+
         /// <summary>
-        /// Price a non-unique cluster jewel by its enchant text, passive count, and item level.
+        /// Price a non-unique cluster jewel by its enchant text, passive count, base and item level.
         /// Ninja indexes these by enchant name with variant = "{N} passives" and levelRequired tiers.
+        /// When the passive count cannot be read the cheapest matching line is used for statistics,
+        /// never the most expensive one.
         /// </summary>
-        private PriceResult PriceClusterJewel(Entity entity, Mods? mods)
+        private PriceResult PriceClusterJewel(Entity entity, Mods? mods, string baseName)
         {
             if (mods?.EnchantedStats == null || mods.EnchantedStats.Count == 0)
                 return PriceResult.Zero;
@@ -458,78 +535,99 @@ namespace AutoExile.Systems
 
             foreach (var stat in mods.EnchantedStats)
             {
-                if (stat.StartsWith(ClusterEnchantPrefix, StringComparison.Ordinal))
+                if (string.IsNullOrEmpty(stat)) continue;
+                var countMatch = ClusterPassiveCountPattern.Match(stat);
+                if (passiveCount == 0 && countMatch.Success && int.TryParse(countMatch.Groups[1].Value, out var count))
+                    passiveCount = count;
+
+                var prefixAt = stat.IndexOf(ClusterEnchantPrefix, StringComparison.Ordinal);
+                if (prefixAt >= 0 && enchantName == null)
                 {
-                    enchantName = stat[ClusterEnchantPrefix.Length..].Replace("\n", ", ");
-                }
-                else if (stat.StartsWith("Adds ", StringComparison.Ordinal) && stat.Contains("Passive Skill"))
-                {
-                    // "Adds 3 Passive Skills" → extract the number
-                    var parts = stat.Split(' ');
-                    if (parts.Length >= 2 && int.TryParse(parts[1], out var count))
-                        passiveCount = count;
+                    enchantName = stat[(prefixAt + ClusterEnchantPrefix.Length)..]
+                        .Replace("\r\n", ", ")
+                        .Replace("\n", ", ")
+                        .Replace("\r", "")
+                        .Trim();
                 }
             }
 
             if (string.IsNullOrEmpty(enchantName))
-            {
-                // Try LocalStats for passive count if enchant parsing didn't get it
-                if (entity.TryGetComponent<LocalStats>(out var localStats) && localStats.StatDictionary != null)
-                {
-                    var statKey = Enum.Parse<GameStat>(nameof(GameStat.LocalJewelExpansionPassiveNodeCount));
-                    localStats.StatDictionary.TryGetValue(statKey, out passiveCount);
-                }
                 return PriceResult.Zero;
-            }
 
-            // Also try LocalStats for passive count as backup
             if (passiveCount == 0 && entity.TryGetComponent<LocalStats>(out var ls) && ls.StatDictionary != null)
-            {
-                var statKey = Enum.Parse<GameStat>(nameof(GameStat.LocalJewelExpansionPassiveNodeCount));
-                ls.StatDictionary.TryGetValue(statKey, out passiveCount);
-            }
+                ls.StatDictionary.TryGetValue(GameStat.LocalJewelExpansionPassiveNodeCount, out passiveCount);
 
             var itemLevel = mods.ItemLevel;
             var variantStr = passiveCount > 0 ? $"{passiveCount} passives" : null;
 
-            // Look up by enchant name in cluster jewel data
             var prices = _prices;
             if (!prices.TryGetValue(NinjaPriceCategory.ClusterJewel, out var byName))
                 return PriceResult.Zero;
             if (!byName.TryGetValue(enchantName, out var entries) || entries.Count == 0)
                 return PriceResult.Zero;
 
-            // Filter by variant (passive count) and find best level match (highest levelRequired <= itemLevel)
-            ItemLine? bestMatch = null;
+            var fitting = new List<ItemLine>();
             foreach (var entry in entries)
             {
-                // Filter by passive count if we know it
+                if ((entry.ChaosValue ?? 0) <= 0) continue;
+                if (!string.IsNullOrEmpty(baseName) && !string.IsNullOrEmpty(entry.BaseType) &&
+                    !string.Equals(entry.BaseType, baseName, StringComparison.Ordinal))
+                    continue;
                 if (variantStr != null && entry.Variant != null && entry.Variant != variantStr)
                     continue;
-
-                // Filter by level requirement
                 if (entry.LevelRequired.HasValue && entry.LevelRequired.Value > itemLevel)
                     continue;
+                fitting.Add(entry);
+            }
+            if (fitting.Count == 0) return PriceResult.Zero;
 
-                // Pick the entry with the highest levelRequired that fits (most specific price)
-                if (bestMatch == null ||
-                    (entry.LevelRequired ?? 0) > (bestMatch.LevelRequired ?? 0))
+            var liquid = fitting.FindAll(e => !e.ListingCount.HasValue || e.ListingCount.Value >= ClusterMinListings);
+            ItemLine chosen;
+            if (liquid.Count == 0)
+            {
+                // Only thin lines: no reliable price. Statistics book 0; pickup still sees the cheapest line.
+                chosen = fitting.MinBy(e => e.ChaosValue ?? 0)!;
+                return new PriceResult
                 {
-                    bestMatch = entry;
-                }
+                    MinChaosValue = 0,
+                    MaxChaosValue = chosen.ChaosValue ?? 0,
+                    MatchCount = Math.Max(2, fitting.Count),
+                    DetailsId = chosen.DetailsId,
+                    PricingNote = ClusterNote(enchantName, passiveCount, itemLevel, chosen) + " thin_only",
+                };
+            }
+            var pool = liquid;
+
+            if (variantStr != null)
+            {
+                // Known variant: the highest levelRequired tier that fits; cheapest line inside that tier.
+                var tier = pool.Max(e => e.LevelRequired ?? 0);
+                chosen = pool.Where(e => (e.LevelRequired ?? 0) == tier).MinBy(e => e.ChaosValue ?? 0)!;
+                var val = chosen.ChaosValue ?? 0;
+                return new PriceResult
+                {
+                    MinChaosValue = val, MaxChaosValue = val, MatchCount = 1, DetailsId = chosen.DetailsId,
+                    PricingNote = ClusterNote(enchantName, passiveCount, itemLevel, chosen),
+                };
             }
 
-            if (bestMatch == null) return PriceResult.Zero;
-
-            var val = bestMatch.ChaosValue ?? 0;
+            // Unknown passives: statistics take the cheapest line, pickup keeps the ceiling.
+            chosen = pool.MinBy(e => e.ChaosValue ?? 0)!;
+            var min = chosen.ChaosValue ?? 0;
+            var max = pool.Max(e => e.ChaosValue ?? 0);
             return new PriceResult
             {
-                MinChaosValue = val,
-                MaxChaosValue = val,
-                MatchCount = 1,
-                DetailsId = bestMatch.DetailsId,
+                MinChaosValue = min,
+                MaxChaosValue = max,
+                MatchCount = Math.Max(2, pool.Count),
+                DetailsId = chosen.DetailsId,
+                PricingNote = ClusterNote(enchantName, passiveCount, itemLevel, chosen) + $" pool={pool.Count} max={max:F0}",
             };
         }
+
+        private static string ClusterNote(string enchant, int passives, int itemLevel, ItemLine line)
+            => $"cluster enchant='{enchant}' passives={passives} ilvl={itemLevel} line={line.DetailsId} " +
+               $"variant={line.Variant} lvl={line.LevelRequired} listings={line.ListingCount}";
 
         private PriceResult LookupItem(string name, NinjaPriceCategory category)
         {
@@ -800,7 +898,7 @@ namespace AutoExile.Systems
                         {
                             var url = $"https://poe.ninja/poe1/api/economy/exchange/current/overview?league={Uri.EscapeDataString(league)}&type={type}";
                             var cacheFile = Path.Combine(cacheDir, $"{type}.json");
-                            var json = await FetchWithCache(url, cacheFile);
+                            var json = await FetchWithCache(url, cacheFile, type);
                             if (json == null) continue;
 
                             var response = JsonSerializer.Deserialize<CurrencyOverviewResponse>(json,
@@ -838,9 +936,9 @@ namespace AutoExile.Systems
                     {
                         try
                         {
-                            var url = $"https://poe.ninja/api/data/itemoverview?league={Uri.EscapeDataString(league)}&type={type}&language=en";
+                            var url = $"https://poe.ninja/poe1/api/economy/stash/current/item/overview?league={Uri.EscapeDataString(league)}&type={type}";
                             var cacheFile = Path.Combine(cacheDir, $"{type}.json");
-                            var json = await FetchWithCache(url, cacheFile);
+                            var json = await FetchWithCache(url, cacheFile, type);
                             if (json == null) continue;
 
                             var response = JsonSerializer.Deserialize<ItemOverviewResponse>(json,
@@ -877,6 +975,9 @@ namespace AutoExile.Systems
                         await Task.Delay(200); // Rate limit
                     }
 
+                    var unidentifiedVoicesValue = await FetchUnidentifiedVoicesPrice(
+                        league, newCurrencyPrices, cacheDir);
+
                     // Write metadata
                     try
                     {
@@ -889,6 +990,7 @@ namespace AutoExile.Systems
                     // Atomic swap
                     _prices = newPrices;
                     _currencyPrices = newCurrencyPrices;
+                    Volatile.Write(ref _unidentifiedVoicesChaosValue, unidentifiedVoicesValue);
                     _priceCount = totalEntries;
                     LastRefreshTime = DateTime.Now;
                     Status = $"loaded {totalEntries} prices ({successCount}/{totalEndpoints} endpoints)";
@@ -906,7 +1008,115 @@ namespace AutoExile.Systems
             });
         }
 
-        private async Task<string?> FetchWithCache(string url, string cacheFile)
+        private async Task<double> FetchUnidentifiedVoicesPrice(string league,
+            IReadOnlyDictionary<string, double> currencyPrices, string cacheDir)
+        {
+            var cacheFile = Path.Combine(cacheDir, "UnidentifiedVoices.json");
+            try
+            {
+                var payload = new
+                {
+                    query = new
+                    {
+                        status = new { option = "online" },
+                        name = "Voices",
+                        type = "Large Cluster Jewel",
+                        stats = new[] { new { type = "and", filters = Array.Empty<object>() } },
+                        filters = new
+                        {
+                            type_filters = new { filters = new { rarity = new { option = "unique" } } },
+                            misc_filters = new { filters = new { identified = new { option = "false" } } },
+                        },
+                    },
+                    sort = new { price = "asc" },
+                };
+
+                var searchUrl = $"https://www.pathofexile.com/api/trade/search/{Uri.EscapeDataString(league)}";
+                using var request = new HttpRequestMessage(HttpMethod.Post, searchUrl)
+                {
+                    Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"),
+                };
+                using var searchResponse = await _http.SendAsync(request);
+                searchResponse.EnsureSuccessStatusCode();
+                using var searchJson = JsonDocument.Parse(await searchResponse.Content.ReadAsStringAsync());
+                var root = searchJson.RootElement;
+                var queryId = root.GetProperty("id").GetString();
+                var ids = root.GetProperty("result").EnumerateArray()
+                    .Select(value => value.GetString())
+                    .Where(value => !string.IsNullOrWhiteSpace(value))
+                    .Take(10)
+                    .ToArray();
+                if (string.IsNullOrWhiteSpace(queryId) || ids.Length == 0)
+                    throw new InvalidOperationException("no unidentified Voices listings");
+
+                var fetchUrl = $"https://www.pathofexile.com/api/trade/fetch/{string.Join(',', ids)}" +
+                    $"?query={Uri.EscapeDataString(queryId)}";
+                using var fetchResponse = await _http.GetAsync(fetchUrl);
+                fetchResponse.EnsureSuccessStatusCode();
+                using var fetchJson = JsonDocument.Parse(await fetchResponse.Content.ReadAsStringAsync());
+
+                var values = new List<double>();
+                foreach (var result in fetchJson.RootElement.GetProperty("result").EnumerateArray())
+                {
+                    if (!result.TryGetProperty("listing", out var listing) ||
+                        !listing.TryGetProperty("price", out var price) ||
+                        !price.TryGetProperty("amount", out var amountElement) ||
+                        !price.TryGetProperty("currency", out var currencyElement))
+                        continue;
+
+                    var amount = amountElement.GetDouble();
+                    var currency = currencyElement.GetString() ?? "";
+                    double chaosValue;
+                    if (currency.Equals("chaos", StringComparison.OrdinalIgnoreCase))
+                        chaosValue = amount;
+                    else if (currency.Equals("divine", StringComparison.OrdinalIgnoreCase) &&
+                             currencyPrices.TryGetValue("Divine Orb", out var divineChaos))
+                        chaosValue = amount * divineChaos;
+                    else
+                        continue;
+
+                    if (chaosValue > 0) values.Add(chaosValue);
+                }
+
+                if (values.Count == 0)
+                    throw new InvalidOperationException("no convertible unidentified Voices listings");
+
+                values.Sort();
+                var middle = values.Count / 2;
+                var median = values.Count % 2 == 0
+                    ? (values[middle - 1] + values[middle]) / 2d
+                    : values[middle];
+                try
+                {
+                    File.WriteAllText(cacheFile, JsonSerializer.Serialize(new
+                    {
+                        chaosValue = median,
+                        fetchedAtUtc = DateTime.UtcNow,
+                    }));
+                }
+                catch { }
+
+                _log($"Unidentified Voices market value: {median:F1}c ({values.Count} listings)");
+                return median;
+            }
+            catch (Exception ex)
+            {
+                _log($"Unidentified Voices price failed: {ex.Message}");
+                try
+                {
+                    if (File.Exists(cacheFile))
+                    {
+                        using var cached = JsonDocument.Parse(File.ReadAllText(cacheFile));
+                        if (cached.RootElement.TryGetProperty("chaosValue", out var value))
+                            return value.GetDouble();
+                    }
+                }
+                catch { }
+                return 0;
+            }
+        }
+
+        private async Task<string?> FetchWithCache(string url, string cacheFile, string endpointType)
         {
             // Try web first
             try
@@ -918,15 +1128,26 @@ namespace AutoExile.Systems
                     return json;
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                _log($"Price endpoint {endpointType} failed: {ex.Message}");
+            }
 
             // Fall back to cache
             try
             {
                 if (File.Exists(cacheFile))
+                {
+                    _log($"Using cached prices for {endpointType}");
                     return File.ReadAllText(cacheFile);
+                }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                _log($"Price cache {endpointType} failed: {ex.Message}");
+            }
+
+            _log($"No prices available for {endpointType}");
 
             return null;
         }

@@ -56,6 +56,9 @@ namespace AutoExile.Modes
         {
             _phase = HeistPhase.Idle;
             _state.Reset();
+            // Force the first Tick to establish a fresh run even when the user
+            // switches back to Heist without changing areas.
+            _lastAreaName = "";
             _status = "Heist mode entered";
             // Heist curio drops are "quest" items — must pick them up
             ctx.Loot.IgnoreQuestItems = false;
@@ -81,9 +84,27 @@ namespace AutoExile.Modes
             var currentArea = gc.Area?.CurrentArea?.Name ?? "";
             if (!string.IsNullOrEmpty(currentArea) && currentArea != _lastAreaName)
             {
+                var previousPhase = _phase;
                 if (!string.IsNullOrEmpty(_lastAreaName))
                     OnAreaChanged(ctx);
                 _lastAreaName = currentArea;
+
+                var isSafeArea = gc.Area?.CurrentArea?.IsHideout == true || gc.Area?.CurrentArea?.IsTown == true;
+                if (isSafeArea)
+                {
+                    var escaped = previousPhase == HeistPhase.ExitingMap;
+                    ctx.Stats.EndRun(Name, escaped ? "completed" : "failed",
+                        escaped ? "heist_escaped" : "heist_returned_without_escape");
+                }
+                else
+                {
+                    var instanceHash = gc.IngameState?.Data?.CurrentAreaHash ?? 0;
+                    if (instanceHash != 0)
+                    {
+                        ctx.Stats.BeginRun(Name, $"heist:{instanceHash}", currentArea, consumed: true);
+                        ctx.Stats.ObserveRunEntry(Name, instanceHash, currentArea);
+                    }
+                }
             }
 
             // In hideout/town — idle
@@ -592,7 +613,7 @@ namespace AutoExile.Modes
                 var retryDelay = _companionClickAttempts == 0 ? 0.5 : 3.0;
                 if (timeSinceClick > retryDelay)
                 {
-                    var sent = BotInput.PressKey(settings.CompanionInteractKey);
+                    var sent = BotInput.PressKey(settings.CompanionInteractKey.Value);
                     if (sent)
                     {
                         _lastCompanionClickTime = DateTime.Now;
@@ -685,7 +706,7 @@ namespace AutoExile.Modes
                 var retryDelay = _companionClickAttempts == 0 ? 0.5 : 3.0;
                 if (timeSinceClick > retryDelay)
                 {
-                    var sent = BotInput.PressKey(settings.CompanionInteractKey);
+                    var sent = BotInput.PressKey(settings.CompanionInteractKey.Value);
                     if (sent) _lastCompanionClickTime = DateTime.Now;
                     _companionClickAttempts++;
                 }
@@ -935,7 +956,7 @@ namespace AutoExile.Modes
             else if (door.DistancePlayer < 40)
             {
                 // Press V — TickAtDoor will verify it was accepted via heist_locked state
-                var sent = BotInput.PressKey(ctx.Settings.Heist.CompanionInteractKey);
+                var sent = BotInput.PressKey(ctx.Settings.Heist.CompanionInteractKey.Value);
                 if (sent)
                     _lastCompanionClickTime = DateTime.Now;
                 // If not sent (input gate blocked), _lastCompanionClickTime stays at MinValue
@@ -961,7 +982,7 @@ namespace AutoExile.Modes
             var heistLocked = HeistState.GetStateValue(sm, "heist_locked");
             if (heistLocked > 0 && chest.DistancePlayer < 40)
             {
-                var sent = BotInput.PressKey(ctx.Settings.Heist.CompanionInteractKey);
+                var sent = BotInput.PressKey(ctx.Settings.Heist.CompanionInteractKey.Value);
                 if (sent)
                     _lastCompanionClickTime = DateTime.Now;
             }
@@ -1666,19 +1687,19 @@ namespace AutoExile.Modes
                 var heightData = gc.IngameState?.Data?.RawTerrainHeightData;
 
                 var rect = gc.Window.GetWindowRectangle();
-                ImGuiNET.ImGui.SetNextWindowSize(new Vector2(rect.Width, rect.Height));
-                ImGuiNET.ImGui.SetNextWindowPos(new Vector2(rect.Left, rect.Top));
-                ImGuiNET.ImGui.Begin("heist_route_overlay",
-                    ImGuiNET.ImGuiWindowFlags.NoDecoration |
-                    ImGuiNET.ImGuiWindowFlags.NoInputs |
-                    ImGuiNET.ImGuiWindowFlags.NoMove |
-                    ImGuiNET.ImGuiWindowFlags.NoScrollWithMouse |
-                    ImGuiNET.ImGuiWindowFlags.NoSavedSettings |
-                    ImGuiNET.ImGuiWindowFlags.NoFocusOnAppearing |
-                    ImGuiNET.ImGuiWindowFlags.NoBringToFrontOnFocus |
-                    ImGuiNET.ImGuiWindowFlags.NoBackground);
+                Hexa.NET.ImGui.ImGui.SetNextWindowSize(new Vector2(rect.Width, rect.Height));
+                Hexa.NET.ImGui.ImGui.SetNextWindowPos(new Vector2(rect.Left, rect.Top));
+                Hexa.NET.ImGui.ImGui.Begin("heist_route_overlay",
+                    Hexa.NET.ImGui.ImGuiWindowFlags.NoDecoration |
+                    Hexa.NET.ImGui.ImGuiWindowFlags.NoInputs |
+                    Hexa.NET.ImGui.ImGuiWindowFlags.NoMove |
+                    Hexa.NET.ImGui.ImGuiWindowFlags.NoScrollWithMouse |
+                    Hexa.NET.ImGui.ImGuiWindowFlags.NoSavedSettings |
+                    Hexa.NET.ImGui.ImGuiWindowFlags.NoFocusOnAppearing |
+                    Hexa.NET.ImGui.ImGuiWindowFlags.NoBringToFrontOnFocus |
+                    Hexa.NET.ImGui.ImGuiWindowFlags.NoBackground);
 
-                var dl = ImGuiNET.ImGui.GetWindowDrawList();
+                var dl = Hexa.NET.ImGui.ImGui.GetWindowDrawList();
                 const float boxHalf = 12f;
 
                 Vector2 ToMap(Vector2 gp)
@@ -1687,7 +1708,7 @@ namespace AutoExile.Modes
                     return mapCenter + GridDeltaToMap(gp - playerPos, playerHeight + h, mapScale);
                 }
 
-                uint white = ImGuiNET.ImGui.ColorConvertFloat4ToU32(new Vector4(1f, 1f, 1f, 0.9f));
+                uint white = Hexa.NET.ImGui.ImGui.ColorConvertFloat4ToU32(new Vector4(1f, 1f, 1f, 0.9f));
 
                 for (int i = 0; i < _state.PlannedRoute.Count; i++)
                 {
@@ -1696,15 +1717,15 @@ namespace AutoExile.Modes
 
                     uint fill;
                     if (rt.Reached)
-                        fill = ImGuiNET.ImGui.ColorConvertFloat4ToU32(new Vector4(0f, 0.7f, 0f, 0.5f));    // green = done
+                        fill = Hexa.NET.ImGui.ImGui.ColorConvertFloat4ToU32(new Vector4(0f, 0.7f, 0f, 0.5f));    // green = done
                     else if (rt.Skipped)
-                        fill = ImGuiNET.ImGui.ColorConvertFloat4ToU32(new Vector4(0.5f, 0f, 0f, 0.5f));    // dark red = skipped
+                        fill = Hexa.NET.ImGui.ImGui.ColorConvertFloat4ToU32(new Vector4(0.5f, 0f, 0f, 0.5f));    // dark red = skipped
                     else if (isActive)
-                        fill = ImGuiNET.ImGui.ColorConvertFloat4ToU32(new Vector4(1f, 1f, 0f, 0.7f));      // yellow = current
+                        fill = Hexa.NET.ImGui.ImGui.ColorConvertFloat4ToU32(new Vector4(1f, 1f, 0f, 0.7f));      // yellow = current
                     else
-                        fill = ImGuiNET.ImGui.ColorConvertFloat4ToU32(new Vector4(0.9f, 0.7f, 0f, 0.5f));  // gold = pending
+                        fill = Hexa.NET.ImGui.ImGui.ColorConvertFloat4ToU32(new Vector4(0.9f, 0.7f, 0f, 0.5f));  // gold = pending
 
-                    uint outline = ImGuiNET.ImGui.ColorConvertFloat4ToU32(new Vector4(1f, 1f, 1f, 0.3f));
+                    uint outline = Hexa.NET.ImGui.ImGui.ColorConvertFloat4ToU32(new Vector4(1f, 1f, 1f, 0.3f));
 
                     var center = ToMap(rt.GridPos);
                     var tl = center + new Vector2(-boxHalf, -boxHalf);
@@ -1718,12 +1739,12 @@ namespace AutoExile.Modes
                     if (i + 1 < _state.PlannedRoute.Count && !rt.Reached && !rt.Skipped)
                     {
                         var nextCenter = ToMap(_state.PlannedRoute[i + 1].GridPos);
-                        uint lineColor = ImGuiNET.ImGui.ColorConvertFloat4ToU32(new Vector4(0.6f, 0.6f, 0.6f, 0.4f));
+                        uint lineColor = Hexa.NET.ImGui.ImGui.ColorConvertFloat4ToU32(new Vector4(0.6f, 0.6f, 0.6f, 0.4f));
                         dl.AddLine(center, nextCenter, lineColor, 1f);
                     }
                 }
 
-                ImGuiNET.ImGui.End();
+                Hexa.NET.ImGui.ImGui.End();
             }
             catch { }
         }

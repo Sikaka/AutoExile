@@ -200,6 +200,7 @@ namespace AutoExile.Systems
             FailedRegions.Clear();
             TotalWalkableCells = 0;
             LastAction = "";
+            _lastUpdatePos = NoUpdatePos;
         }
 
         /// <summary>
@@ -218,6 +219,9 @@ namespace AutoExile.Systems
                     region.SeenCount = 0;
             }
             FailedRegions.Clear();
+            // Without this the first Update after a re-sweep is skipped while the player stands still,
+            // so the cells around the player stay unseen and stay the exploration target.
+            _lastUpdatePos = NoUpdatePos;
         }
 
         // ═══════════════════════════════════════════════════
@@ -225,7 +229,8 @@ namespace AutoExile.Systems
         // ═══════════════════════════════════════════════════
 
         // Rate limit: skip update if player hasn't moved enough to reveal new cells
-        private Vector2 _lastUpdatePos;
+        private static readonly Vector2 NoUpdatePos = new(float.NaN, float.NaN);
+        private Vector2 _lastUpdatePos = NoUpdatePos;
         private const float MinUpdateDistance = 5f; // grid units — only rescan after moving 5+ cells
 
         /// <summary>

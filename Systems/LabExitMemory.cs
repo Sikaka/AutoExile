@@ -1,7 +1,7 @@
 using System.IO;
 using System.Numerics;
-using System.Text.Json;
 using System.Text.Json.Serialization;
+using AutoExile.Statistics;
 
 namespace AutoExile.Systems
 {
@@ -44,34 +44,35 @@ namespace AutoExile.Systems
 
         private ExitMemoryFile _data = new();
         private bool _dirty;
+        private bool _savePending;
+        private long _dirtyVersion;
+        private readonly object _saveGate = new();
         private const float DefaultTolerance = 20f; // degrees
 
         /// <summary>
-        /// Load from JSON file. Discards entries not matching today's date.
+        /// Load today's learned exits from the canonical SQLite store.
         /// </summary>
-        public void Load(string filePath, Action<string>? log = null)
+        public void Load(StatsService stats, Action<string>? log = null)
         {
             var today = DateTime.Now.ToString("yyyy-MM-dd");
             try
             {
-                if (!File.Exists(filePath))
+                _data = new ExitMemoryFile { Date = today };
+                foreach (var group in stats.ReadLabExitMemory(today)
+                    .GroupBy(value => new { value.ZoneName, value.ExitCount }))
                 {
-                    _data = new ExitMemoryFile { Date = today };
-                    return;
+                    _data.Entries.Add(new ExitMemoryEntry
+                    {
+                        ZoneName = group.Key.ZoneName,
+                        ExitCount = group.Key.ExitCount,
+                        Mappings = group.Select(value => new ExitAngleMapping
+                        {
+                            AngleDegrees = value.AngleDegrees,
+                            DestinationName = value.DestinationName,
+                        }).ToList(),
+                    });
                 }
-
-                var json = File.ReadAllText(filePath);
-                var parsed = JsonSerializer.Deserialize<ExitMemoryFile>(json);
-                if (parsed != null && parsed.Date == today)
-                {
-                    _data = parsed;
-                    log?.Invoke($"Exit memory loaded: {_data.Entries.Count} zones for {today}");
-                }
-                else
-                {
-                    _data = new ExitMemoryFile { Date = today };
-                    log?.Invoke($"Exit memory: stale date or empty, starting fresh for {today}");
-                }
+                log?.Invoke($"Exit memory loaded: {_data.Entries.Count} zones for {today}");
             }
             catch (Exception ex)
             {
@@ -81,22 +82,41 @@ namespace AutoExile.Systems
         }
 
         /// <summary>
-        /// Save to JSON file (only today's entries).
+        /// Save today's learned exits to the canonical SQLite store.
         /// </summary>
-        public void Save(string filePath, Action<string>? log = null)
+        public void Save(StatsService stats, Action<string>? log = null)
         {
-            if (!_dirty) return;
+            long version;
+            lock (_saveGate)
+            {
+                if (!_dirty || _savePending) return;
+                _savePending = true;
+                version = _dirtyVersion;
+            }
+
             try
             {
-                var options = new JsonSerializerOptions { WriteIndented = true };
-                var json = JsonSerializer.Serialize(_data, options);
-                File.WriteAllText(filePath, json);
-                _dirty = false;
-                log?.Invoke($"Exit memory saved: {_data.Entries.Count} zones");
+                var rows = _data.Entries.SelectMany(entry => entry.Mappings.Select(mapping =>
+                    new LabExitMemorySnapshot(_data.Date, entry.ZoneName, entry.ExitCount,
+                        mapping.AngleDegrees, mapping.DestinationName))).ToList();
+                var zoneCount = _data.Entries.Count;
+                stats.ReplaceLabExitMemory(_data.Date, rows, succeeded =>
+                {
+                    lock (_saveGate)
+                    {
+                        if (succeeded && _dirtyVersion == version)
+                            _dirty = false;
+                        _savePending = false;
+                    }
+                    log?.Invoke(succeeded
+                        ? $"Exit memory saved: {zoneCount} zones"
+                        : "Exit memory save deferred: statistics store is unavailable");
+                });
             }
             catch (Exception ex)
             {
-                log?.Invoke($"Exit memory save error: {ex.Message}");
+                lock (_saveGate) _savePending = false;
+                log?.Invoke($"Exit memory SQLite save error: {ex.Message}");
             }
         }
 
@@ -143,7 +163,7 @@ namespace AutoExile.Systems
                         return false; // duplicate — same angle, same destination
                     mapping.AngleDegrees = angleDegrees;
                     mapping.DestinationName = destinationName;
-                    _dirty = true;
+                    MarkDirty();
                     return true;
                 }
             }
@@ -154,11 +174,23 @@ namespace AutoExile.Systems
                 AngleDegrees = angleDegrees,
                 DestinationName = destinationName,
             });
-            _dirty = true;
+            MarkDirty();
             return true;
         }
 
-        public bool IsDirty => _dirty;
+        public bool IsDirty
+        {
+            get { lock (_saveGate) return _dirty; }
+        }
+
+        private void MarkDirty()
+        {
+            lock (_saveGate)
+            {
+                _dirty = true;
+                _dirtyVersion++;
+            }
+        }
 
         private ExitMemoryEntry? FindEntry(string zoneName, int exitCount)
         {

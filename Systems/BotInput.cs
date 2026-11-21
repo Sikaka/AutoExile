@@ -5,6 +5,7 @@ using ExileCore;
 using ExileCore.PoEMemory.Components;
 using ExileCore.PoEMemory.MemoryObjects;
 using Input = ExileCore.Input;
+using AutoExile.Statistics;
 
 namespace AutoExile.Systems
 {
@@ -35,6 +36,7 @@ namespace AutoExile.Systems
     /// </summary>
     public static class BotInput
     {
+        public static StatsService? Stats { get; set; }
         // ── Window bounds (set by BotCore each tick) ──
         /// <summary>Game window rect in absolute screen coordinates. Set by BotCore each tick.</summary>
         public static SharpDX.RectangleF WindowRect;
@@ -56,6 +58,27 @@ namespace AutoExile.Systems
 
             pos.X = Math.Clamp(pos.X, minX, maxX);
             pos.Y = Math.Clamp(pos.Y, minY, maxY);
+            return true;
+        }
+
+        // Keep world-directed cursor input away from UI-heavy screen edges. These
+        // ratios mirror AutoPOE's world safe zone; UI clicks still use the full
+        // window so stash and map-device controls remain reachable.
+        private const float WorldSafeMinXRatio = 0.0977f;
+        private const float WorldSafeMaxXRatio = 0.9023f;
+        private const float WorldSafeMinYRatio = 0.12f;
+        private const float WorldSafeMaxYRatio = 0.84f;
+
+        private static bool ClampToWorldSafeZone(ref Vector2 pos)
+        {
+            if (!ClampToWindow(ref pos)) return false;
+
+            pos.X = Math.Clamp(pos.X,
+                WindowRect.X + WindowRect.Width * WorldSafeMinXRatio,
+                WindowRect.X + WindowRect.Width * WorldSafeMaxXRatio);
+            pos.Y = Math.Clamp(pos.Y,
+                WindowRect.Y + WindowRect.Height * WorldSafeMinYRatio,
+                WindowRect.Y + WindowRect.Height * WorldSafeMaxYRatio);
             return true;
         }
 
@@ -103,6 +126,8 @@ namespace AutoExile.Systems
             _actionLog[_actionLogIndex] = new ActionRecord(DateTime.Now, type, position, key, accepted);
             _actionLogIndex = (_actionLogIndex + 1) % _actionLog.Length;
             if (_actionLogCount < _actionLog.Length) _actionLogCount++;
+            Stats?.RecordRuntimeEvent("input", type, accepted ? "sent" : "dropped",
+                accepted ? null : "gate_or_window", new { key = key?.ToString(), x = position?.X, y = position?.Y });
         }
 
         // ── Click position randomization ──
@@ -317,89 +342,224 @@ namespace AutoExile.Systems
 
         /// <summary>
         /// Click within a label rect with hover verification via Targetable.isTargeted.
-        /// Moves cursor to a random position within the rect, waits for settle, then checks
-        /// that the expected entity is targeted. If a different entity is under the cursor
-        /// (overlapping labels), retries at different positions. Aborts without clicking if
-        /// verification fails on all attempts.
+        /// Moves cursor to the fresh label center, waits for settle, then checks that the
+        /// expected entity is targeted. Aborts without clicking when verification fails.
         /// </summary>
-        /// <returns>True if initiated, false if gate blocked. Check WasVerified after completion.</returns>
+        /// <returns>True if the transaction started, false if the input gate was blocked.</returns>
         public static bool ClickLabelVerified(GameController gc, SharpDX.RectangleF rect, Entity entity,
             Func<SharpDX.RectangleF?>? rectProvider = null)
         {
             if (!CanAct) return false;
             if (!IsRectOnScreen(rect)) return false;
-            SuspendMovement();
+
+            int generation;
+            lock (LabelClickSync)
+            {
+                if (_labelClickBusy) return false;
+                _labelClickBusy = true;
+                _labelClickEntityId = entity.Id;
+                _labelClickResult = LabelClickResult.InProgress;
+                generation = ++_labelClickGeneration;
+            }
+
+            // A loot click owns movement until it finishes. Suspending would allow the
+            // movement layer to resume an old combat/explore destination mid-pickup.
+            StopMovement();
             var windowRect = gc.Window.GetWindowRectangle();
             var settle = RandSettle();
             var hold = RandHold();
             var center = new Vector2(rect.X + rect.Width / 2, rect.Y + rect.Height / 2);
             var moveMs = EstimateMoveMs(new Vector2(windowRect.X + center.X, windowRect.Y + center.Y));
             NextActionAt = DateTime.Now.AddMilliseconds(
-                MaxHoverAttempts * (moveMs + settle) + hold + ActionCooldownMs);
-            _ = DoClickLabelVerified(entity, rect, windowRect, settle, hold, rectProvider);
+                MaxHoverAttempts * (moveMs + settle + HoverVerifyDelayMs * 2) +
+                hold + ActionCooldownMs);
+            _ = DoClickLabelVerified(
+                entity, rect, windowRect, settle, hold, generation, rectProvider);
             LogAction("ClickLabelVerified", center, null, true);
             return true;
         }
 
-        /// <summary>True if the last ClickLabelVerified confirmed the correct entity before clicking.</summary>
+        public enum LabelClickResult
+        {
+            None,
+            InProgress,
+            ClickSent,
+            VerificationFailed,
+        }
+
+        private static readonly object LabelClickSync = new();
+        private static bool _labelClickBusy;
+        private static long _labelClickEntityId;
+        private static int _labelClickGeneration;
+        private static LabelClickResult _labelClickResult;
+
+        /// <summary>True while hover verification or its verified click is still executing.</summary>
+        public static bool IsLabelClickBusy
+        {
+            get
+            {
+                lock (LabelClickSync) return _labelClickBusy;
+            }
+        }
+
+        /// <summary>True if the requested entity currently owns the label-click transaction.</summary>
+        public static bool IsLabelClickInProgress(long entityId)
+        {
+            lock (LabelClickSync)
+                return _labelClickBusy && _labelClickEntityId == entityId;
+        }
+
+        /// <summary>Consume the completed result for one ground-item label transaction.</summary>
+        public static bool TryConsumeLabelClickResult(long entityId, out LabelClickResult result)
+        {
+            lock (LabelClickSync)
+            {
+                if (_labelClickBusy || _labelClickEntityId != entityId ||
+                    _labelClickResult is LabelClickResult.None or LabelClickResult.InProgress)
+                {
+                    result = LabelClickResult.None;
+                    return false;
+                }
+
+                result = _labelClickResult;
+                _labelClickEntityId = 0;
+                _labelClickResult = LabelClickResult.None;
+                return true;
+            }
+        }
+
+        /// <summary>True if the last completed ClickLabelVerified sent a verified click.</summary>
         public static bool LastClickWasVerified { get; private set; }
 
         private static async Task DoClickLabelVerified(
             Entity entity, SharpDX.RectangleF rect, SharpDX.RectangleF windowRect,
-            int settleMs, int holdMs, Func<SharpDX.RectangleF?>? rectProvider = null)
+            int settleMs, int holdMs, int generation,
+            Func<SharpDX.RectangleF?>? rectProvider = null)
         {
             LastClickWasVerified = false;
-
-            for (int attempt = 0; attempt < MaxHoverAttempts; attempt++)
+            var result = LabelClickResult.VerificationFailed;
+            try
             {
-                // Use fresh rect if available (compensates for character slide)
-                var useRect = rectProvider?.Invoke() ?? rect;
-                var useWindowRect = rectProvider != null
-                    ? new SharpDX.RectangleF(windowRect.X, windowRect.Y, windowRect.Width, windowRect.Height)
-                    : windowRect;
-
-                var clickPos = RandomizeWithinRect(useRect);
-                var absPos = new Vector2(useWindowRect.X + clickPos.X, useWindowRect.Y + clickPos.Y);
-
-                await MoveCursorTo(absPos);
-                await Task.Delay(settleMs);
-
-                // Final snap correction — re-read label position right before verification
-                if (rectProvider != null)
+                for (int attempt = 0; attempt < MaxHoverAttempts; attempt++)
                 {
-                    var correctedRect = rectProvider.Invoke();
-                    if (correctedRect.HasValue)
+                    if (!IsCurrentLabelClick(entity.Id, generation)) return;
+
+                    // A missing fresh rect means the label moved or disappeared. Never
+                    // click the previous coordinates: that is an empty-floor click.
+                    var freshRect = rectProvider?.Invoke();
+                    if (rectProvider != null && !freshRect.HasValue)
                     {
-                        var correctedPos = RandomizeWithinRect(correctedRect.Value);
-                        var correctedAbs = new Vector2(useWindowRect.X + correctedPos.X, useWindowRect.Y + correctedPos.Y);
+                        await Task.Delay(HoverVerifyDelayMs);
+                        continue;
+                    }
+
+                    var useRect = freshRect ?? rect;
+                    var useWindowRect = rectProvider != null
+                        ? new SharpDX.RectangleF(windowRect.X, windowRect.Y, windowRect.Width, windowRect.Height)
+                        : windowRect;
+
+                    // Dense loot labels are narrow; edge randomization amplifies overlap
+                    // and makes the cursor visibly thrash. Aim at the current exact center.
+                    var clickPos = new Vector2(
+                        useRect.X + useRect.Width / 2f,
+                        useRect.Y + useRect.Height / 2f);
+                    var absPos = new Vector2(useWindowRect.X + clickPos.X, useWindowRect.Y + clickPos.Y);
+
+                    await MoveCursorTo(absPos);
+                    await Task.Delay(settleMs);
+                    if (!IsCurrentLabelClick(entity.Id, generation)) return;
+
+                    // Final snap correction — re-read label position right before verification
+                    if (rectProvider != null)
+                    {
+                        var correctedRect = rectProvider.Invoke();
+                        if (!correctedRect.HasValue)
+                        {
+                            await Task.Delay(HoverVerifyDelayMs);
+                            continue;
+                        }
+
+                        var correctedPos = new Vector2(
+                            correctedRect.Value.X + correctedRect.Value.Width / 2f,
+                            correctedRect.Value.Y + correctedRect.Value.Height / 2f);
+                        var correctedAbs = new Vector2(
+                            useWindowRect.X + correctedPos.X,
+                            useWindowRect.Y + correctedPos.Y);
                         Input.SetCursorPos(correctedAbs);
+                        // Targetable.isTargeted updates after the snap, not synchronously
+                        // with SetCursorPos.
+                        await Task.Delay(HoverVerifyDelayMs);
                     }
-                }
 
-                try
-                {
-                    var targetable = entity.GetComponent<Targetable>();
-                    if (targetable?.isTargeted == true)
+                    if (!IsCurrentLabelClick(entity.Id, generation)) return;
+                    try
                     {
-                        LastClickWasVerified = true;
-                        await SendDelay();
-                        SendLeftDown("label-verified");
-                        await Task.Delay(holdMs);
-                        await SendDelay();
-                        SendLeftUp("label-verified");
-                        return;
+                        var targetable = entity.GetComponent<Targetable>();
+                        if (targetable?.isTargeted == true)
+                        {
+                            await SendDelay();
+                            if (!IsCurrentLabelClick(entity.Id, generation)) return;
+                            if (!SendLeftDown("label-verified"))
+                                continue;
+
+                            try
+                            {
+                                await Task.Delay(holdMs);
+                            }
+                            finally
+                            {
+                                await SendDelay();
+                                SendLeftUp("label-verified");
+                            }
+
+                            LastClickWasVerified = true;
+                            result = LabelClickResult.ClickSent;
+                            return;
+                        }
                     }
+                    catch { }
+
+                    await Task.Delay(HoverVerifyDelayMs);
                 }
-                catch { }
-
-                await Task.Delay(HoverVerifyDelayMs);
             }
+            finally
+            {
+                CompleteLabelClick(entity.Id, generation, result);
+            }
+        }
 
-            // Verification failed on all attempts — DON'T click.
-            // Clicking an unverified target risks hitting overlapping entities
-            // (e.g. ritual altar opens shop, NPC opens dialog).
-            // The interaction system will detect the failed attempt and either
-            // reposition the player or mark the item as blocked.
+        private static bool IsCurrentLabelClick(long entityId, int generation)
+        {
+            lock (LabelClickSync)
+                return _labelClickBusy && _labelClickEntityId == entityId &&
+                    _labelClickGeneration == generation;
+        }
+
+        private static void CompleteLabelClick(
+            long entityId, int generation, LabelClickResult result)
+        {
+            lock (LabelClickSync)
+            {
+                if (_labelClickEntityId != entityId || _labelClickGeneration != generation)
+                    return;
+
+                _labelClickResult = result;
+                var cooldownUntil = DateTime.Now.AddMilliseconds(ActionCooldownMs);
+                if (cooldownUntil > NextActionAt)
+                    NextActionAt = cooldownUntil;
+                _labelClickBusy = false;
+            }
+        }
+
+        private static void CancelLabelClick()
+        {
+            lock (LabelClickSync)
+            {
+                _labelClickGeneration++;
+                _labelClickBusy = false;
+                _labelClickEntityId = 0;
+                _labelClickResult = LabelClickResult.None;
+            }
             LastClickWasVerified = false;
         }
 
@@ -483,6 +643,17 @@ namespace AutoExile.Systems
         private static bool CanSendInputEvent =>
             (DateTime.Now - _lastInputEvent).TotalMilliseconds >= MinInputEventGapMs;
 
+        private sealed record InputEventTelemetry(
+            string? Key,
+            string Context,
+            double ElapsedSinceLastInputMs,
+            int MinimumGapMs);
+
+        private static InputEventTelemetry CaptureInputTelemetry(Keys? key, string context) =>
+            new(key?.ToString(), context,
+                Math.Max(0d, (DateTime.Now - _lastInputEvent).TotalMilliseconds),
+                MinInputEventGapMs);
+
         /// <summary>Record that an input event was just sent.</summary>
         private static void MarkInputEvent(string eventType = "?", string detail = "")
         {
@@ -491,7 +662,7 @@ namespace AutoExile.Systems
         }
 
         // ── Raw Input Wrappers ──
-        // ALL game input MUST go through these. They log every event, enforce
+        // ALL game input MUST go through these. They count every event, enforce
         // the global rate limit, and are the ONLY methods that call ExileCore's
         // Input class directly. Everything else in BotInput uses these.
         //
@@ -509,30 +680,57 @@ namespace AutoExile.Systems
 
         private static void SendKeyDown(Keys key, string context = "")
         {
+            var telemetry = CaptureInputTelemetry(key, context);
             if (!CanSendInputEvent)
             {
                 LogRawInput("KeyDown-DROPPED", $"{key} {context} (too soon: {(DateTime.Now - _lastInputEvent).TotalMilliseconds:F0}ms)".Trim());
+                Stats?.RecordRuntimeEvent("input", "key_down", "dropped", "rate_limit", telemetry);
                 return;
             }
+            if (key == Keys.RButton)
+            {
+                SendRightDown(context);
+                return;
+            }
+            if (key == Keys.MButton)
+            {
+                SendMiddleDown(context);
+                return;
+            }
+
             MarkInputEvent("KeyDown", $"{key} {context}".Trim());
             Input.KeyDown(key);
         }
 
         private static void SendKeyUp(Keys key, string context = "")
         {
+            if (key == Keys.RButton)
+            {
+                SendRightUp(context);
+                return;
+            }
+            if (key == Keys.MButton)
+            {
+                SendMiddleUp(context);
+                return;
+            }
+
             MarkInputEvent("KeyUp", $"{key} {context}".Trim());
             Input.KeyUp(key);
         }
 
-        private static void SendLeftDown(string context = "")
+        private static bool SendLeftDown(string context = "")
         {
+            var telemetry = CaptureInputTelemetry(Keys.LButton, context);
             if (!CanSendInputEvent)
             {
                 LogRawInput("LeftDown-DROPPED", $"{context} (too soon: {(DateTime.Now - _lastInputEvent).TotalMilliseconds:F0}ms)".Trim());
-                return;
+                Stats?.RecordRuntimeEvent("input", "left_down", "dropped", "rate_limit", telemetry);
+                return false;
             }
             MarkInputEvent("LeftDown", context);
             Input.LeftDown();
+            return true;
         }
 
         private static void SendLeftUp(string context = "")
@@ -543,9 +741,11 @@ namespace AutoExile.Systems
 
         private static void SendRightDown(string context = "")
         {
+            var telemetry = CaptureInputTelemetry(Keys.RButton, context);
             if (!CanSendInputEvent)
             {
                 LogRawInput("RightDown-DROPPED", $"{context} (too soon: {(DateTime.Now - _lastInputEvent).TotalMilliseconds:F0}ms)".Trim());
+                Stats?.RecordRuntimeEvent("input", "right_down", "dropped", "rate_limit", telemetry);
                 return;
             }
             MarkInputEvent("RightDown", context);
@@ -558,21 +758,52 @@ namespace AutoExile.Systems
             Input.RightUp();
         }
 
+        private const uint MouseEventMiddleDown = 0x0020;
+        private const uint MouseEventMiddleUp = 0x0040;
+
+        private static void SendMiddleDown(string context = "")
+        {
+            var telemetry = CaptureInputTelemetry(Keys.MButton, context);
+            if (!CanSendInputEvent)
+            {
+                LogRawInput("MiddleDown-DROPPED", $"{context} (too soon: {(DateTime.Now - _lastInputEvent).TotalMilliseconds:F0}ms)".Trim());
+                Stats?.RecordRuntimeEvent("input", "middle_down", "dropped", "rate_limit", telemetry);
+                return;
+            }
+            MarkInputEvent("MiddleDown", context);
+            MouseEvent(MouseEventMiddleDown, 0, 0, 0, UIntPtr.Zero);
+        }
+
+        private static void SendMiddleUp(string context = "")
+        {
+            MarkInputEvent("MiddleUp", context);
+            MouseEvent(MouseEventMiddleUp, 0, 0, 0, UIntPtr.Zero);
+        }
+
         /// <summary>
         /// Async delay that enforces the minimum gap between input events.
         /// Call before sending a new input event in async methods.
         /// </summary>
         private static async Task SendDelay()
         {
-            var elapsed = (DateTime.Now - _lastInputEvent).TotalMilliseconds;
-            if (elapsed < MinInputEventGapMs)
-                await Task.Delay((int)(MinInputEventGapMs - elapsed));
+            // Re-check after every wake-up. Integer truncation and another async
+            // input can otherwise leave the next down event inside the raw-input floor.
+            while (true)
+            {
+                var remaining = MinInputEventGapMs -
+                    (DateTime.Now - _lastInputEvent).TotalMilliseconds;
+                if (remaining <= 0)
+                    return;
+
+                await Task.Delay(Math.Max(1, (int)Math.Ceiling(remaining)));
+            }
         }
 
         private static readonly Random _rng = new();
 
         /// <summary>True if we can start a new action right now.</summary>
-        public static bool CanAct => ReplayMode || DateTime.Now >= NextActionAt;
+        public static bool CanAct => ReplayMode ||
+            (!IsKeyPairBusy && !IsLabelClickBusy && !IsBatchRunning && DateTime.Now >= NextActionAt);
 
         // ══════════════════════════════════════════════════════════════
         // Continuous movement layer
@@ -596,6 +827,9 @@ namespace AutoExile.Systems
 
         [DllImport("user32.dll")]
         private static extern short GetAsyncKeyState(int vKey);
+
+        [DllImport("user32.dll", EntryPoint = "mouse_event")]
+        private static extern void MouseEvent(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
 
         /// <summary>True if the OS reports a modifier key as physically held
         /// (outside our own tracking — e.g. a user-pressed key or a leaked
@@ -687,6 +921,7 @@ namespace AutoExile.Systems
 
         /// <summary>True if movement is temporarily suspended for a discrete action.</summary>
         public static bool IsMovementSuspended { get; private set; }
+        private static DateTime _movementSuspendedAt = DateTime.MinValue;
 
 
 
@@ -700,7 +935,7 @@ namespace AutoExile.Systems
         public static bool StartMovement(Vector2 absScreenPos, Keys moveKey)
         {
             if (TryCaptureReplay("StartMovement", absScreenPos, moveKey)) return true;
-            if (!ClampToWindow(ref absScreenPos)) return false;
+            if (!ClampToWorldSafeZone(ref absScreenPos)) return false;
 
             // Move-only walks TO the cursor. If the target is on the player the
             // character stands still. Safety-nudge every call, including the
@@ -748,13 +983,23 @@ namespace AutoExile.Systems
             {
                 SendKeyDown(moveKey, "movement");
                 IsMovementSuspended = false;
+                _movementSuspendedAt = DateTime.MinValue;
             }
             else
             {
                 IsMovementSuspended = true;
+                if (_movementSuspendedAt == DateTime.MinValue)
+                    _movementSuspendedAt = DateTime.Now;
             }
 
             LogAction("StartMovement", absScreenPos, moveKey, true);
+            Stats?.RecordRuntimeEvent("movement", "start", "active", null, new
+            {
+                key = moveKey.ToString(),
+                cursorX = absScreenPos.X,
+                cursorY = absScreenPos.Y,
+                suspended = IsMovementSuspended,
+            });
             return true;
         }
 
@@ -772,7 +1017,7 @@ namespace AutoExile.Systems
         {
             if (!IsMovementActive || IsMovementSuspended) return false;
             if (TryCaptureReplay("UpdateMovementCursor", absScreenPos)) return true;
-            if (!ClampToWindow(ref absScreenPos)) return false;
+            if (!ClampToWorldSafeZone(ref absScreenPos)) return false;
             absScreenPos = NudgeOffPlayer(absScreenPos);
 
             // Throttle: only update if position changed significantly or enough time passed
@@ -798,8 +1043,17 @@ namespace AutoExile.Systems
             if (!IsMovementActive) return;
 
             SendKeyUp(_movementKey, "stop");
+            var suspendedMs = _movementSuspendedAt == DateTime.MinValue
+                ? 0d
+                : Math.Max(0d, (DateTime.Now - _movementSuspendedAt).TotalMilliseconds);
             IsMovementActive = false;
             IsMovementSuspended = false;
+            _movementSuspendedAt = DateTime.MinValue;
+            Stats?.RecordRuntimeEvent("movement", "stop", "inactive", context: new
+            {
+                key = _movementKey.ToString(),
+                suspendedMs,
+            });
         }
 
         /// <summary>
@@ -827,6 +1081,13 @@ namespace AutoExile.Systems
 
             SendKeyUp(_movementKey, "suspend");
             IsMovementSuspended = true;
+            _movementSuspendedAt = DateTime.Now;
+            Stats?.RecordRuntimeEvent("movement", "suspend", "suspended", context: new
+            {
+                key = _movementKey.ToString(),
+                cursorX = _movementCursorPos.X,
+                cursorY = _movementCursorPos.Y,
+            });
         }
 
         /// <summary>
@@ -849,7 +1110,18 @@ namespace AutoExile.Systems
             ReleaseAllModifiersBeforeMove();
             Input.SetCursorPos(target);
             SendKeyDown(_movementKey, "resume");
+            var suspendedMs = _movementSuspendedAt == DateTime.MinValue
+                ? 0d
+                : Math.Max(0d, (DateTime.Now - _movementSuspendedAt).TotalMilliseconds);
             IsMovementSuspended = false;
+            _movementSuspendedAt = DateTime.MinValue;
+            Stats?.RecordRuntimeEvent("movement", "resume", "active", context: new
+            {
+                key = _movementKey.ToString(),
+                suspendedMs,
+                cursorX = target.X,
+                cursorY = target.Y,
+            });
         }
 
         /// <summary>
@@ -926,6 +1198,7 @@ namespace AutoExile.Systems
 
         /// <summary>Currently held keys and when they were pressed.</summary>
         private static readonly Dictionary<Keys, DateTime> _heldKeys = new();
+        private static long _holdGeneration;
 
         /// <summary>Auto-release held keys after this many seconds (safety watchdog).</summary>
         public static float HeldKeyTimeoutSeconds = 5f;
@@ -960,6 +1233,8 @@ namespace AutoExile.Systems
             if (TryCaptureReplay("HoldKey", key: key)) return true;
             if (!CanAct) return false;
 
+            // Supersede any targeted hold whose cursor movement is still pending.
+            Interlocked.Increment(ref _holdGeneration);
             SuspendMovement();
 
             // Release if already held (prevents double-down)
@@ -982,7 +1257,7 @@ namespace AutoExile.Systems
         {
             if (TryCaptureReplay("HoldKeyAt", absPos, key)) return true;
             if (!CanAct) return false;
-            if (!ClampToWindow(ref absPos)) return false;
+            if (!ClampToWorldSafeZone(ref absPos)) return false;
 
             SuspendMovement();
 
@@ -992,22 +1267,37 @@ namespace AutoExile.Systems
 
             var moveMs = EstimateMoveMs(absPos);
             NextActionAt = DateTime.Now.AddMilliseconds(moveMs + ActionCooldownMs);
-            _ = DoHoldKeyAt(absPos, key);
+            var generation = Interlocked.Increment(ref _holdGeneration);
+            _ = DoHoldKeyAt(absPos, key, generation);
             return true;
         }
 
-        private static async Task DoHoldKeyAt(Vector2 absPos, Keys key)
+        private static async Task DoHoldKeyAt(Vector2 absPos, Keys key, long generation)
         {
             await MoveCursorTo(absPos);
+            if (generation != Volatile.Read(ref _holdGeneration)) return;
             await Task.Delay(RandSettle());
+            if (generation != Volatile.Read(ref _holdGeneration)) return;
             await SendDelay();
+            if (generation != Volatile.Read(ref _holdGeneration)) return;
             SendKeyDown(key);
             _heldKeys[key] = DateTime.Now;
+        }
+
+        /// <summary>Update a channelled skill cursor inside the world-safe region.</summary>
+        public static bool UpdateWorldSkillCursor(Vector2 absPos)
+        {
+            if (!ClampToWorldSafeZone(ref absPos)) return false;
+            Input.SetCursorPos(absPos);
+            return true;
         }
 
         /// <summary>Release a specific held key.</summary>
         public static void ReleaseKey(Keys key)
         {
+            // Cancel a matching hold even when its async cursor move has not yet
+            // reached the key-down/tracking step.
+            Interlocked.Increment(ref _holdGeneration);
             if (_heldKeys.Remove(key))
                 SendKeyUp(key);
         }
@@ -1018,6 +1308,8 @@ namespace AutoExile.Systems
         /// </summary>
         public static void ReleaseAllKeys()
         {
+            // Invalidate pending HoldKeyAt continuations before releasing keys.
+            Interlocked.Increment(ref _holdGeneration);
             if (_heldKeys.Count > 0)
             {
                 foreach (var key in _heldKeys.Keys)
@@ -1163,7 +1455,7 @@ namespace AutoExile.Systems
         {
             if (TryCaptureReplay("CursorPressKey", absPos, key)) return true;
             if (!CanAct) { LogAction("CursorPressKey", absPos, key, false); return false; }
-            if (!ClampToWindow(ref absPos)) { LogAction("CursorPressKey", absPos, key, false); return false; }
+            if (!ClampToWorldSafeZone(ref absPos)) { LogAction("CursorPressKey", absPos, key, false); return false; }
             SuspendMovement();
             ReleaseAllKeys();
             var moveMs = EstimateMoveMs(absPos);
@@ -1178,7 +1470,7 @@ namespace AutoExile.Systems
         /// <summary>Force cursor+key press, bypassing the input gate. For dodge — survival trumps input cadence.</summary>
         public static bool ForceCursorPressKey(Vector2 absPos, Keys key)
         {
-            if (!ClampToWindow(ref absPos)) { LogAction("ForceCursorPressKey", absPos, key, false); return false; }
+            if (!ClampToWorldSafeZone(ref absPos)) { LogAction("ForceCursorPressKey", absPos, key, false); return false; }
             SuspendMovement();
             ReleaseAllKeys();
             var moveMs = EstimateMoveMs(absPos);
@@ -1243,6 +1535,57 @@ namespace AutoExile.Systems
             _ = DoPressKey(key, hold);
             LogAction("PressKeyOverlay", null, key, true);
             return true;
+        }
+
+        /// <summary>
+        /// Send the same key twice as one movement-suspending transaction.
+        /// PoE's Z/Z loot-label refresh must never expose an unmatched first press.
+        /// </summary>
+        public static bool PressKeyPair(Keys key, int betweenPressesMs)
+        {
+            if (TryCaptureReplay("PressKeyPair", key: key)) return true;
+            if (!CanAct || IsKeyPairBusy)
+            {
+                LogAction("PressKeyPair", null, key, false);
+                return false;
+            }
+            if (HasHeldModifiers)
+            {
+                LogAction("PressKeyPair", null, key, false);
+                return false;
+            }
+
+            StopMovement();
+            ReleaseAllKeys();
+
+            var firstHold = RandHold();
+            var secondHold = RandHold();
+            var boundedGap = Math.Max(0, betweenPressesMs);
+            NextActionAt = DateTime.Now.AddMilliseconds(
+                firstHold + secondHold + boundedGap + (ActionCooldownMs * 4));
+            IsKeyPairBusy = true;
+            _ = DoPressKeyPair(key, firstHold, secondHold, boundedGap);
+            LogAction("PressKeyPair", null, key, true);
+            return true;
+        }
+
+        /// <summary>True until both key presses in the active pair have completed.</summary>
+        public static bool IsKeyPairBusy { get; private set; }
+
+        private static async Task DoPressKeyPair(
+            Keys key, int firstHoldMs, int secondHoldMs, int betweenPressesMs)
+        {
+            try
+            {
+                await DoPressKey(key, firstHoldMs);
+                if (betweenPressesMs > 0)
+                    await Task.Delay(betweenPressesMs);
+                await DoPressKey(key, secondHoldMs);
+            }
+            finally
+            {
+                IsKeyPairBusy = false;
+            }
         }
 
         private static async Task DoPressKey(Keys key, int holdMs)
@@ -1523,6 +1866,7 @@ namespace AutoExile.Systems
         /// <summary>Cancel any pending action, release held keys, stop movement, and reset gate.</summary>
         public static void Cancel()
         {
+            CancelLabelClick();
             StopMovement();
             ReleaseAllKeys();
             NextActionAt = DateTime.MinValue;
