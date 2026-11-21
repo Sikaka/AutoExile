@@ -736,7 +736,8 @@ namespace AutoExile.Modes
             var g = ctx.Graphics;
             if (g == null) return;
 
-            float hudX = 20, hudY = 200, lineH = 18;
+            // Starts below the status panel (BotCore sets ModeHudTop every frame).
+            float hudX = 20, hudY = ctx.ModeHudTop, lineH = 18;
             g.DrawText($"Boss: {_activeEncounter?.Name ?? "none"}", new Vector2(hudX, hudY), SharpDX.Color.Orange);
             hudY += lineH;
             g.DrawText($"Phase: {_phase}  Runs: {_runsCompleted}  Deaths: {_deathCount}  Drops: {_targetItemsLooted}",

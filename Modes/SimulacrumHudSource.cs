@@ -4,6 +4,22 @@ namespace AutoExile.Modes
 {
     public partial class SimulacrumMode
     {
+        private static string PhaseLabel(SimPhase phase) => phase switch
+        {
+            SimPhase.InHideout => "Hideout",
+            SimPhase.StashItems => "Stash",
+            SimPhase.OpenMap => "Open map",
+            SimPhase.EnterPortal => "Portal",
+            SimPhase.FindMonolith => "Search",
+            SimPhase.NavigateToMonolith => "To monolith",
+            SimPhase.WaveCycle => "Wave",
+            SimPhase.BetweenWaveStash => "Stash",
+            SimPhase.LootSweep => "Loot",
+            SimPhase.ExitMap => "Exit",
+            SimPhase.Done => "Done",
+            _ => "Idle",
+        };
+
         /// <summary>Snapshot of what the in-game panel shows for Simulacrum, formatted for display.</summary>
         public SimulacrumHud BuildHud(BotContext ctx)
         {
@@ -26,14 +42,15 @@ namespace AutoExile.Modes
             {
                 Wave = _state.CurrentWave,
                 WaveActive = _state.IsWaveActive,
-                RunTime = currentRun != null ? HudFormat.Duration(DateTime.UtcNow - currentRun.ActivatedAtUtc) : "--",
+                // Short form keeps runs past an hour inside the telemetry cell.
+                RunTime = currentRun != null ? HudFormat.ShortDuration(DateTime.UtcNow - currentRun.ActivatedAtUtc) : "--",
                 Deaths = _state.DeathCount,
                 MaxDeaths = ctx.Settings.Run.MaxDeaths.Value,
                 RunItems = currentRun?.ItemsLooted,
                 RunValue = runValue.Item1,
                 RunValueUnit = runValue.Item2,
+                Phase = PhaseLabel(_phase),
                 // Decision is never cleared, so it goes stale; StatusText tracks the live step.
-                Phase = _phase.ToString(),
                 Status = StatusText,
                 Warnings = warnings,
                 Monsters = ctx.Combat.NearbyMonsterCount,

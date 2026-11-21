@@ -3238,7 +3238,8 @@ namespace AutoExile.Modes
             var g = ctx.Graphics;
 
             // --- HUD ---
-            var hudY = 100f;
+            // Starts below the status panel (BotCore sets ModeHudTop every frame).
+            var hudY = ctx.ModeHudTop;
             var hudX = 20f;
             var lineH = 16f;
 

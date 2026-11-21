@@ -539,7 +539,8 @@ namespace AutoExile.Modes.BossEncounters
                     g.DrawText("LOOT HERE", screen + new Vector2(-30, -20), SharpDX.Color.Gold);
             }
 
-            float hudX = 20, hudY = 250, lineH = 18;
+            // Below BossMode's three HUD lines, which start under the status panel.
+            float hudX = 20, hudY = ctx.ModeHudTop + 3 * 18, lineH = 18;
             var phaseColor = _phase switch
             {
                 FearPhase.WaitForVulnerable => SharpDX.Color.Yellow,

@@ -982,7 +982,8 @@ namespace AutoExile.Modes.WaveFarm
             if (g == null) return;
 
             var x = 100f;
-            var y = 120f;
+            // Starts below the status panel (BotCore sets ModeHudTop every frame).
+            var y = ctx.ModeHudTop;
             const float lineH = 16f;
             var dim = new SharpDX.Color(180, 180, 180, 255);
             var bright = SharpDX.Color.White;

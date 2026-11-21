@@ -1090,7 +1090,8 @@ namespace AutoExile.Modes
             if (gfx == null) return;
 
             var hudX = 100f;
-            var hudY = 100f;
+            // Starts below the status panel (BotCore sets ModeHudTop every frame).
+            var hudY = ctx.ModeHudTop;
             var lineH = 20f;
 
             // Status with color-coded state

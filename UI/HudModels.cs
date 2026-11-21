@@ -12,6 +12,8 @@ namespace AutoExile.UI
         public string? Limit { get; init; }
         /// <summary>Less than 10% of the runtime limit is left.</summary>
         public bool LimitLow { get; init; }
+        /// <summary>Less than 5 minutes of the runtime limit is left.</summary>
+        public bool LimitCritical { get; init; }
         /// <summary>Human recorder tick count while recording, otherwise null.</summary>
         public long? RecordingTicks { get; init; }
     }

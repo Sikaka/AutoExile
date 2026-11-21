@@ -1413,7 +1413,8 @@ namespace AutoExile.Modes
 
             // ═══ HUD Panel ═══
             var hudX = 20f;
-            var hudY = 100f;
+            // Starts below the status panel (BotCore sets ModeHudTop every frame).
+            var hudY = ctx.ModeHudTop;
             var lineH = 16f;
 
             g.DrawText("=== HEIST ===", new Vector2(hudX, hudY), SharpDX.Color.Cyan);

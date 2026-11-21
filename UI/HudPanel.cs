@@ -32,7 +32,12 @@ namespace AutoExile.UI
         private static readonly Vector4 SegNext = new(1f, 1f, 1f, 0.09f);
         private static readonly Vector4 Chev = new(0.80f, 0.83f, 0.88f, 0.90f);
 
-        private const float PanelW = 316f, ContentW = 296f, PadX = 12f, PadY = 7f;
+        private const float ContentW = 340f, PadX = 12f, PadY = 8f, PanelW = ContentW + 2 * PadX - 4f;
+        /// <summary>Row pitch relative to the font height; 1.0 looked cramped in game.</summary>
+        private const float RowSpacing = 1.2f;
+        // Column anchors derived from the content width.
+        private const float ToggleX = ContentW - 16f, ChipX = ContentW - 52f, GaugeX = 88f, GaugeW = ChipX - 8f - GaugeX;
+        private const float ColValue = ContentW / 2f - 8f, ColSep = ContentW / 2f + 0.5f, ColLabel = ContentW / 2f + 8f;
         private const ImGuiWindowFlags PanelFlags = ImGuiWindowFlags.NoDecoration | ImGuiWindowFlags.NoInputs |
             ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.NoFocusOnAppearing |
             ImGuiWindowFlags.NoBringToFrontOnFocus | ImGuiWindowFlags.NoNav | ImGuiWindowFlags.NoBackground;
@@ -53,10 +58,13 @@ namespace AutoExile.UI
         {
             _lineH = ImGui.GetTextLineHeight();
             _sx = Math.Max(0.5f, ImGui.CalcTextSize("0").X / 8f);
-            _sy = Math.Max(1f, _lineH / 16f);
+            _sy = Math.Max(1f, _lineH / 16f) * RowSpacing;
 
-            var warnings = sim?.Warnings.Count ?? 0;
-            var rows = warnings + (header.RecordingTicks.HasValue ? 1 : 0);
+            // Collapsed, the ignored-item count has no row of its own, so it shows as a warning.
+            IReadOnlyList<string> warnings = sim == null ? Array.Empty<string>()
+                : !expanded && sim.Ignored > 0 ? sim.Warnings.Append($"Ignored items: {sim.Ignored}").ToList()
+                : sim.Warnings;
+            var rows = warnings.Count + (header.RecordingTicks.HasValue ? 1 : 0);
             var bodyBottom = sim != null
                 ? (rows == 0 ? 86f : 92f + 18f * rows - 2f)
                 : (rows == 0 ? 18f : 28f + 18f * rows - 2f);
@@ -90,7 +98,7 @@ namespace AutoExile.UI
                 _dl.AddRectFilled(pos + new Vector2(3f, 6f), pos + new Vector2(5f, size.Y - 6f), U(stateCol, 0.9f), 1f);
 
                 DrawHeader(header, toggle != null);
-                var y = sim != null ? DrawSimulacrumBody(sim, header.Running) : 28f;
+                var y = sim != null ? DrawSimulacrumBody(sim, warnings, header.Running) : 28f;
                 if (sim == null && rows > 0) HLine(23.5f);
                 if (header.RecordingTicks.HasValue) RecRow(y, header.RecordingTicks.Value, header.Running);
                 if (sim != null && expanded) DrawDetails(sim, bodyBottom, showLive, decision);
@@ -117,7 +125,7 @@ namespace AutoExile.UI
             _dl.AddCircleFilled(At(9f, 9f), 3f * _sx, U(stateCol, Pulse(h.Running)));
             Text(17f, 0f, 18f, h.Running ? "RUNNING" : "PAUSED", stateCol);
 
-            var rtRight = hasToggle ? 272f : 296f;
+            var rtRight = hasToggle ? ToggleX - 8f : ContentW;
             var mode = h.Mode.ToUpperInvariant();
             var elapsedW = W(h.Elapsed);
             var modeMax = rtRight - 86f - 8f - elapsedW;
@@ -133,10 +141,10 @@ namespace AutoExile.UI
             }
             var x = rtRight - elapsedW - (limit != null ? W(limit) : 0f);
             x = TextRun(x, 0f, 18f, h.Elapsed, Bright);
-            if (limit != null) Text(x, 0f, 18f, limit, h.LimitLow ? Amber : Dim);
+            if (limit != null) Text(x, 0f, 18f, limit, h.LimitCritical ? Red : h.LimitLow ? Amber : Dim);
         }
 
-        private float DrawSimulacrumBody(SimulacrumHud s, bool running)
+        private float DrawSimulacrumBody(SimulacrumHud s, IReadOnlyList<string> warnings, bool running)
         {
             HLine(23.5f);
 
@@ -148,41 +156,41 @@ namespace AutoExile.UI
             if (s.WaveMax > 0)
             {
                 var n = s.WaveMax;
-                var segW = MathF.Max(1f, MathF.Floor((148f - 2f * (n - 1)) / n));
+                var segW = MathF.Max(1f, MathF.Floor((GaugeW - 2f * (n - 1)) / n));
                 for (var i = 1; i <= n; i++)
                 {
-                    var sx = 88f + (i - 1) * (segW + 2f);
+                    var sx = GaugeX + (i - 1) * (segW + 2f);
                     var col = s.Wave == 0 || i > s.Wave ? U(SegNext)
                         : i < s.Wave ? U(SegDone)
                         : U(waveCol, Pulse(running && s.WaveActive));
                     _dl.AddRectFilled(At(sx, 33f), At(sx + segW, 39f), col, 1f);
                 }
             }
-            Chip(244f, 28f, 296f, 44f, waveCol);
+            Chip(ChipX, 28f, ContentW, 44f, waveCol);
             var chip = s.WaveActive ? "ACTIVE" : "IDLE";
-            Text(244f + (52f - W(chip)) / 2f, 28f, 16f, chip, waveCol);
+            Text(ChipX + (52f - W(chip)) / 2f, 28f, 16f, chip, waveCol);
 
             // Telemetry row: run time | deaths | loot.
             x = TextRun(0f, 50f, 16f, "RUN ", Dim);
             Text(x, 50f, 16f, s.RunTime, Bright);
-            VLine(92.5f, 53f, 63f);
-            if (s.Deaths > 0) _dl.AddRectFilled(At(96f, 50f), At(160f, 66f), U(Red, 0.14f), 2f);
+            VLine(104.5f, 53f, 63f);
+            if (s.Deaths > 0) _dl.AddRectFilled(At(108f, 50f), At(184f, 66f), U(Red, 0.14f), 2f);
             var atMax = s.MaxDeaths > 0 && s.Deaths >= s.MaxDeaths;
-            x = TextRun(100f, 50f, 16f, "DTH ", atMax ? Red : Dim);
+            x = TextRun(114f, 50f, 16f, "DTH ", atMax ? Red : Dim);
             x = TextRun(x, 50f, 16f, s.Deaths.ToString(), s.Deaths > 0 ? Red : Bright);
             Text(x, 50f, 16f, "/" + s.MaxDeaths, Dim);
-            VLine(164.5f, 53f, 63f);
-            _dl.AddTriangleFilled(At(175f, 54f), At(179f, 58f), At(175f, 62f), U(Gold));
-            _dl.AddTriangleFilled(At(175f, 54f), At(175f, 62f), At(171f, 58f), U(Gold));
-            _dl.PushClipRect(At(184f, 48f), At(296f, 68f), true);
+            VLine(188.5f, 53f, 63f);
+            _dl.AddTriangleFilled(At(201f, 54f), At(205f, 58f), At(201f, 62f), U(Gold));
+            _dl.AddTriangleFilled(At(201f, 54f), At(201f, 62f), At(197f, 58f), U(Gold));
+            _dl.PushClipRect(At(210f, 48f), At(ContentW, 68f), true);
             if (s.RunItems is int items)
             {
-                x = TextRun(184f, 50f, 16f, items.ToString(), Bright);
+                x = TextRun(210f, 50f, 16f, items.ToString(), Bright);
                 x = TextRun(x, 50f, 16f, " · ", Dim);
                 x = TextRun(x, 50f, 16f, s.RunValue, Gold);
                 Text(x, 50f, 16f, s.RunValueUnit, Dim);
             }
-            else Text(184f, 50f, 16f, "--", Dim);
+            else Text(210f, 50f, 16f, "--", Dim);
             _dl.PopClipRect();
 
             // Phase and live status.
@@ -195,7 +203,7 @@ namespace AutoExile.UI
             Text(statusX, 70f, 16f, Truncate(s.Status, ContentW - statusX), Mid);
 
             var y = 92f;
-            foreach (var warning in s.Warnings)
+            foreach (var warning in warnings)
             {
                 _dl.AddRectFilled(At(0f, y), At(ContentW, y + 16f), U(Amber, 0.12f), 2f);
                 _dl.AddRectFilled(At(0f, y), At(2f, y + 16f), U(Amber, 0.9f));
@@ -221,9 +229,9 @@ namespace AutoExile.UI
             {
                 var y = b + 12f;
                 Text(0f, y, 16f, "MONSTERS", Dim);
-                TextRight(140f, y, s.Monsters.ToString(), Bright);
-                VLine(148.5f, y + 3f, y + 13f);
-                Text(156f, y, 16f, "IGNORED", Dim);
+                TextRight(ColValue, y, s.Monsters.ToString(), Bright);
+                VLine(ColSep, y + 3f, y + 13f);
+                Text(ColLabel, y, 16f, "IGNORED", Dim);
                 TextRight(ContentW, y, s.Ignored.ToString(), s.Ignored > 0 ? Amber : Bright);
                 cursor = b + 28f;
             }
@@ -241,7 +249,7 @@ namespace AutoExile.UI
             if (!string.IsNullOrEmpty(s.League))
             {
                 x = TextRun(x, sy, 16f, " · ", Dim);
-                Text(x, sy, 16f, Truncate(s.League.ToUpperInvariant(), 200f - x), Mid);
+                Text(x, sy, 16f, Truncate(s.League.ToUpperInvariant(), ContentW - 90f - x), Mid);
             }
             TextRight(ContentW, sy, s.TotalsTime, Mid);
 
@@ -253,9 +261,9 @@ namespace AutoExile.UI
         private void GridRow(float y, string l1, string v1, string? u1, string l2, string v2, string? u2)
         {
             Text(0f, y, 16f, l1, Dim);
-            Compound(140f, y, v1, u1);
-            VLine(148.5f, y + 3f, y + 13f);
-            Text(156f, y, 16f, l2, Dim);
+            Compound(ColValue, y, v1, u1);
+            VLine(ColSep, y + 3f, y + 13f);
+            Text(ColLabel, y, 16f, l2, Dim);
             Compound(ContentW, y, v2, u2);
         }
 
@@ -270,7 +278,7 @@ namespace AutoExile.UI
         private void DrawToggle(bool expanded, Action toggle)
         {
             var size = new Vector2(16f * _sx, 16f * _sy);
-            ImGui.SetNextWindowPos(At(280f, 1f));
+            ImGui.SetNextWindowPos(At(ToggleX, 1f));
             ImGui.SetNextWindowSize(size);
             ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, Vector2.Zero);
             ImGui.PushStyleVar(ImGuiStyleVar.WindowBorderSize, 0f);
@@ -280,12 +288,12 @@ namespace AutoExile.UI
                 if (ImGui.InvisibleButton("##t", size)) toggle();
                 var hovered = ImGui.IsItemHovered();
                 var dl = ImGui.GetWindowDrawList();
-                dl.AddRectFilled(At(280f, 1f), At(296f, 17f), U(new Vector4(1f, 1f, 1f, hovered ? 0.12f : 0.06f)), 3f);
-                dl.AddRect(At(280f, 1f), At(296f, 17f), U(new Vector4(1f, 1f, 1f, hovered ? 0.35f : 0.18f)), 3f);
+                dl.AddRectFilled(At(ToggleX, 1f), At(ContentW, 17f), U(new Vector4(1f, 1f, 1f, hovered ? 0.12f : 0.06f)), 3f);
+                dl.AddRect(At(ToggleX, 1f), At(ContentW, 17f), U(new Vector4(1f, 1f, 1f, hovered ? 0.35f : 0.18f)), 3f);
                 if (expanded)
-                    dl.AddTriangleFilled(At(284.5f, 11f), At(291.5f, 11f), At(288f, 7f), U(Chev));
+                    dl.AddTriangleFilled(At(ToggleX + 4.5f, 11f), At(ToggleX + 11.5f, 11f), At(ToggleX + 8f, 7f), U(Chev));
                 else
-                    dl.AddTriangleFilled(At(284.5f, 7f), At(291.5f, 7f), At(288f, 11f), U(Chev));
+                    dl.AddTriangleFilled(At(ToggleX + 4.5f, 7f), At(ToggleX + 11.5f, 7f), At(ToggleX + 8f, 11f), U(Chev));
             }
             ImGui.End();
             ImGui.PopStyleVar(3);

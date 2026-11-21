@@ -950,6 +950,7 @@ namespace AutoExile
             var hudTop = Math.Clamp(windowRect.Height * 0.12f, 120f, 180f);
             var maxMin = Settings.Run.MaxRuntimeMinutes.Value;
             var elapsed = _runtime.ActiveDuration;
+            var remainingMin = maxMin > 0 ? _runtime.Remaining(maxMin).TotalMinutes : double.MaxValue;
             var header = new HudHeader
             {
                 // Pause time is excluded automatically by RuntimeTracker.
@@ -957,7 +958,8 @@ namespace AutoExile
                 Mode = _mode.Name,
                 Elapsed = $"{(int)elapsed.TotalHours}:{elapsed.Minutes:D2}",
                 Limit = maxMin > 0 ? $"{maxMin / 60}:{maxMin % 60:D2}" : null,
-                LimitLow = maxMin > 0 && _runtime.Remaining(maxMin).TotalMinutes < maxMin * 0.10,
+                LimitLow = remainingMin < maxMin * 0.10,
+                LimitCritical = remainingMin < 5,
                 RecordingTicks = _humanRecorder.IsRecording ? _humanRecorder.TicksRecorded : null,
             };
             var simHud = _simulacrumMode != null && _mode == _simulacrumMode ? _simulacrumMode.BuildHud(_ctx) : null;
