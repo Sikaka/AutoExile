@@ -58,28 +58,33 @@ namespace AutoExile.UI
         {
             _lineH = ImGui.GetTextLineHeight();
             _sx = Math.Max(0.5f, ImGui.CalcTextSize("0").X / 8f);
-            _sy = Math.Max(1f, _lineH / 16f) * RowSpacing;
+            var baseSy = Math.Max(1f, _lineH / 16f);
+            var details = sim != null && expanded;
 
-            // Collapsed, the ignored-item count has no row of its own, so it shows as a warning.
-            IReadOnlyList<string> warnings = sim == null ? Array.Empty<string>()
-                : !expanded && sim.Ignored > 0 ? sim.Warnings.Append($"Ignored items: {sim.Ignored}").ToList()
-                : sim.Warnings;
-            var rows = warnings.Count + (header.RecordingTicks.HasValue ? 1 : 0);
-            var bodyBottom = sim != null
-                ? (rows == 0 ? 86f : 92f + 18f * rows - 2f)
-                : (rows == 0 ? 18f : 28f + 18f * rows - 2f);
-
+            // Fit above maxBottom (the chat): first drop the extra row spacing, then cut the decision to
+            // one line, then drop the monsters/ignored row.
             var showLive = true;
-            var decision = Array.Empty<string>();
-            if (sim != null && expanded)
+            var decision = details ? Wrap(sim!.Decision, ContentW, 2) : Array.Empty<string>();
+            IReadOnlyList<string> warnings = Array.Empty<string>();
+            float bodyBottom = 0f, bottom = 0f;
+            var rows = 0;
+            for (var step = 0; step < 4; step++)
             {
-                decision = Wrap(sim.Decision, ContentW, 2);
-                if (pos.Y + (ExpandedBottom(bodyBottom, true, decision.Length) + 2 * PadY) * _sy > maxBottom && decision.Length > 1)
-                    decision = Wrap(sim.Decision, ContentW, 1);
-                if (pos.Y + (ExpandedBottom(bodyBottom, true, decision.Length) + 2 * PadY) * _sy > maxBottom)
-                    showLive = false;
+                _sy = baseSy * (step == 0 ? RowSpacing : 1f);
+                if (step == 2 && decision.Length > 1) decision = Wrap(sim!.Decision, ContentW, 1);
+                if (step == 3) showLive = false;
+
+                // Without the details row, the ignored-item count shows as a warning instead.
+                warnings = sim == null ? Array.Empty<string>()
+                    : sim.Ignored > 0 && !(details && showLive) ? sim.Warnings.Append($"Ignored items: {sim.Ignored}").ToList()
+                    : sim.Warnings;
+                rows = warnings.Count + (header.RecordingTicks.HasValue ? 1 : 0);
+                bodyBottom = sim != null
+                    ? (rows == 0 ? 86f : 92f + 18f * rows - 2f)
+                    : (rows == 0 ? 18f : 28f + 18f * rows - 2f);
+                bottom = details ? ExpandedBottom(bodyBottom, showLive, decision.Length) : bodyBottom;
+                if (pos.Y + (bottom + 2 * PadY) * _sy <= maxBottom) break;
             }
-            var bottom = sim != null && expanded ? ExpandedBottom(bodyBottom, showLive, decision.Length) : bodyBottom;
             var size = new Vector2(PanelW * _sx, (bottom + 2 * PadY) * _sy);
             _o = pos + new Vector2(PadX * _sx, PadY * _sy);
 
@@ -108,6 +113,61 @@ namespace AutoExile.UI
             ImGui.PopStyleVar(3);
 
             if (toggle != null) DrawToggle(expanded, toggle);
+            return pos.Y + size.Y;
+        }
+
+        /// <summary>
+        /// One-line status pill centred at the top, used while a left-side game panel (stash) is open so
+        /// the full panel does not cover it. Takes no input. Returns the pixel y of its bottom edge.
+        /// </summary>
+        public float DrawPill(float centerX, float top, HudHeader header, SimulacrumHud? sim)
+        {
+            _lineH = ImGui.GetTextLineHeight();
+            _sx = Math.Max(0.5f, ImGui.CalcTextSize("0").X / 8f);
+            _sy = Math.Max(1f, _lineH / 16f);
+
+            var parts = new List<(string Text, Vector4 Col)> { (header.Mode.ToUpperInvariant(), Bright) };
+            if (sim != null)
+            {
+                parts.Add(("  W", Dim));
+                parts.Add((sim.Wave.ToString(), sim.WaveActive ? Red : Cyan));
+                parts.Add(("/" + sim.WaveMax, Dim));
+                parts.Add(("  RUN ", Dim));
+                parts.Add((sim.RunTime, Bright));
+                if (sim.Deaths > 0)
+                {
+                    parts.Add(("  DTH ", Dim));
+                    parts.Add((sim.Deaths.ToString(), Red));
+                }
+            }
+            parts.Add(("  ", Dim));
+            parts.Add((header.Elapsed, Mid));
+
+            const float padX = 9f, padY = 3f;
+            var textW = parts.Sum(p => W(p.Text));
+            var size = new Vector2((padX + 12f + textW + padX) * _sx, (16f + 2f * padY) * _sy);
+            var pos = new Vector2(MathF.Round(centerX - size.X / 2f), top);
+            _o = pos + new Vector2(padX * _sx, padY * _sy);
+
+            ImGui.SetNextWindowPos(pos);
+            ImGui.SetNextWindowSize(size);
+            ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, Vector2.Zero);
+            ImGui.PushStyleVar(ImGuiStyleVar.WindowBorderSize, 0f);
+            ImGui.PushStyleVar(ImGuiStyleVar.WindowMinSize, Vector2.One);
+            if (ImGui.Begin("##aeHudPill", PanelFlags))
+            {
+                _dl = ImGui.GetWindowDrawList();
+                var stateCol = header.Running ? Green : Yellow;
+                var radius = size.Y / 2f;
+                _dl.AddRectFilled(pos, pos + size, U(WinBg), radius);
+                _dl.AddRect(pos + new Vector2(0.5f, 0.5f), pos + size - new Vector2(0.5f, 0.5f), U(stateCol, 0.45f), radius);
+                _dl.AddCircleFilled(At(3f, 8f), 3f * _sx, U(stateCol, Pulse(header.Running)));
+                var x = 12f;
+                foreach (var (text, col) in parts) x = TextRun(x, 0f, 16f, text, col);
+                ImGui.Dummy(size);
+            }
+            ImGui.End();
+            ImGui.PopStyleVar(3);
             return pos.Y + size.Y;
         }
 
@@ -285,8 +345,10 @@ namespace AutoExile.UI
             ImGui.PushStyleVar(ImGuiStyleVar.WindowMinSize, Vector2.One);
             if (ImGui.Begin("##aeHudToggle", ToggleFlags))
             {
-                if (ImGui.InvisibleButton("##t", size)) toggle();
+                // Fires on press, not release: the bot moves the cursor away between the two.
+                ImGui.InvisibleButton("##t", size);
                 var hovered = ImGui.IsItemHovered();
+                if (hovered && ImGui.IsMouseClicked(ImGuiMouseButton.Left)) toggle();
                 var dl = ImGui.GetWindowDrawList();
                 dl.AddRectFilled(At(ToggleX, 1f), At(ContentW, 17f), U(new Vector4(1f, 1f, 1f, hovered ? 0.12f : 0.06f)), 3f);
                 dl.AddRect(At(ToggleX, 1f), At(ContentW, 17f), U(new Vector4(1f, 1f, 1f, hovered ? 0.35f : 0.18f)), 3f);

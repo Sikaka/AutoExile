@@ -575,6 +575,20 @@ namespace AutoExile
         private long _lastLeagueCheckMs = long.MinValue / 2;
 
         private readonly HudPanel _hudPanel = new();
+
+        private bool LeftGamePanelOpen()
+        {
+            try
+            {
+                var ui = GameController.IngameState.IngameUi;
+                return ui.OpenLeftPanel?.IsVisible == true || ui.StashElement?.IsVisible == true ||
+                       ui.GuildStashElement?.IsVisible == true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
         private Action? _toggleHudAction;
         private Action _toggleHud => _toggleHudAction ??= () => Settings.CompactHud.Value = !Settings.CompactHud.Value;
         private string? _lastLeagueRead;
@@ -963,8 +977,12 @@ namespace AutoExile
                 RecordingTicks = _humanRecorder.IsRecording ? _humanRecorder.TicksRecorded : null,
             };
             var simHud = _simulacrumMode != null && _mode == _simulacrumMode ? _simulacrumMode.BuildHud(_ctx) : null;
-            var hudBottom = _hudPanel.Draw(new Vector2(12f, hudTop), windowRect.Height * 0.59f, header, simHud,
-                !Settings.CompactHud.Value, simHud != null ? _toggleHud : null);
+            // The stash and other left-side panels open where the HUD sits; while one is open the
+            // HUD shrinks to a one-line pill at the top centre.
+            var hudBottom = LeftGamePanelOpen()
+                ? _hudPanel.DrawPill(windowRect.Width / 2f, hudTop, header, simHud)
+                : _hudPanel.Draw(new Vector2(12f, hudTop), windowRect.Height * 0.64f, header, simHud,
+                    !Settings.CompactHud.Value, simHud != null ? _toggleHud : null);
             // Modes that still draw their own text lines start below the panel.
             _ctx.ModeHudTop = hudBottom + 6f;
 

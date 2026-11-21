@@ -13,7 +13,7 @@ namespace AutoExile.Modes
             SimPhase.FindMonolith => "Search",
             SimPhase.NavigateToMonolith => "To monolith",
             SimPhase.WaveCycle => "Wave",
-            SimPhase.BetweenWaveStash => "Stash",
+            SimPhase.BetweenWaveStash => "Wave stash",
             SimPhase.LootSweep => "Loot",
             SimPhase.ExitMap => "Exit",
             SimPhase.Done => "Done",
