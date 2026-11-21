@@ -85,9 +85,13 @@ namespace AutoExile.Systems
 
         // Recovery hold: an escape/backtrack target is steered for a short window. Without it the
         // next tick steers back to the blocked waypoint before the re-pressed key reaches the game.
-        private const int RecoveryHoldMs = 700;
+        // Held until the target is reached or the window ends; the path is then rebuilt from the
+        // new position so a dead-end pocket is left instead of re-entered.
+        private const int RecoveryHoldMs = 2000;
+        private const float RecoveryReachedGrid = 3f;
         private Vector2 _recoveryTarget;
         private DateTime _recoveryUntil = DateTime.MinValue;
+        private bool _recoveryActive;
         private const float BlinkApproachGrid = 4f;      // tight approach before blink
 
         // Stuck recovery state
@@ -454,6 +458,23 @@ namespace AutoExile.Systems
             }
             _lastPosition = playerGrid;
 
+            // Recovery hold sits before no-progress detection: walking away from the waypoint
+            // is the point of a probe and must not trigger the next probe.
+            if (_recoveryActive)
+            {
+                if (DateTime.Now < _recoveryUntil && Vector2.Distance(playerGrid, _recoveryTarget) > RecoveryReachedGrid)
+                {
+                    ExecuteWalk(GridToScreen(gc, _recoveryTarget), gc.Window.GetWindowRectangle());
+                    return;
+                }
+                _recoveryActive = false;
+                if (Destination.HasValue)
+                {
+                    NavigateTo(gc, Destination.Value, 0, useFailureMemo: false);
+                    return;
+                }
+            }
+
             // No-progress detection: player is moving (not stuck) but not getting closer
             // to the current waypoint — e.g. shield charge bouncing off a wall, or trapped
             // by lab spike trap that blocks movement but causes micro-knockback
@@ -490,12 +511,6 @@ namespace AutoExile.Systems
                         return;
                     }
                 }
-            }
-
-            if (DateTime.Now < _recoveryUntil)
-            {
-                ExecuteWalk(GridToScreen(gc, _recoveryTarget), gc.Window.GetWindowRectangle());
-                return;
             }
 
             // Get current waypoint and determine action
@@ -945,7 +960,10 @@ namespace AutoExile.Systems
             }
 
             if (!Destination.HasValue || Vector2.Distance(Destination.Value, gridTarget) > 10f)
+            {
                 _totalStuckRecoveries = 0;
+                _recoveryActive = false; // a new destination drops a recovery for the old one
+            }
             // A short walk would count as arrived before the first step; finish it properly instead.
             _finalReachGrid = Vector2.Distance(playerGrid, CurrentNavPath[^1].Position) < FinalWaypointGrid + 4f
                 ? CloseFinalWaypointGrid : FinalWaypointGrid;
@@ -1128,6 +1146,7 @@ namespace AutoExile.Systems
         {
             _recoveryTarget = gridTarget;
             _recoveryUntil = DateTime.Now.AddMilliseconds(RecoveryHoldMs);
+            _recoveryActive = true;
         }
 
         private static readonly float[] EscapeDistanceScales = { 1f, 0.7f, 0.4f };
@@ -1314,6 +1333,7 @@ namespace AutoExile.Systems
             _bestDistToWaypoint = float.MaxValue;
             _noProgressTimer = 0;
             _recoveryUntil = DateTime.MinValue;
+            _recoveryActive = false;
             BotInput.StopMovement();
         }
 

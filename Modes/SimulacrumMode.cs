@@ -1048,6 +1048,9 @@ namespace AutoExile.Modes
                 {
                     _wasSearching = true;
                     var monsterDist = Vector2.Distance(playerPos, nearestPos.Value);
+                    // The chased monster died or despawned: the next one starts a fresh clock.
+                    if (_chaseTargetId != 0 && nearestId != _chaseTargetId && !IsAliveMonster(gc, _chaseTargetId))
+                        ResetChase();
                     // Progress is distance to whichever monster is nearest, so two unreachable
                     // monsters swapping as "nearest" cannot keep restarting the clock.
                     if (_chaseProgressAt == DateTime.MinValue || monsterDist < _chaseBestDist - ChaseProgressGrid)
@@ -1189,6 +1192,14 @@ namespace AutoExile.Modes
         {
             if (_chaseTargetId == 0) return;
             _blacklistedMonsters[_chaseTargetId] = DateTime.Now.AddSeconds(ChaseBlacklistSeconds - MonsterBlacklistSeconds);
+        }
+
+        private static bool IsAliveMonster(GameController gc, long entityId)
+        {
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+                if (entity.Id == entityId)
+                    return entity.Type == EntityType.Monster && entity.IsAlive;
+            return false;
         }
 
         private void ResetChase()

@@ -548,7 +548,7 @@ namespace AutoExile
                 var sinceTick = now - lastTick;
                 var sinceInGame = lastInGame == 0 ? -1 : now - lastInGame;
                 var gap = sinceTick >= TickWatchdogPeriodMs || sinceInGame >= TickWatchdogPeriodMs || sinceInGame < 0;
-                if (!gap || !_lastTickRunning)
+                if (!gap || !_lastTickRunning || !Settings.Enable)
                 {
                     _tickGapReports = 0;
                     return;
