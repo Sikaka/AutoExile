@@ -237,6 +237,8 @@ tr:hover td { background:var(--surface2); }
 .run-report-bar { height:100%; min-width:2px; border-radius:3px; background:var(--accent); }
 .run-report-wave.unfinished .run-report-track { border:1px dashed var(--orange); background:transparent; }
 .run-report-wave.unfinished .run-report-bar { display:none; }
+.run-report-wave-gap { color:var(--text-dim); }
+.run-report-wave-gap .run-report-track { border-color:var(--border); }
 .forensics-context { max-width:430px; }
 .forensics-context summary { color:var(--accent); cursor:pointer; font-size:10px; }
 .forensics-context code { display:block; max-height:180px; margin-top:6px; padding:8px; overflow:auto; border:1px solid var(--border); border-radius:5px; background:var(--bg); color:var(--text-dim); font-size:9px; line-height:1.45; white-space:pre-wrap; word-break:break-word; }
@@ -3478,7 +3480,14 @@ function runReportHtml(state, nowMs) {
     const lastStarted = Math.max(0, ...waves.filter(w => w.startedAtUtc).map(w => Number(w.wave) || 0));
     html += '<div class="run-report-section"><h3>Waves</h3><div class="run-report-waves">'
       + '<div class="run-report-wave run-report-wave-head"><span>Wave</span><span></span><span>Time</span><span>Items</span><span>Chaos</span></div>';
+    // Waves before the first recorded start (a run picked up mid-instance or imported) collapse into one row.
+    const firstStarted = Math.min(...waves.filter(w => w.startedAtUtc).map(w => Number(w.wave) || 99), 99);
+    const missing = firstStarted < 99 ? waves.filter(w => Number(w.wave) < firstStarted && !w.startedAtUtc && !w.completedAtUtc) : [];
+    if (missing.length > 1) {
+      html += `<div class="run-report-wave unfinished run-report-wave-gap"><span>W1–W${missing.length}</span><div class="run-report-track"></div><span>Not recorded</span><span></span><span></span></div>`;
+    }
     for (const w of waves) {
+      if (missing.length > 1 && missing.includes(w)) continue;
       const done = w.durationMs != null && Number.isFinite(Number(w.durationMs));
       const status = done ? runReportClock(w.durationMs)
         : !w.startedAtUtc ? 'No start'

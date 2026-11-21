@@ -144,7 +144,64 @@ namespace AutoExile.Statistics
             bool replaceOpenRun = false)
         {
             if (string.IsNullOrWhiteSpace(mode) || string.IsNullOrWhiteSpace(activationKey)) return;
+            Enqueue(db => BeginRunNow(db, mode, activationKey, areaName, consumed, replaceOpenRun));
+        }
+
+        /// <summary>
+        /// The bot found itself inside a Simulacrum it did not activate in this process (plugin restart,
+        /// mode switch back). The same instance keeps its run: an open run on that instance continues,
+        /// and a run on that instance closed by a restart or mode switch within the resume window is
+        /// reopened. Anything else starts a new run as before.
+        /// </summary>
+        public void ResumeOrBeginSimulacrum(long instanceHash, string activationKey, string areaName)
+        {
+            if (string.IsNullOrWhiteSpace(activationKey)) return;
             Enqueue(db =>
+            {
+                if (instanceHash != 0 && TryResumeRun(db, "Simulacrum", instanceHash)) return;
+                BeginRunNow(db, "Simulacrum", activationKey, areaName, consumed: true, replaceOpenRun: true);
+            });
+        }
+
+        private const long RunResumeWindowMs = 30 * 60 * 1000;
+
+        private static bool TryResumeRun(SqliteConnection db, string mode, long instanceHash)
+        {
+            using var tx = db.BeginTransaction();
+            var now = NowMs();
+            var open = GetOpenRunId(db, tx);
+            if (open != null)
+            {
+                var sameInstance = ScalarNullableInt64(db, tx,
+                    "SELECT instance_hash FROM runs WHERE run_id=$id AND mode=$mode", ("$id", open), ("$mode", mode)) == instanceHash;
+                tx.Commit();
+                return sameInstance;
+            }
+            // Only the most recent run may be resumed, and only if nothing else started after it.
+            var runId = ScalarString(db, tx, @"SELECT run_id FROM runs
+WHERE run_id=(SELECT run_id FROM runs ORDER BY activated_at_ms DESC,rowid DESC LIMIT 1)
+AND mode=$mode AND state='closed' AND instance_hash=$hash
+AND terminal_reason IN ('plugin_restarted','mode_switched') AND ended_at_ms>=$since",
+                ("$mode", mode), ("$hash", instanceHash), ("$since", now - RunResumeWindowMs));
+            if (runId == null) { tx.Commit(); return false; }
+
+            var sessionId = ScalarString(db, tx, "SELECT session_id FROM runs WHERE run_id=$id", ("$id", runId))!;
+            var reason = ScalarString(db, tx, "SELECT terminal_reason FROM runs WHERE run_id=$id", ("$id", runId));
+            Execute(db, tx, @"UPDATE runs SET state='open',result=NULL,terminal_reason=NULL,ended_at_ms=NULL,
+last_observed_at_ms=$now WHERE run_id=$run", ("$now", now), ("$run", runId));
+            // The earlier close stays in the timeline as a pause marker; the run gets a fresh end event later.
+            var stamp = Guid.NewGuid().ToString("N");
+            Execute(db, tx, @"UPDATE stats_events SET event_type='run_paused',source_key=source_key||':'||$stamp
+WHERE source_key='run-end:'||$run", ("$stamp", stamp), ("$run", runId));
+            InsertEvent(db, tx, $"run-resume:{runId}:{stamp}", sessionId, runId, "run_resumed", now, null,
+                JsonSerializer.Serialize(new { after = reason }));
+            tx.Commit();
+            return true;
+        }
+
+        private static void BeginRunNow(SqliteConnection db, string mode, string activationKey, string areaName,
+            bool consumed, bool replaceOpenRun)
+        {
             {
                 using var tx = db.BeginTransaction();
                 var now = NowMs();
@@ -188,7 +245,7 @@ VALUES($run,$session,$mode,$key,$area,'open',$consumed,$now,$now,'native')",
                 InsertEvent(db, tx, $"activation:{persistedActivationKey}", sessionId, runId,
                     "run_started", now, null, JsonSerializer.Serialize(new { mode, consumed }));
                 tx.Commit();
-            });
+            }
         }
 
         public void ObserveSimulacrumEntry(long instanceHash, string areaName)

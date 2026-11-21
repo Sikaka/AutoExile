@@ -153,7 +153,8 @@ namespace AutoExile.Modes
             {
                 // Already in a map — try to find monolith
                 var areaHash = gc.IngameState?.Data?.CurrentAreaHash ?? 0;
-                ctx.Stats.BeginSimulacrumActivation($"recovered:{areaHash}",
+                // Same instance after a plugin restart or mode switch: keep its run instead of starting a second one.
+                ctx.Stats.ResumeOrBeginSimulacrum(areaHash, $"recovered:{areaHash}",
                     gc.Area.CurrentArea.Name ?? "");
                 if (areaHash != 0)
                 {

@@ -604,6 +604,57 @@ INSERT INTO loot_events(loot_id,source_key,session_id,run_id,picked_at_ms,item_n
         Require(command.ExecuteScalar() as string == "manual", "manual rotation reason was overwritten");
     }
 
+    // One Simulacrum instance keeps one run across a plugin restart and a mode switch.
+    var resumeDb = Path.Combine(root, "resume", "stats.db");
+    string resumedRun;
+    using (var before = new StatsService(logs.Add, resumeDb))
+    {
+        Require(before.Initialize(seasonPlugin), "resume setup failed");
+        before.BeginSimulacrumActivation("resume-1", "Hideout");
+        before.ObserveSimulacrumEntry(8888, "Simulacrum");
+        before.RecordWaveStarted(1);
+        before.RecordWaveCompleted(1);
+        before.RecordWaveStarted(2);
+        Flush(before);
+        resumedRun = before.Snapshot.CurrentRun!.RunId;
+    }
+    using (var after = new StatsService(logs.Add, resumeDb))
+    {
+        Require(after.Initialize(seasonPlugin), "resume restart failed");
+        Flush(after);
+        Require(after.Snapshot.CurrentRun == null, "restart recovery left the run open");
+        after.ResumeOrBeginSimulacrum(8888, "recovered:8888", "Simulacrum");
+        after.ObserveSimulacrumEntry(8888, "Simulacrum");
+        after.RecordWaveStarted(2);
+        after.RecordWaveCompleted(2);
+        Flush(after);
+        Require(after.Snapshot.CurrentRun?.RunId == resumedRun, "plugin restart split the Simulacrum into a new run");
+
+        // An already open run on the same instance is kept (mode re-entry without a close).
+        after.ResumeOrBeginSimulacrum(8888, "recovered:8888", "Simulacrum");
+        Flush(after);
+        Require(after.Snapshot.CurrentRun?.RunId == resumedRun, "re-entering the mode replaced the open run");
+
+        after.EndRun("Simulacrum", "interrupted", "mode_switched");
+        after.ResumeOrBeginSimulacrum(8888, "recovered:8888", "Simulacrum");
+        after.RecordWaveStarted(3);
+        after.EndSimulacrumRun(false, "resume_test");
+        Flush(after);
+        var resumed = after.ReadRunDetail(resumedRun) ?? throw new InvalidOperationException("resumed run missing");
+        Require(resumed.Run.State == "closed" && resumed.Run.TerminalReason == "resume_test" && resumed.WaveSummary.Completed == 2 &&
+                resumed.Waves.Count == 3 && resumed.Waves[1].DurationMs != null,
+                "resumed run lost its waves or end state");
+        Require(resumed.Events.Count(ev => ev.EventType == "run_ended") == 1 &&
+                resumed.Events.Count(ev => ev.EventType == "run_paused") == 2 &&
+                resumed.Events.Count(ev => ev.EventType == "run_resumed") == 2, "pause/resume markers mismatch");
+
+        // A different instance, or a run that ended normally, starts a new run.
+        after.ResumeOrBeginSimulacrum(8888, "recovered:8888-b", "Simulacrum");
+        Flush(after);
+        Require(after.Snapshot.CurrentRun != null && after.Snapshot.CurrentRun.RunId != resumedRun,
+                "a normally ended run was resumed");
+    }
+
     var freshSeasonDb = Path.Combine(root, "season-fresh", "stats.db");
     using (var fresh = new StatsService(logs.Add, freshSeasonDb))
     {
