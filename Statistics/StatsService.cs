@@ -72,7 +72,7 @@ namespace AutoExile.Statistics
         private long _lastWriteErrorLogTickMs;
         private int _writeErrorsSinceLastLog;
         private int _bestFindsMinimumChaos = 100;
-        private string? _league;            // caller (tick) thread only
+        private string? _league;            // last league handed to the writer; cleared by the writer on failure
 
         public StatsService(Action<string> log, string? databasePathOverride = null)
         {
@@ -168,6 +168,9 @@ namespace AutoExile.Statistics
                     }
                     CloseRun(db, tx, open, null, "replaced_by_new_activation", now);
                 }
+                // No run is open here, so a queued rotation (for example a league change) takes effect first.
+                ApplyPendingRotation(db, tx, now);
+                sessionId = EnsureSession(db, tx, now);
 
                 var runId = Guid.NewGuid().ToString("N");
                 var persistedActivationKey = activationKey;
@@ -206,6 +209,7 @@ VALUES($run,$session,$mode,$key,$area,'open',$consumed,$now,$now,'native')",
                 if (requireStableInstance && existingHash.HasValue && existingHash.Value != instanceHash)
                 {
                     CloseRun(db, tx, runId, "interrupted", "instance_changed", now);
+                    ApplyPendingRotation(db, tx, now);
                     tx.Commit();
                     return;
                 }
@@ -354,9 +358,24 @@ WHERE loot_id=$loot
         public void SetLeague(string? league)
         {
             league = league?.Trim();
-            if (string.IsNullOrEmpty(league) || league == _league) return;
-            _league = league;
-            Enqueue(db =>
+            if (string.IsNullOrEmpty(league) || league == Volatile.Read(ref _league)) return;
+            var previous = Volatile.Read(ref _league);
+            Volatile.Write(ref _league, league);
+            var accepted = Enqueue(db =>
+            {
+                try { ApplyLeague(db, league); }
+                catch
+                {
+                    // Let the next tick retry instead of trusting a league that was never recorded.
+                    Interlocked.CompareExchange(ref _league, null, league);
+                    throw;
+                }
+            });
+            if (!accepted) Interlocked.CompareExchange(ref _league, previous, league);
+        }
+
+        private static void ApplyLeague(SqliteConnection db, string league)
+        {
             {
                 using var tx = db.BeginTransaction();
                 var now = NowMs();
@@ -370,7 +389,7 @@ WHERE loot_id=$loot
                     Execute(db, tx, @"DELETE FROM stats_meta WHERE key='pending_session_rotation'
 AND value IN ('league_changed','league_tracking_started')");
                 }
-                else if (sessionLeague == null && ScalarInt32(db, tx,
+                else if (ScalarInt32(db, tx,
                     @"SELECT (SELECT COUNT(*) FROM runs WHERE session_id=$id)+(SELECT COUNT(*) FROM loot_events WHERE session_id=$id)",
                     ("$id", sessionId)) == 0)
                 {
@@ -381,13 +400,19 @@ AND value IN ('league_changed','league_tracking_started')");
                 {
                     var reason = sessionLeague == null ? "league_tracking_started" : "league_changed";
                     if (GetOpenRunId(db, tx) != null)
-                        Execute(db, tx, "INSERT OR REPLACE INTO stats_meta(key,value) VALUES('pending_session_rotation',$reason)",
+                    {
+                        // An already queued rotation (manual or league) covers this one.
+                        Execute(db, tx, "INSERT OR IGNORE INTO stats_meta(key,value) VALUES('pending_session_rotation',$reason)",
                             ("$reason", reason));
+                    }
                     else
+                    {
                         RotateSessionNow(db, tx, now, reason);
+                        Execute(db, tx, "DELETE FROM stats_meta WHERE key='pending_session_rotation'");
+                    }
                 }
                 tx.Commit();
-            });
+            }
         }
 
         public void RotateSession(string reason = "manual")
@@ -679,6 +704,7 @@ INSERT OR IGNORE INTO schema_migrations(version,applied_at_ms) VALUES(2,$now);",
             }
             foreach (var runId in staleRuns)
                 CloseRun(db, tx, runId, "interrupted", "plugin_restarted", now);
+            ApplyPendingRotation(db, tx, now);
             Execute(db, tx, "UPDATE sessions SET resumed_at_ms=NULL WHERE ended_at_ms IS NULL");
             EnsureSession(db, tx, now);
             tx.Commit();

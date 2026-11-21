@@ -983,11 +983,11 @@ function updateDashboard(s) {
     setText('simPartial', session ? session.partialRuns : 0);
     setText('simNoProgress', session ? (session.noProgressRuns + session.notEnteredRuns) : 0);
     setText('simInterrupted', session ? session.interruptedRuns : 0);
-    setText('simLifetimeWaves', lifetime ? lifetime.wavesCompleted : 0);
-    setText('simLifetimeDeaths', lifetime ? lifetime.deaths : 0);
-    setText('simLifetimeValue', `${formatNumber(lifetime ? lifetime.chaosValue : 0, 1)}c`);
-    setText('simLifetimeItems', lifetime ? lifetime.itemsLooted : 0);
-    setText('simLifetimeRuns', lifetime ? lifetime.attempts : 0);
+    setText('simLifetimeWaves', lifetime ? lifetime.wavesCompleted || 0 : 0);
+    setText('simLifetimeDeaths', lifetime ? lifetime.deaths || 0 : 0);
+    setText('simLifetimeValue', `${formatNumber(lifetime ? lifetime.chaosValue || 0 : 0, 1)}c`);
+    setText('simLifetimeItems', lifetime ? lifetime.itemsLooted || 0 : 0);
+    setText('simLifetimeRuns', lifetime ? lifetime.attempts || 0 : 0);
   } else {
     simCard.style.display = 'none';
     simLedger.style.display = 'none';
@@ -2653,6 +2653,7 @@ async function switchHistory(type, el) {
   document.querySelectorAll('.history-tab').forEach(t=>t.classList.remove('active'));
   if(el) el.classList.add('active');
   if (runReport) closeRunReport(false);
+  document.getElementById('historyFilters').style.display = '';
   currentHistoryType = type;
   historyLimit = 20;
   await loadHistory(type);
@@ -2917,8 +2918,10 @@ async function loadHistory(type) {
     const suffix = type === 'forensics' ? `&hours=${forensicsWindowHours}` : '';
     const fetchLimit = type === 'best-finds' ? 20 : type === 'forensics' ? 500 : 100;
     const r = await fetch(`/api/history/${type}?limit=${fetchLimit}${suffix}`);
+    if (currentHistoryType !== type) return;
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const payload = await r.json();
+    if (currentHistoryType !== type) return;
     const data = type === 'forensics' ? (payload.events || []) : payload;
     if (type === 'forensics') historyReports[type] = payload;
     if (type === 'runs' && runReport) { historyData[type] = data || []; return; }
@@ -2934,6 +2937,7 @@ async function loadHistory(type) {
     renderHistoryControls(type, data);
     applyHistoryView();
   } catch(e) {
+    if (currentHistoryType !== type) return;
     if (type === 'runs' && runReport) return;
     document.getElementById('historyFilters').innerHTML = '';
     container.innerHTML = `<div class="empty-state">Error: ${esc(e.message)}</div>`;
@@ -3190,6 +3194,7 @@ function renderRunsTable(data) {
 // list: season summaries; league: undefined = list view, '' = records before league tracking.
 const seasonView = { list:null, league:undefined, detail:null, error:'', loading:false, seq:0, showAllRuns:false };
 const SEASON_RUN_PREVIEW = 100;
+const SEASON_RUN_LIMIT = 500; // StatsService.SeasonRunLimit
 
 function seasonName(league) {
   return league == null || league === '' ? 'Before seasons' : league;
@@ -3309,7 +3314,7 @@ function seasonDetailHtml() {
   }
 
   const runs = Array.isArray(d.runs) ? d.runs : [];
-  html += `<div class="run-report-section"><h3>Runs (${runs.length.toLocaleString()}${runs.length < (Number(sum.attempts) || 0) ? ` of ${(Number(sum.attempts) || 0).toLocaleString()}` : ''})</h3>`;
+  html += `<div class="run-report-section"><h3>${runs.length >= SEASON_RUN_LIMIT ? `Latest ${SEASON_RUN_LIMIT.toLocaleString()} runs` : `Runs (${runs.length.toLocaleString()})`}</h3>`;
   if (!runs.length) html += '<p class="run-report-note">No closed runs.</p>';
   else {
     const shown = seasonView.showAllRuns ? runs : runs.slice(0, SEASON_RUN_PREVIEW);

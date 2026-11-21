@@ -572,6 +572,7 @@ namespace AutoExile
         }
 
         private long _lastLeagueCheckMs = long.MinValue / 2;
+        private string? _lastLeagueRead;
 
         public override Job Tick()
         {
@@ -585,8 +586,15 @@ namespace AutoExile
                 if (tickNow - _lastLeagueCheckMs >= 5000)
                 {
                     _lastLeagueCheckMs = tickNow;
-                    // Each league is its own stats season; SetLeague ignores an unchanged value.
-                    try { _stats.SetLeague(GameController.IngameState?.ServerData?.League); }
+                    // Each league is its own stats season. A value must repeat on two reads before it
+                    // counts, so a single bad memory read cannot open a season. SetLeague ignores repeats.
+                    try
+                    {
+                        var league = GameController.IngameState?.ServerData?.League?.Trim();
+                        if (!string.IsNullOrEmpty(league) && league == _lastLeagueRead)
+                            _stats.SetLeague(league);
+                        _lastLeagueRead = league;
+                    }
                     catch { }
                 }
             }

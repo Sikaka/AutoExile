@@ -516,9 +516,10 @@ INSERT INTO loot_events(loot_id,source_key,session_id,run_id,picked_at_ms,item_n
         seasons.BeginSimulacrumActivation("season-1", "Hideout");
         seasons.ObserveSimulacrumEntry(4242, "Simulacrum");
         seasons.RecordLoot("Covens Item", 5, 1, 9002, 4242, "Simulacrum");
+        seasons.RecordLoot("Covens Best Find", 150, 1, 9003, 4242, "Simulacrum");
         Flush(seasons);
         var covensSession = seasons.Snapshot.Session.SessionId;
-        Require(seasons.Snapshot.SeasonFor("Simulacrum") is { Attempts: 1, ItemsLooted: 1 }, "season mode totals missed the run");
+        Require(seasons.Snapshot.SeasonFor("Simulacrum") is { Attempts: 1, ItemsLooted: 2 }, "season mode totals missed the run");
 
         seasons.SetLeague("Mercenaries");
         Flush(seasons);
@@ -535,14 +536,15 @@ INSERT INTO loot_events(loot_id,source_key,session_id,run_id,picked_at_ms,item_n
 
         var list = seasons.ReadSeasons();
         Require(list.Select(s => s.League).SequenceEqual(new[] { "Mercenaries", "Covens", null }) &&
-                list[0].Current && !list[1].Current && list[1].Runs == 1 && Math.Abs(list[1].ChaosValue - 5) < 1e-9 &&
+                list[0].Current && !list[1].Current && list[1].Runs == 1 && Math.Abs(list[1].ChaosValue - 155) < 1e-9 &&
                 list[2].ItemsLooted == 1 && list[2].Runs == 0, "season list mismatch");
         var covens = seasons.ReadSeason("Covens") ?? throw new InvalidOperationException("Covens season missing");
-        Require(covens.Summary.Attempts == 1 && covens.Summary.ItemsLooted == 1 && covens.Runs.Count == 1 &&
-                covens.ByMode.ContainsKey("Simulacrum") && covens.BestFinds.Count == 0, "season detail mismatch");
+        Require(covens.Summary.Attempts == 1 && covens.Summary.ItemsLooted == 2 && covens.Runs.Count == 1 &&
+                covens.ByMode.ContainsKey("Simulacrum") && covens.BestFinds.Select(f => f.ItemName).SequenceEqual(new[] { "Covens Best Find" }),
+                "season detail mismatch");
         var preSeason = seasons.ReadSeason("") ?? throw new InvalidOperationException("pre-season bucket missing");
-        Require(preSeason.Season.League == null && preSeason.Summary.ItemsLooted == 1 && preSeason.Summary.Attempts == 0,
-            "pre-season bucket mismatch");
+        Require(preSeason.Season.League == null && preSeason.Summary.ItemsLooted == 1 && preSeason.Summary.Attempts == 0 &&
+                preSeason.BestFinds.Count == 0, "pre-season bucket mismatch");
         Require(seasons.ReadSeason("Unknown League") == null, "unknown league returned a season");
     }
     using (var seasonRestart = new StatsService(logs.Add, seasonDb))
@@ -553,6 +555,55 @@ INSERT INTO loot_events(loot_id,source_key,session_id,run_id,picked_at_ms,item_n
         Require(seasonRestart.Snapshot.Session.SessionId == mercenariesSession && seasonRestart.Snapshot.CurrentLeague == "Mercenaries",
             "restart in the same league rotated the session");
     }
+    // A league change queued during a run survives a restart and is applied exactly once.
+    var pendingDb = Path.Combine(root, "season-pending", "stats.db");
+    string runInA;
+    using (var pending = new StatsService(logs.Add, pendingDb))
+    {
+        Require(pending.Initialize(seasonPlugin), "pending season setup failed");
+        pending.SetLeague("A");
+        pending.BeginSimulacrumActivation("pending-1", "Hideout");
+        pending.ObserveSimulacrumEntry(5151, "Simulacrum");
+        Flush(pending);
+        runInA = pending.Snapshot.CurrentRun!.RunId;
+        pending.SetLeague("B");
+        Flush(pending);
+    }
+    string sessionB;
+    using (var pendingRestart = new StatsService(logs.Add, pendingDb))
+    {
+        Require(pendingRestart.Initialize(seasonPlugin), "pending season restart failed");
+        pendingRestart.SetLeague("B");
+        Flush(pendingRestart);
+        sessionB = pendingRestart.Snapshot.Session.SessionId!;
+        pendingRestart.BeginSimulacrumActivation("pending-2", "Hideout");
+        pendingRestart.ObserveSimulacrumEntry(5252, "Simulacrum");
+        pendingRestart.EndSimulacrumRun(false, "pending_test");
+        Flush(pendingRestart);
+        Require(pendingRestart.Snapshot.Session.SessionId == sessionB, "a league rotation left pending over a restart ran twice");
+        Require(pendingRestart.ReadSeason("A")!.Runs.Single().RunId == runInA && pendingRestart.ReadSeason("B")!.Runs.Count == 1,
+            "runs landed in the wrong season after a restart");
+
+        // A manual rotation queued during a run is not dropped by a league flip-flop.
+        pendingRestart.BeginSimulacrumActivation("pending-3", "Hideout");
+        pendingRestart.ObserveSimulacrumEntry(5353, "Simulacrum");
+        pendingRestart.RotateSession("manual");
+        pendingRestart.SetLeague("C");
+        pendingRestart.SetLeague("B");
+        pendingRestart.EndSimulacrumRun(false, "flip_test");
+        Flush(pendingRestart);
+        Require(pendingRestart.Snapshot.Session.SessionId != sessionB && pendingRestart.Snapshot.CurrentLeague == "B",
+            "manual rotation was lost after a league flip-flop");
+    }
+    using (var pendingCheck = new SqliteConnection($"Data Source={pendingDb};Pooling=False"))
+    {
+        pendingCheck.Open();
+        using var command = pendingCheck.CreateCommand();
+        command.CommandText = "SELECT end_reason FROM sessions WHERE session_id=$id";
+        command.Parameters.AddWithValue("$id", sessionB);
+        Require(command.ExecuteScalar() as string == "manual", "manual rotation reason was overwritten");
+    }
+
     var freshSeasonDb = Path.Combine(root, "season-fresh", "stats.db");
     using (var fresh = new StatsService(logs.Add, freshSeasonDb))
     {

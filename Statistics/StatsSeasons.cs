@@ -33,8 +33,8 @@ FROM sessions s GROUP BY s.league ORDER BY MAX(s.started_at_ms) DESC";
                     Runs = r.GetInt32(3), FullClears = r.GetInt32(4), ItemsLooted = r.GetInt64(5),
                     ChaosValue = r.GetInt64(6) / 1000d,
                 };
-                // An empty pre-tracking bucket (a fresh install) is not a season worth listing.
-                if (league == null && summary.Runs == 0 && summary.ItemsLooted == 0) continue;
+                // A season with nothing recorded (a fresh install, a league visited without playing) is not listed.
+                if (!summary.Current && summary.Runs == 0 && summary.ItemsLooted == 0) continue;
                 result.Add(summary);
             }
             return result;
